@@ -25,6 +25,21 @@ impl BinaryAnalysis {
             Self::Pe(analysis) => &analysis.symbol_graph,
         }
     }
+
+    /// Revalidate the format-specific model and its deterministic base graph.
+    pub fn validate(&self) -> Result<(), crate::AnalysisError> {
+        match self {
+            Self::Pe(analysis) => analysis.validate(),
+        }
+    }
+
+    /// Virtual image size used to validate address-bearing plugin claims.
+    #[must_use]
+    pub(crate) const fn image_size(&self) -> u64 {
+        match self {
+            Self::Pe(analysis) => analysis.size_of_image as u64,
+        }
+    }
 }
 
 /// Deterministic analysis of one PE32+ x86-64 image.

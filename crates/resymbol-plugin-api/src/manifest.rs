@@ -152,7 +152,7 @@ pub enum NativeIsolation {
 
 /// Execution host selected by the manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "kebab-case")]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 #[non_exhaustive]
 pub enum PluginRuntime {
     Wasm {
@@ -381,6 +381,29 @@ mod tests {
     }
 
     #[test]
+    fn identifier_boundaries_match_the_wire_contract() {
+        for value in ["abc", "a.b", "a_b.c-d"] {
+            PluginId::new(value).expect("valid plugin id");
+            PluginCapability::new(value).expect("valid capability");
+            PluginPermission::new(value).expect("valid permission");
+        }
+        PluginId::new("a".repeat(128)).expect("128-byte identifier is valid");
+
+        for value in ["ab", "a..b", "a._b", "a.b-", "a+b"] {
+            assert!(PluginId::new(value).is_err(), "`{value}` must be invalid");
+            assert!(
+                PluginCapability::new(value).is_err(),
+                "`{value}` must be invalid"
+            );
+            assert!(
+                PluginPermission::new(value).is_err(),
+                "`{value}` must be invalid"
+            );
+        }
+        assert!(PluginId::new("a".repeat(129)).is_err());
+    }
+
+    #[test]
     fn in_process_native_runtime_requires_explicit_permission() {
         let manifest = manifest(PluginRuntime::Native {
             entrypoint: "plugin.dll".into(),
@@ -412,5 +435,25 @@ mod tests {
         let json = serde_json::to_value(runtime).expect("serialize runtime");
         assert_eq!(json["kind"], "external-process");
         assert_eq!(json["entrypoint"], "worker");
+    }
+
+    #[test]
+    fn runtime_manifest_typos_are_rejected() {
+        let manifest = r#"
+            manifest_version = 1
+            id = "community.example"
+            name = "Example"
+            version = "1.0.0"
+            api = "^0.1"
+
+            [runtime]
+            kind = "external-process"
+            entrypoint = "worker"
+            argz = ["--stdio"]
+        "#;
+
+        let error = toml::from_str::<PluginManifest>(manifest)
+            .expect_err("unknown nested runtime fields must fail");
+        assert!(error.to_string().contains("unknown field `argz`"));
     }
 }

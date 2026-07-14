@@ -19,7 +19,7 @@ CMakeFiles/
 CMakeCache.txt
 
 # ReSymbol runtime and generated analysis output
-/.resymbol/
+**/.resymbol/
 /dist/
 /coverage/
 /logs/
@@ -36,4 +36,3 @@ CMakeCache.txt
 .DS_Store
 Thumbs.db
 Desktop.ini
-

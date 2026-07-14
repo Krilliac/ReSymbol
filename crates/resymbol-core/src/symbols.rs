@@ -146,7 +146,7 @@ impl BinaryIdentity {
 
 /// Canonical object to which a plugin attaches a claim.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "kebab-case")]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 #[non_exhaustive]
 pub enum SymbolSubject {
     Function {
@@ -200,7 +200,7 @@ impl SymbolSubject {
 
 /// Information proposed for a subject. The core preserves competing claims.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "kebab-case")]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 #[non_exhaustive]
 pub enum SymbolAssertion {
     Name { name: String },
@@ -664,6 +664,23 @@ mod tests {
         let error = serde_json::from_str::<SymbolClaim>(&json)
             .expect_err("empty evidence must be rejected");
         assert!(error.to_string().contains("at least one evidence"));
+    }
+
+    #[test]
+    fn nested_symbol_fields_reject_unknown_properties() {
+        let binary = binary_id();
+        let subject = format!(
+            r#"{{"kind":"function","binary":"{binary}","rva":4096,"unexpected":true}}"#
+        );
+        let error = serde_json::from_str::<SymbolSubject>(&subject)
+            .expect_err("unknown subject fields must fail");
+        assert!(error.to_string().contains("unknown field `unexpected`"));
+
+        let error = serde_json::from_str::<SymbolAssertion>(
+            r#"{"kind":"name","name":"RecoveredName","unexpected":true}"#,
+        )
+        .expect_err("unknown assertion fields must fail");
+        assert!(error.to_string().contains("unknown field `unexpected`"));
     }
 
     #[test]

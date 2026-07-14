@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs, io,
+    fs::{self, File},
+    io::{self, Read},
     path::{Component, Path, PathBuf},
 };
 
@@ -13,7 +14,11 @@ use serde::{Deserialize, Serialize};
 
 pub const PLUGIN_MANIFEST_FILE: &str = "plugin.toml";
 pub const PLUGIN_DISABLED_SENTINEL: &str = "plugin.disabled";
+/// Host-owned trust and quarantine state below the plugin collection root.
+pub const PLUGIN_STATE_DIRECTORY: &str = ".resymbol";
 pub const PLUGIN_PACKAGE_EXTENSION: &str = "resymbol-plugin";
+const MAX_PLUGIN_CANDIDATES: usize = 4_096;
+const MAX_PLUGIN_MANIFEST_BYTES: u64 = 256 * 1024;
 
 /// Source representation found directly beneath the plugin directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,7 +85,8 @@ impl PluginDiscoveryReport {
 
 /// Scan immediate child directories and `*.resymbol-plugin` package files.
 ///
-/// A missing root is equivalent to an empty plugin directory. Discovery never
+/// A missing root is equivalent to an empty plugin directory. At most 4,096 immediate candidates
+/// are accepted, and unpacked manifests are bounded to 262,144 UTF-8 bytes. Discovery never
 /// modifies, deletes, compiles, or executes plugin content.
 pub fn discover_plugins(
     root: impl AsRef<Path>,
@@ -88,11 +94,26 @@ pub fn discover_plugins(
 ) -> io::Result<PluginDiscoveryReport> {
     let root = root.as_ref().to_path_buf();
     let mut paths = match fs::read_dir(&root) {
-        Ok(entries) => entries
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| is_candidate(path))
-            .collect::<Vec<_>>(),
+        Ok(entries) => {
+            let mut paths = Vec::new();
+            for entry in entries {
+                let path = entry?.path();
+                if !is_candidate(&path)? {
+                    continue;
+                }
+                if paths.len() == MAX_PLUGIN_CANDIDATES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "plugin root {} contains more than {MAX_PLUGIN_CANDIDATES} candidates",
+                            root.display()
+                        ),
+                    ));
+                }
+                paths.push(path);
+            }
+            paths
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
         Err(error) => return Err(error),
     };
@@ -110,17 +131,21 @@ pub fn discover_plugins(
     Ok(PluginDiscoveryReport { root, plugins })
 }
 
-fn is_candidate(path: &Path) -> bool {
-    let Ok(metadata) = fs::symlink_metadata(path) else {
-        return false;
-    };
-    metadata.file_type().is_dir()
+fn is_candidate(path: &Path) -> io::Result<bool> {
+    if path
+        .file_name()
+        .is_some_and(|name| name == PLUGIN_STATE_DIRECTORY)
+    {
+        return Ok(false);
+    }
+    let metadata = fs::symlink_metadata(path)?;
+    Ok(metadata.file_type().is_dir()
         || (metadata.file_type().is_file()
             && path.extension().is_some_and(|extension| {
                 extension
                     .to_string_lossy()
                     .eq_ignore_ascii_case(PLUGIN_PACKAGE_EXTENSION)
-            }))
+            })))
 }
 
 fn discover_one(path: PathBuf, options: &PluginDiscoveryOptions) -> DiscoveredPlugin {
@@ -169,7 +194,7 @@ fn discover_package(path: PathBuf, options: &PluginDiscoveryOptions) -> Discover
 
 fn discover_directory(path: PathBuf, options: &PluginDiscoveryOptions) -> DiscoveredPlugin {
     let manifest_path = path.join(PLUGIN_MANIFEST_FILE);
-    let manifest_text = match fs::read_to_string(&manifest_path) {
+    let manifest_text = match read_manifest(&manifest_path) {
         Ok(manifest) => manifest,
         Err(error) => {
             return invalid_directory(
@@ -258,6 +283,38 @@ fn discover_directory(path: PathBuf, options: &PluginDiscoveryOptions) -> Discov
     }
 
     plugin
+}
+
+fn read_manifest(path: &Path) -> io::Result<String> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "plugin manifest must be a regular, unlinked file",
+        ));
+    }
+    if metadata.len() > MAX_PLUGIN_MANIFEST_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "plugin manifest exceeds the {MAX_PLUGIN_MANIFEST_BYTES}-byte limit"
+            ),
+        ));
+    }
+
+    let mut bytes = Vec::new();
+    File::open(path)?
+        .take(MAX_PLUGIN_MANIFEST_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_PLUGIN_MANIFEST_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "plugin manifest exceeds the {MAX_PLUGIN_MANIFEST_BYTES}-byte limit"
+            ),
+        ));
+    }
+    String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 fn has_safe_entrypoint(plugin_path: &Path, entrypoint: &Path) -> bool {
@@ -473,6 +530,22 @@ entrypoint = "plugin.wasm"
     }
 
     #[test]
+    fn host_state_directory_is_not_treated_as_a_plugin() {
+        let temp = TempDir::new().expect("temp directory");
+        fs::create_dir(temp.path().join(PLUGIN_STATE_DIRECTORY))
+            .expect("create host state directory");
+        create_plugin(temp.path(), "real-plugin", "community.real");
+
+        let report = discover_plugins(temp.path(), &PluginDiscoveryOptions::default())
+            .expect("discover plugins");
+        assert_eq!(report.plugins.len(), 1);
+        assert_eq!(
+            report.plugins[0].id().expect("valid manifest").as_str(),
+            "community.real"
+        );
+    }
+
+    #[test]
     fn directory_plugins_autoload_and_sort_by_id() {
         let temp = TempDir::new().expect("temp directory");
         create_plugin(temp.path(), "z-directory", "community.alpha");
@@ -559,6 +632,72 @@ entrypoint = "plugin.wasm"
             plugin.health.state == PluginHealthState::Quarantined && plugin.manifest.is_none()
         }));
         assert_eq!(report.loadable().count(), 1);
+    }
+
+    #[test]
+    fn oversized_manifest_is_an_invalid_plugin_not_a_root_scan_failure() {
+        let temp = TempDir::new().expect("temp directory");
+        let plugin = temp.path().join("oversized");
+        fs::create_dir(&plugin).expect("create plugin directory");
+        let oversized = usize::try_from(MAX_PLUGIN_MANIFEST_BYTES + 1)
+            .expect("manifest limit fits usize");
+        fs::write(plugin.join(PLUGIN_MANIFEST_FILE), vec![b'x'; oversized])
+            .expect("write oversized manifest");
+
+        let report = discover_plugins(temp.path(), &PluginDiscoveryOptions::default())
+            .expect("one bad manifest must not fail root discovery");
+        assert_eq!(report.plugins.len(), 1);
+        assert_eq!(
+            report.plugins[0].health.state,
+            PluginHealthState::Quarantined
+        );
+        assert!(report.plugins[0].health.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == PluginDiagnosticCode::InvalidManifest
+                && diagnostic.message.contains("262144-byte limit")
+        }));
+    }
+
+    #[test]
+    fn non_regular_manifest_is_an_invalid_plugin() {
+        let temp = TempDir::new().expect("temp directory");
+        let plugin = temp.path().join("unreadable");
+        fs::create_dir(&plugin).expect("create plugin directory");
+        fs::create_dir(plugin.join(PLUGIN_MANIFEST_FILE))
+            .expect("create non-regular manifest path");
+
+        let report = discover_plugins(temp.path(), &PluginDiscoveryOptions::default())
+            .expect("one unreadable manifest must not fail root discovery");
+        assert_eq!(report.plugins.len(), 1);
+        assert_eq!(
+            report.plugins[0].health.state,
+            PluginHealthState::Quarantined
+        );
+        assert!(report.plugins[0].health.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == PluginDiagnosticCode::InvalidManifest
+                && diagnostic.message.contains("regular, unlinked file")
+        }));
+    }
+
+    #[test]
+    fn excessive_root_candidates_fail_discovery_before_manifest_reads() {
+        let temp = TempDir::new().expect("temp directory");
+        for index in 0..=MAX_PLUGIN_CANDIDATES {
+            fs::create_dir(temp.path().join(format!("plugin-{index:04}")))
+                .expect("create candidate directory");
+        }
+
+        let error = discover_plugins(temp.path(), &PluginDiscoveryOptions::default())
+            .expect_err("candidate count must be bounded");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("more than 4096 candidates"));
+    }
+
+    #[test]
+    fn candidate_metadata_errors_are_not_silently_dropped() {
+        let temp = TempDir::new().expect("temp directory");
+        let error = is_candidate(&temp.path().join("vanished"))
+            .expect_err("missing candidate metadata must remain visible");
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
     }
 
     #[test]
