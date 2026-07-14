@@ -53,7 +53,9 @@ pub enum PluginRuntimeError {
         permission: String,
         diagnostics: ProcessDiagnostics,
     },
-    #[error("plugin emitted a claim event during `{method}`; claims are accepted only during `analyze`")]
+    #[error(
+        "plugin emitted a claim event during `{method}`; claims are accepted only during `analyze`"
+    )]
     ClaimEventNotAllowed {
         method: String,
         diagnostics: ProcessDiagnostics,

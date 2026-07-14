@@ -105,10 +105,10 @@ impl FromStr for ArtifactFingerprint {
 
         let mut digest = [0_u8; 32];
         for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
-            let high = decode_hex_digit(pair[0])
-                .ok_or_else(|| FingerprintParseError(value.to_owned()))?;
-            let low = decode_hex_digit(pair[1])
-                .ok_or_else(|| FingerprintParseError(value.to_owned()))?;
+            let high =
+                decode_hex_digit(pair[0]).ok_or_else(|| FingerprintParseError(value.to_owned()))?;
+            let low =
+                decode_hex_digit(pair[1]).ok_or_else(|| FingerprintParseError(value.to_owned()))?;
             digest[index] = (high << 4) | low;
         }
         Ok(Self(digest))
@@ -276,14 +276,16 @@ fn collect_entries(
             continue;
         }
 
-        counters.entries = counters.entries.checked_add(1).ok_or_else(|| {
-            FingerprintError::LimitExceeded {
-                limit: "artifact entry count",
-                maximum: limits.max_entries,
-                observed: u64::MAX,
-                path: path.clone(),
-            }
-        })?;
+        counters.entries =
+            counters
+                .entries
+                .checked_add(1)
+                .ok_or_else(|| FingerprintError::LimitExceeded {
+                    limit: "artifact entry count",
+                    maximum: limits.max_entries,
+                    observed: u64::MAX,
+                    path: path.clone(),
+                })?;
         enforce_limit(
             "artifact entry count",
             counters.entries,
@@ -300,20 +302,17 @@ fn collect_entries(
             collect_entries(&path, &relative, depth, limits, counters, entries)?;
         } else if metadata.is_file() {
             let size = metadata.len();
-            enforce_limit(
-                "individual file size",
-                size,
-                limits.max_file_bytes,
-                &path,
-            )?;
-            counters.files = counters.files.checked_add(1).ok_or_else(|| {
-                FingerprintError::LimitExceeded {
-                    limit: "regular file count",
-                    maximum: limits.max_files,
-                    observed: u64::MAX,
-                    path: path.clone(),
-                }
-            })?;
+            enforce_limit("individual file size", size, limits.max_file_bytes, &path)?;
+            counters.files =
+                counters
+                    .files
+                    .checked_add(1)
+                    .ok_or_else(|| FingerprintError::LimitExceeded {
+                        limit: "regular file count",
+                        maximum: limits.max_files,
+                        observed: u64::MAX,
+                        path: path.clone(),
+                    })?;
             enforce_limit(
                 "regular file count",
                 counters.files,
@@ -357,11 +356,7 @@ fn hash_entry(hasher: &mut Sha256, entry: &ArtifactEntry) -> Result<(), Fingerpr
     hasher.update(size.to_le_bytes());
 
     let before = fs::symlink_metadata(&entry.path).map_err(|source| {
-        fingerprint_io(
-            "inspect plugin file before hashing",
-            &entry.path,
-            source,
-        )
+        fingerprint_io("inspect plugin file before hashing", &entry.path, source)
     })?;
     if before.file_type().is_symlink() || !before.is_file() || before.len() != size {
         return Err(FingerprintError::FileChanged {
@@ -389,11 +384,11 @@ fn hash_entry(hasher: &mut Sha256, entry: &ArtifactEntry) -> Result<(), Fingerpr
         if count == 0 {
             break;
         }
-        read = read
-            .checked_add(usize_to_u64(count))
-            .ok_or_else(|| FingerprintError::FileChanged {
-                path: entry.path.clone(),
-            })?;
+        read =
+            read.checked_add(usize_to_u64(count))
+                .ok_or_else(|| FingerprintError::FileChanged {
+                    path: entry.path.clone(),
+                })?;
         if read > size {
             return Err(FingerprintError::FileChanged {
                 path: entry.path.clone(),
@@ -408,11 +403,7 @@ fn hash_entry(hasher: &mut Sha256, entry: &ArtifactEntry) -> Result<(), Fingerpr
     }
 
     let after = fs::symlink_metadata(&entry.path).map_err(|source| {
-        fingerprint_io(
-            "inspect plugin file after hashing",
-            &entry.path,
-            source,
-        )
+        fingerprint_io("inspect plugin file after hashing", &entry.path, source)
     })?;
     if after.file_type().is_symlink() || !after.is_file() || after.len() != size {
         return Err(FingerprintError::FileChanged {
@@ -563,11 +554,7 @@ impl PluginStateStore {
     ) -> Result<StateChange, StateError> {
         let reason = reason.into();
         validate_quarantine_reason(&reason)?;
-        self.create_record(StateRecord::new(
-            RecordKind::Quarantine,
-            key,
-            Some(reason),
-        ))
+        self.create_record(StateRecord::new(RecordKind::Quarantine, key, Some(reason)))
     }
 
     /// Clear quarantine for one exact artifact without granting trust to a different digest.
@@ -660,8 +647,8 @@ impl PluginStateStore {
             return Err(StateError::RecordTooLarge { path });
         }
 
-        let mut file = File::open(&path)
-            .map_err(|source| state_io("open state record", &path, source))?;
+        let mut file =
+            File::open(&path).map_err(|source| state_io("open state record", &path, source))?;
         let mut bytes = Vec::new();
         file.by_ref()
             .take(MAX_STATE_RECORD_BYTES + 1)
@@ -779,11 +766,14 @@ impl StateRecord {
                 reason: error.to_string(),
             }
         })?;
-        let fingerprint = self.artifact_sha256.parse().map_err(
-            |FingerprintParseError(value)| StateError::InvalidRecordValue {
-                reason: format!("invalid artifact fingerprint `{value}`"),
-            },
-        )?;
+        let fingerprint =
+            self.artifact_sha256
+                .parse()
+                .map_err(
+                    |FingerprintParseError(value)| StateError::InvalidRecordValue {
+                        reason: format!("invalid artifact fingerprint `{value}`"),
+                    },
+                )?;
         Ok(ArtifactStateKey::new(plugin_id, fingerprint))
     }
 
@@ -829,17 +819,15 @@ fn record_filename(key: &ArtifactStateKey) -> String {
     hasher.update(PLUGIN_ID_DOMAIN);
     hasher.update(key.plugin_id.as_str().as_bytes());
     let plugin_id_digest = hasher.finalize();
-    format!(
-        "{}-{}.json",
-        encode_hex(&plugin_id_digest),
-        key.fingerprint
-    )
+    format!("{}-{}.json", encode_hex(&plugin_id_digest), key.fingerprint)
 }
 
 fn validate_real_directory(path: &Path, missing_is_ok: bool) -> Result<Option<()>, StateError> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
-        Err(source) if missing_is_ok && source.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) if missing_is_ok && source.kind() == io::ErrorKind::NotFound => {
+            return Ok(None);
+        }
         Err(source) => return Err(state_io("inspect state directory", path, source)),
     };
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -1052,7 +1040,10 @@ args = ["--stdio"]
         let manifest = fs::read_to_string(plugin.join("plugin.toml")).expect("read manifest");
         fs::write(
             plugin.join("plugin.toml"),
-            manifest.replace("args = [\"--stdio\"]", "args = [\"--stdio\", \"--verbose\"]"),
+            manifest.replace(
+                "args = [\"--stdio\"]",
+                "args = [\"--stdio\", \"--verbose\"]",
+            ),
         )
         .expect("change manifest arguments");
         let changed_arguments = fingerprint(&plugin);
@@ -1067,8 +1058,7 @@ args = ["--stdio"]
 
         fs::write(plugin.join(DISABLED_SENTINEL), b"disabled").expect("write sentinel");
         assert_eq!(baseline, fingerprint(&plugin));
-        fs::write(plugin.join(DISABLED_SENTINEL), b"different contents")
-            .expect("change sentinel");
+        fs::write(plugin.join(DISABLED_SENTINEL), b"different contents").expect("change sentinel");
         assert_eq!(baseline, fingerprint(&plugin));
 
         fs::write(plugin.join("data/plugin.disabled"), b"nested")
@@ -1120,14 +1110,16 @@ args = ["--stdio"]
         let store = PluginStateStore::new(&plugins);
         let original_key = key("community.test", fingerprint(&plugin));
 
-        assert_eq!(store.trust(&original_key).expect("trust plugin"), StateChange::Changed);
+        assert_eq!(
+            store.trust(&original_key).expect("trust plugin"),
+            StateChange::Changed
+        );
         assert_eq!(
             store.status(&original_key).expect("read trusted state"),
             PluginArtifactStatus::Trusted
         );
 
-        fs::write(plugin.join("data/signatures.db"), b"updated")
-            .expect("change plugin artifact");
+        fs::write(plugin.join("data/signatures.db"), b"updated").expect("change plugin artifact");
         let changed_key = key("community.test", fingerprint(&plugin));
         assert_eq!(
             store.status(&changed_key).expect("read changed state"),
@@ -1160,7 +1152,10 @@ args = ["--stdio"]
             Err(StateError::CorruptRecord { .. })
         ));
 
-        assert_eq!(store.untrust(&key).expect("remove corrupt record"), StateChange::Changed);
+        assert_eq!(
+            store.untrust(&key).expect("remove corrupt record"),
+            StateChange::Changed
+        );
         assert_eq!(
             store.status(&key).expect("read cleared state"),
             PluginArtifactStatus::ApprovalRequired

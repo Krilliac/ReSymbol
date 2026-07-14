@@ -173,13 +173,8 @@ fn analyze(args: AnalyzeArgs, safe_mode: bool, plugin_dir: PathBuf) -> Result<()
 
     let selectors = parse_plugin_selectors(&args.plugins)?;
     let report = scan_plugins(&plugin_dir, safe_mode)?;
-    let execution = execute_analysis_plugins(
-        &base_analysis,
-        &report,
-        &selectors,
-        safe_mode,
-        &plugin_dir,
-    )?;
+    let execution =
+        execute_analysis_plugins(&base_analysis, &report, &selectors, safe_mode, &plugin_dir)?;
     let strict_failures = strict_plugin_failure_count(&execution.attempts);
     let session = AnalysisSession::new(base_analysis, execution.runs, execution.claims)
         .context("cannot assemble validated analysis session")?;
@@ -246,7 +241,10 @@ fn inspect(args: InspectArgs) -> Result<()> {
 
 fn ensure_output_absent(output: &Path) -> Result<()> {
     match fs::symlink_metadata(output) {
-        Ok(_) => bail!("refusing to overwrite existing package {}", output.display()),
+        Ok(_) => bail!(
+            "refusing to overwrite existing package {}",
+            output.display()
+        ),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error)
             .with_context(|| format!("cannot inspect package destination {}", output.display())),
@@ -356,7 +354,9 @@ fn execute_one_plugin(
         ));
     }
     if plugin.source != PluginSource::Directory {
-        return Ok(skip("only installed directory plugins may execute".to_owned()));
+        return Ok(skip(
+            "only installed directory plugins may execute".to_owned(),
+        ));
     }
     if !manifest.dependencies.is_empty() {
         return Ok(skip(
@@ -422,8 +422,7 @@ fn execute_one_plugin(
         .iter()
         .filter(|permission| {
             let value = permission.as_str();
-            value == PluginPermission::SYMBOLS_READ
-                || value == PluginPermission::CLAIMS_SUBMIT
+            value == PluginPermission::SYMBOLS_READ || value == PluginPermission::CLAIMS_SUBMIT
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -443,14 +442,10 @@ fn execute_one_plugin(
                 .context("cannot serialize base analysis for plugin")?,
         );
     }
-    let request = ExternalProcessRequest::new(
-        request_id,
-        run_id.clone(),
-        PluginMethod::Analyze,
-        payload,
-    )
-    .context("cannot construct bounded plugin request")?
-    .with_granted_permissions(granted_permissions);
+    let request =
+        ExternalProcessRequest::new(request_id, run_id.clone(), PluginMethod::Analyze, payload)
+            .context("cannot construct bounded plugin request")?
+            .with_granted_permissions(granted_permissions);
 
     let second = match fingerprint_plugin_directory(&plugin.path, FingerprintLimits::default()) {
         Ok(report) => report,
@@ -800,11 +795,9 @@ fn plugins(args: PluginArgs, safe_mode: bool, plugin_dir: PathBuf) -> Result<()>
         PluginCommand::Trust { id, fingerprint } => {
             trust_plugin(&plugin_dir, &id, fingerprint.as_deref())
         }
-        PluginCommand::Untrust { id } => mutate_current_plugin_state(
-            &plugin_dir,
-            &id,
-            PluginStateMutation::Untrust,
-        ),
+        PluginCommand::Untrust { id } => {
+            mutate_current_plugin_state(&plugin_dir, &id, PluginStateMutation::Untrust)
+        }
         PluginCommand::Reset { id } => {
             mutate_current_plugin_state(&plugin_dir, &id, PluginStateMutation::Reset)
         }
@@ -839,7 +832,9 @@ fn list_plugins(plugin_dir: &Path, safe_mode: bool) -> Result<()> {
         policy_errors = policy_errors.saturating_add(print_plugin(plugin, &store));
     }
     if policy_errors > 0 {
-        bail!("plugin listing found {policy_errors} fingerprint/state error(s); execution is denied");
+        bail!(
+            "plugin listing found {policy_errors} fingerprint/state error(s); execution is denied"
+        );
     }
 
     Ok(())
@@ -1115,10 +1110,7 @@ fn unique_valid_directory_plugin<'a>(
     Ok(plugin)
 }
 
-fn require_expected_fingerprint(
-    expected: Option<&str>,
-    actual: ArtifactFingerprint,
-) -> Result<()> {
+fn require_expected_fingerprint(expected: Option<&str>, actual: ArtifactFingerprint) -> Result<()> {
     let Some(expected) = expected else {
         return Ok(());
     };
@@ -1528,13 +1520,8 @@ args = ["--stdio", "literal argument"]
         assert_eq!(parsed.as_deref(), Some(fingerprint.as_str()));
 
         for action in ["untrust", "reset"] {
-            Cli::try_parse_from([
-                "resymbol",
-                "plugin",
-                action,
-                "dev.resymbol.external",
-            ])
-            .expect("state mutation arguments parse");
+            Cli::try_parse_from(["resymbol", "plugin", action, "dev.resymbol.external"])
+                .expect("state mutation arguments parse");
         }
     }
 
@@ -1696,8 +1683,7 @@ args = ["--stdio", "literal argument"]
             PluginArtifactStatus::Trusted
         );
 
-        fs::write(plugin_path.join("plugin.bin"), b"executable-v2")
-            .expect("change executable");
+        fs::write(plugin_path.join("plugin.bin"), b"executable-v2").expect("change executable");
         let changed = fingerprint_plugin_directory(&plugin_path, FingerprintLimits::default())
             .expect("fingerprint changed artifact")
             .fingerprint;
@@ -1725,27 +1711,18 @@ args = ["--stdio", "literal argument"]
         let report = scan_plugins(temp.path(), true).expect("discover in safe mode");
         let base = analyze_bytes(&pe_fixture()).expect("analyze fixture");
 
-        let automatic = execute_analysis_plugins(
-            &base,
-            &report,
-            &BTreeSet::new(),
-            true,
-            temp.path(),
-        )
-        .expect("safe automatic selection");
+        let automatic =
+            execute_analysis_plugins(&base, &report, &BTreeSet::new(), true, temp.path())
+                .expect("safe automatic selection");
         assert!(automatic.attempts.is_empty());
         assert!(automatic.runs.is_empty());
 
-        let selected = parse_plugin_selectors(&["dev.resymbol.external".to_owned()])
-            .expect("valid selector");
-        let explicit =
-            execute_analysis_plugins(&base, &report, &selected, true, temp.path())
-                .expect("safe explicit selection");
+        let selected =
+            parse_plugin_selectors(&["dev.resymbol.external".to_owned()]).expect("valid selector");
+        let explicit = execute_analysis_plugins(&base, &report, &selected, true, temp.path())
+            .expect("safe explicit selection");
         assert_eq!(explicit.attempts.len(), 1);
-        assert_eq!(
-            explicit.attempts[0].status,
-            PluginAttemptStatus::Skipped
-        );
+        assert_eq!(explicit.attempts[0].status, PluginAttemptStatus::Skipped);
         assert!(explicit.attempts[0].detail.contains("safe mode"));
     }
 

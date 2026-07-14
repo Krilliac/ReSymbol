@@ -75,12 +75,10 @@ impl ExternalProcessHost {
             .env_clear();
         preserve_operating_system_environment(&mut command);
 
-        let child = command
-            .spawn()
-            .map_err(|source| PluginRuntimeError::Io {
-                operation: "launch plugin entrypoint",
-                source,
-            })?;
+        let child = command.spawn().map_err(|source| PluginRuntimeError::Io {
+            operation: "launch plugin entrypoint",
+            source,
+        })?;
         run_child(child, input, manifest, request, &self.limits, deadline)
     }
 }
@@ -124,24 +122,22 @@ fn resolve_entrypoint(
     plugin_path: &Path,
     manifest: &PluginManifest,
 ) -> Result<(PathBuf, PathBuf), PluginRuntimeError> {
-    let root_metadata = fs::symlink_metadata(plugin_path).map_err(|source| {
-        PluginRuntimeError::Io {
+    let root_metadata =
+        fs::symlink_metadata(plugin_path).map_err(|source| PluginRuntimeError::Io {
             operation: "inspect plugin directory",
             source,
-        }
-    })?;
+        })?;
     if root_metadata.file_type().is_symlink() {
         return Err(PluginRuntimeError::LinkedEntrypoint);
     }
     if !root_metadata.is_dir() {
         return Err(PluginRuntimeError::EntrypointOutsidePlugin);
     }
-    let canonical_root = fs::canonicalize(plugin_path).map_err(|source| {
-        PluginRuntimeError::Io {
+    let canonical_root =
+        fs::canonicalize(plugin_path).map_err(|source| PluginRuntimeError::Io {
             operation: "resolve plugin directory",
             source,
-        }
-    })?;
+        })?;
 
     let mut candidate = plugin_path.to_path_buf();
     for component in manifest.runtime.entrypoint().components() {
@@ -150,12 +146,11 @@ fn resolve_entrypoint(
             Component::Normal(component) => candidate.push(component),
             _ => return Err(PluginRuntimeError::EntrypointOutsidePlugin),
         }
-        let metadata = fs::symlink_metadata(&candidate).map_err(|source| {
-            PluginRuntimeError::Io {
+        let metadata =
+            fs::symlink_metadata(&candidate).map_err(|source| PluginRuntimeError::Io {
                 operation: "inspect plugin entrypoint",
                 source,
-            }
-        })?;
+            })?;
         if metadata.file_type().is_symlink() {
             return Err(PluginRuntimeError::LinkedEntrypoint);
         }
@@ -168,12 +163,11 @@ fn resolve_entrypoint(
     if !metadata.is_file() {
         return Err(PluginRuntimeError::EntrypointNotFile);
     }
-    let canonical_entrypoint = fs::canonicalize(candidate).map_err(|source| {
-        PluginRuntimeError::Io {
+    let canonical_entrypoint =
+        fs::canonicalize(candidate).map_err(|source| PluginRuntimeError::Io {
             operation: "resolve plugin entrypoint",
             source,
-        }
-    })?;
+        })?;
     if !canonical_entrypoint.starts_with(&canonical_root) {
         return Err(PluginRuntimeError::EntrypointOutsidePlugin);
     }
@@ -296,19 +290,16 @@ fn run_child(
         result_sender,
     );
 
-    let (status, mut workers) = match await_child_and_workers(
-        &mut guard.child,
-        deadline,
-        &result_receiver,
-    )? {
-        AwaitOutcome::Complete { status, workers } => (status, workers),
-        AwaitOutcome::Deadline { workers } => {
-            return Err(PluginRuntimeError::Timeout {
-                timeout: limits.request_timeout,
-                diagnostics: diagnostics_from_results(&workers),
-            });
-        }
-    };
+    let (status, mut workers) =
+        match await_child_and_workers(&mut guard.child, deadline, &result_receiver)? {
+            AwaitOutcome::Complete { status, workers } => (status, workers),
+            AwaitOutcome::Deadline { workers } => {
+                return Err(PluginRuntimeError::Timeout {
+                    timeout: limits.request_timeout,
+                    diagnostics: diagnostics_from_results(&workers),
+                });
+            }
+        };
     let stdin_result = workers.stdin.take().expect("complete worker results");
     let stdout_result = workers.stdout.take().expect("complete worker results");
     let stderr_result = workers.stderr.take().expect("complete worker results");
@@ -396,10 +387,7 @@ fn spawn_capture_worker(
     });
 }
 
-fn read_bounded(
-    mut reader: impl Read,
-    limit: usize,
-) -> Result<Vec<u8>, CaptureFailure> {
+fn read_bounded(mut reader: impl Read, limit: usize) -> Result<Vec<u8>, CaptureFailure> {
     let mut captured = Vec::with_capacity(limit.min(8_192));
     let mut buffer = [0_u8; 8_192];
     loop {
@@ -429,12 +417,10 @@ fn await_child_and_workers(
             workers.record(message);
         }
         if status.is_none() {
-            status = child
-                .try_wait()
-                .map_err(|source| PluginRuntimeError::Io {
-                    operation: "poll plugin process",
-                    source,
-                })?;
+            status = child.try_wait().map_err(|source| PluginRuntimeError::Io {
+                operation: "poll plugin process",
+                source,
+            })?;
         }
         if workers.has_failure() && status.is_none() {
             terminate(child)?;
@@ -471,9 +457,7 @@ fn await_child_and_workers(
                 thread::sleep(wait);
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(PluginRuntimeError::WorkerPanicked(
-                    "plugin pipe worker",
-                ));
+                return Err(PluginRuntimeError::WorkerPanicked("plugin pipe worker"));
             }
         }
     }
@@ -490,9 +474,7 @@ fn terminate(child: &mut Child) -> Result<(), PluginRuntimeError> {
     }
 }
 
-fn diagnostics_from_capture(
-    capture: &Result<Vec<u8>, CaptureFailure>,
-) -> ProcessDiagnostics {
+fn diagnostics_from_capture(capture: &Result<Vec<u8>, CaptureFailure>) -> ProcessDiagnostics {
     match capture {
         Ok(bytes) | Err(CaptureFailure::Limit(bytes)) => ProcessDiagnostics::from_bytes(bytes),
         Err(CaptureFailure::Io(_)) => ProcessDiagnostics::default(),

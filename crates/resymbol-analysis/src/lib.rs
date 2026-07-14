@@ -11,9 +11,7 @@ mod types;
 
 pub use error::AnalysisError;
 pub use pe::analyze_pe;
-pub use session::{
-    AnalysisSession, PluginRunRecord, PluginRunStatus, SessionValidationError,
-};
+pub use session::{AnalysisSession, PluginRunRecord, PluginRunStatus, SessionValidationError};
 pub use types::{
     BinaryAnalysis, CoffHeader, DataDirectory, ImportTarget, PeAnalysis, PeDataDirectories,
     PeExport, PeExportName, PeImport, PeImportLibrary, PeSection, RuntimeFunction,

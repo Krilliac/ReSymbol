@@ -33,7 +33,10 @@ const DESCENDANT_READY_MARKER: &str = "descendant-ready.marker";
 
 fn main() {
     let arguments = std::env::args().collect::<Vec<_>>();
-    if arguments.iter().any(|argument| argument == PIPE_HOLDER_SWITCH) {
+    if arguments
+        .iter()
+        .any(|argument| argument == PIPE_HOLDER_SWITCH)
+    {
         thread::sleep(Duration::from_millis(1_500));
         return;
     }
@@ -211,10 +214,10 @@ impl MockFixture {
                 entrypoint: PathBuf::from(entrypoint_name),
                 args: vec![MOCK_SWITCH.to_owned(), LITERAL_SHELL_ARG.to_owned()],
             },
-            capabilities: BTreeSet::from([
-                PluginCapability::new(PluginCapability::ANALYZER_BINARY)
-                    .expect("valid capability"),
-            ]),
+            capabilities: BTreeSet::from([PluginCapability::new(
+                PluginCapability::ANALYZER_BINARY,
+            )
+            .expect("valid capability")]),
             permissions: BTreeSet::from([claims_permission]),
             dependencies: BTreeMap::new(),
             description: None,

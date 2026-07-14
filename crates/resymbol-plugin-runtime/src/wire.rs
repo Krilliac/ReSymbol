@@ -346,7 +346,10 @@ pub(crate) fn parse_output(
                 descriptor: wire_descriptor,
             } => {
                 validate_protocol(&protocol, &version, line_number, &diagnostics)?;
-                if descriptor.is_some() || response.is_some() || !claims.is_empty() || !logs.is_empty()
+                if descriptor.is_some()
+                    || response.is_some()
+                    || !claims.is_empty()
+                    || !logs.is_empty()
                 {
                     return Err(protocol_error(
                         line_number,
@@ -393,9 +396,10 @@ pub(crate) fn parse_output(
                                 diagnostics,
                             });
                         }
-                        let may_submit_claims = request.granted_permissions().iter().any(|permission| {
-                            permission.as_str() == PluginPermission::CLAIMS_SUBMIT
-                        });
+                        let may_submit_claims =
+                            request.granted_permissions().iter().any(|permission| {
+                                permission.as_str() == PluginPermission::CLAIMS_SUBMIT
+                            });
                         if !may_submit_claims {
                             return Err(PluginRuntimeError::PermissionDenied {
                                 permission: PluginPermission::CLAIMS_SUBMIT.to_owned(),
@@ -447,7 +451,10 @@ pub(crate) fn parse_output(
                 if id != request.id() {
                     return Err(protocol_error(
                         line_number,
-                        format!("response id `{id}` does not match request id `{}`", request.id()),
+                        format!(
+                            "response id `{id}` does not match request id `{}`",
+                            request.id()
+                        ),
                         diagnostics,
                     ));
                 }
@@ -795,9 +802,7 @@ fn protocol_error(
 mod tests {
     use super::*;
     use crate::PluginMethod;
-    use resymbol_core::plugin_api::{
-        MANIFEST_VERSION, PluginRuntime,
-    };
+    use resymbol_core::plugin_api::{MANIFEST_VERSION, PluginRuntime};
     use semver::{Version, VersionReq};
     use std::{collections::BTreeMap, path::PathBuf};
 
@@ -831,9 +836,8 @@ mod tests {
     fn bounded_encoder_rejects_large_payload_before_launch() {
         let mut payload = Map::new();
         payload.insert("value".to_owned(), Value::String("x".repeat(2_000)));
-        let request =
-            ExternalProcessRequest::new("one", "session", PluginMethod::Analyze, payload)
-                .expect("valid request");
+        let request = ExternalProcessRequest::new("one", "session", PluginMethod::Analyze, payload)
+            .expect("valid request");
         let mut limits = RuntimeLimits::default();
         limits.max_message_bytes = 1_024;
         assert!(matches!(

@@ -669,9 +669,8 @@ mod tests {
     #[test]
     fn nested_symbol_fields_reject_unknown_properties() {
         let binary = binary_id();
-        let subject = format!(
-            r#"{{"kind":"function","binary":"{binary}","rva":4096,"unexpected":true}}"#
-        );
+        let subject =
+            format!(r#"{{"kind":"function","binary":"{binary}","rva":4096,"unexpected":true}}"#);
         let error = serde_json::from_str::<SymbolSubject>(&subject)
             .expect_err("unknown subject fields must fail");
         assert!(error.to_string().contains("unknown field `unexpected`"));

@@ -2,8 +2,7 @@ use std::collections::BTreeMap;
 
 use resymbol_core::{
     BinaryId, ClaimProducer, ClaimValidationError, GraphValidationError, SymbolAssertion,
-    SymbolClaim, SymbolGraph, SymbolSubject,
-    plugin_api::PluginId,
+    SymbolClaim, SymbolGraph, SymbolSubject, plugin_api::PluginId,
 };
 use semver::Version;
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
@@ -222,11 +221,11 @@ impl AnalysisSession {
             else {
                 return Err(SessionValidationError::NonPluginProducer { index });
             };
-            let run_id = claim.provenance().run_id.as_deref().ok_or(
-                SessionValidationError::MissingRunId {
-                    index,
-                },
-            )?;
+            let run_id = claim
+                .provenance()
+                .run_id
+                .as_deref()
+                .ok_or(SessionValidationError::MissingRunId { index })?;
             let run = runs_by_id.get(run_id).copied().ok_or_else(|| {
                 SessionValidationError::UnknownRun {
                     index,
@@ -253,7 +252,10 @@ impl AnalysisSession {
         }
 
         for run in &self.plugin_runs {
-            let actual = accepted_counts.get(run.run_id.as_str()).copied().unwrap_or(0);
+            let actual = accepted_counts
+                .get(run.run_id.as_str())
+                .copied()
+                .unwrap_or(0);
             if run.accepted_claim_count != actual {
                 return Err(SessionValidationError::AcceptedClaimCountMismatch {
                     run_id: run.run_id.clone(),

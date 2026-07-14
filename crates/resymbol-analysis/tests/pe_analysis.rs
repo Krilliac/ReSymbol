@@ -148,11 +148,13 @@ fn plugin_claim(
         subject,
         assertion,
         Confidence::new(0.75).expect("valid confidence"),
-        vec![Evidence::new(
-            EvidenceKind::new(EvidenceKind::SIGNATURE_MATCH).expect("valid evidence kind"),
-            "matched a deterministic test signature",
-        )
-        .expect("valid evidence")],
+        vec![
+            Evidence::new(
+                EvidenceKind::new(EvidenceKind::SIGNATURE_MATCH).expect("valid evidence kind"),
+                "matched a deterministic test signature",
+            )
+            .expect("valid evidence"),
+        ],
         ClaimProvenance {
             producer,
             method: "session-test".to_owned(),
@@ -794,10 +796,7 @@ fn session_requires_successful_matching_plugin_provenance_and_exact_counts() {
         vec![missing_run],
     )
     .expect_err("plugin provenance requires a run id");
-    assert!(matches!(
-        error,
-        SessionValidationError::MissingRunId { .. }
-    ));
+    assert!(matches!(error, SessionValidationError::MissingRunId { .. }));
 
     let unknown_run = plugin_claim(
         SymbolSubject::Function {

@@ -296,9 +296,7 @@ fn read_manifest(path: &Path) -> io::Result<String> {
     if metadata.len() > MAX_PLUGIN_MANIFEST_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
-                "plugin manifest exceeds the {MAX_PLUGIN_MANIFEST_BYTES}-byte limit"
-            ),
+            format!("plugin manifest exceeds the {MAX_PLUGIN_MANIFEST_BYTES}-byte limit"),
         ));
     }
 
@@ -309,9 +307,7 @@ fn read_manifest(path: &Path) -> io::Result<String> {
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_PLUGIN_MANIFEST_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
-                "plugin manifest exceeds the {MAX_PLUGIN_MANIFEST_BYTES}-byte limit"
-            ),
+            format!("plugin manifest exceeds the {MAX_PLUGIN_MANIFEST_BYTES}-byte limit"),
         ));
     }
     String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
@@ -639,8 +635,8 @@ entrypoint = "plugin.wasm"
         let temp = TempDir::new().expect("temp directory");
         let plugin = temp.path().join("oversized");
         fs::create_dir(&plugin).expect("create plugin directory");
-        let oversized = usize::try_from(MAX_PLUGIN_MANIFEST_BYTES + 1)
-            .expect("manifest limit fits usize");
+        let oversized =
+            usize::try_from(MAX_PLUGIN_MANIFEST_BYTES + 1).expect("manifest limit fits usize");
         fs::write(plugin.join(PLUGIN_MANIFEST_FILE), vec![b'x'; oversized])
             .expect("write oversized manifest");
 
@@ -651,10 +647,16 @@ entrypoint = "plugin.wasm"
             report.plugins[0].health.state,
             PluginHealthState::Quarantined
         );
-        assert!(report.plugins[0].health.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == PluginDiagnosticCode::InvalidManifest
-                && diagnostic.message.contains("262144-byte limit")
-        }));
+        assert!(
+            report.plugins[0]
+                .health
+                .diagnostics
+                .iter()
+                .any(|diagnostic| {
+                    diagnostic.code == PluginDiagnosticCode::InvalidManifest
+                        && diagnostic.message.contains("262144-byte limit")
+                })
+        );
     }
 
     #[test]
@@ -672,10 +674,16 @@ entrypoint = "plugin.wasm"
             report.plugins[0].health.state,
             PluginHealthState::Quarantined
         );
-        assert!(report.plugins[0].health.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == PluginDiagnosticCode::InvalidManifest
-                && diagnostic.message.contains("regular, unlinked file")
-        }));
+        assert!(
+            report.plugins[0]
+                .health
+                .diagnostics
+                .iter()
+                .any(|diagnostic| {
+                    diagnostic.code == PluginDiagnosticCode::InvalidManifest
+                        && diagnostic.message.contains("regular, unlinked file")
+                })
+        );
     }
 
     #[test]
