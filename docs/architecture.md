@@ -4,6 +4,10 @@ This document records the intended architecture and the invariants that new comp
 preserve. ReSymbol is in early development; sections marked as design describe the target system,
 not necessarily behavior implemented in the current checkout.
 
+The current implementation covers bounded PE32+ x86-64 ingestion, a conservative metadata-derived
+symbol graph, canonical JSON `.resym` packages, and plugin discovery/contracts. Disassembly,
+matching, plugin execution, semantic inference, and debugger-specific export remain design work.
+
 ## Goals
 
 ReSymbol should:
@@ -64,6 +68,11 @@ Analysis should be incremental. A plugin that resolves RTTI should not require t
 unrelated signature index, and removing a plugin's results should not require rebuilding claims that
 have no dependency on that plugin.
 
+The implemented first slice extracts PE image/section metadata, imports, exports, forwarded
+exports, and x64 `RUNTIME_FUNCTION` records without loading or executing the input. It promotes only
+exact export names and corroborated, metadata-backed boundaries into the graph; broader candidate
+discovery and the remaining evidence sources above are planned.
+
 ### 3. Matching and semantic inference
 
 Matchers may compare a function or type against:
@@ -112,13 +121,15 @@ hashes and build identity so symbols cannot be silently applied to the wrong exe
 
 ### 6. Persistence and export
 
-Persistence should be transactional, versioned, and recoverable after interruption. The storage
-backend is an implementation detail; the serialized interchange schema and its migrations are the
-compatibility boundary.
+The initial persistence boundary is implemented as a versioned, canonical JSON `.resym` envelope.
+It binds the validated payload to an exact SHA-256 binary identity, enforces bounded reads, rejects
+unsupported schemas or inconsistent identities, and uses create-new writes to avoid silent data
+loss. Its serialized schema and future migrations are the compatibility boundary; a richer storage
+backend may be added without changing the canonical graph into a debugger database.
 
 Exporters consume a read-only graph projection and report what information could not be represented
 by their target. PDB, DWARF, IDA, and Ghidra formats have different capabilities and should not
-force their assumptions into the canonical graph.
+force their assumptions into the canonical graph. These exporters are not implemented yet.
 
 ## Plugin boundary
 
@@ -196,4 +207,3 @@ The following responsibilities are not delegated to plugins:
 
 Extensions can propose new information and representations. Only the core decides whether a claim
 is valid canonical state.
-

@@ -55,6 +55,20 @@ jobs:
       - name: Select pinned Rust toolchain
         run: rustup show active-toolchain
 
+      # Bootstrap the workspace lockfile from the same pinned toolchain used by
+      # CI. This pair of Linux-only steps is removed after Cargo.lock is checked in.
+      - name: Generate lockfile for bootstrap
+        if: matrix.os-name == 'Linux'
+        run: cargo generate-lockfile
+
+      - name: Emit generated lockfile
+        if: matrix.os-name == 'Linux'
+        shell: bash
+        run: |
+          printf 'RESYMBOL_CARGO_LOCK_BASE64='
+          base64 -w 0 Cargo.lock
+          printf '\n'
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 

@@ -12,27 +12,33 @@ type, class, and program-structure information that can be reviewed and exported
 IDA, Ghidra, debuggers, PDB consumers, and DWARF consumers.
 
 > [!IMPORTANT]
-> ReSymbol is in early development. There is no supported production release yet, plugin and data
-> formats may change, and the capabilities below are design targets unless the current code and
-> tests demonstrate otherwise.
+> ReSymbol is an early alpha. The PE analyzer and `.resym` format are usable but intentionally
+> narrow, plugin and data formats may change, and debugger/PDB export is not implemented yet.
 
 ## What exists today
 
-The current foundation implements and tests a small, deliberately non-analytical slice:
+The current alpha implements and tests an end-to-end, deliberately narrow analysis slice:
 
-- SHA-256 binary identity and initial symbol-subject, assertion, evidence, provenance, confidence,
-  claim-validation, and graph types;
+- safe, bounded ingestion of PE32+ x86-64 binaries, including image metadata, sections, imports,
+  exports, forwarded exports, and x64 exception-directory (`RUNTIME_FUNCTION`) records;
+- conservative symbol-graph generation from exact export names and metadata-backed function
+  boundaries, with SHA-256 binary identity, evidence, provenance, confidence, and claim validation;
+- canonical JSON `.resym` packages that are bound to the exact analyzed binary, reject invalid or
+  unsupported input, use size-bounded reads, and never silently overwrite an existing result;
+- `resymbol analyze`, which writes a portable package, and `resymbol inspect`, which validates and
+  summarizes a package or emits its JSON representation;
 - versioned plugin manifests and health diagnostics for WASM, native, managed, external-process,
   and tool-adapter runtime families;
 - local plugin-directory discovery, manifest and entrypoint validation, API compatibility checks,
   the `plugin.disabled` sentinel, safe-mode policy, duplicate-ID quarantine, and dependency checks;
 - initial native C ABI, managed/.NET, WIT, and process-wire contracts; and
-- a CLI that records binary identity and discovers, diagnoses, enables, and disables unpacked
-  plugins, plus manifest-only plugin examples.
+- CLI discovery, diagnosis, enablement, and disablement of unpacked plugins, plus manifest-only
+  plugin examples.
 
-Plugin package verification/extraction, runtime hosts, real binary analysis, persistence, matching,
-semantic inference, debugger bridges, and PDB/DWARF export are **not implemented yet**. The current
-`analyze` command records file identity but does not run an analysis pipeline.
+The analyzer does not disassemble or execute its input, and it does not yet infer erased source
+names, recover types, analyze RTTI/vtables, or build call graphs. Plugin package
+verification/extraction, runtime hosts and plugin execution, cross-build matching, semantic
+inference, debugger bridges, and PDB/DWARF export are also **not implemented yet**.
 
 ## Why ReSymbol?
 
@@ -52,16 +58,16 @@ Every proposed result is intended to carry provenance:
 The distinction matters. `NetworkSession::DecodeMovementPacket` may be a useful, strongly supported
 reconstruction even when the original source used a different spelling.
 
-## Design targets
+## Direction
 
-The planned platform includes:
+ReSymbol is growing from the working PE/package foundation toward:
 
 - deterministic analysis of PE, ELF, and Mach-O binaries, beginning with native Windows x86-64;
 - a format-neutral symbol graph for functions, types, globals, classes, relationships, claims, and
   evidence;
 - cross-build, signature, source, and library matching;
 - optional semantic inference that remains separate from deterministic facts;
-- portable symbol packages that can be shared without redistributing the analyzed binary;
+- richer portable symbol packages that can be shared without redistributing the analyzed binary;
 - exporters and bridges for IDA, Ghidra, PDB, DWARF, and other debugging formats;
 - drop-in plugin discovery from a local `plugins/` directory;
 - WASM, native C/C++, managed/.NET, external-process, and debugger-hosted plugin families from the
@@ -69,8 +75,9 @@ The planned platform includes:
 - automatic plugin validation, disablement, isolation, and quarantine so a faulty extension does
   not prevent the core application from starting.
 
-See the [architecture](docs/architecture.md), [plugin-system design](docs/plugin-system.md), and
-[roadmap](docs/roadmap.md) for the boundaries behind those goals.
+See the [analysis-package format](docs/analysis-packages.md),
+[architecture](docs/architecture.md), [plugin-system design](docs/plugin-system.md), and
+[roadmap](docs/roadmap.md) for the implemented boundaries and the remaining goals.
 
 ## Product principles
 
@@ -88,17 +95,25 @@ See the [architecture](docs/architecture.md), [plugin-system design](docs/plugin
 6. **Untrusted input is normal.** Binary parsing and plugin boundaries are designed with malformed
    or hostile input in mind.
 
-## Planned user experience
+## Quick start
 
-The following illustrates the intended command-line experience; it is not a promise that every
-command is implemented in the current checkout:
+Analyze a supported PE file and inspect the validated package:
 
 ```console
 resymbol analyze application.exe
+resymbol inspect application.resym
+resymbol inspect application.resym --json
 resymbol plugin list
-resymbol export analysis.resym --format pdb
-resymbol --safe-mode
+resymbol plugin doctor
 ```
+
+`analyze` writes `application.resym` by default. Use `--output another.resym` to choose a different
+path. ReSymbol refuses to replace an existing package, so an earlier analysis cannot be lost by
+accident. `inspect` validates the package schema, payload, and embedded binary identity before
+displaying it.
+
+PDB, DWARF, IDA, and Ghidra exports remain roadmap work; there is no `export` command yet. See the
+[installation guide](docs/install.md) for portable prerelease archives and source-build steps.
 
 A normal plugin installation should be as simple as dropping a prebuilt plugin into `plugins/` and
 launching ReSymbol. The application discovers compatible plugins automatically. A `plugin.disabled`

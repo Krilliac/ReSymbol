@@ -1,6 +1,6 @@
 [package]
-name = "resymbol-cli"
-description = "Command-line interface for ReSymbol"
+name = "resymbol-package"
+description = "Deterministic, portable ReSymbol package envelope"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,17 +8,11 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
-[[bin]]
-name = "resymbol"
-path = "src/main.rs"
-
 [dependencies]
-anyhow = "1.0.98"
-clap = { version = "4.5.40", features = ["derive"] }
-resymbol-analysis = { path = "../resymbol-analysis" }
 resymbol-core = { path = "../resymbol-core" }
-resymbol-package = { path = "../resymbol-package" }
+serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
+thiserror = "2.0.12"
 
 [dev-dependencies]
 tempfile = "3.20.0"
