@@ -1,0 +1,264 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://resymbol.dev/schemas/plugin-wire-v1.json",
+  "title": "ReSymbol external-process plugin wire protocol",
+  "description": "Newline-delimited JSON messages exchanged over stdin/stdout with an isolated plugin host. Stdout is protocol-only; diagnostics belong on stderr. Plugins submit claims and never mutate canonical symbol state directly.",
+  "$comment": "The host launches process plugins out of process by definition and applies manifest permissions with OS isolation where available. A plugin declaration cannot opt itself into the ReSymbol process.",
+  "oneOf": [
+    { "$ref": "#/$defs/hello" },
+    { "$ref": "#/$defs/helloResult" },
+    { "$ref": "#/$defs/request" },
+    { "$ref": "#/$defs/response" },
+    { "$ref": "#/$defs/event" }
+  ],
+  "$defs": {
+    "protocolVersion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["major", "minor"],
+      "properties": {
+        "major": { "const": 1 },
+        "minor": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_message_bytes", "max_memory_bytes", "request_timeout_ms"],
+      "properties": {
+        "max_message_bytes": { "type": "integer", "minimum": 1024 },
+        "max_memory_bytes": { "type": "integer", "minimum": 1048576 },
+        "request_timeout_ms": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "isolation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "required"],
+      "properties": {
+        "mode": { "const": "process" },
+        "required": { "const": true }
+      }
+    },
+    "pluginDescriptor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "name",
+        "version",
+        "capabilities",
+        "requested_permissions",
+        "isolation"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$"
+        },
+        "name": { "type": "string", "minLength": 1 },
+        "version": { "type": "string", "minLength": 1 },
+        "capabilities": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "requested_permissions": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "isolation": { "$ref": "#/$defs/isolation" }
+      }
+    },
+    "error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message"],
+      "properties": {
+        "code": {
+          "type": "string",
+          "enum": [
+            "invalid-argument",
+            "incompatible-api",
+            "permission-denied",
+            "unavailable",
+            "cancelled",
+            "resource-limit",
+            "internal"
+          ]
+        },
+        "message": { "type": "string" },
+        "data": { "type": ["object", "array", "string", "number", "boolean", "null"] }
+      }
+    },
+    "claimEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "description"],
+      "properties": {
+        "kind": { "type": "string", "minLength": 1 },
+        "description": { "type": "string", "minLength": 1 },
+        "data": {}
+      }
+    },
+    "symbolClaim": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["subject", "claim", "confidence", "evidence"],
+      "properties": {
+        "subject": { "type": "object" },
+        "claim": { "type": "object" },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "evidence": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/claimEvidence" }
+        }
+      }
+    },
+    "logPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["level", "message"],
+      "properties": {
+        "level": {
+          "enum": ["trace", "debug", "info", "warn", "error"]
+        },
+        "message": { "type": "string" }
+      }
+    },
+    "hello": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocol",
+        "version",
+        "kind",
+        "session_id",
+        "plugin_id",
+        "granted_permissions",
+        "limits",
+        "isolation"
+      ],
+      "properties": {
+        "protocol": { "const": "resymbol.plugin-wire" },
+        "version": { "$ref": "#/$defs/protocolVersion" },
+        "kind": { "const": "hello" },
+        "session_id": { "type": "string", "minLength": 1 },
+        "plugin_id": { "type": "string", "minLength": 1 },
+        "granted_permissions": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "limits": { "$ref": "#/$defs/limits" },
+        "isolation": { "$ref": "#/$defs/isolation" }
+      }
+    },
+    "helloResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol", "version", "kind", "descriptor"],
+      "properties": {
+        "protocol": { "const": "resymbol.plugin-wire" },
+        "version": { "$ref": "#/$defs/protocolVersion" },
+        "kind": { "const": "hello-result" },
+        "descriptor": { "$ref": "#/$defs/pluginDescriptor" }
+      }
+    },
+    "request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol", "version", "kind", "direction", "id", "method", "payload"],
+      "properties": {
+        "protocol": { "const": "resymbol.plugin-wire" },
+        "version": { "$ref": "#/$defs/protocolVersion" },
+        "kind": { "const": "request" },
+        "direction": {
+          "enum": ["host-to-plugin", "plugin-to-host"]
+        },
+        "id": { "type": "string", "minLength": 1 },
+        "method": {
+          "enum": ["initialize", "analyze", "health", "shutdown", "read-binary"]
+        },
+        "payload": { "type": "object" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "method": { "const": "read-binary" } } },
+          "then": {
+            "properties": {
+              "direction": { "const": "plugin-to-host" },
+              "payload": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["rva", "length"],
+                "properties": {
+                  "rva": { "type": "integer", "minimum": 0 },
+                  "length": { "type": "integer", "minimum": 0 }
+                }
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "direction": { "const": "host-to-plugin" }
+            }
+          }
+        }
+      ]
+    },
+    "response": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol", "version", "kind", "direction", "id", "ok"],
+      "properties": {
+        "protocol": { "const": "resymbol.plugin-wire" },
+        "version": { "$ref": "#/$defs/protocolVersion" },
+        "kind": { "const": "response" },
+        "direction": {
+          "enum": ["host-to-plugin", "plugin-to-host"]
+        },
+        "id": { "type": "string", "minLength": 1 },
+        "ok": { "type": "boolean" },
+        "result": {},
+        "error": { "$ref": "#/$defs/error" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "ok": { "const": true } } },
+          "then": { "required": ["result"], "not": { "required": ["error"] } },
+          "else": { "required": ["error"], "not": { "required": ["result"] } }
+        }
+      ]
+    },
+    "event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol", "version", "kind", "direction", "method", "payload"],
+      "properties": {
+        "protocol": { "const": "resymbol.plugin-wire" },
+        "version": { "$ref": "#/$defs/protocolVersion" },
+        "kind": { "const": "event" },
+        "direction": { "const": "plugin-to-host" },
+        "method": { "enum": ["log", "claim"] },
+        "payload": { "type": "object" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "method": { "const": "log" } } },
+          "then": {
+            "properties": {
+              "payload": { "$ref": "#/$defs/logPayload" }
+            }
+          },
+          "else": {
+            "properties": {
+              "payload": { "$ref": "#/$defs/symbolClaim" }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

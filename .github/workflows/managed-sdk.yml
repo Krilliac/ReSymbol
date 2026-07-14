@@ -1,0 +1,59 @@
+name: Managed SDK
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "sdk/dotnet/**"
+      - ".github/workflows/managed-sdk.yml"
+  pull_request:
+    paths:
+      - "sdk/dotnet/**"
+      - ".github/workflows/managed-sdk.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: managed-sdk-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: .NET 8 validation
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Validate managed projects
+        shell: pwsh
+        run: |
+          dotnet --info
+
+          $solutions = @(Get-ChildItem -Path . -Recurse -File -Filter *.sln)
+          if ($solutions.Count -gt 0) {
+            $targets = $solutions
+          }
+          else {
+            $targets = @(Get-ChildItem -Path . -Recurse -File -Filter *.csproj)
+          }
+
+          if ($targets.Count -eq 0) {
+            throw "No managed solution or project was found."
+          }
+
+          foreach ($target in $targets) {
+            dotnet build $target.FullName --configuration Release --nologo --verbosity minimal
+            if ($LASTEXITCODE -ne 0) {
+              exit $LASTEXITCODE
+            }
+          }
+

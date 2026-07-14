@@ -1,0 +1,15 @@
+manifest_version = 1
+id = "dev.resymbol.example.wasm-resolver"
+name = "Example WASM Symbol Resolver"
+version = "0.1.0"
+api = "^0.1.0"
+description = "Manifest-only example of a sandboxed Component Model plugin."
+capabilities = ["resolver.symbols"]
+permissions = ["binary.read", "claims.submit"]
+
+[runtime]
+kind = "wasm"
+entrypoint = "example-resolver.wasm"
+
+# WASM plugins receive no ambient filesystem, network, clock, or process access.
+# The host links only interfaces covered by permissions granted to this plugin.

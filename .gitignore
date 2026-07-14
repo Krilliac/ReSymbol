@@ -1,0 +1,39 @@
+# Rust
+/target/
+**/*.rs.bk
+*.profraw
+*.profdata
+
+# .NET
+**/bin/
+**/obj/
+TestResults/
+*.user
+*.suo
+
+# Native build systems and tooling
+/build/
+/cmake-build-*/
+compile_commands.json
+CMakeFiles/
+CMakeCache.txt
+
+# ReSymbol runtime and generated analysis output
+/.resymbol/
+/dist/
+/coverage/
+/logs/
+*.resym
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Operating systems
+.DS_Store
+Thumbs.db
+Desktop.ini
+

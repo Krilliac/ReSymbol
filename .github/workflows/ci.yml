@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  contracts:
+    name: Language-neutral contracts
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Validate native C and C++ header
+        run: |
+          echo '#include <resymbol_plugin.h>' | cc -x c -std=c11 -Wall -Wextra -Werror -pedantic -fsyntax-only -Isdk/native/include -
+          echo '#include <resymbol_plugin.h>' | c++ -x c++ -std=c++11 -Wall -Wextra -Werror -pedantic -fsyntax-only -Isdk/native/include -
+
+      - name: Validate process protocol JSON
+        run: jq empty protocol/plugin-wire.schema.json
+
+  rust:
+    name: Rust (${{ matrix.os-name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            os-name: Linux
+          - os: windows-latest
+            os-name: Windows
+          - os: macos-latest
+            os-name: macOS
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Select pinned Rust toolchain
+        run: rustup show active-toolchain
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        run: cargo test --workspace --all-features

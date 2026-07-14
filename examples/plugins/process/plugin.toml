@@ -1,0 +1,16 @@
+manifest_version = 1
+id = "dev.resymbol.example.process-exporter"
+name = "Example External-Process Exporter"
+version = "0.1.0"
+api = "^0.1.0"
+description = "Manifest-only example using the versioned NDJSON wire protocol."
+capabilities = ["exporter.symbols"]
+permissions = ["symbols.read"]
+
+[runtime]
+kind = "external-process"
+entrypoint = "example-process-exporter.exe"
+args = ["--stdio", "--protocol", "resymbol.plugin-wire/1"]
+
+# External-process plugins are always isolated from the ReSymbol process. Their
+# stdin/stdout carries protocol/plugin-wire.schema.json; stderr is diagnostic.
