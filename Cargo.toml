@@ -1,13 +1,15 @@
 [workspace]
 members = [
+    "crates/resymbol-analysis",
     "crates/resymbol-cli",
     "crates/resymbol-core",
+    "crates/resymbol-package",
     "crates/resymbol-plugin-api",
 ]
 resolver = "3"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -22,3 +24,7 @@ dbg_macro = "deny"
 todo = "deny"
 unimplemented = "deny"
 
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "symbols"

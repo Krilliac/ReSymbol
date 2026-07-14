@@ -5,11 +5,13 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
+use resymbol_analysis::{BinaryAnalysis, analyze_bytes};
 use resymbol_core::{
-    BinaryId, DiscoveredPlugin, PLUGIN_DISABLED_SENTINEL, PluginDiscoveryOptions, PluginSource,
+    DiscoveredPlugin, PLUGIN_DISABLED_SENTINEL, PluginDiscoveryOptions, PluginSource,
     discover_plugins,
     plugin_api::{DiagnosticSeverity, PluginHealthState, PluginRuntimeKind},
 };
+use resymbol_package::{ResymPackage, read_file_bound, write_file_new_bound};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -32,16 +34,32 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Inspect a binary and report its stable identity.
+    /// Analyze a binary and create a validated `.resym` package.
     Analyze(AnalyzeArgs),
+    /// Inspect and validate a `.resym` analysis package.
+    Inspect(InspectArgs),
     /// Inspect and manage discovered plugins.
     Plugin(PluginArgs),
 }
 
 #[derive(Debug, Args)]
 struct AnalyzeArgs {
-    /// Binary to inspect.
+    /// Binary to analyze.
     binary: PathBuf,
+
+    /// Destination package (defaults to the binary path with a `.resym` extension).
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct InspectArgs {
+    /// `.resym` package to validate and inspect.
+    package: PathBuf,
+
+    /// Print the complete package as pretty JSON.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -67,6 +85,7 @@ fn main() -> Result<()> {
 
     match cli.command {
         Command::Analyze(args) => analyze(args, cli.safe_mode, cli.plugin_dir),
+        Command::Inspect(args) => inspect(args),
         Command::Plugin(args) => plugins(args, cli.safe_mode, cli.plugin_dir),
     }
 }
@@ -78,11 +97,18 @@ fn analyze(args: AnalyzeArgs, safe_mode: bool, plugin_dir: PathBuf) -> Result<()
         .with_context(|| format!("cannot open binary {}", args.binary.display()))?;
     let bytes =
         fs::read(&binary).with_context(|| format!("cannot read binary {}", binary.display()))?;
+    let analysis = analyze_bytes(&bytes)
+        .with_context(|| format!("cannot analyze binary {}", binary.display()))?;
+    let package = ResymPackage::from_bound_payload(env!("CARGO_PKG_VERSION"), analysis)
+        .context("cannot create analysis package")?;
     let report = scan_plugins(&plugin_dir, safe_mode)?;
+    let output = args.output.unwrap_or_else(|| default_package_path(&binary));
+    write_file_new_bound(&output, &package)
+        .with_context(|| format!("cannot write package {}", output.display()))?;
 
     println!("binary: {}", binary.display());
-    println!("size: {} bytes", bytes.len());
-    println!("sha256: {}", BinaryId::digest(&bytes));
+    print_analysis_summary(package.payload());
+    println!("package: {}", output.display());
     println!("plugin directory: {}", plugin_dir.display());
     println!("safe mode: {safe_mode}");
     println!(
@@ -90,9 +116,83 @@ fn analyze(args: AnalyzeArgs, safe_mode: bool, plugin_dir: PathBuf) -> Result<()
         report.loadable().count(),
         report.plugins.len()
     );
-    println!("analysis: binary identity recorded; analyzers are not implemented yet");
+    println!("plugin execution: not implemented; loadable plugins were discovered only");
 
     Ok(())
+}
+
+fn inspect(args: InspectArgs) -> Result<()> {
+    let package_path = args
+        .package
+        .canonicalize()
+        .with_context(|| format!("cannot open package {}", args.package.display()))?;
+    let package: ResymPackage<BinaryAnalysis> = read_file_bound(&package_path)
+        .with_context(|| format!("cannot read package {}", package_path.display()))?;
+
+    if args.json {
+        let json = serde_json::to_string_pretty(&package)
+            .context("cannot serialize validated package as JSON")?;
+        println!("{json}");
+        return Ok(());
+    }
+
+    println!("package: {}", package_path.display());
+    println!("schema: {}", package.schema_version());
+    println!("generator: {}", package.generator_version());
+    print_analysis_summary(package.payload());
+
+    Ok(())
+}
+
+fn default_package_path(binary: &Path) -> PathBuf {
+    binary.with_extension("resym")
+}
+
+fn print_analysis_summary(analysis: &BinaryAnalysis) {
+    let identity = analysis.identity();
+    println!("size: {} bytes", identity.size);
+    println!("sha256: {}", identity.id);
+    println!("architecture: {}", identity.architecture);
+    println!("image base: 0x{:x}", identity.image_base);
+
+    match analysis {
+        BinaryAnalysis::Pe(pe) => {
+            let import_count = pe
+                .imports
+                .iter()
+                .map(|library| library.entries.len())
+                .sum::<usize>();
+            let named_export_count = pe
+                .exports
+                .iter()
+                .map(|export| export.names.len())
+                .sum::<usize>();
+            let forwarder_count = pe
+                .exports
+                .iter()
+                .filter(|export| export.forwarded_to.is_some())
+                .count();
+
+            println!("format: PE32+ (x86-64)");
+            println!("entry point: RVA 0x{:x}", pe.entry_point_rva);
+            println!("sections: {}", pe.sections.len());
+            println!(
+                "imports: {} symbol(s) from {} library/libraries",
+                import_count,
+                pe.imports.len()
+            );
+            println!(
+                "exports: {} slot(s), {} name(s), {} forwarder(s)",
+                pe.exports.len(),
+                named_export_count,
+                forwarder_count
+            );
+            println!("runtime functions: {}", pe.runtime_functions.len());
+        }
+        _ => println!("format: supported extension format"),
+    }
+
+    println!("claims: {}", analysis.symbol_graph().claims().len());
 }
 
 fn plugins(args: PluginArgs, safe_mode: bool, plugin_dir: PathBuf) -> Result<()> {
@@ -263,6 +363,120 @@ const fn severity_name(severity: DiagnosticSeverity) -> &'static str {
 mod tests {
     use super::*;
 
+    const PE_OFFSET: usize = 0x80;
+    const COFF_OFFSET: usize = PE_OFFSET + 4;
+    const OPTIONAL_OFFSET: usize = COFF_OFFSET + 20;
+    const SECTION_OFFSET: usize = OPTIONAL_OFFSET + 0xf0;
+    const RAW_OFFSET: usize = 0x200;
+    const SECTION_RVA: u32 = 0x1000;
+
+    fn put_u16(bytes: &mut [u8], offset: usize, value: u16) {
+        bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
+        bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_c_string(bytes: &mut [u8], offset: usize, value: &str) {
+        let encoded = value.as_bytes();
+        bytes[offset..offset + encoded.len()].copy_from_slice(encoded);
+        bytes[offset + encoded.len()] = 0;
+    }
+
+    fn file_offset(rva: u32) -> usize {
+        RAW_OFFSET + usize::try_from(rva - SECTION_RVA).expect("fixture RVA fits usize")
+    }
+
+    fn set_directory(bytes: &mut [u8], index: usize, rva: u32, size: u32) {
+        let offset = OPTIONAL_OFFSET + 112 + index * 8;
+        put_u32(bytes, offset, rva);
+        put_u32(bytes, offset + 4, size);
+    }
+
+    fn pe_fixture() -> Vec<u8> {
+        let mut bytes = vec![0_u8; 0x800];
+        bytes[0..2].copy_from_slice(b"MZ");
+        put_u32(
+            &mut bytes,
+            0x3c,
+            u32::try_from(PE_OFFSET).expect("fixture offset"),
+        );
+        bytes[PE_OFFSET..PE_OFFSET + 4].copy_from_slice(b"PE\0\0");
+
+        put_u16(&mut bytes, COFF_OFFSET, 0x8664);
+        put_u16(&mut bytes, COFF_OFFSET + 2, 1);
+        put_u32(&mut bytes, COFF_OFFSET + 4, 0x1234_5678);
+        put_u16(&mut bytes, COFF_OFFSET + 16, 0xf0);
+        put_u16(&mut bytes, COFF_OFFSET + 18, 0x2022);
+
+        put_u16(&mut bytes, OPTIONAL_OFFSET, 0x020b);
+        put_u32(&mut bytes, OPTIONAL_OFFSET + 16, 0x1000);
+        put_u64(&mut bytes, OPTIONAL_OFFSET + 24, 0x0000_0001_4000_0000);
+        put_u32(&mut bytes, OPTIONAL_OFFSET + 32, 0x1000);
+        put_u32(&mut bytes, OPTIONAL_OFFSET + 36, 0x200);
+        put_u32(&mut bytes, OPTIONAL_OFFSET + 56, 0x2000);
+        put_u32(&mut bytes, OPTIONAL_OFFSET + 60, 0x200);
+        put_u16(&mut bytes, OPTIONAL_OFFSET + 68, 3);
+        put_u16(&mut bytes, OPTIONAL_OFFSET + 70, 0x8160);
+        put_u32(&mut bytes, OPTIONAL_OFFSET + 108, 16);
+        set_directory(&mut bytes, 0, 0x1100, 0x90);
+        set_directory(&mut bytes, 1, 0x1200, 40);
+        set_directory(&mut bytes, 3, 0x1300, 12);
+
+        bytes[SECTION_OFFSET..SECTION_OFFSET + 5].copy_from_slice(b".all\0");
+        put_u32(&mut bytes, SECTION_OFFSET + 8, 0x600);
+        put_u32(&mut bytes, SECTION_OFFSET + 12, SECTION_RVA);
+        put_u32(&mut bytes, SECTION_OFFSET + 16, 0x600);
+        put_u32(
+            &mut bytes,
+            SECTION_OFFSET + 20,
+            u32::try_from(RAW_OFFSET).expect("fixture raw offset"),
+        );
+        put_u32(&mut bytes, SECTION_OFFSET + 36, 0x6000_0020);
+
+        let export = file_offset(0x1100);
+        put_u32(&mut bytes, export + 12, 0x1180);
+        put_u32(&mut bytes, export + 16, 1);
+        put_u32(&mut bytes, export + 20, 2);
+        put_u32(&mut bytes, export + 24, 2);
+        put_u32(&mut bytes, export + 28, 0x1140);
+        put_u32(&mut bytes, export + 32, 0x1148);
+        put_u32(&mut bytes, export + 36, 0x1150);
+        put_u32(&mut bytes, file_offset(0x1140), 0x1000);
+        put_u32(&mut bytes, file_offset(0x1144), 0);
+        put_u32(&mut bytes, file_offset(0x1148), 0x1160);
+        put_u32(&mut bytes, file_offset(0x114c), 0x1168);
+        put_u16(&mut bytes, file_offset(0x1150), 0);
+        put_u16(&mut bytes, file_offset(0x1152), 0);
+        put_c_string(&mut bytes, file_offset(0x1160), "ExportA");
+        put_c_string(&mut bytes, file_offset(0x1168), "Alias");
+        put_c_string(&mut bytes, file_offset(0x1180), "fixture.dll");
+
+        let import = file_offset(0x1200);
+        put_u32(&mut bytes, import, 0x1240);
+        put_u32(&mut bytes, import + 4, 0x1111_1111);
+        put_u32(&mut bytes, import + 8, 0xffff_ffff);
+        put_u32(&mut bytes, import + 12, 0x1280);
+        put_u32(&mut bytes, import + 16, 0x1260);
+        put_u64(&mut bytes, file_offset(0x1240), 0x1290);
+        put_u64(&mut bytes, file_offset(0x1248), (1_u64 << 63) | 42);
+        put_u64(&mut bytes, file_offset(0x1250), 0);
+        put_c_string(&mut bytes, file_offset(0x1280), "KERNEL32.dll");
+        put_u16(&mut bytes, file_offset(0x1290), 7);
+        put_c_string(&mut bytes, file_offset(0x1292), "Imported");
+
+        let exception = file_offset(0x1300);
+        put_u32(&mut bytes, exception, 0x1000);
+        put_u32(&mut bytes, exception + 4, 0x1020);
+        put_u32(&mut bytes, exception + 8, 0x1350);
+        bytes
+    }
+
     fn create_plugin(root: &Path, id: &str) -> PathBuf {
         let plugin = root.join("example");
         fs::create_dir(&plugin).expect("create plugin directory");
@@ -301,5 +515,100 @@ entrypoint = "plugin.wasm"
         assert!(!sentinel.exists());
         let report = scan_plugins(temp.path(), false).expect("scan enabled plugin");
         assert_eq!(report.plugins[0].health.state, PluginHealthState::Enabled);
+    }
+
+    #[test]
+    fn command_line_accepts_analysis_output_and_json_inspection() {
+        let cli = Cli::try_parse_from([
+            "resymbol",
+            "analyze",
+            "application.exe",
+            "--output",
+            "analysis.resym",
+        ])
+        .expect("analyze arguments parse");
+        let Command::Analyze(args) = cli.command else {
+            panic!("analyze command expected");
+        };
+        assert_eq!(args.binary, PathBuf::from("application.exe"));
+        assert_eq!(args.output, Some(PathBuf::from("analysis.resym")));
+
+        let cli = Cli::try_parse_from(["resymbol", "inspect", "analysis.resym", "--json"])
+            .expect("inspect arguments parse");
+        let Command::Inspect(args) = cli.command else {
+            panic!("inspect command expected");
+        };
+        assert_eq!(args.package, PathBuf::from("analysis.resym"));
+        assert!(args.json);
+    }
+
+    #[test]
+    fn default_package_path_replaces_the_binary_extension() {
+        assert_eq!(
+            default_package_path(Path::new("build/application.exe")),
+            PathBuf::from("build/application.resym")
+        );
+        assert_eq!(
+            default_package_path(Path::new("build/application")),
+            PathBuf::from("build/application.resym")
+        );
+    }
+
+    #[test]
+    fn analyze_writes_a_bound_package_without_overwriting() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let binary = temp.path().join("fixture.exe");
+        let output = temp.path().join("fixture.resym");
+        let plugins = temp.path().join("plugins");
+        fs::create_dir(&plugins).expect("create plugin directory");
+        let bytes = pe_fixture();
+        fs::write(&binary, &bytes).expect("write PE fixture");
+
+        analyze(
+            AnalyzeArgs {
+                binary: binary.clone(),
+                output: Some(output.clone()),
+            },
+            true,
+            plugins.clone(),
+        )
+        .expect("analyze fixture");
+
+        let package: ResymPackage<BinaryAnalysis> =
+            read_file_bound(&output).expect("read bound package");
+        assert_eq!(
+            package.binary_sha256(),
+            &resymbol_core::BinaryId::digest(&bytes)
+        );
+        assert_eq!(&package.payload().identity().id, package.binary_sha256());
+        assert_eq!(package.payload().symbol_graph().claims().len(), 3);
+
+        let original = fs::read(&output).expect("read original package bytes");
+        let error = analyze(
+            AnalyzeArgs {
+                binary,
+                output: Some(output.clone()),
+            },
+            true,
+            plugins,
+        )
+        .expect_err("existing package must not be overwritten");
+        assert!(error.to_string().contains("cannot write package"));
+        assert!(format!("{error:#}").contains("refusing to overwrite"));
+        assert_eq!(
+            fs::read(&output).expect("read preserved package bytes"),
+            original
+        );
+
+        inspect(InspectArgs {
+            package: output.clone(),
+            json: false,
+        })
+        .expect("inspect validates package");
+        inspect(InspectArgs {
+            package: output,
+            json: true,
+        })
+        .expect("JSON inspection serializes validated package");
     }
 }

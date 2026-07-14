@@ -4,7 +4,22 @@ ReSymbol is being built in capability milestones rather than date promises. Orde
 the implementation and security model are validated. A roadmap item is not implemented merely
 because it appears here; the current code, tests, release notes, and issue tracker are authoritative.
 
+## Current checkpoint
+
+The repository foundation and initial graph/plugin-contract work are in place. The first usable
+Milestone 2 slice now performs bounded PE32+ x86-64 ingestion, extracts sections/imports/exports and
+x64 exception metadata, derives conservative metadata-backed claims, writes canonical `.resym`
+packages, and validates or displays those packages through the CLI.
+
+The remaining Milestone 2 work is deliberately substantial: disassembly-assisted candidate
+discovery, strings and references, call relationships and thunks, MSVC RTTI/vtables, an open fixture
+corpus, reports, benchmarks, and continued malformed-input/resource-limit validation. Plugin runtime
+hosts and execution also remain future work; the existing foundation discovers and diagnoses
+plugin packages and defines their contracts.
+
 ## Milestone 0: repository foundation
+
+Implemented in the current alpha.
 
 - Rust workspace with pinned formatting and lint tooling
 - Core, CLI, and plugin-contract crate boundaries
@@ -16,6 +31,8 @@ because it appears here; the current code, tests, release notes, and issue track
 ## Milestone 1: graph and plugin foundation
 
 This milestone establishes extensibility before analysis behavior becomes difficult to decouple.
+Core graph types, plugin discovery/health policy, and initial multi-runtime contracts are
+implemented. Runtime hosts, package installation, and executing plugin code are still outstanding.
 
 - Binary identity and canonical address primitives
 - Versioned entities for functions, ranges, names, types, claims, evidence, and plugin runs
@@ -49,6 +66,10 @@ adversarial obfuscation.
 - Deterministic JSON/report export
 - Reproducible open-source fixture corpus compiled with and without symbols
 - Boundary, coverage, malformed-input, and resource-limit benchmarks
+
+The PE metadata, x64 exception ingestion, portable package, canonical JSON encoding, and CLI
+portions are implemented. Human-readable reports and the other bullets describe the remainder of
+this milestone.
 
 The MVP should be useful without AI, a network connection, Ghidra, or IDA.
 
@@ -106,4 +127,3 @@ An initial public pre-release should not be cut merely because the CLI runs. It 
 - loading arbitrary native plugins in-process without an explicit trust decision;
 - requiring cloud inference for baseline analysis; and
 - silently applying reconstructed symbols to a binary whose identity does not match.
-
