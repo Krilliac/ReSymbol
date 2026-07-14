@@ -113,20 +113,15 @@ fn exercise_runtime() {
         PluginRuntimeError::Protocol { .. }
     ));
 
-    let timeout_limits = RuntimeLimits {
-        request_timeout: Duration::from_millis(50),
-        ..RuntimeLimits::default()
-    };
+    let timeout_limits = RuntimeLimits::default().with_request_timeout(Duration::from_millis(50));
     let timeout_host = ExternalProcessHost::new(timeout_limits).expect("valid timeout limits");
     let timeout = timeout_host
         .execute_trusted(&fixture.plugin, &fixture.request("timeout"))
         .expect_err("hung plugin must be terminated");
     assert!(matches!(timeout, PluginRuntimeError::Timeout { .. }));
 
-    let descendant_limits = RuntimeLimits {
-        request_timeout: Duration::from_millis(500),
-        ..RuntimeLimits::default()
-    };
+    let descendant_limits =
+        RuntimeLimits::default().with_request_timeout(Duration::from_millis(500));
     let descendant_host =
         ExternalProcessHost::new(descendant_limits).expect("valid descendant timeout limits");
     let descendant_started = Instant::now();
@@ -145,12 +140,7 @@ fn exercise_runtime() {
     );
     thread::sleep(Duration::from_millis(1_600).saturating_sub(descendant_elapsed));
 
-    let output_limits = RuntimeLimits {
-        max_message_bytes: 1_024,
-        max_stdout_bytes: 2_048,
-        max_stderr_bytes: 1_024,
-        ..RuntimeLimits::default()
-    };
+    let output_limits = RuntimeLimits::default().with_output_limits(1_024, 2_048, 1_024);
     let output_host = ExternalProcessHost::new(output_limits).expect("valid output limits");
     let oversized = output_host
         .execute_trusted(&fixture.plugin, &fixture.request("oversized"))
@@ -163,10 +153,7 @@ fn exercise_runtime() {
         }
     ));
 
-    let message_limits = RuntimeLimits {
-        max_messages: 1,
-        ..RuntimeLimits::default()
-    };
+    let message_limits = RuntimeLimits::default().with_max_messages(1);
     let message_host = ExternalProcessHost::new(message_limits).expect("valid message limits");
     let too_many_messages = message_host
         .execute_trusted(&fixture.plugin, &fixture.request("success"))

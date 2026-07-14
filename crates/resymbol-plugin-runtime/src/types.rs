@@ -28,6 +28,34 @@ pub struct RuntimeLimits {
 }
 
 impl RuntimeLimits {
+    /// Return these limits with a different wall-clock request deadline.
+    #[must_use]
+    pub const fn with_request_timeout(mut self, request_timeout: Duration) -> Self {
+        self.request_timeout = request_timeout;
+        self
+    }
+
+    /// Return these limits with different per-message and captured-output byte ceilings.
+    #[must_use]
+    pub const fn with_output_limits(
+        mut self,
+        max_message_bytes: usize,
+        max_stdout_bytes: usize,
+        max_stderr_bytes: usize,
+    ) -> Self {
+        self.max_message_bytes = max_message_bytes;
+        self.max_stdout_bytes = max_stdout_bytes;
+        self.max_stderr_bytes = max_stderr_bytes;
+        self
+    }
+
+    /// Return these limits with a different stdout protocol-message ceiling.
+    #[must_use]
+    pub const fn with_max_messages(mut self, max_messages: usize) -> Self {
+        self.max_messages = max_messages;
+        self
+    }
+
     /// Validate limits before they are used to allocate or launch a process.
     pub fn validate(&self) -> Result<(), PluginRuntimeError> {
         if self.max_message_bytes < MIN_MESSAGE_BYTES {
