@@ -254,8 +254,11 @@ mod tests {
 
     #[test]
     fn limits_reject_unbounded_shapes() {
-        let mut limits = RuntimeLimits::default();
-        limits.max_stdout_bytes = limits.max_message_bytes - 1;
+        let defaults = RuntimeLimits::default();
+        let limits = RuntimeLimits {
+            max_stdout_bytes: defaults.max_message_bytes - 1,
+            ..defaults
+        };
         assert!(matches!(
             limits.validate(),
             Err(PluginRuntimeError::InvalidLimits(_))
