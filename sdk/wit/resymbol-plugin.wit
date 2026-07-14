@@ -1,0 +1,124 @@
+package resymbol:plugin@0.1.0;
+
+/// Shared types for sandboxed WebAssembly Component Model plugins.
+interface types {
+    enum log-level {
+        trace,
+        debug,
+        info,
+        warn,
+        error,
+    }
+
+    enum health-state {
+        healthy,
+        degraded,
+        unhealthy,
+    }
+
+    variant plugin-error {
+        invalid-argument(string),
+        permission-denied(string),
+        unavailable(string),
+        cancelled,
+        resource-limit(string),
+        internal(string),
+    }
+
+    record plugin-metadata {
+        id: string,
+        name: string,
+        version: string,
+        capabilities: list<string>,
+        requested-permissions: list<string>,
+    }
+
+    record plugin-limits {
+        max-memory-bytes: u64,
+        max-message-bytes: u64,
+        analyze-timeout-ms: u64,
+    }
+
+    record initialization {
+        session-id: string,
+        host-api-major: u32,
+        host-api-minor: u32,
+        host-api-patch: u32,
+        granted-permissions: list<string>,
+        limits: plugin-limits,
+        options-json: string,
+    }
+
+    record binary-identity {
+        sha256: string,
+        format: string,
+        architecture: string,
+        image-size: u64,
+    }
+
+    record analysis-request {
+        request-id: string,
+        binary: binary-identity,
+        phase: string,
+        options-json: string,
+    }
+
+    record claim-evidence {
+        kind: string,
+        description: string,
+        data-json: option<string>,
+    }
+
+    /// Plugins submit hypotheses. The core validates and commits symbol state.
+    record symbol-claim {
+        subject-json: string,
+        claim-json: string,
+        confidence: f64,
+        evidence: list<claim-evidence>,
+    }
+
+    record plugin-health {
+        state: health-state,
+        message: option<string>,
+        details-json: option<string>,
+    }
+}
+
+/// Capability-limited host calls. No filesystem, network, clock, or process
+/// capability is available unless the host explicitly links the corresponding
+/// WASI interface after a permission grant.
+interface host {
+    use types.{log-level, plugin-error, symbol-claim};
+
+    log: func(level: log-level, message: string);
+
+    /// Read a bounded region from the current image without exposing its path.
+    read-binary: func(rva: u64, length: u32) -> result<list<u8>, plugin-error>;
+
+    /// Propose an evidence-backed claim for validation by the core.
+    submit-claim: func(claim: symbol-claim) -> result<_, plugin-error>;
+
+    is-cancelled: func() -> bool;
+}
+
+/// Functions exported by every ReSymbol WebAssembly component.
+interface guest {
+    use types.{
+        analysis-request,
+        initialization,
+        plugin-error,
+        plugin-health,
+        plugin-metadata,
+    };
+
+    metadata: func() -> plugin-metadata;
+    initialize: func(context: initialization) -> result<_, plugin-error>;
+    analyze: func(request: analysis-request) -> result<_, plugin-error>;
+    health: func() -> result<plugin-health, plugin-error>;
+    shutdown: func();
+}
+
+world resymbol-plugin {
+    import host;
+    export guest;
+}

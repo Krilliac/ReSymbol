@@ -1,0 +1,15 @@
+manifest_version = 1
+id = "dev.resymbol.example.managed-matcher"
+name = "Example Managed Function Matcher"
+version = "0.1.0"
+api = "^0.1.0"
+description = "Manifest-only example of a .NET managed plugin."
+capabilities = ["matcher.functions"]
+permissions = ["binary.read", "symbols.read", "claims.submit"]
+
+[runtime]
+kind = "managed"
+entrypoint = "Example.ManagedMatcher.dll"
+
+# The managed runtime is hosted out of process. The shipped self-contained host
+# supplies .NET; end users do not install an SDK or compile this assembly.

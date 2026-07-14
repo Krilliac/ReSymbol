@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <IsPackable>true</IsPackable>
+    <PackageId>ReSymbol.PluginSdk</PackageId>
+    <Version>0.1.0</Version>
+    <Description>Stable managed plugin contracts for ReSymbol.</Description>
+    <Authors>ReSymbol contributors</Authors>
+  </PropertyGroup>
+</Project>

@@ -1,0 +1,24 @@
+[package]
+name = "resymbol-core"
+description = "Trusted symbol graph and plugin discovery core for ReSymbol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+resymbol-plugin-api = { path = "../resymbol-plugin-api" }
+semver = "1.0.26"
+serde = { version = "1.0.219", features = ["derive"] }
+sha2 = "0.10.9"
+thiserror = "2.0.12"
+toml = "0.8.22"
+
+[dev-dependencies]
+serde_json = "1.0.140"
+tempfile = "3.20.0"
+
+[lints]
+workspace = true

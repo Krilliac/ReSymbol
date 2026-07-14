@@ -1,0 +1,90 @@
+name: Bug report
+description: Report reproducible incorrect behavior in ReSymbol.
+title: "[Bug]: "
+labels: [bug, triage]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve ReSymbol. Do not post vulnerabilities or proprietary binaries here; follow `SECURITY.md` for private reporting.
+
+  - type: input
+    id: version
+    attributes:
+      label: ReSymbol version
+      description: Provide a release version or full commit SHA.
+      placeholder: "0.1.0 or 0123456789abcdef…"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: host-os
+    attributes:
+      label: Host operating system
+      options:
+        - Windows
+        - Linux
+        - macOS
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: host-architecture
+    attributes:
+      label: Host architecture
+      placeholder: "x86-64, arm64, …"
+    validations:
+      required: true
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Describe the observed behavior and what you expected instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction steps
+      description: Include the smallest safe, legal, and reproducible sequence.
+      placeholder: |
+        1. Run …
+        2. Load …
+        3. Observe …
+    validations:
+      required: true
+
+  - type: textarea
+    id: input
+    attributes:
+      label: Input details
+      description: Provide format, target architecture, compiler if known, hash, and whether the input is stripped. Do not attach a binary you cannot redistribute.
+
+  - type: textarea
+    id: plugins
+    attributes:
+      label: Plugins and configuration
+      description: List enabled plugins, versions, trust mode, and relevant non-secret settings. Say whether safe mode changes the result.
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: Paste a minimal redacted error or log. Remove paths, binary contents, secrets, and private source material.
+      render: text
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched for an existing issue.
+          required: true
+        - label: I am authorized to analyze and share the supplied information.
+          required: true
+        - label: This is not a security vulnerability.
+          required: true
+

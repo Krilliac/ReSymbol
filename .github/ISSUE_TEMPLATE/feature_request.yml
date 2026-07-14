@@ -1,0 +1,65 @@
+name: Feature request
+description: Propose a focused capability or improvement.
+title: "[Feature]: "
+labels: [enhancement, triage]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ReSymbol is early in development. Explain the user problem first so the project can preserve stable boundaries while APIs are still taking shape.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What reversing or symbol-reconstruction task is currently difficult?
+    validations:
+      required: true
+
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+      description: Describe the observable result, not only a preferred implementation.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Core symbol graph
+        - Binary analysis
+        - Matching or inference
+        - Plugin system or SDK
+        - Export or tool integration
+        - CLI or user experience
+        - Packaging or installation
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Example and evidence
+      description: Give a legal, redistributable example or describe the metadata needed to test it.
+
+  - type: textarea
+    id: tradeoffs
+    attributes:
+      label: Compatibility and security considerations
+      description: Note format, platform, trust, performance, or privacy implications you can foresee.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched for an existing issue or roadmap item.
+          required: true
+        - label: I described planned behavior as a proposal, not an existing capability.
+          required: true
+

@@ -1,0 +1,67 @@
+name: Plugin proposal
+description: Propose a plugin capability, SDK change, or new extension family.
+title: "[Plugin]: "
+labels: [plugin, design, triage]
+body:
+  - type: input
+    id: name
+    attributes:
+      label: Proposed plugin name and ID
+      placeholder: "MSVC RTTI Resolver / community.msvc-rtti"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: family
+    attributes:
+      label: Plugin family
+      options:
+        - WebAssembly
+        - Native C/C++
+        - Managed/.NET
+        - External process
+        - Tool-hosted bridge
+        - New family proposal
+    validations:
+      required: true
+
+  - type: textarea
+    id: capability
+    attributes:
+      label: Capability
+      description: What claims, sources, analyses, exports, or integration does it provide?
+    validations:
+      required: true
+
+  - type: textarea
+    id: input-output
+    attributes:
+      label: Inputs, outputs, and evidence
+      description: Describe graph projections consumed, claims emitted, evidence retained, and expected determinism.
+    validations:
+      required: true
+
+  - type: textarea
+    id: permissions
+    attributes:
+      label: Permissions and isolation
+      description: List required binary, filesystem, network, process, or host-tool access and why narrower access is insufficient.
+    validations:
+      required: true
+
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Runtime and packaging dependencies
+      description: Explain how ordinary users receive a prebuilt package without installing a compiler or unexpected runtime.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: The plugin can fail without corrupting canonical analysis state.
+          required: true
+        - label: The proposal does not require distributing unauthorized binaries or symbols.
+          required: true
+

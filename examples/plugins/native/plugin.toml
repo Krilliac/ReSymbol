@@ -1,0 +1,17 @@
+manifest_version = 1
+id = "dev.resymbol.example.native-rtti"
+name = "Example Native RTTI Resolver"
+version = "0.1.0"
+api = "^0.1.0"
+description = "Manifest-only example of a native C ABI plugin."
+capabilities = ["analyzer.rtti", "resolver.symbols"]
+permissions = ["binary.read", "claims.submit"]
+
+[runtime]
+kind = "native"
+entrypoint = "example-native-rtti.dll"
+isolation = "out-of-process"
+
+# Native plugins default to a dedicated plugin-host process. In-process loading
+# requires both isolation = "in-process" and the unsafe.in-process permission,
+# followed by an explicit user trust decision.
