@@ -10,8 +10,8 @@ use resymbol_core::{
 };
 
 use crate::{
-    AnalysisError, CoffHeader, DataDirectory, ImportTarget, PeAnalysis, PeDataDirectories, PeExport,
-    PeExportName, PeImport, PeImportLibrary, PeSection, RuntimeFunction,
+    AnalysisError, CoffHeader, DataDirectory, ImportTarget, PeAnalysis, PeDataDirectories,
+    PeExport, PeExportName, PeImport, PeImportLibrary, PeSection, RuntimeFunction,
 };
 
 const DOS_HEADER_SIZE: usize = 64;
@@ -95,12 +95,8 @@ pub fn analyze_pe(bytes: &[u8]) -> Result<PeAnalysis, AnalysisError> {
         architecture: "x86_64".to_owned(),
         image_base: headers.image_base,
     };
-    let symbol_graph = build_symbol_graph(
-        &identity,
-        &headers.sections,
-        &exports,
-        &runtime_functions,
-    )?;
+    let symbol_graph =
+        build_symbol_graph(&identity, &headers.sections, &exports, &runtime_functions)?;
 
     let analysis = PeAnalysis {
         identity,
@@ -128,7 +124,10 @@ pub fn analyze_pe(bytes: &[u8]) -> Result<PeAnalysis, AnalysisError> {
 pub(crate) fn validate_pe_analysis(analysis: &PeAnalysis) -> Result<(), AnalysisError> {
     analysis.identity.validate()?;
     if !matches!(&analysis.identity.format, BinaryFormat::Pe) {
-        return invalid_field("binary format", "PE analysis must use the PE identity format");
+        return invalid_field(
+            "binary format",
+            "PE analysis must use the PE identity format",
+        );
     }
     if analysis.identity.architecture != "x86_64" {
         return invalid_field(
@@ -143,7 +142,10 @@ pub(crate) fn validate_pe_analysis(analysis: &PeAnalysis) -> Result<(), Analysis
         return invalid_field("PE image sizes", "header and image sizes are inconsistent");
     }
     if analysis.section_alignment == 0 || analysis.file_alignment == 0 {
-        return invalid_field("PE alignment", "section and file alignment must be non-zero");
+        return invalid_field(
+            "PE alignment",
+            "section and file alignment must be non-zero",
+        );
     }
     if analysis.entry_point_rva != 0 && analysis.entry_point_rva >= analysis.size_of_image {
         return invalid_field("entry-point RVA", "lies outside the declared image");
@@ -185,9 +187,7 @@ pub(crate) fn validate_pe_analysis(analysis: &PeAnalysis) -> Result<(), Analysis
     let section_table_end = u64::from(analysis.pe_header_offset)
         .checked_add(PE_AND_COFF_HEADER_SIZE_U64)
         .and_then(|value| value.checked_add(u64::from(analysis.coff.optional_header_size)))
-        .and_then(|value| {
-            value.checked_add(section_count.checked_mul(SECTION_HEADER_SIZE_U64)?)
-        })
+        .and_then(|value| value.checked_add(section_count.checked_mul(SECTION_HEADER_SIZE_U64)?))
         .ok_or(AnalysisError::ArithmeticOverflow(
             "deserialized section-table range",
         ))?;
@@ -207,7 +207,9 @@ pub(crate) fn validate_pe_analysis(analysis: &PeAnalysis) -> Result<(), Analysis
             enforce_directory_size("data-directory byte", directory.size)?;
             let end = u64::from(directory.rva)
                 .checked_add(u64::from(directory.size))
-                .ok_or(AnalysisError::ArithmeticOverflow("data-directory RVA range"))?;
+                .ok_or(AnalysisError::ArithmeticOverflow(
+                    "data-directory RVA range",
+                ))?;
             if end > u64::from(analysis.size_of_image) {
                 return invalid_field(name, "extends outside the declared image");
             }
@@ -268,11 +270,7 @@ pub(crate) fn validate_pe_analysis(analysis: &PeAnalysis) -> Result<(), Analysis
 
     let import_library_count = u64::try_from(analysis.imports.len())
         .map_err(|_| AnalysisError::IntegerConversion("import-library count"))?;
-    enforce_limit(
-        "import library",
-        import_library_count,
-        MAX_IMPORT_LIBRARIES,
-    )?;
+    enforce_limit("import library", import_library_count, MAX_IMPORT_LIBRARIES)?;
     let mut import_symbol_count = 0_u64;
     let mut import_name_bytes = 0_u64;
     if !analysis.imports.is_empty() && analysis.directories.imports.is_none() {
@@ -291,11 +289,12 @@ pub(crate) fn validate_pe_analysis(analysis: &PeAnalysis) -> Result<(), Analysis
             descriptor_count,
             MAX_IMPORT_LIBRARIES,
         )?;
-        let required_descriptors = import_library_count
-            .checked_add(1)
-            .ok_or(AnalysisError::ArithmeticOverflow(
-                "import descriptor count including terminator",
-            ))?;
+        let required_descriptors =
+            import_library_count
+                .checked_add(1)
+                .ok_or(AnalysisError::ArithmeticOverflow(
+                    "import descriptor count including terminator",
+                ))?;
         if required_descriptors > descriptor_count {
             return invalid_field(
                 "imports",
@@ -314,29 +313,24 @@ pub(crate) fn validate_pe_analysis(analysis: &PeAnalysis) -> Result<(), Analysis
             "import-name byte",
             MAX_IMPORT_NAME_BYTES,
         )?;
-        let directory = analysis.directories.imports.ok_or_else(|| {
-            AnalysisError::InvalidField {
-                field: "imports",
-                reason: "entry exists without an import directory".to_owned(),
-            }
-        })?;
+        let directory =
+            analysis
+                .directories
+                .imports
+                .ok_or_else(|| AnalysisError::InvalidField {
+                    field: "imports",
+                    reason: "entry exists without an import directory".to_owned(),
+                })?;
         let descriptor_delta = checked_u32_mul(
             u32::try_from(library_index)
                 .map_err(|_| AnalysisError::IntegerConversion("import descriptor index"))?,
             IMPORT_DESCRIPTOR_SIZE_U32,
             "import descriptor RVA",
         )?;
-        let expected_descriptor_rva = checked_u32_add(
-            directory.rva,
-            descriptor_delta,
-            "import descriptor RVA",
-        )?;
+        let expected_descriptor_rva =
+            checked_u32_add(directory.rva, descriptor_delta, "import descriptor RVA")?;
         if library.descriptor_rva != expected_descriptor_rva
-            || !model_rva_is_backed(
-                analysis,
-                library.descriptor_rva,
-                IMPORT_DESCRIPTOR_SIZE_U32,
-            )
+            || !model_rva_is_backed(analysis, library.descriptor_rva, IMPORT_DESCRIPTOR_SIZE_U32)
         {
             return invalid_field(
                 "import descriptor",
@@ -349,11 +343,7 @@ pub(crate) fn validate_pe_analysis(analysis: &PeAnalysis) -> Result<(), Analysis
             import_symbol_count = import_symbol_count
                 .checked_add(1)
                 .ok_or(AnalysisError::ArithmeticOverflow("import-symbol count"))?;
-            enforce_limit(
-                "import symbol",
-                import_symbol_count,
-                MAX_IMPORT_SYMBOLS,
-            )?;
+            enforce_limit("import symbol", import_symbol_count, MAX_IMPORT_SYMBOLS)?;
             let thunk_delta = checked_u32_mul(
                 u32::try_from(entry_index)
                     .map_err(|_| AnalysisError::IntegerConversion("import thunk index"))?,
@@ -406,16 +396,10 @@ pub(crate) fn validate_pe_analysis(analysis: &PeAnalysis) -> Result<(), Analysis
                 8,
                 "import thunk terminator position",
             )?;
-            let lookup_terminator = checked_u32_add(
-                lookup_rva,
-                terminator_delta,
-                "import lookup terminator RVA",
-            )?;
-            let iat_terminator = checked_u32_add(
-                iat_rva,
-                terminator_delta,
-                "import IAT terminator RVA",
-            )?;
+            let lookup_terminator =
+                checked_u32_add(lookup_rva, terminator_delta, "import lookup terminator RVA")?;
+            let iat_terminator =
+                checked_u32_add(iat_rva, terminator_delta, "import IAT terminator RVA")?;
             if !model_rva_is_backed(analysis, lookup_terminator, 8)
                 || !model_rva_is_backed(analysis, iat_terminator, 8)
             {
@@ -528,10 +512,7 @@ pub(crate) fn validate_pe_analysis(analysis: &PeAnalysis) -> Result<(), Analysis
                 .ok_or(AnalysisError::ArithmeticOverflow("export-name count"))?;
             enforce_limit("export name", export_name_count, MAX_EXPORT_NAMES)?;
             if !export_name_indices.insert(name.name_table_index) {
-                return invalid_field(
-                    "export name-table index",
-                    "duplicate source-table index",
-                );
+                return invalid_field("export name-table index", "duplicate source-table index");
             }
             consume_string_budget(
                 &mut export_name_bytes,
@@ -582,18 +563,24 @@ pub(crate) fn validate_pe_analysis(analysis: &PeAnalysis) -> Result<(), Analysis
             );
         }
         if function.begin_rva >= function.end_rva || function.end_rva > analysis.size_of_image {
-            return invalid_field("runtime-function range", "is empty, reversed, or out of image");
+            return invalid_field(
+                "runtime-function range",
+                "is empty, reversed, or out of image",
+            );
         }
-        let inclusive_end_rva = function.end_rva.checked_sub(1).ok_or(
-            AnalysisError::ArithmeticOverflow("runtime-function inclusive end RVA"),
-        )?;
+        let inclusive_end_rva =
+            function
+                .end_rva
+                .checked_sub(1)
+                .ok_or(AnalysisError::ArithmeticOverflow(
+                    "runtime-function inclusive end RVA",
+                ))?;
         let begin_section = section_for_rva(function.begin_rva, &analysis.sections);
         let end_section = section_for_rva(inclusive_end_rva, &analysis.sections);
         if begin_section.map(|(section_index, _)| section_index)
             != end_section.map(|(section_index, _)| section_index)
-            || begin_section.is_none_or(|(_, section)| {
-                section.characteristics & IMAGE_SCN_MEM_EXECUTE == 0
-            })
+            || begin_section
+                .is_none_or(|(_, section)| section.characteristics & IMAGE_SCN_MEM_EXECUTE == 0)
         {
             return invalid_field(
                 "runtime-function range",
@@ -661,10 +648,7 @@ fn producers_semantically_match(expected: &ClaimProducer, actual: &ClaimProducer
                 component: actual_component,
                 version: actual_version,
             },
-        ) => {
-            expected_component == actual_component
-                && valid_provenance_version(actual_version)
-        }
+        ) => expected_component == actual_component && valid_provenance_version(actual_version),
         _ => expected == actual,
     }
 }
@@ -730,18 +714,11 @@ fn parse_headers(reader: &Reader<'_>) -> Result<ParsedHeaders, AnalysisError> {
         });
     }
     let number_of_sections = reader.u16(coff_offset + 2, "COFF section count")?;
-    enforce_limit(
-        "section",
-        u64::from(number_of_sections),
-        MAX_SECTIONS,
-    )?;
+    enforce_limit("section", u64::from(number_of_sections), MAX_SECTIONS)?;
     let timestamp = reader.u32(coff_offset + 4, "COFF timestamp")?;
     let symbol_table_offset = reader.u32(coff_offset + 8, "COFF symbol-table offset")?;
     let number_of_symbols = reader.u32(coff_offset + 12, "COFF symbol count")?;
-    let optional_header_size = reader.u16(
-        coff_offset + 16,
-        "COFF optional-header size",
-    )?;
+    let optional_header_size = reader.u16(coff_offset + 16, "COFF optional-header size")?;
     let optional_size = usize::from(optional_header_size);
     let characteristics = reader.u16(coff_offset + 18, "COFF characteristics")?;
     if optional_size < OPTIONAL_HEADER_MIN_SIZE {
@@ -776,7 +753,10 @@ fn parse_headers(reader: &Reader<'_>) -> Result<ParsedHeaders, AnalysisError> {
         return invalid_field("size of headers", "must be non-zero");
     }
     if section_alignment == 0 || file_alignment == 0 {
-        return invalid_field("PE alignment", "section and file alignment must be non-zero");
+        return invalid_field(
+            "PE alignment",
+            "section and file alignment must be non-zero",
+        );
     }
     if size_of_headers > size_of_image {
         return invalid_field("size of headers", "must not exceed the declared image size");
@@ -836,26 +816,15 @@ fn parse_headers(reader: &Reader<'_>) -> Result<ParsedHeaders, AnalysisError> {
         )?,
     };
 
-    let sections_offset = checked_add(
-        optional_offset,
-        optional_size,
-        "section-table offset",
-    )?;
+    let sections_offset = checked_add(optional_offset, optional_size, "section-table offset")?;
     let section_table_size = checked_mul(
         usize::from(number_of_sections),
         SECTION_HEADER_SIZE,
         "section-table size",
     )?;
-    let section_table_end = checked_add(
-        sections_offset,
-        section_table_size,
-        "section-table end",
-    )?;
+    let section_table_end = checked_add(sections_offset, section_table_size, "section-table end")?;
     if section_table_end > headers_size {
-        return invalid_field(
-            "section table",
-            "extends beyond the declared PE headers",
-        );
+        return invalid_field("section table", "extends beyond the declared PE headers");
     }
     reader.bytes(sections_offset, section_table_size, "section table")?;
     let mut sections = Vec::with_capacity(usize::from(number_of_sections));
@@ -875,9 +844,12 @@ fn parse_headers(reader: &Reader<'_>) -> Result<ParsedHeaders, AnalysisError> {
         let characteristics = reader.u32(offset + 36, "section characteristics")?;
 
         let virtual_span = cmp::max(virtual_size, raw_data_size);
-        let virtual_end = virtual_address.checked_add(virtual_span).ok_or(
-            AnalysisError::ArithmeticOverflow("section virtual-address range"),
-        )?;
+        let virtual_end =
+            virtual_address
+                .checked_add(virtual_span)
+                .ok_or(AnalysisError::ArithmeticOverflow(
+                    "section virtual-address range",
+                ))?;
         if virtual_end > size_of_image {
             return invalid_field(
                 "section virtual range",
@@ -1220,11 +1192,7 @@ fn parse_exports(
     let function_offset = if function_bytes == 0 {
         0
     } else {
-        mapper.offset(
-            function_table_rva,
-            function_bytes,
-            "export address table",
-        )?
+        mapper.offset(function_table_rva, function_bytes, "export address table")?
     };
     let mut exports = Vec::with_capacity(function_count_usize);
     for index in 0..function_count_usize {
@@ -1259,11 +1227,8 @@ fn parse_exports(
             name_pointer_bytes,
             "export name-pointer table",
         )?;
-        let ordinal_offset = mapper.offset(
-            ordinal_table_rva,
-            ordinal_bytes,
-            "export ordinal table",
-        )?;
+        let ordinal_offset =
+            mapper.offset(ordinal_table_rva, ordinal_bytes, "export ordinal table")?;
         for index in 0..name_count_usize {
             let name_rva = reader.u32(
                 checked_add(
@@ -1310,14 +1275,14 @@ fn parse_exports(
 
     let directory_end = u64::from(directory.rva)
         .checked_add(u64::from(directory.size))
-        .ok_or(AnalysisError::ArithmeticOverflow("export-directory RVA range"))?;
+        .ok_or(AnalysisError::ArithmeticOverflow(
+            "export-directory RVA range",
+        ))?;
     for export in &mut exports {
         let Some(address) = export.address_rva else {
             continue;
         };
-        if u64::from(address) >= u64::from(directory.rva)
-            && u64::from(address) < directory_end
-        {
+        if u64::from(address) >= u64::from(directory.rva) && u64::from(address) < directory_end {
             let bytes_remaining = usize::try_from(directory_end - u64::from(address))
                 .map_err(|_| AnalysisError::IntegerConversion("export forwarder length"))?;
             let forwarder = mapper.c_string(
@@ -1363,11 +1328,7 @@ fn parse_runtime_functions(
         );
     }
     let count = directory.size / RUNTIME_FUNCTION_SIZE_U32;
-    enforce_limit(
-        "runtime function",
-        u64::from(count),
-        MAX_RUNTIME_FUNCTIONS,
-    )?;
+    enforce_limit("runtime function", u64::from(count), MAX_RUNTIME_FUNCTIONS)?;
     let byte_count = usize::try_from(directory.size)
         .map_err(|_| AnalysisError::IntegerConversion("exception-directory size"))?;
     let table_offset = mapper.offset(directory.rva, byte_count, "exception directory")?;
@@ -1401,16 +1362,17 @@ fn parse_runtime_functions(
                 format!("entry {index} ends outside the declared image"),
             );
         }
-        let inclusive_end_rva = end_rva.checked_sub(1).ok_or(
-            AnalysisError::ArithmeticOverflow("runtime-function inclusive end RVA"),
-        )?;
+        let inclusive_end_rva = end_rva
+            .checked_sub(1)
+            .ok_or(AnalysisError::ArithmeticOverflow(
+                "runtime-function inclusive end RVA",
+            ))?;
         let begin_section = section_for_rva(begin_rva, mapper.sections);
         let end_section = section_for_rva(inclusive_end_rva, mapper.sections);
         if begin_section.map(|(section_index, _)| section_index)
             != end_section.map(|(section_index, _)| section_index)
-            || begin_section.is_none_or(|(_, section)| {
-                section.characteristics & IMAGE_SCN_MEM_EXECUTE == 0
-            })
+            || begin_section
+                .is_none_or(|(_, section)| section.characteristics & IMAGE_SCN_MEM_EXECUTE == 0)
         {
             return invalid_field(
                 "runtime-function range",
@@ -1429,11 +1391,7 @@ fn parse_runtime_functions(
                 format!("entry {index} has unaligned RVA {unwind_info_rva:#x}"),
             );
         }
-        let _ = mapper.offset(
-            unwind_info_rva,
-            4,
-            "runtime-function unwind info",
-        )?;
+        let _ = mapper.offset(unwind_info_rva, 4, "runtime-function unwind info")?;
         functions.push(RuntimeFunction {
             begin_rva,
             end_rva,
@@ -1475,10 +1433,12 @@ pub(crate) fn build_symbol_graph(
     }
     export_names.sort_by_key(|(index, _, _)| *index);
     for (_, export, name) in export_names {
-        let address_rva = export.address_rva.ok_or_else(|| AnalysisError::InvalidField {
-            field: "export graph claim",
-            reason: "local export unexpectedly lacks an address".to_owned(),
-        })?;
+        let address_rva = export
+            .address_rva
+            .ok_or_else(|| AnalysisError::InvalidField {
+                field: "export graph claim",
+                reason: "local export unexpectedly lacks an address".to_owned(),
+            })?;
         let Some((section_index, section)) = section_for_rva(address_rva, sections) else {
             continue;
         };
@@ -1513,15 +1473,10 @@ pub(crate) fn build_symbol_graph(
                 .insert("section_name".to_owned(), section.name.clone());
         }
         let is_function = is_executable && is_runtime_function_start;
-        let subject_kind = if is_function {
-            "function"
-        } else {
-            "global"
-        };
-        evidence.artifacts.insert(
-            "subject_kind".to_owned(),
-            subject_kind.to_owned(),
-        );
+        let subject_kind = if is_function { "function" } else { "global" };
+        evidence
+            .artifacts
+            .insert("subject_kind".to_owned(), subject_kind.to_owned());
         evidence.artifacts.insert(
             "classification_basis".to_owned(),
             if is_function {
@@ -1556,15 +1511,16 @@ pub(crate) fn build_symbol_graph(
     }
 
     for function in runtime_functions {
-        let size_u32 = function.end_rva.checked_sub(function.begin_rva).ok_or_else(|| {
-            AnalysisError::InvalidField {
+        let size_u32 = function
+            .end_rva
+            .checked_sub(function.begin_rva)
+            .ok_or_else(|| AnalysisError::InvalidField {
                 field: "runtime-function range",
                 reason: format!(
                     "entry {} has {:#x}..{:#x}",
                     function.table_index, function.begin_rva, function.end_rva
                 ),
-            }
-        })?;
+            })?;
         if size_u32 == 0 {
             return invalid_field(
                 "runtime-function range",
@@ -1575,10 +1531,7 @@ pub(crate) fn build_symbol_graph(
         let mut artifacts = BTreeMap::new();
         artifacts.insert("begin_rva".to_owned(), format!("{:#x}", function.begin_rva));
         artifacts.insert("end_rva".to_owned(), format!("{:#x}", function.end_rva));
-        artifacts.insert(
-            "table_index".to_owned(),
-            function.table_index.to_string(),
-        );
+        artifacts.insert("table_index".to_owned(), function.table_index.to_string());
         artifacts.insert(
             "unwind_info_rva".to_owned(),
             format!("{:#x}", function.unwind_info_rva),
@@ -1628,20 +1581,15 @@ impl<'a> RvaMap<'a> {
         }
     }
 
-    fn offset(
-        &self,
-        rva: u32,
-        size: usize,
-        context: &'static str,
-    ) -> Result<usize, AnalysisError> {
-        let size_u64 = u64::try_from(size)
-            .map_err(|_| AnalysisError::IntegerConversion("RVA range size"))?;
+    fn offset(&self, rva: u32, size: usize, context: &'static str) -> Result<usize, AnalysisError> {
+        let size_u64 =
+            u64::try_from(size).map_err(|_| AnalysisError::IntegerConversion("RVA range size"))?;
         let end = u64::from(rva)
             .checked_add(size_u64)
             .ok_or(AnalysisError::ArithmeticOverflow("RVA range"))?;
         if rva < self.size_of_headers && end <= u64::from(self.size_of_headers) {
-            let offset = usize::try_from(rva)
-                .map_err(|_| AnalysisError::IntegerConversion("header RVA"))?;
+            let offset =
+                usize::try_from(rva).map_err(|_| AnalysisError::IntegerConversion("header RVA"))?;
             ensure_slice(self.bytes, offset, size, context)?;
             return Ok(offset);
         }
@@ -1650,7 +1598,9 @@ impl<'a> RvaMap<'a> {
             let section_start = u64::from(section.virtual_address);
             let backed_end = section_start
                 .checked_add(u64::from(section.raw_data_size))
-                .ok_or(AnalysisError::ArithmeticOverflow("section-backed RVA range"))?;
+                .ok_or(AnalysisError::ArithmeticOverflow(
+                    "section-backed RVA range",
+                ))?;
             if u64::from(rva) >= section_start && end <= backed_end {
                 let delta = u64::from(rva) - section_start;
                 let offset_u64 = u64::from(section.raw_data_offset)
@@ -1665,11 +1615,7 @@ impl<'a> RvaMap<'a> {
         Err(AnalysisError::UnmappedRva { context, rva, size })
     }
 
-    fn contiguous_bytes(
-        &self,
-        rva: u32,
-        context: &'static str,
-    ) -> Result<&'a [u8], AnalysisError> {
+    fn contiguous_bytes(&self, rva: u32, context: &'static str) -> Result<&'a [u8], AnalysisError> {
         if rva < self.size_of_headers {
             let offset = usize::try_from(rva)
                 .map_err(|_| AnalysisError::IntegerConversion("header string RVA"))?;
@@ -1687,9 +1633,9 @@ impl<'a> RvaMap<'a> {
         }
         for section in self.sections {
             let start = u64::from(section.virtual_address);
-            let end = start
-                .checked_add(u64::from(section.raw_data_size))
-                .ok_or(AnalysisError::ArithmeticOverflow("section-backed RVA range"))?;
+            let end = start.checked_add(u64::from(section.raw_data_size)).ok_or(
+                AnalysisError::ArithmeticOverflow("section-backed RVA range"),
+            )?;
             if u64::from(rva) >= start && u64::from(rva) < end {
                 let delta = u64::from(rva) - start;
                 let offset = u64::from(section.raw_data_offset)
@@ -1806,47 +1752,27 @@ fn ensure_slice<'a>(
     })
 }
 
-fn checked_add(
-    left: usize,
-    right: usize,
-    context: &'static str,
-) -> Result<usize, AnalysisError> {
+fn checked_add(left: usize, right: usize, context: &'static str) -> Result<usize, AnalysisError> {
     left.checked_add(right)
         .ok_or(AnalysisError::ArithmeticOverflow(context))
 }
 
-fn checked_mul(
-    left: usize,
-    right: usize,
-    context: &'static str,
-) -> Result<usize, AnalysisError> {
+fn checked_mul(left: usize, right: usize, context: &'static str) -> Result<usize, AnalysisError> {
     left.checked_mul(right)
         .ok_or(AnalysisError::ArithmeticOverflow(context))
 }
 
-fn checked_u32_add(
-    left: u32,
-    right: u32,
-    context: &'static str,
-) -> Result<u32, AnalysisError> {
+fn checked_u32_add(left: u32, right: u32, context: &'static str) -> Result<u32, AnalysisError> {
     left.checked_add(right)
         .ok_or(AnalysisError::ArithmeticOverflow(context))
 }
 
-fn checked_u32_mul(
-    left: u32,
-    right: u32,
-    context: &'static str,
-) -> Result<u32, AnalysisError> {
+fn checked_u32_mul(left: u32, right: u32, context: &'static str) -> Result<u32, AnalysisError> {
     left.checked_mul(right)
         .ok_or(AnalysisError::ArithmeticOverflow(context))
 }
 
-fn enforce_limit(
-    kind: &'static str,
-    count: u64,
-    limit: u64,
-) -> Result<(), AnalysisError> {
+fn enforce_limit(kind: &'static str, count: u64, limit: u64) -> Result<(), AnalysisError> {
     if count > limit {
         Err(AnalysisError::LimitExceeded { kind, count, limit })
     } else {

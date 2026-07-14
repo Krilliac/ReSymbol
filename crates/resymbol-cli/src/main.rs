@@ -102,9 +102,7 @@ fn analyze(args: AnalyzeArgs, safe_mode: bool, plugin_dir: PathBuf) -> Result<()
     let package = ResymPackage::from_bound_payload(env!("CARGO_PKG_VERSION"), analysis)
         .context("cannot create analysis package")?;
     let report = scan_plugins(&plugin_dir, safe_mode)?;
-    let output = args
-        .output
-        .unwrap_or_else(|| default_package_path(&binary));
+    let output = args.output.unwrap_or_else(|| default_package_path(&binary));
     write_file_new_bound(&output, &package)
         .with_context(|| format!("cannot write package {}", output.display()))?;
 
@@ -578,7 +576,10 @@ entrypoint = "plugin.wasm"
 
         let package: ResymPackage<BinaryAnalysis> =
             read_file_bound(&output).expect("read bound package");
-        assert_eq!(package.binary_sha256(), &resymbol_core::BinaryId::digest(&bytes));
+        assert_eq!(
+            package.binary_sha256(),
+            &resymbol_core::BinaryId::digest(&bytes)
+        );
         assert_eq!(&package.payload().identity().id, package.binary_sha256());
         assert_eq!(package.payload().symbol_graph().claims().len(), 3);
 

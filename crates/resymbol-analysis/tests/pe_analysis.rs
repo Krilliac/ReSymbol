@@ -1,6 +1,4 @@
-use resymbol_analysis::{
-    AnalysisError, BinaryAnalysis, ImportTarget, analyze_bytes, analyze_pe,
-};
+use resymbol_analysis::{AnalysisError, BinaryAnalysis, ImportTarget, analyze_bytes, analyze_pe};
 use resymbol_core::{BinaryId, SymbolAssertion, SymbolSubject};
 use resymbol_package::BinaryBoundPayload;
 
@@ -42,7 +40,11 @@ fn set_directory(bytes: &mut [u8], index: usize, rva: u32, size: u32) {
 fn fixture() -> Vec<u8> {
     let mut bytes = vec![0_u8; 0x800];
     bytes[0..2].copy_from_slice(b"MZ");
-    put_u32(&mut bytes, 0x3c, u32::try_from(PE_OFFSET).expect("fixture offset"));
+    put_u32(
+        &mut bytes,
+        0x3c,
+        u32::try_from(PE_OFFSET).expect("fixture offset"),
+    );
     bytes[PE_OFFSET..PE_OFFSET + 4].copy_from_slice(b"PE\0\0");
 
     put_u16(&mut bytes, COFF_OFFSET, 0x8664);
@@ -185,7 +187,10 @@ fn analysis_round_trips_through_serde() {
     let json = serde_json::to_string(&analysis).expect("serialize analysis");
     let decoded = serde_json::from_str(&json).expect("deserialize analysis");
     assert_eq!(analysis, decoded);
-    assert_eq!(analysis.rebuild_symbol_graph().expect("rebuild"), analysis.symbol_graph);
+    assert_eq!(
+        analysis.rebuild_symbol_graph().expect("rebuild"),
+        analysis.symbol_graph
+    );
 }
 
 #[test]
@@ -391,10 +396,13 @@ fn classifies_non_executable_exports_as_globals() {
 
     let analysis = analyze_pe(&bytes).expect("valid data export");
     assert_eq!(analysis.symbol_graph.claims().len(), 2);
-    assert!(analysis.symbol_graph.claims().iter().all(|claim| matches!(
-        claim.subject(),
-        SymbolSubject::Global { rva: 0x1000, .. }
-    )));
+    assert!(
+        analysis
+            .symbol_graph
+            .claims()
+            .iter()
+            .all(|claim| matches!(claim.subject(), SymbolSubject::Global { rva: 0x1000, .. }))
+    );
 }
 
 #[test]

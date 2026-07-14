@@ -15,7 +15,9 @@ pub enum AnalysisError {
     PeHeaderOffsetLimit { offset: u32, limit: u32 },
     #[error("unsupported COFF machine {machine:#06x}; only x86-64 ({expected:#06x}) is supported")]
     UnsupportedMachine { machine: u16, expected: u16 },
-    #[error("unsupported optional-header magic {magic:#06x}; only PE32+ ({expected:#06x}) is supported")]
+    #[error(
+        "unsupported optional-header magic {magic:#06x}; only PE32+ ({expected:#06x}) is supported"
+    )]
     UnsupportedOptionalHeader { magic: u16, expected: u16 },
     #[error("optional header is {actual} bytes; at least {minimum} bytes are required")]
     OptionalHeaderTooSmall { actual: usize, minimum: usize },
@@ -25,7 +27,9 @@ pub enum AnalysisError {
         count: u64,
         limit: u64,
     },
-    #[error("truncated {context} at file offset {offset:#x}: need {needed} bytes, only {available} remain")]
+    #[error(
+        "truncated {context} at file offset {offset:#x}: need {needed} bytes, only {available} remain"
+    )]
     Truncated {
         context: &'static str,
         offset: usize,
@@ -37,10 +41,7 @@ pub enum AnalysisError {
     #[error("cannot represent {0} on this platform")]
     IntegerConversion(&'static str),
     #[error("invalid {field}: {reason}")]
-    InvalidField {
-        field: &'static str,
-        reason: String,
-    },
+    InvalidField { field: &'static str, reason: String },
     #[error("{context} RVA range {rva:#x}..+{size:#x} is not backed by file data")]
     UnmappedRva {
         context: &'static str,

@@ -323,8 +323,8 @@ pub fn from_slice_with_options<T: DeserializeOwned>(
     let wire: WirePackage = serde_json::from_slice(bytes).map_err(PackageError::Deserialize)?;
     validate_schema(wire.schema_version, options.schema_compatibility)?;
     validate_generator_version(&wire.generator_version)?;
-    let binary_sha256 = BinaryId::from_sha256(wire.binary_sha256)
-        .map_err(PackageError::InvalidBinaryId)?;
+    let binary_sha256 =
+        BinaryId::from_sha256(wire.binary_sha256).map_err(PackageError::InvalidBinaryId)?;
     let payload = serde_json::from_value(wire.payload).map_err(PackageError::Deserialize)?;
 
     Ok(ResymPackage {
@@ -403,7 +403,9 @@ pub fn read_file_with_options<T: DeserializeOwned>(
         }
     }
 
-    let read_limit = u64::try_from(options.max_bytes).unwrap_or(u64::MAX).saturating_add(1);
+    let read_limit = u64::try_from(options.max_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
     let mut bytes = Vec::new();
     file.take(read_limit)
         .read_to_end(&mut bytes)
@@ -812,8 +814,8 @@ mod tests {
         );
         let compatibility = SchemaCompatibility::inclusive(1, 2).expect("valid range");
         let options = PackageOptions::new(1024, compatibility).expect("valid options");
-        let decoded = from_slice_with_options::<u64>(bytes.as_bytes(), options)
-            .expect("schema is accepted");
+        let decoded =
+            from_slice_with_options::<u64>(bytes.as_bytes(), options).expect("schema is accepted");
 
         assert_eq!(decoded.schema_version(), 2);
         assert_eq!(*decoded.payload(), 42);
@@ -829,12 +831,11 @@ mod tests {
         ));
 
         let bytes = to_vec(&package).expect("package encodes");
-        let error = from_slice_checked::<TestPayload, _, _>(
-            &bytes,
-            PackageOptions::default(),
-            |_| Err("content-store digest differs"),
-        )
-        .expect_err("custom check rejects identity");
+        let error =
+            from_slice_checked::<TestPayload, _, _>(&bytes, PackageOptions::default(), |_| {
+                Err("content-store digest differs")
+            })
+            .expect_err("custom check rejects identity");
         assert!(matches!(&error, PackageError::BinaryIdRejected { .. }));
         assert!(error.to_string().contains("content-store digest differs"));
     }
@@ -845,8 +846,8 @@ mod tests {
             binary_id: BinaryId::from_sha256(DIGEST_A).expect("valid test digest"),
             value: 7,
         };
-        let package = ResymPackage::from_bound_payload("0.1.0", payload)
-            .expect("bound package is valid");
+        let package =
+            ResymPackage::from_bound_payload("0.1.0", payload).expect("bound package is valid");
 
         assert_eq!(package.binary_sha256().as_str(), DIGEST_A);
         package
@@ -859,8 +860,8 @@ mod tests {
         let bytes = format!(
             "{{\"schema_version\":1,\"generator_version\":\"0.1.0\",\"binary_sha256\":\"{DIGEST_A}\",\"payload\":{{\"binary_id\":\"{DIGEST_B}\",\"value\":7}}}}"
         );
-        let error = from_slice_bound::<BoundPayload>(bytes.as_bytes())
-            .expect_err("binding must fail");
+        let error =
+            from_slice_bound::<BoundPayload>(bytes.as_bytes()).expect_err("binding must fail");
 
         assert!(matches!(
             error,
