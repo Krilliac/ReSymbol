@@ -650,7 +650,7 @@ impl PluginStateStore {
         let mut file =
             File::open(&path).map_err(|source| state_io("open state record", &path, source))?;
         let mut bytes = Vec::new();
-        file.by_ref()
+        Read::by_ref(&mut file)
             .take(MAX_STATE_RECORD_BYTES + 1)
             .read_to_end(&mut bytes)
             .map_err(|source| state_io("read state record", &path, source))?;
