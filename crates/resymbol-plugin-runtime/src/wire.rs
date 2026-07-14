@@ -838,8 +838,10 @@ mod tests {
         payload.insert("value".to_owned(), Value::String("x".repeat(2_000)));
         let request = ExternalProcessRequest::new("one", "session", PluginMethod::Analyze, payload)
             .expect("valid request");
-        let mut limits = RuntimeLimits::default();
-        limits.max_message_bytes = 1_024;
+        let limits = RuntimeLimits {
+            max_message_bytes: 1_024,
+            ..RuntimeLimits::default()
+        };
         assert!(matches!(
             encode_input(&manifest(), &request, &limits),
             Err(PluginRuntimeError::StreamLimit {
