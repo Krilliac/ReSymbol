@@ -218,12 +218,8 @@ impl SymbolAssertion {
             Self::FunctionPrototype { declaration } => {
                 ("assertion.declaration", declaration.as_str())
             }
-            Self::TypeDefinition { declaration } => {
-                ("assertion.declaration", declaration.as_str())
-            }
-            Self::ClassMembership { class_name } => {
-                ("assertion.class_name", class_name.as_str())
-            }
+            Self::TypeDefinition { declaration } => ("assertion.declaration", declaration.as_str()),
+            Self::ClassMembership { class_name } => ("assertion.class_name", class_name.as_str()),
             Self::Comment { text } => ("assertion.text", text.as_str()),
             Self::FunctionBoundary { size } => {
                 if *size == 0 {
@@ -587,10 +583,7 @@ pub enum GraphValidationError {
     MismatchedBinaryKey { key: BinaryId, identity: BinaryId },
 }
 
-fn require_nonempty(
-    field: &'static str,
-    value: &str,
-) -> Result<(), ClaimValidationError> {
+fn require_nonempty(field: &'static str, value: &str) -> Result<(), ClaimValidationError> {
     if value.trim().is_empty() {
         Err(ClaimValidationError::EmptyField(field))
     } else {

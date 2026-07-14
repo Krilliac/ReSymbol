@@ -8,11 +8,9 @@ mod health;
 mod manifest;
 
 pub use health::{
-    DiagnosticSeverity, PluginDiagnostic, PluginDiagnosticCode, PluginHealth,
-    PluginHealthState,
+    DiagnosticSeverity, PluginDiagnostic, PluginDiagnosticCode, PluginHealth, PluginHealthState,
 };
 pub use manifest::{
-    MANIFEST_VERSION, PLUGIN_API_VERSION, ManifestValidationError, NativeIsolation,
-    PluginCapability, PluginId, PluginManifest, PluginPermission, PluginRuntime,
-    PluginRuntimeKind,
+    MANIFEST_VERSION, ManifestValidationError, NativeIsolation, PLUGIN_API_VERSION,
+    PluginCapability, PluginId, PluginManifest, PluginPermission, PluginRuntime, PluginRuntimeKind,
 };

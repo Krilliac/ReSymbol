@@ -5,8 +5,8 @@ use std::{
 };
 
 use resymbol_plugin_api::{
-    PLUGIN_API_VERSION, ManifestValidationError, PluginDiagnostic,
-    PluginDiagnosticCode, PluginHealth, PluginHealthState, PluginId, PluginManifest,
+    ManifestValidationError, PLUGIN_API_VERSION, PluginDiagnostic, PluginDiagnosticCode,
+    PluginHealth, PluginHealthState, PluginId, PluginManifest,
 };
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -193,7 +193,10 @@ fn discover_directory(path: PathBuf, options: &PluginDiscoveryOptions) -> Discov
         manifest: Some(manifest),
         health: PluginHealth::new(PluginHealthState::Enabled),
     };
-    let manifest = plugin.manifest.as_ref().expect("manifest was just assigned");
+    let manifest = plugin
+        .manifest
+        .as_ref()
+        .expect("manifest was just assigned");
 
     if let Err(error) = manifest.validate() {
         let (state, diagnostic) = manifest_validation_diagnostic(&error);
@@ -493,40 +496,33 @@ entrypoint = "plugin.wasm"
         let temp = TempDir::new().expect("temp directory");
         let disabled = create_plugin(temp.path(), "disabled", "community.disabled");
         create_plugin(temp.path(), "enabled", "community.enabled");
-        fs::write(disabled.join(PLUGIN_DISABLED_SENTINEL), b"")
-            .expect("write sentinel");
+        fs::write(disabled.join(PLUGIN_DISABLED_SENTINEL), b"").expect("write sentinel");
 
         let report = discover_plugins(temp.path(), &PluginDiscoveryOptions::default())
             .expect("discover plugins");
         let states = report
             .plugins
             .iter()
-            .map(|plugin| {
-                (
-                    plugin.id().expect("manifest").as_str(),
-                    plugin.health.state,
-                )
-            })
+            .map(|plugin| (plugin.id().expect("manifest").as_str(), plugin.health.state))
             .collect::<BTreeMap<_, _>>();
 
-        assert_eq!(
-            states["community.disabled"],
-            PluginHealthState::Disabled
-        );
+        assert_eq!(states["community.disabled"], PluginHealthState::Disabled);
         assert_eq!(states["community.enabled"], PluginHealthState::Enabled);
     }
 
     #[test]
     fn package_files_are_discovered_without_executing_them() {
         let temp = TempDir::new().expect("temp directory");
-        fs::write(temp.path().join("example.resymbol-plugin"), b"package")
-            .expect("write package");
+        fs::write(temp.path().join("example.resymbol-plugin"), b"package").expect("write package");
 
         let report = discover_plugins(temp.path(), &PluginDiscoveryOptions::default())
             .expect("discover plugins");
         assert_eq!(report.plugins.len(), 1);
         assert_eq!(report.plugins[0].source, PluginSource::Package);
-        assert_eq!(report.plugins[0].health.state, PluginHealthState::Discovered);
+        assert_eq!(
+            report.plugins[0].health.state,
+            PluginHealthState::Discovered
+        );
         assert!(report.plugins[0].manifest.is_none());
     }
 
@@ -561,8 +557,7 @@ entrypoint = "plugin.wasm"
             .expect("scan continues");
         assert_eq!(report.plugins.len(), 2);
         assert!(report.plugins.iter().any(|plugin| {
-            plugin.health.state == PluginHealthState::Quarantined
-                && plugin.manifest.is_none()
+            plugin.health.state == PluginHealthState::Quarantined && plugin.manifest.is_none()
         }));
         assert_eq!(report.loadable().count(), 1);
     }
@@ -601,9 +596,16 @@ entrypoint = "plugin.wasm"
 
         let report = discover_plugins(temp.path(), &PluginDiscoveryOptions::default())
             .expect("discover plugins");
-        assert_eq!(report.plugins[0].health.state, PluginHealthState::Quarantined);
-        assert!(report.plugins[0].health.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == PluginDiagnosticCode::MissingEntrypoint
-        }));
+        assert_eq!(
+            report.plugins[0].health.state,
+            PluginHealthState::Quarantined
+        );
+        assert!(
+            report.plugins[0]
+                .health
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.code == PluginDiagnosticCode::MissingEntrypoint })
+        );
     }
 }

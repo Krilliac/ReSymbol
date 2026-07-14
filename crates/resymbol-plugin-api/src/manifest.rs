@@ -283,10 +283,7 @@ impl PluginManifest {
     }
 
     /// Validate both schema invariants and compatibility with a concrete host.
-    pub fn validate_for_host(
-        &self,
-        host_api: &Version,
-    ) -> Result<(), ManifestValidationError> {
+    pub fn validate_for_host(&self, host_api: &Version) -> Result<(), ManifestValidationError> {
         self.validate()?;
         if !self.api.matches(host_api) {
             return Err(ManifestValidationError::IncompatibleApi {
@@ -317,10 +314,7 @@ pub enum ManifestValidationError {
     MissingInProcessPermission,
 }
 
-fn validate_identifier(
-    field: &'static str,
-    value: &str,
-) -> Result<(), ManifestValidationError> {
+fn validate_identifier(field: &'static str, value: &str) -> Result<(), ManifestValidationError> {
     let valid = (3..=128).contains(&value.len())
         && value.split('.').all(|segment| {
             let first = segment.as_bytes().first().copied();
@@ -328,13 +322,9 @@ fn validate_identifier(
             !segment.is_empty()
                 && !matches!(first, Some(b'-' | b'_'))
                 && !matches!(last, Some(b'-' | b'_'))
-                && segment
-                    .bytes()
-                    .all(|byte| {
-                        byte.is_ascii_lowercase()
-                            || byte.is_ascii_digit()
-                            || b"-_".contains(&byte)
-                    })
+                && segment.bytes().all(|byte| {
+                    byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"-_".contains(&byte)
+                })
         });
 
     if valid {
@@ -385,8 +375,8 @@ mod tests {
 
     #[test]
     fn identifiers_are_validated_during_deserialization() {
-        let error = serde_json::from_str::<PluginId>(r#""Not Valid""#)
-            .expect_err("invalid id must fail");
+        let error =
+            serde_json::from_str::<PluginId>(r#""Not Valid""#).expect_err("invalid id must fail");
         assert!(error.to_string().contains("lowercase dotted identifiers"));
     }
 

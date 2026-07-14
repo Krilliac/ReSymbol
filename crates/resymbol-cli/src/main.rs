@@ -1,10 +1,13 @@
-use std::{fs, path::{Path, PathBuf}};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use resymbol_core::{
-    BinaryId, DiscoveredPlugin, PluginDiscoveryOptions, PluginSource,
-    PLUGIN_DISABLED_SENTINEL, discover_plugins,
+    BinaryId, DiscoveredPlugin, PLUGIN_DISABLED_SENTINEL, PluginDiscoveryOptions, PluginSource,
+    discover_plugins,
     plugin_api::{DiagnosticSeverity, PluginHealthState, PluginRuntimeKind},
 };
 
@@ -73,8 +76,8 @@ fn analyze(args: AnalyzeArgs, safe_mode: bool, plugin_dir: PathBuf) -> Result<()
         .binary
         .canonicalize()
         .with_context(|| format!("cannot open binary {}", args.binary.display()))?;
-    let bytes = fs::read(&binary)
-        .with_context(|| format!("cannot read binary {}", binary.display()))?;
+    let bytes =
+        fs::read(&binary).with_context(|| format!("cannot read binary {}", binary.display()))?;
     let report = scan_plugins(&plugin_dir, safe_mode)?;
 
     println!("binary: {}", binary.display());
@@ -185,7 +188,11 @@ fn set_plugin_enabled(plugin_dir: &Path, id: &str, enabled: bool) -> Result<()> 
     let matches = report
         .plugins
         .iter()
-        .filter(|plugin| plugin.id().is_some_and(|plugin_id| plugin_id.as_str() == id))
+        .filter(|plugin| {
+            plugin
+                .id()
+                .is_some_and(|plugin_id| plugin_id.as_str() == id)
+        })
         .collect::<Vec<_>>();
 
     let [plugin] = matches.as_slice() else {
@@ -214,9 +221,8 @@ fn set_plugin_enabled(plugin_dir: &Path, id: &str, enabled: bool) -> Result<()> 
     } else if sentinel.exists() {
         println!("plugin {id} is already disabled");
     } else {
-        fs::write(&sentinel, b"").with_context(|| {
-            format!("cannot create disable sentinel {}", sentinel.display())
-        })?;
+        fs::write(&sentinel, b"")
+            .with_context(|| format!("cannot create disable sentinel {}", sentinel.display()))?;
         println!("disabled plugin {id}");
     }
 
@@ -286,14 +292,12 @@ entrypoint = "plugin.wasm"
         let plugin = create_plugin(temp.path(), "dev.resymbol.cli-test");
         let sentinel = plugin.join(PLUGIN_DISABLED_SENTINEL);
 
-        set_plugin_enabled(temp.path(), "dev.resymbol.cli-test", false)
-            .expect("disable plugin");
+        set_plugin_enabled(temp.path(), "dev.resymbol.cli-test", false).expect("disable plugin");
         assert!(sentinel.is_file());
         let report = scan_plugins(temp.path(), false).expect("scan disabled plugin");
         assert_eq!(report.plugins[0].health.state, PluginHealthState::Disabled);
 
-        set_plugin_enabled(temp.path(), "dev.resymbol.cli-test", true)
-            .expect("enable plugin");
+        set_plugin_enabled(temp.path(), "dev.resymbol.cli-test", true).expect("enable plugin");
         assert!(!sentinel.exists());
         let report = scan_plugins(temp.path(), false).expect("scan enabled plugin");
         assert_eq!(report.plugins[0].health.state, PluginHealthState::Enabled);

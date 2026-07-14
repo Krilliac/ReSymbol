@@ -8,13 +8,12 @@ mod plugin_discovery;
 mod symbols;
 
 pub use plugin_discovery::{
-    DiscoveredPlugin, PluginDiscoveryOptions, PluginDiscoveryReport, PluginSource,
-    PLUGIN_DISABLED_SENTINEL, PLUGIN_MANIFEST_FILE, PLUGIN_PACKAGE_EXTENSION,
-    discover_plugins,
+    DiscoveredPlugin, PLUGIN_DISABLED_SENTINEL, PLUGIN_MANIFEST_FILE, PLUGIN_PACKAGE_EXTENSION,
+    PluginDiscoveryOptions, PluginDiscoveryReport, PluginSource, discover_plugins,
 };
 pub use resymbol_plugin_api as plugin_api;
 pub use symbols::{
-    BinaryFormat, BinaryId, BinaryIdentity, ClaimProducer, ClaimProvenance,
-    ClaimValidationError, Confidence, Evidence, EvidenceKind, GraphValidationError,
-    SymbolAssertion, SymbolClaim, SymbolGraph, SymbolSubject,
+    BinaryFormat, BinaryId, BinaryIdentity, ClaimProducer, ClaimProvenance, ClaimValidationError,
+    Confidence, Evidence, EvidenceKind, GraphValidationError, SymbolAssertion, SymbolClaim,
+    SymbolGraph, SymbolSubject,
 };

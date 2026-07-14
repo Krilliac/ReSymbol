@@ -121,10 +121,7 @@ impl PluginHealth {
     }
 
     #[must_use]
-    pub fn with_diagnostic(
-        state: PluginHealthState,
-        diagnostic: PluginDiagnostic,
-    ) -> Self {
+    pub fn with_diagnostic(state: PluginHealthState, diagnostic: PluginDiagnostic) -> Self {
         Self {
             state,
             consecutive_failures: 0,
@@ -139,11 +136,7 @@ impl PluginHealth {
     /// Record a recoverable runtime failure and quarantine after the configured
     /// number of consecutive failures. A threshold of zero quarantines on the
     /// first failure.
-    pub fn record_failure(
-        &mut self,
-        diagnostic: PluginDiagnostic,
-        quarantine_after: u32,
-    ) {
+    pub fn record_failure(&mut self, diagnostic: PluginDiagnostic, quarantine_after: u32) {
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         self.diagnostics.push(diagnostic);
 
@@ -173,10 +166,8 @@ mod tests {
     #[test]
     fn repeated_failures_quarantine_without_overflowing() {
         let mut health = PluginHealth::new(PluginHealthState::Enabled);
-        let diagnostic = PluginDiagnostic::error(
-            PluginDiagnosticCode::RuntimeFailure,
-            "plugin trapped",
-        );
+        let diagnostic =
+            PluginDiagnostic::error(PluginDiagnosticCode::RuntimeFailure, "plugin trapped");
 
         health.record_failure(diagnostic.clone(), 2);
         assert_eq!(health.state, PluginHealthState::Enabled);
