@@ -5,6 +5,8 @@ members = [
     "crates/resymbol-core",
     "crates/resymbol-package",
     "crates/resymbol-plugin-api",
+    "crates/resymbol-plugin-runtime",
+    "crates/resymbol-plugin-state",
 ]
 resolver = "3"
 

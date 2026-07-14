@@ -20,6 +20,11 @@ by compilation, reconstruct types, analyze RTTI/vtables, or produce PDB/debugger
 binaries, .NET assemblies, other CPU architectures, ELF, Mach-O, and debugger export are future
 analysis milestones.
 
+The current release also includes the first external-process analysis-plugin runtime. Dropped-in
+plugins are discovered automatically, but process code requires explicit approval bound to its
+exact directory fingerprint before it can execute. WASM, native C/C++, managed/.NET, and
+debugger-hosted contracts are present for plugin authors; their execution hosts remain future work.
+
 The command-line executable itself is built for these host platforms:
 
 | Archive suffix | Host |
@@ -133,27 +138,80 @@ entrypoint:
 
 ```text
 plugins/
-└── community.example-resolver/
-    ├── plugin.toml
-    └── plugin.wasm
+├── community.example-process-resolver/
+│   ├── plugin.toml
+│   └── resolver[.exe]
+└── .resymbol/                  # ReSymbol-owned trust/quarantine state
 ```
 
-Do not place plugin source code in this directory expecting ReSymbol to compile it. Current builds
-discover and validate unpacked plugin directories, but the WASM, native, managed, and external
-runtime hosts are not implemented yet, so plugin code is not executed during analysis.
+Do not place plugin source code in this directory expecting ReSymbol to compile it. A process
+plugin must include a runnable entrypoint and any private runtime it needs; on Unix, that entrypoint
+must have execute permission. Ordinary users should not need the plugin author's compiler or SDK.
+
+Inspect the artifact and its requested protocol permissions, then approve its exact fingerprint:
+
+```console
+resymbol plugin list
+resymbol plugin doctor
+resymbol plugin trust community.example-process-resolver
+```
+
+For scripted installation, pin the value you reviewed so approval fails if the directory changed:
+
+```console
+resymbol plugin trust community.example-process-resolver --fingerprint <sha256>
+```
+
+An unchanged trusted process analyzer is eligible to run automatically during later analyses. Any
+change to a fingerprinted file, including `plugin.toml`, its entrypoint, bundled libraries, or data,
+invalidates trust. The host-owned records under `plugins/.resymbol/` are outside plugin directories;
+do not copy them as part of a plugin package. Corrupt or unsafe state fails closed.
+
+> [!WARNING]
+> The external process is separated from ReSymbol, but it is not operating-system sandboxed. It
+> has the ambient filesystem, network, credential, and process access of the user launching it.
+> Manifest permissions limit ReSymbol protocol operations; they do not restrict ambient OS access.
+> Trust only plugins whose code and publisher you would run directly.
+
+Run a specific approved plugin by ID, or let analysis run all eligible trusted process analyzers:
+
+```console
+resymbol analyze path/to/application.exe --plugin community.example-process-resolver
+resymbol analyze path/to/application.exe
+```
+
+Plugin failures do not prevent base analysis or package creation, and partial claims are discarded.
+Unsafe startup, protocol, resource, claim, or runtime failures quarantine that exact artifact. Use
+strict mode in automation when plugin success is required; ReSymbol still writes the valid package
+before returning a failure status:
+
+```console
+resymbol analyze path/to/application.exe \
+  --plugin community.example-process-resolver \
+  --strict-plugins
+```
+
+The first process host supports one-shot `analyze` requests. Interactive `binary.read`/
+`read-binary` requests are reserved and not yet available.
 
 Disable a discovered plugin without deleting it:
 
 ```console
-resymbol plugin disable community.example-resolver
-resymbol plugin enable community.example-resolver
+resymbol plugin disable community.example-process-resolver
+resymbol plugin enable community.example-process-resolver
+resymbol plugin untrust community.example-process-resolver
+resymbol plugin reset community.example-process-resolver
 ```
 
 The disable command creates `plugin.disabled` in that plugin directory. It can also be created by
-hand as an emergency recovery measure. Safe mode suppresses all third-party plugins for that run:
+hand as an emergency recovery measure; it is excluded from the artifact fingerprint so disabling
+and re-enabling an unchanged plugin does not silently change its trust identity. `untrust` revokes
+approval. `reset` clears quarantine for the current artifact but does not trust a changed one.
+
+Safe mode suppresses all third-party plugin execution for that run:
 
 ```console
-resymbol --safe-mode plugin list
+resymbol --safe-mode analyze path/to/application.exe
 ```
 
 ## Build from source

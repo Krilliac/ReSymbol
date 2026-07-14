@@ -7,15 +7,24 @@ because it appears here; the current code, tests, release notes, and issue track
 ## Current checkpoint
 
 The repository foundation and initial graph/plugin-contract work are in place. The first usable
-Milestone 2 slice now performs bounded PE32+ x86-64 ingestion, extracts sections/imports/exports and
-x64 exception metadata, derives conservative metadata-backed claims, writes canonical `.resym`
-packages, and validates or displays those packages through the CLI.
+Milestone 2 slice performs bounded PE32+ x86-64 ingestion, extracts sections/imports/exports and x64
+exception metadata, and derives conservative metadata-backed claims. Canonical `.resym` packages
+now carry an `AnalysisSession`: deterministic base analysis, an auditable plugin-run ledger, and
+separately validated plugin claims with a derived combined graph.
+
+The first external-process analysis host is also implemented. Dropped-in process plugins require an
+explicit full-directory-fingerprint trust decision, then unchanged trusted artifacts can autoload.
+The host launches directly without a shell, exchanges bounded NDJSON for one analysis request,
+enforces deadlines and output limits, and commits claims transactionally. Unsafe failures
+quarantine the exact fingerprint without blocking base analysis or package creation. Process
+separation is not an OS sandbox, and interactive binary reads remain reserved rather than
+implemented.
 
 The remaining Milestone 2 work is deliberately substantial: disassembly-assisted candidate
 discovery, strings and references, call relationships and thunks, MSVC RTTI/vtables, an open fixture
-corpus, reports, benchmarks, and continued malformed-input/resource-limit validation. Plugin runtime
-hosts and execution also remain future work; the existing foundation discovers and diagnoses
-plugin packages and defines their contracts.
+corpus, reports, benchmarks, and continued malformed-input/resource-limit validation. The WASM,
+native C/C++, managed/.NET, and debugger-hosted execution paths remain future work; their contracts
+and architecture are present, but should not be mistaken for working hosts.
 
 ## Milestone 0: repository foundation
 
@@ -31,17 +40,22 @@ Implemented in the current alpha.
 ## Milestone 1: graph and plugin foundation
 
 This milestone establishes extensibility before analysis behavior becomes difficult to decouple.
-Core graph types, plugin discovery/health policy, and initial multi-runtime contracts are
-implemented. Runtime hosts, package installation, and executing plugin code are still outstanding.
+Core graph types, plugin discovery/health policy, initial multi-runtime contracts, and the first
+external-process execution host are implemented. Package installation and the other runtime hosts
+are still outstanding.
 
 - Binary identity and canonical address primitives
 - Versioned entities for functions, ranges, names, types, claims, evidence, and plugin runs
 - Transactional claim validation and conflict preservation
 - Local `plugins/` discovery and autoload
 - Manual disablement and `plugin.disabled` sentinel support
-- Incompatible, quarantined, and development-error health states
+- Exact-directory fingerprinting and explicit trust before first process execution
+- Host-owned `.resymbol/` trust/quarantine records, update invalidation, and fail-closed reads
+- Incompatible, approval-required, quarantined, and development-error health states
 - Safe mode and plugin diagnostics
-- Version negotiation, dependency ordering, limits, and permission records
+- Version negotiation, dependency compatibility diagnostics, limits, and permission records
+- Direct no-shell, timeout- and output-bounded one-shot external-process analysis
+- Transactional plugin claims and failure-tolerant `AnalysisSession` packaging
 - Initial contracts and example packages for:
   - WebAssembly plugins
   - native C ABI and C++ SDK plugins
@@ -49,8 +63,11 @@ implemented. Runtime hosts, package installation, and executing plugin code are 
   - external-process plugins
   - debugger-hosted bridges
 
-The native and managed families are initial architecture requirements, not post-1.0 add-ons.
-Process isolation is the default even when an in-process trusted fast path is eventually available.
+The native and managed families are initial architecture requirements, not post-1.0 add-ons, but
+their current deliverables are contracts and SDK foundations rather than execution hosts.
+Out-of-process hosting is the default even when an in-process trusted fast path is eventually available. A
+child process is a crash boundary, not an OS security sandbox; platform sandboxing remains separate
+work.
 
 ## Milestone 2: useful native-binary MVP
 

@@ -9,7 +9,8 @@ mod symbols;
 
 pub use plugin_discovery::{
     DiscoveredPlugin, PLUGIN_DISABLED_SENTINEL, PLUGIN_MANIFEST_FILE, PLUGIN_PACKAGE_EXTENSION,
-    PluginDiscoveryOptions, PluginDiscoveryReport, PluginSource, discover_plugins,
+    PLUGIN_STATE_DIRECTORY, PluginDiscoveryOptions, PluginDiscoveryReport, PluginSource,
+    discover_plugins,
 };
 pub use resymbol_plugin_api as plugin_api;
 pub use symbols::{

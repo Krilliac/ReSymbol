@@ -12,5 +12,6 @@ kind = "external-process"
 entrypoint = "example-process-exporter.exe"
 args = ["--stdio", "--protocol", "resymbol.plugin-wire/1"]
 
-# External-process plugins are always isolated from the ReSymbol process. Their
-# stdin/stdout carries protocol/plugin-wire.schema.json; stderr is diagnostic.
+# ReSymbol launches this entrypoint directly, without a shell, and uses bounded
+# NDJSON on stdin/stdout. A child process is a crash boundary, not an OS sandbox:
+# after fingerprint-bound approval, it has the user's ambient process access.

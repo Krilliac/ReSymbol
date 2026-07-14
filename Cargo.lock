@@ -291,6 +291,7 @@ version = "0.1.0-alpha.1"
 dependencies = [
  "resymbol-core",
  "resymbol-package",
+ "semver",
  "serde",
  "serde_json",
  "thiserror",
@@ -305,6 +306,8 @@ dependencies = [
  "resymbol-analysis",
  "resymbol-core",
  "resymbol-package",
+ "resymbol-plugin-runtime",
+ "resymbol-plugin-state",
  "serde_json",
  "tempfile",
 ]
@@ -341,6 +344,31 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "thiserror",
+ "toml",
+]
+
+[[package]]
+name = "resymbol-plugin-runtime"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "resymbol-core",
+ "semver",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
+name = "resymbol-plugin-state"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "resymbol-plugin-api",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
  "thiserror",
 ]
 
@@ -574,4 +602,3 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
-

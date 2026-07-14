@@ -1422,6 +1422,10 @@ pub(crate) fn build_symbol_graph(
         method: method.to_owned(),
         run_id: None,
     };
+    let runtime_function_starts = runtime_functions
+        .iter()
+        .map(|function| function.begin_rva)
+        .collect::<BTreeSet<_>>();
 
     let mut export_names = Vec::new();
     for export in exports {
@@ -1443,9 +1447,7 @@ pub(crate) fn build_symbol_graph(
             continue;
         };
         let is_executable = section.characteristics & IMAGE_SCN_MEM_EXECUTE != 0;
-        let is_runtime_function_start = runtime_functions
-            .iter()
-            .any(|function| function.begin_rva == address_rva);
+        let is_runtime_function_start = runtime_function_starts.contains(&address_rva);
         if is_executable && !is_runtime_function_start {
             continue;
         }

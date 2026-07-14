@@ -13,7 +13,8 @@ IDA, Ghidra, debuggers, PDB consumers, and DWARF consumers.
 
 > [!IMPORTANT]
 > ReSymbol is an early alpha. The PE analyzer and `.resym` format are usable but intentionally
-> narrow, plugin and data formats may change, and debugger/PDB export is not implemented yet.
+> narrow. The first external-process plugin runtime is also usable, but it is not an OS sandbox.
+> Plugin and data formats may change, and debugger/PDB export is not implemented yet.
 
 ## What exists today
 
@@ -23,22 +24,29 @@ The current alpha implements and tests an end-to-end, deliberately narrow analys
   exports, forwarded exports, and x64 exception-directory (`RUNTIME_FUNCTION`) records;
 - conservative symbol-graph generation from exact export names and metadata-backed function
   boundaries, with SHA-256 binary identity, evidence, provenance, confidence, and claim validation;
-- canonical JSON `.resym` packages that are bound to the exact analyzed binary, reject invalid or
-  unsupported input, use size-bounded reads, and never silently overwrite an existing result;
+- canonical JSON `.resym` packages whose `AnalysisSession` payload keeps deterministic base
+  analysis, plugin-run records, and plugin claims separate while exposing a validated combined
+  graph;
 - `resymbol analyze`, which writes a portable package, and `resymbol inspect`, which validates and
   summarizes a package or emits its JSON representation;
 - versioned plugin manifests and health diagnostics for WASM, native, managed, external-process,
   and tool-adapter runtime families;
 - local plugin-directory discovery, manifest and entrypoint validation, API compatibility checks,
-  the `plugin.disabled` sentinel, safe-mode policy, duplicate-ID quarantine, and dependency checks;
+  the `plugin.disabled` sentinel, safe mode, duplicate-ID quarantine, and dependency checks;
+- fingerprint-bound approval and host-owned trust/quarantine state for dropped-in plugins: a
+  changed artifact loses trust, while an unchanged approved artifact can load on later runs;
+- a first external-process analysis runtime with direct no-shell launch, bounded NDJSON,
+  permission-gated claims, deadlines, output limits, transactional results, and automatic
+  quarantine after unsafe runtime or protocol failures;
 - initial native C ABI, managed/.NET, WIT, and process-wire contracts; and
-- CLI discovery, diagnosis, enablement, and disablement of unpacked plugins, plus manifest-only
-  plugin examples.
+- CLI discovery, diagnosis, enablement, disablement, fingerprint trust/revocation, quarantine reset,
+  plugin selection, and strict automation behavior, plus manifest-only plugin examples.
 
 The analyzer does not disassemble or execute its input, and it does not yet infer erased source
-names, recover types, analyze RTTI/vtables, or build call graphs. Plugin package
-verification/extraction, runtime hosts and plugin execution, cross-build matching, semantic
-inference, debugger bridges, and PDB/DWARF export are also **not implemented yet**.
+names, recover types, analyze RTTI/vtables, or build call graphs. The current process host supports
+one-shot analysis requests; interactive binary reads are reserved for a later protocol revision.
+Plugin package verification/extraction, WASM/native/managed execution hosts, cross-build matching,
+semantic inference, debugger bridges, and PDB/DWARF export are also **not implemented yet**.
 
 ## Why ReSymbol?
 
@@ -71,9 +79,9 @@ ReSymbol is growing from the working PE/package foundation toward:
 - exporters and bridges for IDA, Ghidra, PDB, DWARF, and other debugging formats;
 - drop-in plugin discovery from a local `plugins/` directory;
 - WASM, native C/C++, managed/.NET, external-process, and debugger-hosted plugin families from the
-  initial architecture; and
-- automatic plugin validation, disablement, isolation, and quarantine so a faulty extension does
-  not prevent the core application from starting.
+  initial architecture, with external-process execution implemented first; and
+- automatic plugin validation, disablement, bounded execution, and quarantine so a faulty
+  extension does not prevent the core application from starting.
 
 See the [analysis-package format](docs/analysis-packages.md),
 [architecture](docs/architecture.md), [plugin-system design](docs/plugin-system.md), and
@@ -93,7 +101,7 @@ See the [analysis-package format](docs/analysis-packages.md),
 5. **Interoperability beats lock-in.** The internal graph is not a PDB, an IDA database, or a Ghidra
    project. Those are import and export targets.
 6. **Untrusted input is normal.** Binary parsing and plugin boundaries are designed with malformed
-   or hostile input in mind.
+   or hostile input in mind. A child process is a crash boundary, not by itself a security sandbox.
 
 ## Quick start
 
@@ -105,6 +113,9 @@ resymbol inspect application.resym
 resymbol inspect application.resym --json
 resymbol plugin list
 resymbol plugin doctor
+# After reviewing a dropped-in process plugin:
+resymbol plugin trust community.example-analyzer --fingerprint <sha256>
+resymbol analyze application.exe --plugin community.example-analyzer
 ```
 
 `analyze` writes `application.resym` by default. Use `--output another.resym` to choose a different
@@ -115,9 +126,17 @@ displaying it.
 PDB, DWARF, IDA, and Ghidra exports remain roadmap work; there is no `export` command yet. See the
 [installation guide](docs/install.md) for portable prerelease archives and source-build steps.
 
-A normal plugin installation should be as simple as dropping a prebuilt plugin into `plugins/` and
-launching ReSymbol. The application discovers compatible plugins automatically. A `plugin.disabled`
-sentinel or a CLI command can disable one without deleting it.
+A normal plugin installation is dropping a prebuilt plugin directory into `plugins/`. ReSymbol
+discovers it automatically, but an external-process plugin cannot execute until the user explicitly
+trusts its exact directory fingerprint. That unchanged artifact autoloads on later analyses; any
+file update changes the fingerprint and requires a new decision. A `plugin.disabled` sentinel or a
+CLI command disables it without deletion, and `--safe-mode` suppresses every third-party plugin.
+
+Process plugins run with the ambient access granted to an ordinary child process on the host. The
+manifest permissions govern ReSymbol protocol operations; they are not filesystem, network, or
+process restrictions enforced by the operating system. Only trust process plugins whose code and
+publisher you would run directly. A failed plugin never prevents base analysis or package creation;
+its partial claims are discarded and unsafe failures are quarantined under `plugins/.resymbol/`.
 
 ## Development
 

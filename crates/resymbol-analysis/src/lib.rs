@@ -6,10 +6,12 @@
 
 mod error;
 mod pe;
+mod session;
 mod types;
 
 pub use error::AnalysisError;
 pub use pe::analyze_pe;
+pub use session::{AnalysisSession, PluginRunRecord, PluginRunStatus, SessionValidationError};
 pub use types::{
     BinaryAnalysis, CoffHeader, DataDirectory, ImportTarget, PeAnalysis, PeDataDirectories,
     PeExport, PeExportName, PeImport, PeImportLibrary, PeSection, RuntimeFunction,
@@ -33,6 +35,12 @@ pub fn analyze_bytes(bytes: &[u8]) -> Result<BinaryAnalysis, AnalysisError> {
 impl resymbol_package::BinaryBoundPayload for BinaryAnalysis {
     fn binary_id(&self) -> &resymbol_core::BinaryId {
         &self.identity().id
+    }
+}
+
+impl resymbol_package::BinaryBoundPayload for AnalysisSession {
+    fn binary_id(&self) -> &resymbol_core::BinaryId {
+        &self.base_analysis().identity().id
     }
 }
 

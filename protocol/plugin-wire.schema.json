@@ -2,8 +2,8 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://resymbol.dev/schemas/plugin-wire-v1.json",
   "title": "ReSymbol external-process plugin wire protocol",
-  "description": "Newline-delimited JSON messages exchanged over stdin/stdout with an isolated plugin host. Stdout is protocol-only; diagnostics belong on stderr. Plugins submit claims and never mutate canonical symbol state directly.",
-  "$comment": "The host launches process plugins out of process by definition and applies manifest permissions with OS isolation where available. A plugin declaration cannot opt itself into the ReSymbol process.",
+  "description": "Newline-delimited JSON messages exchanged over stdin/stdout with an out-of-process plugin. Stdout is protocol-only; diagnostics belong on stderr. Plugins submit claims and never mutate canonical symbol state directly.",
+  "$comment": "A process boundary protects ReSymbol from plugin crashes but is not, by itself, an operating-system sandbox. Hosts must require artifact-bound trust unless they can enforce the declared permissions. A plugin declaration cannot opt itself into the ReSymbol process.",
   "oneOf": [
     { "$ref": "#/$defs/hello" },
     { "$ref": "#/$defs/helloResult" },
@@ -18,17 +18,36 @@
       "required": ["major", "minor"],
       "properties": {
         "major": { "const": 1 },
-        "minor": { "type": "integer", "minimum": 0 }
+        "minor": { "const": 0 }
       }
+    },
+    "manifestIdentifier": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 128,
+      "pattern": "^[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?)*$"
     },
     "limits": {
       "type": "object",
       "additionalProperties": false,
       "required": ["max_message_bytes", "max_memory_bytes", "request_timeout_ms"],
       "properties": {
-        "max_message_bytes": { "type": "integer", "minimum": 1024 },
-        "max_memory_bytes": { "type": "integer", "minimum": 1048576 },
-        "request_timeout_ms": { "type": "integer", "minimum": 1 }
+        "max_message_bytes": {
+          "type": "integer",
+          "minimum": 1024,
+          "maximum": 18446744073709551615
+        },
+        "max_memory_bytes": {
+          "type": "integer",
+          "minimum": 1048576,
+          "maximum": 18446744073709551615,
+          "description": "Memory budget advertised to the plugin. It is enforceable only when the selected platform host provides a memory sandbox."
+        },
+        "request_timeout_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 18446744073709551615
+        }
       }
     },
     "isolation": {
@@ -52,21 +71,18 @@
         "isolation"
       ],
       "properties": {
-        "id": {
-          "type": "string",
-          "pattern": "^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$"
-        },
+        "id": { "$ref": "#/$defs/manifestIdentifier" },
         "name": { "type": "string", "minLength": 1 },
         "version": { "type": "string", "minLength": 1 },
         "capabilities": {
           "type": "array",
           "uniqueItems": true,
-          "items": { "type": "string", "minLength": 1 }
+          "items": { "$ref": "#/$defs/manifestIdentifier" }
         },
         "requested_permissions": {
           "type": "array",
           "uniqueItems": true,
-          "items": { "type": "string", "minLength": 1 }
+          "items": { "$ref": "#/$defs/manifestIdentifier" }
         },
         "isolation": { "$ref": "#/$defs/isolation" }
       }
@@ -97,21 +113,141 @@
       "additionalProperties": false,
       "required": ["kind", "description"],
       "properties": {
-        "kind": { "type": "string", "minLength": 1 },
+        "kind": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 128,
+          "pattern": "^[a-z0-9._-]+$"
+        },
         "description": { "type": "string", "minLength": 1 },
         "data": {}
       }
+    },
+    "symbolSubject": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "binary", "rva"],
+          "properties": {
+            "kind": { "const": "function" },
+            "binary": { "type": "string", "pattern": "^[0-9A-Fa-f]{64}$" },
+            "rva": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 18446744073709551615
+            },
+            "size": {
+              "type": ["integer", "null"],
+              "minimum": 1,
+              "maximum": 18446744073709551615
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "binary", "rva"],
+          "properties": {
+            "kind": { "const": "global" },
+            "binary": { "type": "string", "pattern": "^[0-9A-Fa-f]{64}$" },
+            "rva": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 18446744073709551615
+            },
+            "size": {
+              "type": ["integer", "null"],
+              "minimum": 1,
+              "maximum": 18446744073709551615
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "binary", "key"],
+          "properties": {
+            "kind": { "const": "type" },
+            "binary": { "type": "string", "pattern": "^[0-9A-Fa-f]{64}$" },
+            "key": { "type": "string", "minLength": 1 }
+          }
+        }
+      ]
+    },
+    "symbolAssertion": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "name"],
+          "properties": {
+            "kind": { "const": "name" },
+            "name": { "type": "string", "minLength": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "declaration"],
+          "properties": {
+            "kind": { "const": "function-prototype" },
+            "declaration": { "type": "string", "minLength": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "size"],
+          "properties": {
+            "kind": { "const": "function-boundary" },
+            "size": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 18446744073709551615
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "declaration"],
+          "properties": {
+            "kind": { "const": "type-definition" },
+            "declaration": { "type": "string", "minLength": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "class_name"],
+          "properties": {
+            "kind": { "const": "class-membership" },
+            "class_name": { "type": "string", "minLength": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "text"],
+          "properties": {
+            "kind": { "const": "comment" },
+            "text": { "type": "string", "minLength": 1 }
+          }
+        }
+      ]
     },
     "symbolClaim": {
       "type": "object",
       "additionalProperties": false,
       "required": ["subject", "claim", "confidence", "evidence"],
       "properties": {
-        "subject": { "type": "object" },
-        "claim": { "type": "object" },
+        "subject": { "$ref": "#/$defs/symbolSubject" },
+        "claim": { "$ref": "#/$defs/symbolAssertion" },
         "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
         "evidence": {
           "type": "array",
+          "minItems": 1,
           "items": { "$ref": "#/$defs/claimEvidence" }
         }
       }
@@ -145,11 +281,11 @@
         "version": { "$ref": "#/$defs/protocolVersion" },
         "kind": { "const": "hello" },
         "session_id": { "type": "string", "minLength": 1 },
-        "plugin_id": { "type": "string", "minLength": 1 },
+        "plugin_id": { "$ref": "#/$defs/manifestIdentifier" },
         "granted_permissions": {
           "type": "array",
           "uniqueItems": true,
-          "items": { "type": "string", "minLength": 1 }
+          "items": { "$ref": "#/$defs/manifestIdentifier" }
         },
         "limits": { "$ref": "#/$defs/limits" },
         "isolation": { "$ref": "#/$defs/isolation" }
@@ -174,39 +310,13 @@
         "protocol": { "const": "resymbol.plugin-wire" },
         "version": { "$ref": "#/$defs/protocolVersion" },
         "kind": { "const": "request" },
-        "direction": {
-          "enum": ["host-to-plugin", "plugin-to-host"]
-        },
+        "direction": { "const": "host-to-plugin" },
         "id": { "type": "string", "minLength": 1 },
         "method": {
-          "enum": ["initialize", "analyze", "health", "shutdown", "read-binary"]
+          "enum": ["initialize", "analyze", "health", "shutdown"]
         },
         "payload": { "type": "object" }
-      },
-      "allOf": [
-        {
-          "if": { "properties": { "method": { "const": "read-binary" } } },
-          "then": {
-            "properties": {
-              "direction": { "const": "plugin-to-host" },
-              "payload": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["rva", "length"],
-                "properties": {
-                  "rva": { "type": "integer", "minimum": 0 },
-                  "length": { "type": "integer", "minimum": 0 }
-                }
-              }
-            }
-          },
-          "else": {
-            "properties": {
-              "direction": { "const": "host-to-plugin" }
-            }
-          }
-        }
-      ]
+      }
     },
     "response": {
       "type": "object",
@@ -216,9 +326,7 @@
         "protocol": { "const": "resymbol.plugin-wire" },
         "version": { "$ref": "#/$defs/protocolVersion" },
         "kind": { "const": "response" },
-        "direction": {
-          "enum": ["host-to-plugin", "plugin-to-host"]
-        },
+        "direction": { "const": "plugin-to-host" },
         "id": { "type": "string", "minLength": 1 },
         "ok": { "type": "boolean" },
         "result": {},

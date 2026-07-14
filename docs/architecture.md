@@ -5,8 +5,9 @@ preserve. ReSymbol is in early development; sections marked as design describe t
 not necessarily behavior implemented in the current checkout.
 
 The current implementation covers bounded PE32+ x86-64 ingestion, a conservative metadata-derived
-symbol graph, canonical JSON `.resym` packages, and plugin discovery/contracts. Disassembly,
-matching, plugin execution, semantic inference, and debugger-specific export remain design work.
+symbol graph, canonical JSON `.resym` packages, plugin discovery/contracts, and the first trusted
+external-process analysis runtime. Disassembly, matching, semantic inference, debugger-specific
+export, and the WASM/native/managed execution hosts remain design work.
 
 ## Goals
 
@@ -29,10 +30,11 @@ claims and must remain visibly different in the data model and UI.
 ```mermaid
 flowchart TD
     B["Binary and related evidence"] --> I["Ingestion and identity"]
-    I --> A["Deterministic analysis"]
-    P["Plugin hosts"] --> A
-    A --> C["Claim and evidence ledger"]
-    C --> R["Validation and reconciliation"]
+    I --> A["Deterministic base analysis"]
+    A --> S["AnalysisSession"]
+    P["Plugin hosts"] --> C["Validated plugin runs and claims"]
+    C --> S
+    S --> R["Validation and reconciliation"]
     R --> G["Canonical symbol graph"]
     G --> X["Packages, reports, and tool exports"]
 ```
@@ -124,8 +126,11 @@ hashes and build identity so symbols cannot be silently applied to the wrong exe
 The initial persistence boundary is implemented as a versioned, canonical JSON `.resym` envelope.
 It binds the validated payload to an exact SHA-256 binary identity, enforces bounded reads, rejects
 unsupported schemas or inconsistent identities, and uses create-new writes to avoid silent data
-loss. Its serialized schema and future migrations are the compatibility boundary; a richer storage
-backend may be added without changing the canonical graph into a debugger database.
+loss. Its `AnalysisSession` payload contains the deterministic base analysis, an auditable plugin
+run ledger, and separately validated plugin claims. A combined symbol graph is derived from those
+parts rather than allowing plugins to mutate the metadata graph. The serialized schema and future
+migrations are the compatibility boundary; a richer storage backend may be added without changing
+the canonical graph into a debugger database.
 
 Exporters consume a read-only graph projection and report what information could not be represented
 by their target. PDB, DWARF, IDA, and Ghidra formats have different capabilities and should not
@@ -136,17 +141,31 @@ force their assumptions into the canonical graph. These exporters are not implem
 ReSymbol supports several extension families because no single runtime fits binary parsing,
 high-performance native analysis, managed tooling, model experiments, and debugger integration:
 
-| Family | Intended use | Default isolation |
+| Family | Intended use | Host boundary |
 |---|---|---|
-| WebAssembly | Portable analyzers, matchers, rules, and exporters | Capability sandbox |
-| Native C/C++ | Existing reversing libraries and performance-critical work | Separate native host process |
-| Managed/.NET | Managed analyzers, SDK consumers, and ecosystem integrations | Self-contained managed host process |
-| External process | Python, model runtimes, proprietary SDKs, or heavyweight tools | Framed RPC over a child process |
+| WebAssembly | Portable analyzers, matchers, rules, and exporters | Planned capability sandbox |
+| Native C/C++ | Existing reversing libraries and performance-critical work | Planned separate native host process |
+| Managed/.NET | Managed analyzers, SDK consumers, and ecosystem integrations | Planned self-contained managed host process |
+| External process | Python, model runtimes, proprietary SDKs, or heavyweight tools | Child process; bounded protocol, but no OS sandbox |
 | Tool-hosted bridge | IDA, Ghidra, Binary Ninja, and debugger adapters | The host tool's process and API |
 
 Native in-process loading may eventually be available as an explicit trusted performance mode. It
 is never the safe default. Rust's native ABI is not a public plugin contract; native plugins use a
 versioned C ABI with language wrappers.
+
+The first implemented execution host is deliberately narrower than the complete design. It starts
+an explicitly approved external-process plugin directly, without a shell, for one analysis request;
+exchanges size- and count-bounded NDJSON; enforces a deadline and bounded diagnostics; and accepts
+claims only as one validated transaction. Interactive `binary.read`/`read-binary` requests are
+reserved and are not serviced by this one-shot host. A plugin failure discards its claim batch but
+does not invalidate deterministic analysis or prevent the `.resym` package from being written.
+
+Process separation contains ordinary crashes, not authority. The child still has the ambient
+filesystem, network, and process access of the account running ReSymbol. Consequently a process
+plugin requires explicit approval tied to its complete directory fingerprint before first
+execution. The unchanged fingerprint may autoload later; any update invalidates that approval.
+Manifest permissions constrain ReSymbol's protocol operations and data projections, not the
+child's ambient operating-system access.
 
 See [plugin-system.md](plugin-system.md) for discovery, health states, and contracts.
 
@@ -167,8 +186,9 @@ Developer toolchains are a contributor concern, not an end-user installation ste
 
 1. **Input binaries are untrusted.** Parsers apply bounds and resource limits and should avoid
    unsafe code.
-2. **Third-party plugins are untrusted by default.** Their runtime, permissions, and execution
-   limits depend on the plugin family.
+2. **Third-party plugins are untrusted by default.** External-process code is never launched before
+   an explicit fingerprint-bound trust decision. Trust and quarantine records live in the
+   host-owned `plugins/.resymbol/` directory, outside plugin-controlled directories.
 3. **Native in-process code is fully trusted.** Enabling it is an explicit decision with a clear
    warning because it can corrupt memory or escape every application-level control.
 4. **Remote content is untrusted.** Symbol servers, source indexes, registries, and model endpoints
@@ -178,6 +198,11 @@ Developer toolchains are a contributor concern, not an end-user installation ste
 
 The core should retain enough structured diagnostics to explain which boundary failed without
 logging binary contents, source material, or secrets by default.
+
+`plugin.disabled` remains an out-of-band manual stop switch and safe mode suppresses all
+third-party execution. Unsafe launch, runtime, resource, claim, or protocol failures quarantine the exact
+process-plugin fingerprint. Corrupt host state fails closed. Quarantine does not grant trust to an
+updated artifact, and plugin failure never deletes the installed files.
 
 ## Compatibility
 

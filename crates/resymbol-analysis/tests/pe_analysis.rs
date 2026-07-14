@@ -1,5 +1,11 @@
-use resymbol_analysis::{AnalysisError, BinaryAnalysis, ImportTarget, analyze_bytes, analyze_pe};
-use resymbol_core::{BinaryId, SymbolAssertion, SymbolSubject};
+use resymbol_analysis::{
+    AnalysisError, AnalysisSession, BinaryAnalysis, ImportTarget, PluginRunRecord, PluginRunStatus,
+    SessionValidationError, analyze_bytes, analyze_pe,
+};
+use resymbol_core::{
+    BinaryId, ClaimProducer, ClaimProvenance, Confidence, Evidence, EvidenceKind, SymbolAssertion,
+    SymbolClaim, SymbolSubject, plugin_api::PluginId,
+};
 use resymbol_package::BinaryBoundPayload;
 
 const PE_OFFSET: usize = 0x80;
@@ -114,6 +120,66 @@ fn fixture() -> Vec<u8> {
     put_u32(&mut bytes, exception + 4, 0x1020);
     put_u32(&mut bytes, exception + 8, 0x1350);
     bytes
+}
+
+fn plugin_id() -> PluginId {
+    PluginId::new("dev.resymbol.session-test").expect("valid plugin id")
+}
+
+fn plugin_run(status: PluginRunStatus, accepted_claim_count: u64) -> PluginRunRecord {
+    PluginRunRecord::new(
+        plugin_id(),
+        "1.2.3",
+        "run-001",
+        BinaryId::digest(b"exact plugin artifact").to_string(),
+        status,
+        accepted_claim_count,
+    )
+    .expect("valid plugin run")
+}
+
+fn plugin_claim(
+    subject: SymbolSubject,
+    assertion: SymbolAssertion,
+    producer: ClaimProducer,
+    run_id: Option<&str>,
+) -> SymbolClaim {
+    SymbolClaim::new(
+        subject,
+        assertion,
+        Confidence::new(0.75).expect("valid confidence"),
+        vec![
+            Evidence::new(
+                EvidenceKind::new(EvidenceKind::SIGNATURE_MATCH).expect("valid evidence kind"),
+                "matched a deterministic test signature",
+            )
+            .expect("valid evidence"),
+        ],
+        ClaimProvenance {
+            producer,
+            method: "session-test".to_owned(),
+            run_id: run_id.map(str::to_owned),
+        },
+    )
+    .expect("valid core claim")
+}
+
+fn valid_plugin_claim(binary: BinaryId) -> SymbolClaim {
+    plugin_claim(
+        SymbolSubject::Function {
+            binary,
+            rva: 0x1040,
+            size: Some(0x10),
+        },
+        SymbolAssertion::Name {
+            name: "PluginRecoveredName".to_owned(),
+        },
+        ClaimProducer::Plugin {
+            id: plugin_id(),
+            version: "1.2.3".to_owned(),
+        },
+        Some("run-001"),
+    )
 }
 
 #[test]
@@ -389,6 +455,37 @@ fn preserves_duplicate_export_name_claims_in_source_order() {
 }
 
 #[test]
+fn classifies_export_names_against_all_runtime_function_starts() {
+    let mut bytes = fixture();
+    put_u32(&mut bytes, file_offset(0x1144), 0x1010);
+    put_u16(&mut bytes, file_offset(0x1152), 1);
+    set_directory(&mut bytes, 3, 0x1300, 24);
+    let table = file_offset(0x1300);
+    put_u32(&mut bytes, table + 12, 0x1010);
+    put_u32(&mut bytes, table + 16, 0x1030);
+    put_u32(&mut bytes, table + 20, 0x1360);
+
+    let analysis = analyze_pe(&bytes).expect("valid exports at two runtime starts");
+    let claims = analysis.symbol_graph.claims();
+    assert!(matches!(
+        claims[0].subject(),
+        SymbolSubject::Function { rva: 0x1000, .. }
+    ));
+    assert!(matches!(
+        claims[1].subject(),
+        SymbolSubject::Function { rva: 0x1010, .. }
+    ));
+    assert!(matches!(
+        claims[0].assertion(),
+        SymbolAssertion::Name { name } if name == "ExportA"
+    ));
+    assert!(matches!(
+        claims[1].assertion(),
+        SymbolAssertion::Name { name } if name == "Alias"
+    ));
+}
+
+#[test]
 fn classifies_non_executable_exports_as_globals() {
     let mut bytes = fixture();
     set_directory(&mut bytes, 3, 0, 0);
@@ -491,4 +588,382 @@ fn rejects_unknown_formats_without_guessing() {
         analyze_bytes(b"\x7fELFtest"),
         Err(AnalysisError::UnsupportedBinaryFormat { .. })
     ));
+}
+
+#[test]
+fn analysis_session_round_trips_and_combines_without_mutating_the_base_graph() {
+    let base_analysis = analyze_bytes(&fixture()).expect("valid PE");
+    let base_claims = base_analysis.symbol_graph().claims().to_vec();
+    let plugin_claim = valid_plugin_claim(base_analysis.identity().id.clone());
+    let session = AnalysisSession::new(
+        base_analysis,
+        vec![plugin_run(PluginRunStatus::Succeeded, 1)],
+        vec![plugin_claim.clone()],
+    )
+    .expect("valid session");
+
+    assert_eq!(session.binary_id(), &session.base_analysis().identity().id);
+    assert_eq!(session.base_analysis().symbol_graph().claims(), base_claims);
+    let combined = session.combined_symbol_graph().expect("combined graph");
+    assert_eq!(combined.claims().len(), base_claims.len() + 1);
+    assert_eq!(&combined.claims()[..base_claims.len()], base_claims);
+    assert_eq!(combined.claims().last(), Some(&plugin_claim));
+
+    let json = serde_json::to_string(&session).expect("serialize session");
+    let decoded: AnalysisSession = serde_json::from_str(&json).expect("deserialize session");
+    assert_eq!(decoded, session);
+}
+
+#[test]
+fn session_deserialization_preserves_the_exact_pe_base_graph_invariant() {
+    let base_analysis = analyze_bytes(&fixture()).expect("valid PE");
+    let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
+        .expect("valid base-only session");
+    let mut json = serde_json::to_value(session).expect("serialize session");
+    json["base_analysis"]["analysis"]["symbol_graph"]["claims"][0]["confidence"] =
+        serde_json::json!(0.25);
+
+    let error = serde_json::from_value::<AnalysisSession>(json)
+        .expect_err("tampered deterministic base graph must fail");
+    assert!(error.to_string().contains("symbol graph"));
+}
+
+#[test]
+fn session_rejects_noncanonical_plugin_fingerprints_and_duplicate_runs() {
+    let run = plugin_run(PluginRunStatus::Succeeded, 0);
+    assert_eq!(run.plugin_id(), &plugin_id());
+    assert_eq!(run.plugin_version(), "1.2.3");
+    assert_eq!(run.run_id(), "run-001");
+    assert_eq!(run.status(), PluginRunStatus::Succeeded);
+    assert_eq!(run.accepted_claim_count(), 0);
+    assert_eq!(run.artifact_sha256().len(), 64);
+
+    let mut json = serde_json::to_value(&run).expect("serialize run");
+    json["artifact_sha256"] = serde_json::json!("A".repeat(64));
+    let error = serde_json::from_value::<PluginRunRecord>(json)
+        .expect_err("uppercase fingerprint is not canonical");
+    assert!(error.to_string().contains("lowercase hexadecimal"));
+
+    let base_analysis = analyze_bytes(&fixture()).expect("valid PE");
+    let error = AnalysisSession::new(base_analysis, vec![run.clone(), run], Vec::new())
+        .expect_err("duplicate run ids are ambiguous");
+    assert!(matches!(
+        error,
+        SessionValidationError::DuplicateRunId { .. }
+    ));
+
+    let error = PluginRunRecord::new(
+        plugin_id(),
+        "1.2",
+        "run-002",
+        BinaryId::digest(b"plugin").to_string(),
+        PluginRunStatus::Succeeded,
+        0,
+    )
+    .expect_err("plugin version must be canonical SemVer");
+    assert!(matches!(
+        error,
+        SessionValidationError::InvalidPluginVersion
+    ));
+
+    let error = PluginRunRecord::new(
+        plugin_id(),
+        "1.2.3",
+        "run-002",
+        BinaryId::digest(b"plugin").to_string(),
+        PluginRunStatus::Failed,
+        1,
+    )
+    .expect_err("failed runs cannot record accepted claims");
+    assert!(matches!(
+        error,
+        SessionValidationError::FailedRunAcceptedClaims { count: 1, .. }
+    ));
+}
+
+#[test]
+fn session_rejects_claims_for_a_different_binary_or_outside_the_image() {
+    let base_analysis = analyze_bytes(&fixture()).expect("valid PE");
+    let wrong_binary_claim = valid_plugin_claim(BinaryId::digest(b"different binary"));
+    let error = AnalysisSession::new(
+        base_analysis.clone(),
+        vec![plugin_run(PluginRunStatus::Succeeded, 1)],
+        vec![wrong_binary_claim],
+    )
+    .expect_err("cross-binary claim must fail");
+    assert!(matches!(error, SessionValidationError::WrongBinary { .. }));
+
+    let outside_claim = plugin_claim(
+        SymbolSubject::Function {
+            binary: base_analysis.identity().id.clone(),
+            rva: 0x1fff,
+            size: Some(2),
+        },
+        SymbolAssertion::Name {
+            name: "OutsideImage".to_owned(),
+        },
+        ClaimProducer::Plugin {
+            id: plugin_id(),
+            version: "1.2.3".to_owned(),
+        },
+        Some("run-001"),
+    );
+    let error = AnalysisSession::new(
+        base_analysis.clone(),
+        vec![plugin_run(PluginRunStatus::Succeeded, 1)],
+        vec![outside_claim],
+    )
+    .expect_err("subject range beyond SizeOfImage must fail");
+    assert!(matches!(
+        error,
+        SessionValidationError::AddressOutsideImage { .. }
+    ));
+
+    let outside_boundary = plugin_claim(
+        SymbolSubject::Function {
+            binary: base_analysis.identity().id.clone(),
+            rva: 0x1ff0,
+            size: None,
+        },
+        SymbolAssertion::FunctionBoundary { size: 0x20 },
+        ClaimProducer::Plugin {
+            id: plugin_id(),
+            version: "1.2.3".to_owned(),
+        },
+        Some("run-001"),
+    );
+    let error = AnalysisSession::new(
+        base_analysis,
+        vec![plugin_run(PluginRunStatus::Succeeded, 1)],
+        vec![outside_boundary],
+    )
+    .expect_err("asserted boundary beyond SizeOfImage must fail");
+    assert!(matches!(
+        error,
+        SessionValidationError::AddressOutsideImage { .. }
+    ));
+}
+
+#[test]
+fn session_requires_successful_matching_plugin_provenance_and_exact_counts() {
+    let base_analysis = analyze_bytes(&fixture()).expect("valid PE");
+    let binary = base_analysis.identity().id.clone();
+
+    let core_claim = plugin_claim(
+        SymbolSubject::Function {
+            binary: binary.clone(),
+            rva: 0x1040,
+            size: Some(4),
+        },
+        SymbolAssertion::Comment {
+            text: "not plugin-owned".to_owned(),
+        },
+        ClaimProducer::Core {
+            component: "forged".to_owned(),
+            version: "1".to_owned(),
+        },
+        Some("run-001"),
+    );
+    let error = AnalysisSession::new(
+        base_analysis.clone(),
+        vec![plugin_run(PluginRunStatus::Succeeded, 1)],
+        vec![core_claim],
+    )
+    .expect_err("core provenance cannot appear in plugin claims");
+    assert!(matches!(
+        error,
+        SessionValidationError::NonPluginProducer { .. }
+    ));
+
+    let missing_run = plugin_claim(
+        SymbolSubject::Function {
+            binary: binary.clone(),
+            rva: 0x1040,
+            size: Some(4),
+        },
+        SymbolAssertion::Comment {
+            text: "missing run".to_owned(),
+        },
+        ClaimProducer::Plugin {
+            id: plugin_id(),
+            version: "1.2.3".to_owned(),
+        },
+        None,
+    );
+    let error = AnalysisSession::new(
+        base_analysis.clone(),
+        vec![plugin_run(PluginRunStatus::Succeeded, 1)],
+        vec![missing_run],
+    )
+    .expect_err("plugin provenance requires a run id");
+    assert!(matches!(error, SessionValidationError::MissingRunId { .. }));
+
+    let unknown_run = plugin_claim(
+        SymbolSubject::Function {
+            binary: binary.clone(),
+            rva: 0x1040,
+            size: Some(4),
+        },
+        SymbolAssertion::Comment {
+            text: "unknown run".to_owned(),
+        },
+        ClaimProducer::Plugin {
+            id: plugin_id(),
+            version: "1.2.3".to_owned(),
+        },
+        Some("run-999"),
+    );
+    let error = AnalysisSession::new(
+        base_analysis.clone(),
+        vec![plugin_run(PluginRunStatus::Succeeded, 1)],
+        vec![unknown_run],
+    )
+    .expect_err("claim must reference a recorded run");
+    assert!(matches!(error, SessionValidationError::UnknownRun { .. }));
+
+    let mismatched_producer = plugin_claim(
+        SymbolSubject::Function {
+            binary: binary.clone(),
+            rva: 0x1040,
+            size: Some(4),
+        },
+        SymbolAssertion::Comment {
+            text: "mismatched producer".to_owned(),
+        },
+        ClaimProducer::Plugin {
+            id: PluginId::new("dev.resymbol.different-plugin").expect("valid plugin id"),
+            version: "1.2.3".to_owned(),
+        },
+        Some("run-001"),
+    );
+    let error = AnalysisSession::new(
+        base_analysis.clone(),
+        vec![plugin_run(PluginRunStatus::Succeeded, 1)],
+        vec![mismatched_producer],
+    )
+    .expect_err("producer identity must match its run");
+    assert!(matches!(
+        error,
+        SessionValidationError::ProducerRunMismatch { .. }
+    ));
+
+    let valid_claim = valid_plugin_claim(binary);
+    let error = AnalysisSession::new(
+        base_analysis.clone(),
+        vec![plugin_run(PluginRunStatus::Failed, 0)],
+        vec![valid_claim.clone()],
+    )
+    .expect_err("failed runs cannot own accepted claims");
+    assert!(matches!(
+        error,
+        SessionValidationError::UnsuccessfulRun { .. }
+    ));
+
+    let error = AnalysisSession::new(
+        base_analysis,
+        vec![plugin_run(PluginRunStatus::Succeeded, 2)],
+        vec![valid_claim],
+    )
+    .expect_err("recorded count must equal retained claims");
+    assert!(matches!(
+        error,
+        SessionValidationError::AcceptedClaimCountMismatch {
+            recorded: 2,
+            actual: 1,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn function_boundaries_require_function_subjects_and_matching_sizes() {
+    let base_analysis = analyze_bytes(&fixture()).expect("valid PE");
+    let binary = base_analysis.identity().id.clone();
+    let producer = || ClaimProducer::Plugin {
+        id: plugin_id(),
+        version: "1.2.3".to_owned(),
+    };
+
+    let global_boundary = plugin_claim(
+        SymbolSubject::Global {
+            binary: binary.clone(),
+            rva: 0x1040,
+            size: Some(4),
+        },
+        SymbolAssertion::FunctionBoundary { size: 4 },
+        producer(),
+        Some("run-001"),
+    );
+    let error = AnalysisSession::new(
+        base_analysis.clone(),
+        vec![plugin_run(PluginRunStatus::Succeeded, 1)],
+        vec![global_boundary],
+    )
+    .expect_err("function boundaries cannot describe globals");
+    assert!(matches!(
+        error,
+        SessionValidationError::FunctionBoundaryRequiresFunction { .. }
+    ));
+
+    let type_boundary = plugin_claim(
+        SymbolSubject::Type {
+            binary: binary.clone(),
+            key: "type-key".to_owned(),
+        },
+        SymbolAssertion::FunctionBoundary { size: 4 },
+        producer(),
+        Some("run-001"),
+    );
+    let error = AnalysisSession::new(
+        base_analysis.clone(),
+        vec![plugin_run(PluginRunStatus::Succeeded, 1)],
+        vec![type_boundary],
+    )
+    .expect_err("function boundaries cannot describe types");
+    assert!(matches!(
+        error,
+        SessionValidationError::FunctionBoundaryRequiresFunction { .. }
+    ));
+
+    let mismatched_size = plugin_claim(
+        SymbolSubject::Function {
+            binary,
+            rva: 0x1040,
+            size: Some(8),
+        },
+        SymbolAssertion::FunctionBoundary { size: 4 },
+        producer(),
+        Some("run-001"),
+    );
+    let error = AnalysisSession::new(
+        base_analysis.clone(),
+        vec![plugin_run(PluginRunStatus::Succeeded, 1)],
+        vec![mismatched_size],
+    )
+    .expect_err("subject and boundary sizes must agree");
+    assert!(matches!(
+        error,
+        SessionValidationError::FunctionBoundarySizeMismatch {
+            subject_size: 8,
+            boundary_size: 4,
+            ..
+        }
+    ));
+
+    let matching_boundary = plugin_claim(
+        SymbolSubject::Function {
+            binary: base_analysis.identity().id.clone(),
+            rva: 0x1040,
+            size: Some(4),
+        },
+        SymbolAssertion::FunctionBoundary { size: 4 },
+        producer(),
+        Some("run-001"),
+    );
+    AnalysisSession::new(
+        base_analysis,
+        vec![plugin_run(PluginRunStatus::Succeeded, 1)],
+        vec![matching_boundary],
+    )
+    .expect("matching function boundary is valid");
 }
