@@ -297,7 +297,7 @@ impl PluginManifest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ManifestValidationError {
-    #[error("{field} must not be empty")]
+    #[error("{0} must not be empty")]
     EmptyField(&'static str),
     #[error("invalid {field} `{value}`: use lowercase dotted identifiers")]
     InvalidIdentifier { field: &'static str, value: String },
