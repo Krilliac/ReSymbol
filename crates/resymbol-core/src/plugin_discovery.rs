@@ -73,7 +73,6 @@ pub struct PluginDiscoveryReport {
 }
 
 impl PluginDiscoveryReport {
-    #[must_use]
     pub fn loadable(&self) -> impl Iterator<Item = &DiscoveredPlugin> {
         self.plugins.iter().filter(|plugin| plugin.is_loadable())
     }
@@ -106,7 +105,7 @@ pub fn discover_plugins(
 
     quarantine_duplicate_ids(&mut plugins);
     disable_unresolved_dependencies(&mut plugins);
-    plugins.sort_by(|left, right| discovery_sort_key(left).cmp(&discovery_sort_key(right)));
+    plugins.sort_by_key(discovery_sort_key);
 
     Ok(PluginDiscoveryReport { root, plugins })
 }
@@ -426,7 +425,7 @@ fn deterministic_path_key(path: &Path) -> (String, String) {
 
 fn path_name(path: &Path) -> String {
     path.file_name()
-        .unwrap_or_else(|| path.as_os_str())
+        .unwrap_or(path.as_os_str())
         .to_string_lossy()
         .into_owned()
 }
