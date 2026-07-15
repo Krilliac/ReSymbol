@@ -27,6 +27,41 @@ fn put_c_string(bytes: &mut [u8], offset: usize, value: &str) {
     bytes[offset + value.len()] = 0;
 }
 
+fn put_text_rel8(bytes: &mut [u8], rva: u32, opcode: u8, target_rva: u32) {
+    let next_rva = rva.checked_add(2).expect("fixture instruction end");
+    let displacement = i64::from(target_rva) - i64::from(next_rva);
+    let displacement = i8::try_from(displacement).expect("fixture rel8 displacement");
+    let offset = 0x200 + usize::try_from(rva - 0x1000).expect("fixture text RVA");
+    bytes[offset..offset + 2].copy_from_slice(&[opcode, displacement.to_le_bytes()[0]]);
+}
+
+fn put_text_rel32(bytes: &mut [u8], rva: u32, opcode: u8, target_rva: u32) {
+    let next_rva = rva.checked_add(5).expect("fixture instruction end");
+    let displacement = i64::from(target_rva) - i64::from(next_rva);
+    let displacement = i32::try_from(displacement).expect("fixture rel32 displacement");
+    let offset = 0x200 + usize::try_from(rva - 0x1000).expect("fixture text RVA");
+    bytes[offset] = opcode;
+    bytes[offset + 1..offset + 5].copy_from_slice(&displacement.to_le_bytes());
+}
+
+fn put_text_conditional_rel32(bytes: &mut [u8], rva: u32, condition_opcode: u8, target_rva: u32) {
+    let next_rva = rva.checked_add(6).expect("fixture instruction end");
+    let displacement = i64::from(target_rva) - i64::from(next_rva);
+    let displacement = i32::try_from(displacement).expect("fixture rel32 displacement");
+    let offset = 0x200 + usize::try_from(rva - 0x1000).expect("fixture text RVA");
+    bytes[offset..offset + 2].copy_from_slice(&[0x0f, condition_opcode]);
+    bytes[offset + 2..offset + 6].copy_from_slice(&displacement.to_le_bytes());
+}
+
+fn put_text_lea(bytes: &mut [u8], rva: u32, target_rva: u32) {
+    let next_rva = rva.checked_add(7).expect("fixture instruction end");
+    let displacement = i64::from(target_rva) - i64::from(next_rva);
+    let displacement = i32::try_from(displacement).expect("fixture RIP displacement");
+    let offset = 0x200 + usize::try_from(rva - 0x1000).expect("fixture text RVA");
+    bytes[offset..offset + 3].copy_from_slice(&[0x48, 0x8d, 0x05]);
+    bytes[offset + 3..offset + 7].copy_from_slice(&displacement.to_le_bytes());
+}
+
 fn minimal_pe() -> Vec<u8> {
     let mut bytes = vec![0_u8; 0x400];
     bytes[..2].copy_from_slice(b"MZ");
@@ -115,6 +150,52 @@ fn string_and_data_reference_pe() -> Vec<u8> {
         offset += 2;
     }
     bytes[offset..offset + 2].fill(0);
+    bytes
+}
+
+fn cfg_control_flow_pe() -> Vec<u8> {
+    const RDATA_OFFSET: usize = 0x400;
+
+    let mut bytes = string_and_data_reference_pe();
+    bytes[0x200..0x400].fill(0x90);
+
+    // Extend the one runtime-function record installed by the base fixture.
+    put_u32(&mut bytes, RDATA_OFFSET + 0x80, 0x1000);
+    put_u32(&mut bytes, RDATA_OFFSET + 0x84, 0x1080);
+    put_u32(&mut bytes, RDATA_OFFSET + 0x88, 0x2060);
+
+    put_text_rel8(&mut bytes, 0x1000, 0xeb, 0x1004);
+    bytes[0x202..0x204].copy_from_slice(&[0xf0, 0x90]);
+    put_text_rel32(&mut bytes, 0x1004, 0xe8, 0x1100);
+    put_text_lea(&mut bytes, 0x1009, 0x2000);
+    put_text_rel8(&mut bytes, 0x1010, 0xeb, 0x1040);
+
+    put_text_rel8(&mut bytes, 0x1040, 0x75, 0x1050);
+    put_text_rel32(&mut bytes, 0x1042, 0xe8, 0x1120);
+    put_text_rel8(&mut bytes, 0x1047, 0xeb, 0x1060);
+    put_text_rel32(&mut bytes, 0x1050, 0xe8, 0x1140);
+    put_text_rel8(&mut bytes, 0x1055, 0xeb, 0x1060);
+    put_text_rel32(&mut bytes, 0x1060, 0xe8, 0x1160);
+    put_text_rel8(&mut bytes, 0x1065, 0x75, 0x1040);
+    put_text_conditional_rel32(&mut bytes, 0x1067, 0x85, 0x1180);
+
+    // The valid fallthrough reaches a RET. These relation-shaped bytes follow
+    // that reachable terminator and therefore remain unreachable.
+    put_text_rel32(&mut bytes, 0x106d, 0xe8, 0x1170);
+    bytes[0x272] = 0xc3;
+    put_text_rel32(&mut bytes, 0x1073, 0xe8, 0x11a0);
+    put_text_lea(&mut bytes, 0x1078, 0x2020);
+
+    // The jump target is backed but outside the runtime-function interval.
+    put_text_rel32(&mut bytes, 0x1180, 0xe8, 0x11c0);
+    put_text_lea(&mut bytes, 0x1185, 0x2040);
+    for rva in [0x1100, 0x1120, 0x1140, 0x1160, 0x1170, 0x11a0, 0x11c0] {
+        let offset = 0x200 + usize::try_from(rva - 0x1000).expect("fixture target RVA");
+        bytes[offset] = 0xc3;
+    }
+    put_c_string(&mut bytes, RDATA_OFFSET, "reachable CFG data");
+    put_c_string(&mut bytes, RDATA_OFFSET + 0x20, "post RET fake data");
+    put_c_string(&mut bytes, RDATA_OFFSET + 0x40, "out of range fake data");
     bytes
 }
 
@@ -277,6 +358,97 @@ fn recovered_direct_call_survives_json_but_entry_only_target_skips_writers() {
         render_ghidra_java(&projection, "ReSymbolControlFlowFixture").expect("Ghidra script");
     assert!(ghidra.contains("1000,10,"));
     assert!(!ghidra.contains("1020,"));
+}
+
+#[test]
+fn cfg_recovery_keeps_session_and_projection_shapes_stable() {
+    let bytes = cfg_control_flow_pe();
+    let analysis = analyze_bytes(&bytes).expect("valid PE with reachable CFG relationships");
+    let session = AnalysisSession::new(analysis, Vec::new(), Vec::new()).expect("valid session");
+    let projection = ExportProjection::from_session(&session).expect("session projection");
+    projection.validate().expect("projection remains valid");
+
+    assert_eq!(projection.schema_version, 4);
+    assert_eq!(
+        projection
+            .direct_calls
+            .iter()
+            .map(|call| (call.caller_rva, call.call_site_rva, call.target.clone()))
+            .collect::<Vec<_>>(),
+        [
+            (
+                0x1000,
+                0x1004,
+                ExportControlFlowTarget::Function { rva: 0x1100 },
+            ),
+            (
+                0x1000,
+                0x1042,
+                ExportControlFlowTarget::Function { rva: 0x1120 },
+            ),
+            (
+                0x1000,
+                0x1050,
+                ExportControlFlowTarget::Function { rva: 0x1140 },
+            ),
+            (
+                0x1000,
+                0x1060,
+                ExportControlFlowTarget::Function { rva: 0x1160 },
+            ),
+            (
+                0x1000,
+                0x106d,
+                ExportControlFlowTarget::Function { rva: 0x1170 },
+            ),
+        ]
+    );
+    assert_eq!(projection.data_references.len(), 1);
+    assert_eq!(projection.data_references[0].caller_rva, 0x1000);
+    assert_eq!(projection.data_references[0].instruction_rva, 0x1009);
+    assert_eq!(projection.data_references[0].instruction_size, 7);
+    assert_eq!(projection.data_references[0].target_rva, 0x2000);
+    assert!(
+        projection
+            .direct_calls
+            .iter()
+            .all(|call| !matches!(call.call_site_rva, 0x1073 | 0x1180))
+    );
+    assert!(
+        projection
+            .data_references
+            .iter()
+            .all(|reference| !matches!(reference.instruction_rva, 0x1078 | 0x1185))
+    );
+
+    let session_json = serde_json::to_string(&session).expect("serialize CFG session");
+    let decoded_session =
+        serde_json::from_str::<AnalysisSession>(&session_json).expect("deserialize CFG session");
+    let decoded_projection =
+        ExportProjection::from_session(&decoded_session).expect("project decoded CFG session");
+    assert_eq!(projection, decoded_projection);
+
+    let projection_json = serde_json::to_value(&projection).expect("serialize CFG projection");
+    assert_eq!(projection_json["schema_version"], serde_json::json!(4));
+    assert_eq!(
+        projection_json["direct_calls"][0],
+        serde_json::json!({
+            "caller_rva": 0x1000,
+            "call_site_rva": 0x1004,
+            "target": { "kind": "function", "rva": 0x1100 },
+            "attribution": projection_json["direct_calls"][0]["attribution"].clone(),
+        })
+    );
+    assert_eq!(
+        projection_json["data_references"][0],
+        serde_json::json!({
+            "caller_rva": 0x1000,
+            "instruction_rva": 0x1009,
+            "instruction_size": 7,
+            "target_rva": 0x2000,
+            "attribution": projection_json["data_references"][0]["attribution"].clone(),
+        })
+    );
 }
 
 #[test]

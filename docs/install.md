@@ -13,11 +13,12 @@ CMake, Visual Studio, LLVM, DIA, or another compiler to run an official archive.
 The current analyzer accepts native Windows x86-64 PE32+ input. It safely extracts image and section
 metadata, imports, exports, forwarded exports, and x64 exception-directory records. Exact export
 names and metadata-backed `RUNTIME_FUNCTION` ranges become evidence-bearing symbol-graph claims.
-It also performs a bounded pure-Rust x86-64 linear sweep inside fully file-backed exception ranges
-and checks metadata-backed entry candidates for one-instruction internal or import thunks. It
-retains supported direct calls, RIP-relative data references, and thunks without inventing source
-names, function sizes, or target semantics. A separate bounded pass recovers exact NUL-terminated
-ASCII and UTF-16LE strings from eligible file-backed data.
+It also performs a bounded pure-Rust x86-64 control-flow-guided block sweep inside fully file-backed
+exception ranges and checks metadata-backed entry candidates for one-instruction internal or import
+thunks. It follows supported direct same-range branches, stops paths at terminal or indirect flow,
+and retains supported direct calls, RIP-relative data references, and thunks without inventing
+source names, function sizes, or target semantics. A separate bounded pass recovers exact
+NUL-terminated ASCII and UTF-16LE strings from eligible file-backed data.
 The built-in bounded RTTI pass also validates modern MSVC x64 Rev1 type descriptors, class and base
 records, vftables, and executable virtual-slot targets. Recovered class/type names, vftable names,
 and function-to-class relationships become evidence-bearing claims, and the result is written to a
@@ -37,14 +38,16 @@ and richer debugger integration are future analysis milestones.
 
 The core PE/RTTI analysis is offline and never executes the input. Its narrow decoder is included
 in the executable and requires no native library or compiler. Code recovery decodes at most 64 MiB
-and 1,000,000 instructions, retaining at most 8,192 direct calls, 32,768 data references, and 4,096
-thunks. String recovery has its own bounded scan and retention budgets. An internal target covered
-by known `RUNTIME_FUNCTION` metadata is suppressed unless its RVA matches a recorded
-runtime-function begin. Because this is a heuristic-confidence linear sweep rather than recursive
-disassembly, bytes after a terminator or embedded data can produce false positives, while an
-invalid encoding can stop a range and omit later calls or references. RTTI discovery scans at most
-64 MiB of eligible read-only initialized data for candidate back-pointers; candidate validation
-then performs bounded reads of referenced metadata and contiguous executable slot candidates. It
+and 1,000,000 instructions, discovers at most 262,144 block starts, and retains at most 8,192 direct
+calls, 32,768 data references, and 4,096 thunks. String recovery has its own bounded scan and
+retention budgets. An internal target covered by known `RUNTIME_FUNCTION` metadata is suppressed
+unless its RVA matches a recorded runtime-function begin. The guided sweep suppresses unreachable
+post-terminal bytes and can cross jump-over data, but it remains heuristic-confidence evidence:
+reachable embedded data can produce false positives, while invalid or unsupported flow can omit
+later calls or references on that path. It does not persist a basic-block graph. RTTI discovery
+scans at most 64 MiB of eligible read-only initialized data for candidate back-pointers; candidate
+validation then performs bounded reads of referenced metadata and contiguous executable slot
+candidates. It
 retains at most 16 MiB of RTTI name text, with additional record-count limits. If an aggregate
 limit is reached, the valid prefix is kept and explicitly marked partial rather than reported as a
 complete scan.

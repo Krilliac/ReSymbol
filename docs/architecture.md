@@ -84,24 +84,30 @@ function entries and relationships, validated string literals, RTTI type/vftable
 function-to-class relationships from virtual slots become evidence-bearing graph claims. Broader
 candidate discovery and unsupported evidence sources remain planned.
 
-The x86-64 decoder is a pure-Rust, bounded linear sweep used only over complete file-backed
-executable exception ranges and the first instruction at metadata-backed thunk seeds. The
-implemented forms are `E8` internal calls, RIP-relative `FF 15` calls to exact parsed IAT slots,
-`E9`/`EB` internal thunks, and RIP-relative `FF 25` import thunks. Internal targets covered by known
-runtime-function metadata are suppressed unless their RVA matches a recorded runtime-function
-begin. Aggregate limits of 64 MiB, 1,000,000 instructions, 8,192 retained direct calls, 4,096
-retained thunks, and 32,768 retained data references retain canonical prefixes when exhausted;
+The x86-64 decoder is a pure-Rust, bounded control-flow-guided block sweep used only over complete
+file-backed executable exception ranges and the first instruction at metadata-backed thunk seeds.
+Each distinct exception range seeds an ordered worklist. Pending supported direct conditional and
+unconditional targets within that same range are dequeued by smallest RVA, while permitted
+fallthrough continues immediately. Returns, terminal or indirect control flow, invalid
+instructions, out-of-range targets, and targets inside a previously decoded instruction stop only
+the affected path. The recorded forms remain `E8` internal calls, RIP-relative `FF 15` calls to
+exact parsed IAT slots, `E9`/`EB` internal thunks, and RIP-relative `FF 25` import thunks. Internal
+targets covered by known runtime-function metadata are suppressed
+unless their RVA matches a recorded runtime-function begin. Aggregate limits of 64 MiB, 1,000,000
+instructions, 262,144 discovered block starts, 8,192 retained direct calls, 4,096 retained thunks,
+and 32,768 retained data references retain deterministic traversal prefixes when exhausted;
 `code_recovery_scan_truncated` and `data_reference_scan_truncated` persist the applicable partial
 state independently. Exhausting the shared decode budget makes both instruction-derived sets
-partial. Overlapping
-runtime-function ranges are preserved and may be swept and budgeted separately, so adversarial
-overlap metadata can make the bounded pass partial earlier.
+partial. Overlapping runtime-function ranges are preserved and traversed separately, with each
+decode charged to the shared budgets, so adversarial overlap metadata can make the bounded pass
+partial earlier.
 
-This sweep supplies heuristic-confidence evidence rather than a recursive, reachability-aware
-disassembly. It can decode post-terminator bytes or embedded data as instructions and retain false
-positives; an invalid encoding can stop one range and omit later control flow. The pass does not
-turn entry evidence into a fabricated source name, size, basic-block model, or complete
-control-flow graph.
+This sweep supplies heuristic-confidence evidence rather than complete recursive disassembly. It
+suppresses unreachable post-terminal bytes and can reach a valid block after jump-over data, but
+reachable embedded data can still decode as instructions and retain false positives; invalid or
+unsupported flow can omit later relationships on that path. The ephemeral worklist is not
+persisted. The pass does not turn entry evidence into a fabricated source name, size, basic-block
+model, or complete control-flow graph.
 
 The RTTI pass candidate-scans only file-backed initialized data sections that are readable,
 non-writable, and non-executable. Vftables and their back-pointers, complete object locators,

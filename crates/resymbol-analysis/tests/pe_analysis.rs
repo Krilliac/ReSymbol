@@ -15,6 +15,14 @@ const OPTIONAL_OFFSET: usize = COFF_OFFSET + 20;
 const SECTION_OFFSET: usize = OPTIONAL_OFFSET + 0xf0;
 const RAW_OFFSET: usize = 0x200;
 const SECTION_RVA: u32 = 0x1000;
+const DIRECT_CALL_EVIDENCE_SUMMARY: &str = concat!(
+    "exact supported x64 call encoding observed during a bounded ",
+    "control-flow-guided traversal of a file-backed runtime-function range",
+);
+const LEGACY_DIRECT_CALL_EVIDENCE_SUMMARY: &str = concat!(
+    "exact supported x64 call encoding observed during a bounded linear sweep ",
+    "of a file-backed runtime-function range",
+);
 
 fn put_u16(bytes: &mut [u8], offset: usize, value: u16) {
     bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
@@ -288,6 +296,20 @@ fn put_rel32_instruction_at_rtti_rva(bytes: &mut [u8], rva: u32, opcode: u8, tar
     bytes[offset + 1..offset + 5].copy_from_slice(&displacement.to_le_bytes());
 }
 
+fn put_rel32_conditional_at_rtti_rva(
+    bytes: &mut [u8],
+    rva: u32,
+    condition_opcode: u8,
+    target_rva: u32,
+) {
+    let next_rva = rva.checked_add(6).expect("fixture instruction end");
+    let displacement = i64::from(target_rva) - i64::from(next_rva);
+    let displacement = i32::try_from(displacement).expect("fixture rel32 displacement");
+    let offset = rtti_file_offset(rva);
+    bytes[offset..offset + 2].copy_from_slice(&[0x0f, condition_opcode]);
+    bytes[offset + 2..offset + 6].copy_from_slice(&displacement.to_le_bytes());
+}
+
 fn put_lea_rip_relative_at_rtti_rva(bytes: &mut [u8], rva: u32, target_rva: u32) {
     let next_rva = rva.checked_add(7).expect("fixture instruction end");
     let displacement = i64::from(target_rva) - i64::from(next_rva);
@@ -485,6 +507,102 @@ fn string_and_data_reference_fixture() -> Vec<u8> {
         offset += 2;
     }
     bytes[offset..offset + 2].fill(0);
+    bytes
+}
+
+/// One runtime-function range containing reachable and deliberately unreachable
+/// x64 blocks. The layout exercises work-list traversal without relying on an
+/// assembler or a checked-in binary fixture.
+fn cfg_recovery_fixture() -> Vec<u8> {
+    let mut bytes = rtti_fixture();
+
+    // Replace the two small runtime functions with one range. Keep the second
+    // table entry on disk but outside the declared directory so it cannot seed
+    // traversal independently.
+    set_directory(&mut bytes, 3, 0x2000, 12);
+    put_rtti_rva_u32(&mut bytes, 0x2000, 0x1000);
+    put_rtti_rva_u32(&mut bytes, 0x2004, 0x1080);
+    put_rtti_rva_u32(&mut bytes, 0x2008, 0x2080);
+    bytes[rtti_file_offset(0x1000)..=rtti_file_offset(0x11ff)].fill(0x90);
+
+    // Jump over an invalid instruction pair, then recover a real call and data
+    // reference from the reachable target block.
+    put_rel8_instruction(&mut bytes, 0x1000, 0xeb, 0x1004);
+    bytes[rtti_file_offset(0x1002)..rtti_file_offset(0x1004)].copy_from_slice(&[0xf0, 0x90]);
+    put_rel32_instruction_at_rtti_rva(&mut bytes, 0x1004, 0xe8, 0x1100);
+    put_lea_rip_relative_at_rtti_rva(&mut bytes, 0x1009, 0x2300);
+    put_rel8_instruction(&mut bytes, 0x1010, 0xeb, 0x1040);
+
+    // Both arms are reachable. They converge on one call, then a conditional
+    // backedge revisits the branch block without creating duplicate records.
+    put_rel8_instruction(&mut bytes, 0x1040, 0x75, 0x1050);
+    put_rel32_instruction_at_rtti_rva(&mut bytes, 0x1042, 0xe8, 0x1120);
+    put_rel8_instruction(&mut bytes, 0x1047, 0xeb, 0x1060);
+    put_rel32_instruction_at_rtti_rva(&mut bytes, 0x1050, 0xe8, 0x1140);
+    put_rel8_instruction(&mut bytes, 0x1055, 0xeb, 0x1060);
+    put_rel32_instruction_at_rtti_rva(&mut bytes, 0x1060, 0xe8, 0x1160);
+    put_rel8_instruction(&mut bytes, 0x1065, 0x75, 0x1040);
+
+    // The taken target is backed executable code but outside this runtime
+    // function. Its valid fallthrough reaches a RET, and valid-looking bytes
+    // immediately after that terminator must not be decoded.
+    put_rel32_conditional_at_rtti_rva(&mut bytes, 0x1067, 0x85, 0x1180);
+    put_rel32_instruction_at_rtti_rva(&mut bytes, 0x106d, 0xe8, 0x1170);
+    bytes[rtti_file_offset(0x1072)] = 0xc3;
+    put_rel32_instruction_at_rtti_rva(&mut bytes, 0x1073, 0xe8, 0x11a0);
+    put_lea_rip_relative_at_rtti_rva(&mut bytes, 0x1078, 0x2320);
+    put_rel32_instruction_at_rtti_rva(&mut bytes, 0x1180, 0xe8, 0x11c0);
+    put_lea_rip_relative_at_rtti_rva(&mut bytes, 0x1185, 0x2340);
+
+    for rva in [0x1100, 0x1120, 0x1140, 0x1160, 0x1170, 0x11a0, 0x11c0] {
+        bytes[rtti_file_offset(rva)] = 0xc3;
+    }
+    put_c_string(&mut bytes, rtti_file_offset(0x2300), "reachable CFG data");
+    put_c_string(&mut bytes, rtti_file_offset(0x2320), "post RET fake data");
+    put_c_string(
+        &mut bytes,
+        rtti_file_offset(0x2340),
+        "out of range fake data",
+    );
+    bytes
+}
+
+fn cfg_interior_overlap_fixture() -> Vec<u8> {
+    let mut bytes = rtti_fixture();
+    set_directory(&mut bytes, 3, 0x2000, 12);
+    put_rtti_rva_u32(&mut bytes, 0x2000, 0x1000);
+    put_rtti_rva_u32(&mut bytes, 0x2004, 0x1040);
+    put_rtti_rva_u32(&mut bytes, 0x2008, 0x2080);
+    bytes[rtti_file_offset(0x1000)..=rtti_file_offset(0x11ff)].fill(0x90);
+
+    // The taken target, 0x1004, is inside the fallthrough MOV's immediate.
+    // Its bytes deliberately spell a fake E8 so decoding the overlapping target
+    // would invent a second direct call.
+    put_rel8_instruction(&mut bytes, 0x1000, 0x75, 0x1004);
+    bytes[rtti_file_offset(0x1002)..rtti_file_offset(0x1004)].copy_from_slice(&[0x48, 0xb8]);
+    put_rel32_instruction_at_rtti_rva(&mut bytes, 0x1004, 0xe8, 0x1140);
+    bytes[rtti_file_offset(0x1009)..rtti_file_offset(0x100c)].fill(0);
+
+    put_rel32_instruction_at_rtti_rva(&mut bytes, 0x100c, 0xe8, 0x1120);
+    put_lea_rip_relative_at_rtti_rva(&mut bytes, 0x1011, 0x2300);
+    bytes[rtti_file_offset(0x1018)] = 0xc3;
+    bytes[rtti_file_offset(0x1120)] = 0xc3;
+    bytes[rtti_file_offset(0x1140)] = 0xc3;
+    put_c_string(
+        &mut bytes,
+        rtti_file_offset(0x2300),
+        "canonical fallthrough data",
+    );
+    bytes
+}
+
+fn fred_return_fixture(prefix: u8) -> Vec<u8> {
+    let mut bytes = rtti_fixture();
+    bytes[rtti_file_offset(0x1000)..rtti_file_offset(0x1010)].fill(0x90);
+    bytes[rtti_file_offset(0x1000)..rtti_file_offset(0x1004)]
+        .copy_from_slice(&[prefix, 0x0f, 0x01, 0xca]);
+    put_rel32_instruction_at_rtti_rva(&mut bytes, 0x1004, 0xe8, 0x1100);
+    bytes[rtti_file_offset(0x1009)] = 0xc3;
     bytes
 }
 
@@ -701,7 +819,10 @@ fn recovers_bounded_direct_calls_and_exact_jump_thunks() {
         })
         .expect("retained direct edge claim");
     assert_eq!(direct_edge.confidence().get(), 0.90);
-    assert!(direct_edge.evidence()[0].summary.contains("linear sweep"));
+    assert_eq!(
+        direct_edge.evidence()[0].summary,
+        DIRECT_CALL_EVIDENCE_SUMMARY
+    );
 
     let thunk_edge = claims
         .iter()
@@ -794,6 +915,80 @@ fn recovers_bounded_direct_calls_and_exact_jump_thunks() {
     let encoded = serde_json::to_string(&analysis).expect("serialize recovered control flow");
     let decoded = serde_json::from_str(&encoded).expect("deserialize recovered control flow");
     assert_eq!(analysis, decoded);
+}
+
+#[test]
+fn validated_deserialization_accepts_exact_legacy_direct_call_evidence_summary() {
+    let analysis = analyze_pe(&code_recovery_fixture()).expect("valid recovered control flow");
+    let direct_call_count = analysis.direct_calls.len();
+    let mut value = serde_json::to_value(analysis).expect("serialize recovered control flow");
+    let mut legacy_summary_count = 0;
+
+    for claim in value["symbol_graph"]["claims"]
+        .as_array_mut()
+        .expect("serialized claims")
+    {
+        if claim["provenance"]["method"].as_str() == Some("pe-x64-direct-call") {
+            assert_eq!(
+                claim["evidence"][0]["summary"].as_str(),
+                Some(DIRECT_CALL_EVIDENCE_SUMMARY)
+            );
+            claim["evidence"][0]["summary"] =
+                serde_json::json!(LEGACY_DIRECT_CALL_EVIDENCE_SUMMARY);
+            legacy_summary_count += 1;
+        }
+    }
+    assert_eq!(legacy_summary_count, direct_call_count);
+
+    let decoded = serde_json::from_value::<resymbol_analysis::PeAnalysis>(value)
+        .expect("the exact prior direct-call summary remains package-compatible");
+    assert_eq!(decoded.direct_calls.len(), direct_call_count);
+    assert!(
+        decoded
+            .symbol_graph
+            .claims()
+            .iter()
+            .filter(|claim| claim.provenance().method == "pe-x64-direct-call")
+            .all(|claim| claim.evidence()[0].summary == LEGACY_DIRECT_CALL_EVIDENCE_SUMMARY)
+    );
+}
+
+#[test]
+fn validated_deserialization_rejects_other_direct_call_evidence_changes() {
+    let analysis = analyze_pe(&code_recovery_fixture()).expect("valid recovered control flow");
+    let mut legacy = serde_json::to_value(analysis).expect("serialize recovered control flow");
+    let direct_call_claim = legacy["symbol_graph"]["claims"]
+        .as_array_mut()
+        .expect("serialized claims")
+        .iter_mut()
+        .find(|claim| claim["provenance"]["method"] == "pe-x64-direct-call")
+        .expect("direct-call claim");
+    direct_call_claim["evidence"][0]["summary"] =
+        serde_json::json!(LEGACY_DIRECT_CALL_EVIDENCE_SUMMARY);
+
+    let mut arbitrary_summary = legacy.clone();
+    let direct_call_claim = arbitrary_summary["symbol_graph"]["claims"]
+        .as_array_mut()
+        .expect("serialized claims")
+        .iter_mut()
+        .find(|claim| claim["provenance"]["method"] == "pe-x64-direct-call")
+        .expect("direct-call claim");
+    direct_call_claim["evidence"][0]["summary"] =
+        serde_json::json!("bounded control-flow traversal with untrusted wording");
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(arbitrary_summary)
+        .expect_err("only the exact legacy evidence summary may differ");
+    assert!(error.to_string().contains("symbol graph"));
+
+    let direct_call_claim = legacy["symbol_graph"]["claims"]
+        .as_array_mut()
+        .expect("serialized claims")
+        .iter_mut()
+        .find(|claim| claim["provenance"]["method"] == "pe-x64-direct-call")
+        .expect("direct-call claim");
+    direct_call_claim["evidence"][0]["artifacts"]["instruction_size"] = serde_json::json!("99");
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(legacy)
+        .expect_err("legacy wording must not relax any other evidence field");
+    assert!(error.to_string().contains("symbol graph"));
 }
 
 #[test]
@@ -1136,6 +1331,136 @@ fn invalid_decode_is_candidate_local_and_partially_backed_ranges_are_skipped() {
     assert_eq!(analysis.runtime_functions.len(), 2);
     assert!(analysis.direct_calls.is_empty());
     assert!(!analysis.code_recovery_scan_truncated);
+}
+
+#[test]
+fn cfg_recovery_follows_only_reachable_blocks_and_terminates_backedges() {
+    let analysis = analyze_pe(&cfg_recovery_fixture())
+        .expect("valid PE with synthetic reachable control-flow blocks");
+
+    assert!(!analysis.code_recovery_scan_truncated);
+    assert!(!analysis.data_reference_scan_truncated);
+    assert_eq!(
+        analysis.direct_calls,
+        [
+            PeDirectCall {
+                caller_rva: 0x1000,
+                call_site_rva: 0x1004,
+                instruction_size: 5,
+                target: PeControlFlowTarget::Function { rva: 0x1100 },
+            },
+            PeDirectCall {
+                caller_rva: 0x1000,
+                call_site_rva: 0x1042,
+                instruction_size: 5,
+                target: PeControlFlowTarget::Function { rva: 0x1120 },
+            },
+            PeDirectCall {
+                caller_rva: 0x1000,
+                call_site_rva: 0x1050,
+                instruction_size: 5,
+                target: PeControlFlowTarget::Function { rva: 0x1140 },
+            },
+            PeDirectCall {
+                caller_rva: 0x1000,
+                call_site_rva: 0x1060,
+                instruction_size: 5,
+                target: PeControlFlowTarget::Function { rva: 0x1160 },
+            },
+            PeDirectCall {
+                caller_rva: 0x1000,
+                call_site_rva: 0x106d,
+                instruction_size: 5,
+                target: PeControlFlowTarget::Function { rva: 0x1170 },
+            },
+        ]
+    );
+    assert_eq!(
+        analysis.data_references,
+        [PeDataReference {
+            caller_rva: 0x1000,
+            instruction_rva: 0x1009,
+            instruction_size: 7,
+            target_rva: 0x2300,
+        }]
+    );
+
+    assert!(
+        analysis
+            .direct_calls
+            .iter()
+            .all(|call| !matches!(call.call_site_rva, 0x1073 | 0x1180)),
+        "post-RET and out-of-range blocks must not contribute calls",
+    );
+    assert!(
+        analysis
+            .data_references
+            .iter()
+            .all(|reference| !matches!(reference.instruction_rva, 0x1078 | 0x1185)),
+        "post-RET and out-of-range blocks must not contribute data references",
+    );
+
+    assert_eq!(
+        analysis
+            .rebuild_symbol_graph()
+            .expect("rebuild reachable CFG graph"),
+        analysis.symbol_graph
+    );
+    let encoded = serde_json::to_string(&analysis).expect("serialize CFG analysis");
+    let decoded = serde_json::from_str(&encoded).expect("deserialize CFG analysis");
+    assert_eq!(analysis, decoded);
+}
+
+#[test]
+fn cfg_recovery_skips_interior_targets_but_keeps_canonical_fallthrough() {
+    let analysis = analyze_pe(&cfg_interior_overlap_fixture())
+        .expect("valid PE with an interior branch target");
+
+    assert!(!analysis.code_recovery_scan_truncated);
+    assert!(!analysis.data_reference_scan_truncated);
+    assert_eq!(
+        analysis.direct_calls,
+        [PeDirectCall {
+            caller_rva: 0x1000,
+            call_site_rva: 0x100c,
+            instruction_size: 5,
+            target: PeControlFlowTarget::Function { rva: 0x1120 },
+        }]
+    );
+    assert_eq!(
+        analysis.data_references,
+        [PeDataReference {
+            caller_rva: 0x1000,
+            instruction_rva: 0x1011,
+            instruction_size: 7,
+            target_rva: 0x2300,
+        }]
+    );
+    assert!(
+        analysis
+            .direct_calls
+            .iter()
+            .all(|call| call.call_site_rva != 0x1004),
+        "the fake E8 inside the MOV immediate must never be decoded",
+    );
+}
+
+#[test]
+fn cfg_recovery_stops_at_fred_returns() {
+    for (prefix, name) in [(0xf2, "ERETS"), (0xf3, "ERETU")] {
+        let analysis = analyze_pe(&fred_return_fixture(prefix))
+            .unwrap_or_else(|error| panic!("valid PE with {name}: {error}"));
+
+        assert!(
+            analysis
+                .direct_calls
+                .iter()
+                .all(|call| call.call_site_rva != 0x1004),
+            "the fake E8 after {name} must remain unreachable",
+        );
+        assert!(!analysis.code_recovery_scan_truncated);
+        assert!(!analysis.data_reference_scan_truncated);
+    }
 }
 
 #[test]

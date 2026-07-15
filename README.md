@@ -61,18 +61,22 @@ The current alpha implements and tests an end-to-end, deliberately narrow analys
   plugin selection, and strict automation behavior, plus manifest-only plugin examples.
 
 The core PE analyzer never loads or executes its input and requires no network service. Its decoder
-is a bounded linear sweep, not a general recursive disassembler: it scans validated x64 exception
-ranges in RVA order and recognizes only `E8` direct calls, RIP-relative `FF 15` import calls, and
-seeded `E9`, `EB`, or RIP-relative `FF 25` thunks. The built-in pass retains at most 8,192 direct
-calls, 32,768 supported RIP-relative data references, and 4,096 thunks. These are
-heuristic-confidence findings: bytes after a terminator or embedded data can be decoded as
-instructions and produce false positives, while an invalid encoding can stop the affected range
-and omit later relationships. An internal target covered by known `RUNTIME_FUNCTION` metadata is
-suppressed unless its RVA matches a recorded runtime-function begin. The pass
-does not infer erased identifiers, invent names or sizes, recover register-indirect control flow,
-or claim a complete call graph. A separate bounded pass retains exact, fully terminated printable
-ASCII and valid UTF-16LE strings from eligible data, with deterministic overlap handling; it does
-not publish truncated prefixes or infer a variable type from a literal. Its RTTI slice recovers
+is a bounded control-flow-guided block sweep, not a general recursive disassembler: it starts at
+validated x64 exception-range entries, follows supported direct same-range branches with a
+deterministic ordered worklist, and stops a path at returns, terminal or indirect control flow,
+invalid instructions, and ambiguous interior targets. It recognizes supported `E8` direct calls,
+RIP-relative `FF 15` import calls, and seeded `E9`, `EB`, or RIP-relative `FF 25` thunks. The
+built-in pass discovers at most
+262,144 block starts and retains at most 8,192 direct calls, 32,768 supported RIP-relative data
+references, and 4,096 thunks. These are heuristic-confidence findings: reachable embedded data can
+still decode as instructions, while an invalid encoding or unsupported branch can omit later
+relationships on that path. An internal target covered by known `RUNTIME_FUNCTION` metadata is
+suppressed unless its RVA matches a recorded runtime-function begin. The pass does not persist a
+basic-block graph, infer erased identifiers, invent names or sizes, recover register-indirect
+control flow, or claim a complete call graph. A separate bounded pass retains exact, fully
+terminated printable ASCII and valid UTF-16LE strings from eligible data, with deterministic
+overlap handling; it does not publish truncated prefixes or infer a variable type from a literal.
+Its RTTI slice recovers
 names and relationships actually present in validated compiler metadata and deliberately supports
 only modern MSVC x64 Rev1 records whose base-class descriptors use the 28-byte form with an
 embedded class-hierarchy reference. Candidate scanning and the vftable/back-pointer, COL, CHD,

@@ -11,10 +11,10 @@ prereleases; breaking changes remain explicit.
 - Added bounded modern MSVC x64 Rev1 RTTI and vftable discovery, including validated stored type
   names, base-class records, virtual-slot targets, vftable names, and attributed function-to-class
   relationships.
-- Added a pure-Rust x86-64 decoder that performs a bounded linear sweep of fully file-backed
-  `RUNTIME_FUNCTION` ranges for supported direct calls and checks metadata-backed entries for
-  one-instruction internal or import thunks. No native disassembler library or compiler is needed
-  to run a release build.
+- Added a pure-Rust x86-64 decoder that performs a bounded control-flow-guided block sweep of fully
+  file-backed `RUNTIME_FUNCTION` ranges for supported direct calls and data references, and checks
+  metadata-backed entries for one-instruction internal or import thunks. No native disassembler
+  library or compiler is needed to run a release build.
 - Added bounded exact recovery of NUL-terminated printable ASCII and valid UTF-16LE strings from
   file-backed, initialized, readable, non-executable PE sections, with deterministic overlap
   handling and explicit partial-scan state.
@@ -73,6 +73,13 @@ prereleases; breaking changes remain explicit.
 - PDB's `--binary` requirement is enforced during CLI argument parsing, and the public Rust writer
   accepts exact PE bytes and performs its own digest and CodeView inspection instead of trusting a
   caller-constructed metadata summary.
+- Code recovery now uses a deterministic ordered worklist for direct same-range branch targets,
+  stops at terminal or indirect control flow, and refuses to decode branch targets inside an
+  already decoded instruction. This suppresses unreachable post-return bytes and can recover valid
+  blocks after jump-over data without changing package schema 3 or projection schema 4.
+- New direct-call graph evidence describes the control-flow-guided traversal accurately. Validated
+  package reads continue accepting the exact legacy bounded-linear-sweep evidence summary without
+  relaxing any other evidence field.
 
 These public-struct field additions are source-breaking for downstream Rust code that constructs or
 destructures the structs directly. ReSymbol is not yet 1.0; downstream users should pin an alpha
@@ -106,20 +113,22 @@ version and validate serialized schema versions independently.
 ### Safety and limits
 
 - Built-in code recovery is capped at 64 MiB of decoded instruction bytes, 1,000,000 instructions,
-  8,192 retained direct calls, 32,768 retained data references, and 4,096 retained thunks.
-  Exhaustion retains deterministic valid results and marks the applicable relationship sets
-  partial. Neutral projection validation applies separate, larger collection caps.
+  262,144 discovered block starts, 8,192 retained direct calls, 32,768 retained data references,
+  and 4,096 retained thunks. Exhaustion retains deterministic valid results and marks the
+  applicable relationship sets partial. Neutral projection validation applies separate, larger
+  collection caps.
 - Built-in string recovery scans at most 64 MiB, retains at most 16,384 literals and 4 MiB of UTF-8
   text in aggregate, and caps each exact value at 4 KiB UTF-8 and 4 KiB encoded data including its
   terminator. Reaching a limit never publishes a truncated prefix and records the scan as partial.
 - Internal targets covered by known runtime-function metadata are suppressed unless their RVA
   matches a recorded runtime-function begin. A call to its own next instruction is not promoted to
-  a function target. Overlapping runtime-function ranges may be swept and charged to decoder budgets
-  separately.
-- The decoder is heuristic-confidence evidence, not recursive disassembly. Post-terminator bytes or
-  embedded data can produce false positives, while invalid instructions can omit later control flow
-  in the affected range. Register-indirect control flow and complete call-graph recovery remain out
-  of scope.
+  a function target. Overlapping runtime-function ranges may be traversed and charged to decoder
+  budgets separately.
+- The decoder is heuristic-confidence evidence, not complete recursive disassembly or a persisted
+  control-flow graph. It avoids unreachable post-terminal bytes and follows supported direct
+  branches, but reachable embedded data can still produce false positives and invalid or unsupported
+  control flow can omit later relationships on that path. Register-indirect control flow and
+  complete call-graph recovery remain out of scope.
 - Persisted-package validation can enforce structural, ordering, range, encoding, size, and graph
   invariants, but a `.resym` file does not contain the executable bytes. A later read therefore
   cannot independently byte-compare a recovered string or re-decode a data-reference instruction;
