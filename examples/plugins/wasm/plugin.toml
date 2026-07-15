@@ -3,8 +3,8 @@ id = "dev.resymbol.example.wasm-resolver"
 name = "Example WASM Symbol Resolver"
 version = "0.1.0"
 api = "^0.1.0"
-description = "Manifest-only example of a sandboxed Component Model plugin."
-capabilities = ["resolver.symbols"]
+description = "Source-backed sandboxed Component Model analyzer that verifies the DOS MZ signature."
+capabilities = ["analyzer.binary", "resolver.symbols"]
 permissions = ["binary.read", "claims.submit"]
 
 [runtime]
@@ -12,6 +12,7 @@ kind = "wasm"
 entrypoint = "example-resolver.wasm"
 
 # WASM plugins receive no ambient filesystem, network, clock, or process access.
-# The host links only interfaces covered by permissions granted to this plugin.
+# The host links only the ReSymbol host interface (no WASI) and enforces permissions
+# and lifecycle phase on each sensitive call.
 # sdk/wit/resymbol-plugin.wit includes typed recovery-assertion helpers while
 # protocol 1.0 continues to submit their canonical tagged claim-json form.

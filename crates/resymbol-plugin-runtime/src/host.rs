@@ -118,7 +118,7 @@ fn validate_plugin<'a>(
     Ok(manifest)
 }
 
-fn resolve_entrypoint(
+pub(crate) fn resolve_entrypoint(
     plugin_path: &Path,
     manifest: &PluginManifest,
 ) -> Result<(PathBuf, PathBuf), PluginRuntimeError> {

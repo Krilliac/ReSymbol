@@ -72,7 +72,9 @@ interface types {
     /// Canonical decoded encoding names used by string-literal claims.
     enum string-encoding {
         ascii,
-        utf-16-le,
+        /// WIT identifiers cannot contain a numeric segment after `-`.
+        /// This maps to the canonical claim JSON spelling `utf-16-le`.
+        utf16-le,
     }
 
     /// Typed helper corresponding to claim-json kind `string-literal`.

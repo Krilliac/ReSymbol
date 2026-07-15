@@ -478,6 +478,40 @@ pub enum PluginArtifactStatus {
     Quarantined { reason: String },
 }
 
+/// Trust requirement applied when evaluating whether an artifact may execute.
+///
+/// `Sandboxed` is appropriate only when the selected runtime enforces ReSymbol's capability-
+/// limited sandbox and grants no ambient authority. Native, managed, external-process, and other
+/// less-isolated runtimes must continue to require explicit trust.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactTrustPolicy {
+    /// Launch only when an exact trust record exists for the plugin ID and artifact digest.
+    RequireApproval,
+    /// Do not require a trust record, while still enforcing manual disablement and quarantine.
+    Sandboxed,
+}
+
+/// Launch decision after manual disablement, quarantine, and trust policy are combined.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PluginExecutionPolicy {
+    /// The exact artifact may be launched by the runtime associated with the trust policy.
+    Allowed,
+    /// A root `plugin.disabled` sentinel prevents automatic or explicit launch.
+    Disabled,
+    /// The runtime requires explicit trust and no exact trust record exists.
+    ApprovalRequired,
+    /// The exact artifact is quarantined following a validation or runtime fault.
+    Quarantined { reason: String },
+}
+
+impl PluginExecutionPolicy {
+    /// Whether this policy permits the artifact to be launched.
+    #[must_use]
+    pub const fn is_allowed(&self) -> bool {
+        matches!(self, Self::Allowed)
+    }
+}
+
 /// Whether a requested state mutation changed durable state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StateChange {
@@ -532,6 +566,42 @@ impl PluginStateStore {
             Ok(PluginArtifactStatus::Trusted)
         } else {
             Ok(PluginArtifactStatus::ApprovalRequired)
+        }
+    }
+
+    /// Evaluate the execution policy for one exact artifact and runtime isolation level.
+    ///
+    /// A root `plugin.disabled` entry always wins. Quarantine is exact-fingerprint scoped and wins
+    /// over trust. Sandboxed runtimes deliberately do not read trust state, so a missing or corrupt
+    /// trust record cannot prevent a capability-limited WASM component from autoloading. Corrupt or
+    /// unsafe quarantine state still fails closed.
+    pub fn execution_policy(
+        &self,
+        plugin_root: impl AsRef<Path>,
+        key: &ArtifactStateKey,
+        trust_policy: ArtifactTrustPolicy,
+    ) -> Result<PluginExecutionPolicy, StateError> {
+        if plugin_is_disabled(plugin_root.as_ref())? {
+            return Ok(PluginExecutionPolicy::Disabled);
+        }
+
+        if trust_policy == ArtifactTrustPolicy::RequireApproval {
+            return self.status(key).map(|status| match status {
+                PluginArtifactStatus::ApprovalRequired => PluginExecutionPolicy::ApprovalRequired,
+                PluginArtifactStatus::Trusted => PluginExecutionPolicy::Allowed,
+                PluginArtifactStatus::Quarantined { reason } => {
+                    PluginExecutionPolicy::Quarantined { reason }
+                }
+            });
+        }
+
+        match self.read_record(RecordKind::Quarantine, key)? {
+            Some(record) => Ok(PluginExecutionPolicy::Quarantined {
+                reason: record
+                    .reason
+                    .expect("validated quarantine records contain a reason"),
+            }),
+            None => Ok(PluginExecutionPolicy::Allowed),
         }
     }
 
@@ -838,6 +908,40 @@ fn validate_real_directory(path: &Path, missing_is_ok: bool) -> Result<Option<()
     Ok(Some(()))
 }
 
+fn plugin_is_disabled(plugin_root: &Path) -> Result<bool, StateError> {
+    let metadata = match fs::symlink_metadata(plugin_root) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            return Err(StateError::PluginArtifactRootMissing {
+                path: plugin_root.to_path_buf(),
+            });
+        }
+        Err(source) => {
+            return Err(state_io(
+                "inspect plugin artifact root",
+                plugin_root,
+                source,
+            ));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(StateError::UnsafePluginArtifactPath {
+            path: plugin_root.to_path_buf(),
+        });
+    }
+
+    let sentinel = plugin_root.join(DISABLED_SENTINEL);
+    match fs::symlink_metadata(&sentinel) {
+        Ok(_) => Ok(true),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(state_io(
+            "inspect plugin disable sentinel",
+            &sentinel,
+            source,
+        )),
+    }
+}
+
 fn validate_quarantine_reason(reason: &str) -> Result<(), StateError> {
     if reason.trim().is_empty()
         || reason.len() > MAX_QUARANTINE_REASON_BYTES
@@ -938,6 +1042,13 @@ pub enum FingerprintError {
 pub enum StateError {
     #[error("plugin root does not exist: {path}", path = .path.display())]
     PluginsRootMissing { path: PathBuf },
+    #[error("plugin artifact root does not exist: {path}", path = .path.display())]
+    PluginArtifactRootMissing { path: PathBuf },
+    #[error(
+        "plugin artifact path is linked or has an unsafe file type: {path}",
+        path = .path.display()
+    )]
+    UnsafePluginArtifactPath { path: PathBuf },
     #[error("plugin state path is linked or has an unsafe file type: {path}", path = .path.display())]
     UnsafeStatePath { path: PathBuf },
     #[error("plugin state record is too large: {path}", path = .path.display())]
@@ -1160,6 +1271,161 @@ args = ["--stdio"]
             store.status(&key).expect("read cleared state"),
             PluginArtifactStatus::ApprovalRequired
         );
+    }
+
+    #[test]
+    fn sandboxed_execution_is_independent_of_trust() {
+        let temporary = tempfile::tempdir().expect("create temporary directory");
+        let plugins = temporary.path().join("plugins");
+        fs::create_dir(&plugins).expect("create plugin root");
+        let plugin = write_plugin(&plugins);
+        let store = PluginStateStore::new(&plugins);
+        let key = key("community.test", fingerprint(&plugin));
+
+        assert_eq!(
+            store
+                .execution_policy(&plugin, &key, ArtifactTrustPolicy::Sandboxed)
+                .expect("evaluate sandboxed policy"),
+            PluginExecutionPolicy::Allowed
+        );
+        assert_eq!(
+            store
+                .execution_policy(&plugin, &key, ArtifactTrustPolicy::RequireApproval)
+                .expect("evaluate trust-required policy"),
+            PluginExecutionPolicy::ApprovalRequired
+        );
+
+        store.trust(&key).expect("trust plugin");
+        assert_eq!(
+            store
+                .execution_policy(&plugin, &key, ArtifactTrustPolicy::RequireApproval)
+                .expect("evaluate trusted policy"),
+            PluginExecutionPolicy::Allowed
+        );
+    }
+
+    #[test]
+    fn corrupt_trust_does_not_block_sandbox_but_still_fails_closed_elsewhere() {
+        let temporary = tempfile::tempdir().expect("create temporary directory");
+        let plugins = temporary.path().join("plugins");
+        fs::create_dir(&plugins).expect("create plugin root");
+        let plugin = write_plugin(&plugins);
+        let store = PluginStateStore::new(&plugins);
+        let key = key("community.test", fingerprint(&plugin));
+        store.trust(&key).expect("trust plugin");
+
+        let trust_path = store
+            .state_root()
+            .join(STATE_VERSION_DIRECTORY)
+            .join(TRUST_DIRECTORY)
+            .join(record_filename(&key));
+        fs::write(&trust_path, b"not valid JSON").expect("corrupt trust record");
+
+        assert_eq!(
+            store
+                .execution_policy(&plugin, &key, ArtifactTrustPolicy::Sandboxed)
+                .expect("sandbox does not consume trust state"),
+            PluginExecutionPolicy::Allowed
+        );
+        assert!(matches!(
+            store.execution_policy(&plugin, &key, ArtifactTrustPolicy::RequireApproval),
+            Err(StateError::CorruptRecord { .. })
+        ));
+    }
+
+    #[test]
+    fn disable_and_quarantine_take_precedence_and_reset_is_exact() {
+        let temporary = tempfile::tempdir().expect("create temporary directory");
+        let plugins = temporary.path().join("plugins");
+        fs::create_dir(&plugins).expect("create plugin root");
+        let plugin = write_plugin(&plugins);
+        let store = PluginStateStore::new(&plugins);
+        let key = key("community.test", fingerprint(&plugin));
+
+        fs::write(plugin.join(DISABLED_SENTINEL), b"disabled").expect("disable plugin");
+        store
+            .quarantine(&key, "component validation failed")
+            .expect("quarantine plugin");
+        assert_eq!(
+            store
+                .execution_policy(&plugin, &key, ArtifactTrustPolicy::Sandboxed)
+                .expect("manual disable wins"),
+            PluginExecutionPolicy::Disabled
+        );
+
+        fs::remove_file(plugin.join(DISABLED_SENTINEL)).expect("enable plugin");
+        assert_eq!(
+            store
+                .execution_policy(&plugin, &key, ArtifactTrustPolicy::Sandboxed)
+                .expect("quarantine blocks sandbox"),
+            PluginExecutionPolicy::Quarantined {
+                reason: "component validation failed".to_owned()
+            }
+        );
+
+        store.reset(&key).expect("reset quarantine");
+        assert_eq!(
+            store
+                .execution_policy(&plugin, &key, ArtifactTrustPolicy::Sandboxed)
+                .expect("sandbox may autoload after reset"),
+            PluginExecutionPolicy::Allowed
+        );
+    }
+
+    #[test]
+    fn quarantine_is_not_inherited_by_a_changed_sandboxed_artifact() {
+        let temporary = tempfile::tempdir().expect("create temporary directory");
+        let plugins = temporary.path().join("plugins");
+        fs::create_dir(&plugins).expect("create plugin root");
+        let plugin = write_plugin(&plugins);
+        let store = PluginStateStore::new(&plugins);
+        let original_key = key("community.test", fingerprint(&plugin));
+        store
+            .quarantine(&original_key, "old component failed")
+            .expect("quarantine original artifact");
+
+        fs::write(plugin.join("data/signatures.db"), b"replacement").expect("change artifact");
+        let changed_key = key("community.test", fingerprint(&plugin));
+        assert_eq!(
+            store
+                .execution_policy(&plugin, &changed_key, ArtifactTrustPolicy::Sandboxed)
+                .expect("evaluate changed artifact"),
+            PluginExecutionPolicy::Allowed
+        );
+        assert_eq!(
+            store
+                .execution_policy(&plugin, &original_key, ArtifactTrustPolicy::Sandboxed)
+                .expect("evaluate original artifact"),
+            PluginExecutionPolicy::Quarantined {
+                reason: "old component failed".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn execution_policy_rejects_missing_or_unsafe_plugin_roots() {
+        let temporary = tempfile::tempdir().expect("create temporary directory");
+        let plugins = temporary.path().join("plugins");
+        fs::create_dir(&plugins).expect("create plugin root");
+        let plugin = write_plugin(&plugins);
+        let store = PluginStateStore::new(&plugins);
+        let key = key("community.test", fingerprint(&plugin));
+
+        assert!(matches!(
+            store.execution_policy(
+                plugins.join("missing"),
+                &key,
+                ArtifactTrustPolicy::Sandboxed
+            ),
+            Err(StateError::PluginArtifactRootMissing { .. })
+        ));
+
+        let regular_file = plugins.join("not-a-plugin-directory");
+        fs::write(&regular_file, b"file").expect("write regular file");
+        assert!(matches!(
+            store.execution_policy(&regular_file, &key, ArtifactTrustPolicy::Sandboxed),
+            Err(StateError::UnsafePluginArtifactPath { .. })
+        ));
     }
 
     #[test]

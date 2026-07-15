@@ -4,18 +4,20 @@ use std::{
 };
 
 #[cfg(test)]
-use resymbol_core::StringEncoding;
+use resymbol_core::{EvidenceKind, StringEncoding, SymbolAssertion};
 use resymbol_core::{
-    ClaimProducer, ClaimProvenance, Confidence, Evidence, EvidenceKind, SymbolAssertion,
-    SymbolClaim, SymbolSubject,
+    SymbolClaim,
     plugin_api::{PluginCapability, PluginId, PluginManifest, PluginPermission},
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
+#[cfg(test)]
+use crate::claim::WireClaim;
 use crate::{
     ExternalProcessRequest, PluginDescriptor, PluginExecution, PluginLog, PluginResponse,
     PluginRuntimeError, ProcessDiagnostics, RuntimeLimits, StreamKind,
+    claim::{ClaimDecodeError, decode_claim},
 };
 
 const PROTOCOL: &str = "resymbol.plugin-wire";
@@ -257,24 +259,6 @@ where
 struct WireLog {
     level: String,
     message: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WireClaim {
-    subject: SymbolSubject,
-    claim: SymbolAssertion,
-    confidence: Confidence,
-    evidence: Vec<WireEvidence>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WireEvidence {
-    kind: String,
-    description: String,
-    #[serde(default)]
-    data: Present<Value>,
 }
 
 pub(crate) fn parse_output(
@@ -715,51 +699,17 @@ fn parse_claim(
     line: usize,
     diagnostics: &ProcessDiagnostics,
 ) -> Result<SymbolClaim, PluginRuntimeError> {
-    let wire = serde_json::from_value::<WireClaim>(payload).map_err(|source| {
-        PluginRuntimeError::InvalidJson {
+    decode_claim(payload, manifest, request).map_err(|error| match error {
+        ClaimDecodeError::Json(source) => PluginRuntimeError::InvalidJson {
             line,
             source,
             diagnostics: diagnostics.clone(),
-        }
-    })?;
-    let evidence = wire
-        .evidence
-        .into_iter()
-        .map(|item| {
-            let kind = EvidenceKind::new(item.kind)?;
-            let mut evidence = Evidence::new(kind, item.description)?;
-            if let Present::Value(data) = item.data {
-                evidence
-                    .artifacts
-                    .insert("wire.data".to_owned(), data.to_string());
-            }
-            Ok(evidence)
-        })
-        .collect::<Result<Vec<_>, resymbol_core::ClaimValidationError>>()
-        .map_err(|source| PluginRuntimeError::InvalidClaim {
-            line,
-            source,
-            diagnostics: diagnostics.clone(),
-        })?;
-    let provenance = ClaimProvenance {
-        producer: ClaimProducer::Plugin {
-            id: manifest.id.clone(),
-            version: manifest.version.to_string(),
         },
-        method: request.method().as_str().to_owned(),
-        run_id: Some(request.session_id().to_owned()),
-    };
-    SymbolClaim::new(
-        wire.subject,
-        wire.claim,
-        wire.confidence,
-        evidence,
-        provenance,
-    )
-    .map_err(|source| PluginRuntimeError::InvalidClaim {
-        line,
-        source,
-        diagnostics: diagnostics.clone(),
+        ClaimDecodeError::Validation(source) => PluginRuntimeError::InvalidClaim {
+            line,
+            source,
+            diagnostics: diagnostics.clone(),
+        },
     })
 }
 

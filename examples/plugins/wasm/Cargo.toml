@@ -1,0 +1,9 @@
+[workspace]
+members = ["componentize", "guest"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.86"
+license = "MIT OR Apache-2.0"
+

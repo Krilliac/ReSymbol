@@ -8,6 +8,18 @@ prereleases; breaking changes remain explicit.
 
 ### Added
 
+- Added the first sandboxed WebAssembly Component Model analysis host for PE32+ x86-64 sessions.
+  Components run in an in-process Wasmtime store that links only the checked-in ReSymbol WIT
+  imports and no WASI interfaces, receive permission- and phase-gated `binary.read` and claim
+  submission plus bounded logging and cancellation checks, and commit claims only after the
+  complete lifecycle and final artifact checks succeed. Eligible WASM plugins autoload without an
+  approval record because they have no ambient authority, while safe mode, `plugin.disabled`,
+  exact-artifact quarantine, reset, and post-run policy checks still apply.
+- Added a source-backed Rust Component Model example that verifies the exact DOS `MZ` bytes,
+  submits one evidence-backed comment claim, and is rebuilt reproducibly with ordinary Cargo plus
+  an example-local `wit-component` encoder. CI verifies the checked-in component against locked
+  source, every release platform runs the staged two-file plugin through its exact release CLI,
+  and portable archives include the ready-to-run component under `plugins/`.
 - Added the first native C/C++ out-of-process analysis host. Drop-in plugins approved by exact
   directory fingerprint run in a bundled disposable sibling helper, can use a permission-gated,
   size-bounded PE `binary.read` callback, and commit claims only after full-batch validation; native
@@ -73,6 +85,8 @@ prereleases; breaking changes remain explicit.
 
 ### Changed
 
+- Raised the pinned Rust source-build toolchain and workspace MSRV to 1.86 for the Component Model
+  host. Ordinary release users and users of the bundled WASM example still need no compiler.
 - New `.resym` analyses use package schema 3. The `PeAnalysis` public alpha model now carries
   recovered strings, data references, and independent partial-scan state in addition to code
   recovery records.
@@ -127,9 +141,26 @@ version and validate serialized schema versions independently.
   exact original PE. It does not add fields to package schema 3 or projection schema 4.
 - Managed-plugin execution adds no package-schema field: successful runs and validated claims use
   the existing `AnalysisSession` plugin ledger and claim representation.
+- WASM-plugin execution likewise adds no package-schema field. It uses the existing plugin ledger,
+  claim validation, and exact binary/artifact identity domains; the WIT package remains
+  `resymbol:plugin@0.1.0`.
 
 ### Safety and limits
 
+- The default WASM invocation accepts a component up to 64 MiB, enforces a 256 MiB linear-memory
+  store limit, 100,000,000 fuel, a 2 MiB WebAssembly stack, one memory, two tables, 32 instances,
+  and a 100,000-element table limit. It has a 30-second epoch deadline, permits at most 4,096
+  host events and 8 MiB of aggregate event data with a 1 MiB per-event ceiling, and permits at
+  most 64 MiB of aggregate `binary.read` requests with a 1 MiB per-call ceiling. The first host
+  accepts only a validated PE32+ x86-64 image and caps exact input bytes at 1 GiB.
+- No WASI interface is linked, so ordinary components have no ambient filesystem, network,
+  environment, clock, or process access. Wasmtime and its generated native code execute inside
+  ReSymbol, however: an engine, compiler, or host-binding vulnerability can cross the component
+  boundary or terminate the application. The component-byte cap applies before compilation, but
+  fuel, epoch deadlines, stack, and store limits govern instantiated guest execution. They do not
+  interrupt synchronous validation/JIT compilation or cap compiler and other host allocations, so
+  compilation can exceed the configured guest time and memory ceilings. Transactional output and
+  the guest limits are not process isolation.
 - Built-in code recovery is capped at 64 MiB of decoded instruction bytes, 1,000,000 instructions,
   262,144 discovered block starts, 8,192 retained direct calls, 32,768 retained data references,
   and 4,096 retained thunks. Exhaustion retains deterministic valid results and marks the

@@ -14,8 +14,9 @@ IDA, Ghidra, debuggers, PDB consumers, and DWARF consumers.
 
 > [!IMPORTANT]
 > ReSymbol is an early alpha. The PE analyzer and `.resym` format are usable but intentionally
-> narrow. The external-process, native C/C++, and managed/.NET plugin runtimes are also usable,
-> but process separation is crash isolation rather than an OS sandbox.
+> narrow. The no-WASI WebAssembly Component Model, external-process, native C/C++, and
+> managed/.NET plugin runtimes are also usable. WASM is capability-limited but executes through an
+> in-process engine; the process runtimes provide crash isolation rather than an OS sandbox.
 > The initial JSON, Markdown, Microsoft-linker-style MAP, exact-RSDS public-symbol PDB, IDAPython,
 > and Ghidra Java exporters are usable but deliberately conservative.
 > Plugin and data formats may change; DWARF and interactive debugger bridges are not implemented
@@ -52,8 +53,14 @@ The current alpha implements and tests an end-to-end, deliberately narrow analys
   and tool-adapter runtime families;
 - local plugin-directory discovery, manifest and entrypoint validation, API compatibility checks,
   the `plugin.disabled` sentinel, safe mode, duplicate-ID quarantine, and dependency checks;
-- fingerprint-bound approval and host-owned trust/quarantine state for dropped-in plugins: a
-  changed artifact loses trust, while an unchanged approved artifact can load on later runs;
+- fingerprint-bound approval for executable process plugins and host-owned quarantine state for
+  every executable family: a changed process artifact loses trust, while an unchanged approved
+  artifact can load on later runs;
+- a first WebAssembly Component Model analysis runtime that links only the checked-in ReSymbol WIT
+  host interface—no WASI—caps component bytes and applies store, fuel, stack, event, binary-read,
+  and epoch-deadline controls to instantiated guest execution, validates lifecycle metadata and
+  claims transactionally, and autoloads sandboxed components without a trust record while still
+  honoring safe mode, manual disablement, exact-artifact quarantine, and reset;
 - a first external-process analysis runtime with direct no-shell launch, bounded NDJSON,
   permission-gated claims, deadlines, output limits, transactional results, and automatic
   quarantine after unsafe runtime or protocol failures;
@@ -66,7 +73,8 @@ The current alpha implements and tests an end-to-end, deliberately narrow analys
   verification, bounded host services, deadline enforcement, and transactional output;
 - initial native C ABI, WIT, and process-wire contracts; and
 - CLI discovery, diagnosis, enablement, disablement, fingerprint trust/revocation, quarantine reset,
-  plugin selection, and strict automation behavior, plus manifest-only plugin examples.
+  plugin selection, and strict automation behavior, plus source-backed WASM and managed examples
+  and native contract examples.
 
 The core PE analyzer never loads or executes its input and requires no network service. Its decoder
 is a bounded control-flow-guided block sweep, not a general recursive disassembler: it starts at
@@ -95,9 +103,8 @@ candidate-scanned. The current external-process host supports one-shot analysis 
 interactive binary reads are reserved for a later protocol revision. The native host instead
 provides a bounded synchronous C callback for file-backed RVAs in the exact PE. The managed host
 provides the equivalent bounded asynchronous SDK service for approved .NET plugins. Plugin package
-verification/extraction, WASM execution, cross-build matching, semantic inference,
-interactive debugger bridges, richer PDB records, and DWARF export are also **not implemented
-yet**.
+verification/extraction, cross-build matching, semantic inference, interactive debugger bridges,
+richer PDB records, and DWARF export are also **not implemented yet**.
 
 ## Why ReSymbol?
 
@@ -134,7 +141,7 @@ ReSymbol is growing from the working PE/package foundation toward:
   approved layout and themes currently documented as design rather than implemented behavior;
 - drop-in plugin discovery from a local `plugins/` directory;
 - WASM, native C/C++, managed/.NET, external-process, and debugger-hosted plugin families from the
-  initial architecture, with external-process, native C/C++, and managed/.NET execution
+  initial architecture, with WASM, external-process, native C/C++, and managed/.NET execution
   implemented; and
 - automatic plugin validation, disablement, bounded execution, and quarantine so a faulty
   extension does not prevent the core application from starting.
@@ -239,11 +246,22 @@ remain roadmap work. See the
 [installation guide](docs/install.md) for portable prerelease archives and source-build steps.
 
 A normal plugin installation is dropping a prebuilt plugin directory into `plugins/`. ReSymbol
-discovers it automatically, but an external-process, native, or managed plugin cannot execute until
-the user explicitly trusts its exact directory fingerprint. That unchanged artifact autoloads on
-later analyses; any fingerprinted-file update requires a new decision. A `plugin.disabled`
-sentinel or a CLI command disables it without deletion, and `--safe-mode` suppresses every
-third-party plugin.
+discovers it automatically. A capability-limited WASM component autoloads without a trust record;
+`resymbol plugin trust` intentionally does not apply to this runtime. External-process, native, and
+managed plugins cannot execute until the user explicitly trusts their exact directory fingerprint.
+That unchanged executable artifact autoloads on later analyses; any fingerprinted-file update
+requires a new decision. Every family still honors exact-artifact quarantine, a
+`plugin.disabled` sentinel or CLI disable command, and `--safe-mode`.
+
+The WASM host links the ReSymbol WIT imports and no WASI interfaces, so components receive no
+ambient filesystem, network, environment, clock, or process access. It is nevertheless embedded in
+the ReSymbol process: a defect in Wasmtime, its compiler, or ReSymbol's host bindings could crash or
+compromise the application. The component-byte cap applies before compilation; fuel, epoch, stack,
+and store limits constrain instantiated guest execution. Those controls do not interrupt
+synchronous Wasmtime validation/JIT compilation or cap compiler and other host allocations, so a
+pathological component can exceed the configured guest deadline or memory limit while compiling.
+None of these controls is a separate-process containment boundary. Official archives include a
+prebuilt MZ-checking WASM example under `plugins/dev.resymbol.example.wasm-resolver/`.
 
 Native libraries load only in the version-matched `resymbol-native-host[.exe]` shipped beside the
 main executable, never in ReSymbol itself or through a helper supplied by a plugin. The helper
@@ -274,7 +292,7 @@ helper built on Ubuntu 22.04 for glibc 2.35 or newer so it can load ordinary gli
 
 ## Development
 
-The Rust workspace uses the pinned toolchain in `rust-toolchain.toml`:
+The Rust workspace uses the pinned Rust 1.86 toolchain in `rust-toolchain.toml`:
 
 ```console
 cargo build --workspace
@@ -286,9 +304,13 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 Rust is the only required toolchain for the core workspace; x86-64 decoding uses a pure-Rust crate
 and does not require a native disassembler library. The .NET SDK is needed only when working on
 managed plugin SDK, example, or host projects; official archives publish the managed helper
-self-contained. CI also syntax-checks the stable native header as both C11 and C++11, compiles and
-runs the native fixture through the disposable helper, tests the managed SDK and host on all release
-platforms, and validates the external-process protocol schema.
+self-contained. WASM plugin authors add Rust's `wasm32-unknown-unknown` target and can rebuild the
+source-backed example with `examples/plugins/wasm/build.sh` or
+`examples/plugins/wasm/build.ps1`; users consume only the prebuilt component. CI rebuilds that
+component from its locked source, compiles and runs the native
+fixture through the disposable helper, tests the managed SDK and host, runs the exact staged WASM
+plugin through each platform's release CLI, syntax-checks the native header as C11 and C++11, and
+validates the external-process protocol schema.
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before proposing a substantial protocol or architecture
 change. During this early phase, opening an issue first helps avoid parallel designs that cannot be

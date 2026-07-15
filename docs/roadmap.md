@@ -77,10 +77,31 @@ dependency resolution, but explicit `Assembly.Load*`, default-context, `NativeLi
 other framework APIs remain available to plugin code. Exact-fingerprint trust therefore remains
 mandatory.
 
+The first WebAssembly Component Model analysis host is implemented for the same PE32+ x86-64
+sessions. It runs components in an in-process Wasmtime store, links only the versioned ReSymbol WIT
+imports, and deliberately links no WASI interfaces. Permission- and phase-bounded `binary.read` and
+claim submission, output-bounded logging, and cancellation checks operate under enforced
+component-byte limits and instantiated-guest linear-memory, table, instance, stack, fuel, event,
+read, and epoch-deadline controls. Lifecycle output is transactional, and the exact plugin
+fingerprint and binary identity are checked around execution. Sandboxed WASM autoloads without a
+trust record while safe mode, `plugin.disabled`, exact-artifact quarantine, and reset remain
+effective.
+
+No-WASI capability isolation removes ambient filesystem, network, environment, clock, and process
+interfaces, but the engine and generated native code remain in ReSymbol's process. A Wasmtime,
+compiler, or host-binding vulnerability is therefore not crash- or compromise-contained by a
+separate process. The guest fuel, epoch, stack, and store controls also do not interrupt synchronous
+validation/JIT compilation or cap compiler and other host allocations; except for the
+component-byte cap, compilation can exceed the guest deadline or memory limit. The checked-in
+source-backed example and locked ordinary-Cargo build are reproducibly rebuilt in CI, exercised
+through each exact release CLI, and shipped as a ready-to-run two-file plugin in every portable
+archive.
+
 Official archives bundle both disposable helpers. Linux releases pair the static musl main
 executable with a GNU native helper built on Ubuntu 22.04 for glibc 2.35 or newer so ordinary glibc
 `.so` plugins can load. Every archive also carries the matching single-file, self-contained managed
-helper, so ordinary users need no compiler, SDK, or separately installed .NET runtime.
+helper, so ordinary users need no compiler, SDK, or separately installed .NET runtime. Archives
+also include the prebuilt WASM example; ordinary users need no Rust or WASM development toolchain.
 
 The first export checkpoint is implemented as a validated, debugger-neutral projection with
 deterministic JSON output, a bounded human-readable Markdown report, PE-only
@@ -121,8 +142,8 @@ The remaining Milestone 2 work is deliberately substantial: broader disassembly-
 discovery, indirect control flow and richer call-graph analysis, string-reference correlation,
 persisted basic-block modeling, broader RTTI/ABI coverage, an open fixture corpus, benchmarks, and
 continued malformed-input/resource-limit validation.
-The WASM and debugger-hosted execution paths remain future work; their contracts and architecture
-are present, but should not be mistaken for working hosts.
+The debugger-hosted execution paths remain future work; their contracts and architecture should not
+be mistaken for working hosts.
 
 ## Milestone 0: repository foundation
 
@@ -139,8 +160,8 @@ Implemented in the current alpha.
 
 This milestone establishes extensibility before analysis behavior becomes difficult to decouple.
 Core graph types, plugin discovery/health policy, initial multi-runtime contracts, and the first
-external-process, native C/C++, and managed/.NET execution hosts are implemented. Package
-installation and the WASM and debugger-hosted runtimes are still outstanding.
+WASM, external-process, native C/C++, and managed/.NET execution hosts are implemented. Package
+installation and debugger-hosted runtimes are still outstanding.
 
 - Binary identity and canonical address primitives
 - Versioned entities for functions, ranges, names, types, claims, evidence, and plugin runs
@@ -153,13 +174,15 @@ installation and the WASM and debugger-hosted runtimes are still outstanding.
 - Safe mode and plugin diagnostics
 - Version negotiation, dependency compatibility diagnostics, limits, and permission records
 - Direct no-shell, timeout- and output-bounded one-shot external-process analysis
+- No-WASI Component Model analysis with bounded WIT host services, enforced Wasmtime resource
+  limits, sandboxed autoload, transactional claims, and exact-artifact quarantine
 - Disposable sibling-process native C/C++ analysis with bounded file-backed PE `binary.read`
   callbacks and full-batch validation
 - App-local self-contained managed/.NET analysis helper with a host-supplied SDK, verified private
   DLL and exact-binary snapshots, phase-bounded services, and transactional lifecycle
 - Transactional plugin claims and failure-tolerant `AnalysisSession` packaging
 - Initial contracts and example packages for:
-  - WebAssembly plugins
+  - WebAssembly plugins with a source-backed, release-staged component
   - native C ABI and C++ SDK plugins
   - managed/.NET SDK plugins with a self-contained host
   - external-process plugins

@@ -48,6 +48,16 @@ pub enum PluginRuntimeError {
     InvalidNativeContext(String),
     #[error("invalid managed-plugin execution context: {0}")]
     InvalidManagedContext(String),
+    #[error("invalid WebAssembly-plugin execution context: {0}")]
+    InvalidWasmContext(String),
+    #[error("WebAssembly engine is unavailable: {reason}")]
+    WasmEngineUnavailable { reason: String },
+    #[error("WebAssembly plugin artifact does not match the expected fingerprint: {reason}")]
+    WasmArtifactMismatch { reason: String },
+    #[error("WebAssembly component failed during {stage}: {reason}")]
+    WasmComponent { stage: &'static str, reason: String },
+    #[error("WebAssembly plugin exceeded its {resource} limit of {limit}")]
+    WasmResourceLimit { resource: &'static str, limit: u64 },
     #[error(
         "native-plugin helper is unavailable at {path}: {reason}",
         path = .path.display()
