@@ -30,10 +30,12 @@ The current alpha implements and tests an end-to-end, deliberately narrow analys
   candidates;
 - bounded pure-Rust x86-64 decoding inside fully file-backed `RUNTIME_FUNCTION` ranges, recovering
   supported direct calls and one-instruction thunks to internal executable targets or exact parsed
-  import-address-table slots;
+  import-address-table slots, plus exact supported RIP-relative references into eligible data;
+- bounded recovery of exact NUL-terminated ASCII and UTF-16LE strings from file-backed,
+  initialized, readable, non-executable sections, including writable data;
 - conservative symbol-graph generation from exact export names, metadata-backed function
-  boundaries, function-entry candidates, direct calls, and thunks, with SHA-256 binary identity,
-  evidence, provenance, confidence, and claim validation;
+  boundaries, function-entry candidates, direct calls, thunks, recovered strings, and data
+  references, with SHA-256 binary identity, evidence, provenance, confidence, and claim validation;
 - canonical JSON `.resym` packages whose `AnalysisSession` payload keeps deterministic base
   analysis, plugin-run records, and plugin claims separate while exposing a validated combined
   graph;
@@ -60,13 +62,15 @@ The core PE analyzer never loads or executes its input and requires no network s
 is a bounded linear sweep, not a general recursive disassembler: it scans validated x64 exception
 ranges in RVA order and recognizes only `E8` direct calls, RIP-relative `FF 15` import calls, and
 seeded `E9`, `EB`, or RIP-relative `FF 25` thunks. The built-in pass retains at most 8,192 direct
-calls and 4,096 thunks. These are heuristic-confidence findings: bytes after a terminator or
-embedded data can be decoded as instructions and produce false positives, while an invalid
-encoding can stop the affected range and omit later control flow. An internal target covered by
-known `RUNTIME_FUNCTION` metadata is suppressed unless its RVA matches a recorded runtime-function
-begin. The pass
+calls, 32,768 supported RIP-relative data references, and 4,096 thunks. These are
+heuristic-confidence findings: bytes after a terminator or embedded data can be decoded as
+instructions and produce false positives, while an invalid encoding can stop the affected range
+and omit later relationships. An internal target covered by known `RUNTIME_FUNCTION` metadata is
+suppressed unless its RVA matches a recorded runtime-function begin. The pass
 does not infer erased identifiers, invent names or sizes, recover register-indirect control flow,
-or claim a complete call graph. Its RTTI slice recovers
+or claim a complete call graph. A separate bounded pass retains exact, fully terminated printable
+ASCII and valid UTF-16LE strings from eligible data, with deterministic overlap handling; it does
+not publish truncated prefixes or infer a variable type from a literal. Its RTTI slice recovers
 names and relationships actually present in validated compiler metadata and deliberately supports
 only modern MSVC x64 Rev1 records whose base-class descriptors use the 28-byte form with an
 embedded class-hierarchy reference. Candidate scanning and the vftable/back-pointer, COL, CHD,
@@ -162,30 +166,31 @@ accident. `inspect` validates the package schema, payload, and embedded binary i
 displaying it. `export` also uses create-new writes; use `--output` to choose a destination instead
 of replacing an existing projection, report, or script.
 
-New analyses write package schema 2. `inspect` and `export` also accept a schema 1 package by
-migrating its persisted metadata and plugin ledger to a validated current in-memory session and
-rebuilding the deterministic base graph. Migration does not rewrite the source package and cannot
-run the newer decoder because `.resym` does not embed the executable bytes; its recovered-call and
-thunk sets therefore remain empty. Reanalyze the exact original binary to create a schema 2 package
-with code-recovery results.
+New analyses write package schema 3. `inspect` and `export` also accept schema 1 and schema 2
+packages through validated in-memory compatibility paths. Migration does not rewrite the source
+package or rerun analysis because `.resym` does not embed the executable bytes. Schema 1 therefore
+has no available recovered calls, thunks, strings, or data references. Schema 2 retains its calls
+and thunks, but strings and data references remain unavailable. Reanalyze the exact original binary
+to produce package schema 3 with current recovery results.
 
-The `analyze` and `inspect` summaries report recovered direct calls and thunks as well as discovered
-MSVC RTTI vftables, unique types, base-class records, and virtual slots. If a fixed control-flow or
-RTTI discovery budget is reached, the corresponding summary prints a `partial` status; the valid
-deterministic prefix remains available and the package records the truncation explicitly.
+The `analyze` and `inspect` summaries report recovered strings, data references, direct calls, and
+thunks as well as discovered MSVC RTTI vftables, unique types, base-class records, and virtual
+slots. If a fixed string, data-reference, control-flow, or RTTI discovery budget is reached, the
+corresponding summary prints a `partial` status; the valid deterministic results remain available
+and the package records the truncation explicitly.
 
 The Markdown output is a deterministic, bounded presentation report for people to review. It is
 not a stable interchange format; integrations should consume the neutral JSON projection instead.
-Without `--output`, it is written as `application.symbols.md` beside the package. Package schema 2
-and neutral projection schema 3 remain unchanged by this presentation-only format.
+Without `--output`, it is written as `application.symbols.md` beside the package. Package schema 3
+and neutral projection schema 4 remain unchanged by this presentation-only format.
 
 The generated IDA and Ghidra scripts verify the exact loaded binary SHA-256 before changing a
 database and calculate addresses from the tool's current image base plus each RVA. They preserve
 existing user-authored names and apply only the first projection subset: selected function/global
 names (including validated vftable global names) and conservative non-overlapping function
 boundaries. The neutral JSON projection retains attributed function entries, direct calls, thunks,
-and class-membership relationships, while the current scripts ignore that relationship metadata
-and do not synthesize virtual-method names. See the
+recovered strings, data references, and class-membership relationships, while the current scripts
+ignore those relationship and literal records and do not synthesize virtual-method names. See the
 [export guide](docs/exporting.md) for report contents, usage, limitations, and in-tool
 instructions. PDB, MAP, DWARF, richer type application, and interactive preview bridges remain
 roadmap work. See the

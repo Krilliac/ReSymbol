@@ -15,6 +15,6 @@ pub use plugin_discovery::{
 pub use resymbol_plugin_api as plugin_api;
 pub use symbols::{
     BinaryFormat, BinaryId, BinaryIdentity, ClaimProducer, ClaimProvenance, ClaimValidationError,
-    Confidence, ControlFlowTarget, Evidence, EvidenceKind, GraphValidationError, SymbolAssertion,
-    SymbolClaim, SymbolGraph, SymbolSubject,
+    Confidence, ControlFlowTarget, Evidence, EvidenceKind, GraphValidationError, StringEncoding,
+    SymbolAssertion, SymbolClaim, SymbolGraph, SymbolSubject,
 };

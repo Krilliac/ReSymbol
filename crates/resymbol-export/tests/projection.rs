@@ -1,12 +1,12 @@
 use resymbol_core::{
     BinaryFormat, BinaryId, BinaryIdentity, ClaimProducer, ClaimProvenance, Confidence,
-    ControlFlowTarget, Evidence, EvidenceKind, SymbolAssertion, SymbolClaim, SymbolGraph,
-    SymbolSubject, plugin_api::PluginId,
+    ControlFlowTarget, Evidence, EvidenceKind, StringEncoding, SymbolAssertion, SymbolClaim,
+    SymbolGraph, SymbolSubject, plugin_api::PluginId,
 };
 use resymbol_export::{
-    ExportControlFlowTarget, ExportError, ExportProducer, ExportProjection, ExportSubject,
-    MAX_CLASS_MEMBERSHIPS_PER_FUNCTION, MAX_DIRECT_CALLS, MAX_NAME_BYTES, MAX_OUTPUT_NAME_BYTES,
-    MAX_THUNKS, ProjectionValidationError, ProjectionWarningCode,
+    ExportControlFlowTarget, ExportError, ExportProducer, ExportProjection, ExportStringEncoding,
+    ExportSubject, MAX_CLASS_MEMBERSHIPS_PER_FUNCTION, MAX_DIRECT_CALLS, MAX_NAME_BYTES,
+    MAX_OUTPUT_NAME_BYTES, MAX_THUNKS, ProjectionValidationError, ProjectionWarningCode,
 };
 
 fn binary() -> BinaryIdentity {
@@ -204,6 +204,68 @@ fn thunk(rva: u64, target: ControlFlowTarget, confidence: f64, core_claim: bool)
             core("thunk")
         } else {
             plugin("thunk")
+        },
+    )
+}
+
+fn string_literal(
+    rva: u64,
+    encoding: StringEncoding,
+    value: &str,
+    confidence: f64,
+    core_claim: bool,
+) -> SymbolClaim {
+    let byte_size = match encoding {
+        StringEncoding::Ascii => u64::try_from(value.len()).expect("test string length") + 1,
+        StringEncoding::Utf16Le => {
+            u64::try_from(value.encode_utf16().count()).expect("test string length") * 2 + 2
+        }
+        _ => panic!("test only uses supported string encodings"),
+    };
+    claim(
+        SymbolSubject::Global {
+            binary: binary().id,
+            rva,
+            size: Some(byte_size),
+        },
+        SymbolAssertion::StringLiteral {
+            encoding,
+            value: value.to_owned(),
+        },
+        confidence,
+        if core_claim {
+            core("string-literal")
+        } else {
+            plugin("string-literal")
+        },
+    )
+}
+
+fn data_reference(
+    caller_rva: u64,
+    caller_size: Option<u64>,
+    instruction_rva: u64,
+    instruction_size: u8,
+    target_rva: u64,
+    confidence: f64,
+    core_claim: bool,
+) -> SymbolClaim {
+    claim(
+        SymbolSubject::Function {
+            binary: binary().id,
+            rva: caller_rva,
+            size: caller_size,
+        },
+        SymbolAssertion::DataReference {
+            instruction_rva,
+            instruction_size,
+            target_rva,
+        },
+        confidence,
+        if core_claim {
+            core("data-reference")
+        } else {
+            plugin("data-reference")
         },
     )
 }
@@ -423,7 +485,7 @@ fn control_flow_projection_is_canonical_and_keeps_strongest_attribution() {
     let reverse = project(claims.into_iter().rev());
 
     assert_eq!(forward, reverse);
-    assert_eq!(forward.schema_version, 3);
+    assert_eq!(forward.schema_version, 4);
     assert_eq!(
         forward
             .functions
@@ -460,6 +522,211 @@ fn control_flow_projection_is_canonical_and_keeps_strongest_attribution() {
             .warnings
             .iter()
             .all(|warning| warning.code != ProjectionWarningCode::UnsupportedAssertion)
+    );
+}
+
+#[test]
+fn strings_and_data_references_are_canonical_and_claim_order_invariant() {
+    let claims = vec![
+        string_literal(0x500, StringEncoding::Ascii, "World", 1.0, false),
+        string_literal(0x500, StringEncoding::Ascii, "Hello", 0.8, true),
+        string_literal(0x502, StringEncoding::Ascii, "Overlap", 1.0, false),
+        string_literal(0x600, StringEncoding::Utf16Le, "Wide", 0.9, true),
+        data_reference(0x100, Some(0x40), 0x108, 7, 0x600, 1.0, false),
+        data_reference(0x100, Some(0x40), 0x108, 7, 0x500, 0.8, true),
+    ];
+
+    let forward = project(claims.clone());
+    let reverse = project(claims.into_iter().rev());
+
+    assert_eq!(forward, reverse);
+    assert_eq!(forward.schema_version, 4);
+    assert_eq!(forward.strings.len(), 2);
+    assert_eq!(forward.strings[0].rva, 0x500);
+    assert_eq!(forward.strings[0].byte_size, 6);
+    assert_eq!(forward.strings[0].encoding, ExportStringEncoding::Ascii);
+    assert_eq!(forward.strings[0].value, "Hello");
+    assert!(matches!(
+        forward.strings[0].attribution.provenance.producer,
+        ExportProducer::Core { .. }
+    ));
+    assert_eq!(forward.strings[1].rva, 0x600);
+    assert_eq!(forward.strings[1].byte_size, 10);
+    assert_eq!(forward.strings[1].encoding, ExportStringEncoding::Utf16Le);
+    assert_eq!(forward.data_references.len(), 1);
+    assert_eq!(forward.data_references[0].caller_rva, 0x100);
+    assert_eq!(forward.data_references[0].instruction_rva, 0x108);
+    assert_eq!(forward.data_references[0].instruction_size, 7);
+    assert_eq!(forward.data_references[0].target_rva, 0x500);
+    assert!(matches!(
+        forward.data_references[0].attribution.provenance.producer,
+        ExportProducer::Core { .. }
+    ));
+    assert!(forward.functions[0].entry_attribution.is_some());
+    assert_eq!(
+        serde_json::to_vec(&forward).expect("serialize schema-4 projection"),
+        serde_json::to_vec(&reverse).expect("serialize reversed schema-4 projection")
+    );
+}
+
+#[test]
+fn string_and_data_reference_validation_rejects_tampering_and_caps_growth() {
+    let projection = project([
+        string_literal(0x500, StringEncoding::Ascii, "Hello", 0.8, true),
+        string_literal(0x600, StringEncoding::Utf16Le, "Wide", 0.9, true),
+        data_reference(0x100, Some(0x40), 0x108, 7, 0x500, 0.8, true),
+    ]);
+
+    let mut unsorted_strings = projection.clone();
+    unsorted_strings.strings.swap(0, 1);
+    assert!(matches!(
+        unsorted_strings.validate(),
+        Err(ProjectionValidationError::UnsortedCollection {
+            collection: "strings"
+        })
+    ));
+
+    let mut wrong_string_size = projection.clone();
+    wrong_string_size.strings[0].byte_size += 1;
+    assert!(matches!(
+        wrong_string_size.validate(),
+        Err(ProjectionValidationError::InvalidBinaryField {
+            field: "string.byte_size"
+        })
+    ));
+
+    let mut overlapping_strings = projection.clone();
+    overlapping_strings.strings[1].rva = 0x502;
+    assert!(matches!(
+        overlapping_strings.validate(),
+        Err(ProjectionValidationError::InvalidBinaryField {
+            field: "strings.overlap"
+        })
+    ));
+
+    let mut hostile_string = projection.clone();
+    hostile_string.strings[0].value = "bad\nvalue".to_owned();
+    assert!(matches!(
+        hostile_string.validate(),
+        Err(ProjectionValidationError::InvalidText {
+            field: "string.value"
+        })
+    ));
+
+    let mut oversized_string = projection.clone();
+    oversized_string.strings[0].value = "A".repeat(16 * 1024 + 1);
+    oversized_string.strings[0].byte_size = 16 * 1024 + 2;
+    assert!(matches!(
+        oversized_string.validate(),
+        Err(ProjectionValidationError::InvalidText {
+            field: "string.value"
+        })
+    ));
+
+    let mut too_many_strings = projection.clone();
+    too_many_strings
+        .strings
+        .resize(65_537, projection.strings[0].clone());
+    assert!(matches!(
+        too_many_strings.validate(),
+        Err(ProjectionValidationError::CollectionLimit {
+            collection: "strings"
+        })
+    ));
+
+    let mut zero_instruction_size = projection.clone();
+    zero_instruction_size.data_references[0].instruction_size = 0;
+    assert!(matches!(
+        zero_instruction_size.validate(),
+        Err(ProjectionValidationError::InvalidBinaryField {
+            field: "data_reference.instruction_size"
+        })
+    ));
+
+    let mut before_caller = projection.clone();
+    before_caller.data_references[0].instruction_rva = 0x80;
+    assert!(matches!(
+        before_caller.validate(),
+        Err(ProjectionValidationError::InvalidBinaryField {
+            field: "data_reference.instruction_rva"
+        })
+    ));
+
+    let mut duplicate_site = projection.clone();
+    let mut competing = duplicate_site.data_references[0].clone();
+    competing.target_rva = 0x600;
+    duplicate_site.data_references.push(competing);
+    assert!(matches!(
+        duplicate_site.validate(),
+        Err(ProjectionValidationError::UnsortedCollection {
+            collection: "data_references"
+        })
+    ));
+
+    let mut missing_caller = projection.clone();
+    missing_caller.functions.clear();
+    assert!(matches!(
+        missing_caller.validate(),
+        Err(ProjectionValidationError::InvalidBinaryField {
+            field: "control_flow.function_entry"
+        })
+    ));
+}
+
+#[test]
+fn recovered_string_encoding_uses_the_canonical_wire_spelling() {
+    assert_eq!(
+        serde_json::to_value(ExportStringEncoding::Ascii).expect("serialize ASCII encoding"),
+        serde_json::json!("ascii")
+    );
+    assert_eq!(
+        serde_json::to_value(ExportStringEncoding::Utf16Le).expect("serialize UTF-16LE encoding"),
+        serde_json::json!("utf-16-le")
+    );
+}
+
+#[test]
+fn string_and_data_reference_assertions_on_wrong_subjects_warn_and_are_omitted() {
+    let projection = project([
+        claim(
+            SymbolSubject::Function {
+                binary: binary().id,
+                rva: 0x100,
+                size: Some(6),
+            },
+            SymbolAssertion::StringLiteral {
+                encoding: StringEncoding::Ascii,
+                value: "Hello".to_owned(),
+            },
+            0.9,
+            core("wrong-string-subject"),
+        ),
+        claim(
+            SymbolSubject::Global {
+                binary: binary().id,
+                rva: 0x500,
+                size: Some(8),
+            },
+            SymbolAssertion::DataReference {
+                instruction_rva: 0x500,
+                instruction_size: 7,
+                target_rva: 0x600,
+            },
+            0.9,
+            core("wrong-reference-subject"),
+        ),
+    ]);
+
+    assert!(projection.strings.is_empty());
+    assert!(projection.data_references.is_empty());
+    assert_eq!(
+        projection
+            .warnings
+            .iter()
+            .filter(|warning| warning.code == ProjectionWarningCode::AssertionSubjectMismatch)
+            .map(|warning| warning.occurrences)
+            .sum::<u64>(),
+        2
     );
 }
 
@@ -646,7 +913,7 @@ fn function_class_memberships_survive_projection_with_attribution() {
         class_membership(0x100, "demo::Base", 0.8, true),
     ]);
 
-    assert_eq!(projection.schema_version, 3);
+    assert_eq!(projection.schema_version, 4);
     assert_eq!(projection.functions.len(), 1);
     assert_eq!(
         projection.functions[0]

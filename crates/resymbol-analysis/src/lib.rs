@@ -9,6 +9,7 @@ mod error;
 mod msvc_rtti;
 mod pe;
 mod session;
+mod string_recovery;
 mod types;
 
 pub use error::AnalysisError;
@@ -16,8 +17,9 @@ pub use pe::analyze_pe;
 pub use session::{AnalysisSession, PluginRunRecord, PluginRunStatus, SessionValidationError};
 pub use types::{
     BinaryAnalysis, CoffHeader, DataDirectory, ImportTarget, MsvcRttiBaseClass, MsvcRttiVftable,
-    PeAnalysis, PeControlFlowTarget, PeDataDirectories, PeDirectCall, PeExport, PeExportName,
-    PeImport, PeImportLibrary, PeSection, PeThunk, RuntimeFunction,
+    PeAnalysis, PeControlFlowTarget, PeDataDirectories, PeDataReference, PeDirectCall, PeExport,
+    PeExportName, PeImport, PeImportLibrary, PeRecoveredString, PeSection, PeStringEncoding,
+    PeThunk, RuntimeFunction,
 };
 
 /// Detect and analyze a supported binary container.

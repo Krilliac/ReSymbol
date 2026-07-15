@@ -1,4 +1,4 @@
-use resymbol_core::{BinaryIdentity, SymbolGraph};
+use resymbol_core::{BinaryIdentity, StringEncoding, SymbolGraph};
 use serde::{Deserialize, Serialize};
 
 /// A supported, fully parsed binary analysis.
@@ -72,6 +72,18 @@ pub struct PeAnalysis {
     /// Canonical one-instruction jump thunks decoded from metadata-backed function candidates.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub thunks: Vec<PeThunk>,
+    /// Whether bounded initialized-data scanning stopped before every eligible byte was checked.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub string_recovery_scan_truncated: bool,
+    /// Canonical NUL-terminated strings recovered from fully file-backed PE data.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub strings: Vec<PeRecoveredString>,
+    /// Whether bounded instruction decoding could not retain or inspect every data reference.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub data_reference_scan_truncated: bool,
+    /// Canonical x64 RIP-relative references from runtime-function code to PE data.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub data_references: Vec<PeDataReference>,
     /// Whether RTTI discovery stopped after its fixed read-only-data scan budget.
     #[serde(default, skip_serializing_if = "is_false")]
     pub msvc_rtti_scan_truncated: bool,
@@ -105,6 +117,8 @@ impl PeAnalysis {
             runtime_functions: &self.runtime_functions,
             direct_calls: &self.direct_calls,
             thunks: &self.thunks,
+            strings: &self.strings,
+            data_references: &self.data_references,
             msvc_rtti_vftables: &self.msvc_rtti_vftables,
         })
     }
@@ -136,6 +150,14 @@ struct UncheckedPeAnalysis {
     #[serde(default)]
     thunks: Vec<PeThunk>,
     #[serde(default)]
+    string_recovery_scan_truncated: bool,
+    #[serde(default)]
+    strings: Vec<PeRecoveredString>,
+    #[serde(default)]
+    data_reference_scan_truncated: bool,
+    #[serde(default)]
+    data_references: Vec<PeDataReference>,
+    #[serde(default)]
     msvc_rtti_scan_truncated: bool,
     #[serde(default)]
     msvc_rtti_vftables: Vec<MsvcRttiVftable>,
@@ -166,6 +188,10 @@ impl TryFrom<UncheckedPeAnalysis> for PeAnalysis {
             code_recovery_scan_truncated: value.code_recovery_scan_truncated,
             direct_calls: value.direct_calls,
             thunks: value.thunks,
+            string_recovery_scan_truncated: value.string_recovery_scan_truncated,
+            strings: value.strings,
+            data_reference_scan_truncated: value.data_reference_scan_truncated,
+            data_references: value.data_references,
             msvc_rtti_scan_truncated: value.msvc_rtti_scan_truncated,
             msvc_rtti_vftables: value.msvc_rtti_vftables,
             symbol_graph: value.symbol_graph,
@@ -298,6 +324,32 @@ pub struct PeThunk {
     pub rva: u32,
     pub instruction_size: u8,
     pub target: PeControlFlowTarget,
+}
+
+/// PE analysis name for the core's canonical recovered-string encoding.
+pub type PeStringEncoding = StringEncoding;
+
+/// One bounded string literal recovered from fully file-backed PE section data.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeRecoveredString {
+    pub rva: u32,
+    /// Encoded content plus its trailing NUL terminator, in bytes.
+    pub byte_size: u32,
+    pub encoding: PeStringEncoding,
+    /// Canonical UTF-8 representation of the recovered content.
+    pub value: String,
+}
+
+/// One exact x64 RIP-relative reference to data in the current image.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeDataReference {
+    /// Start RVA of the containing runtime-function record.
+    pub caller_rva: u32,
+    pub instruction_rva: u32,
+    pub instruction_size: u8,
+    pub target_rva: u32,
 }
 
 /// One validated MSVC x64 vftable and its Rev1 RTTI metadata.

@@ -238,6 +238,32 @@ impl ControlFlowTarget {
     }
 }
 
+/// Source encoding used to decode one recovered string literal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum StringEncoding {
+    #[serde(rename = "ascii")]
+    Ascii,
+    #[serde(rename = "utf-16-le")]
+    Utf16Le,
+}
+
+impl StringEncoding {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ascii => "ascii",
+            Self::Utf16Le => "utf-16-le",
+        }
+    }
+}
+
+impl fmt::Display for StringEncoding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// Information proposed for a subject. The core preserves competing claims.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
@@ -260,6 +286,15 @@ pub enum SymbolAssertion {
     ThunkTarget {
         target: ControlFlowTarget,
     },
+    StringLiteral {
+        encoding: StringEncoding,
+        value: String,
+    },
+    DataReference {
+        instruction_rva: u64,
+        instruction_size: u8,
+        target_rva: u64,
+    },
     TypeDefinition {
         declaration: String,
     },
@@ -281,6 +316,23 @@ impl SymbolAssertion {
             Self::TypeDefinition { declaration } => ("assertion.declaration", declaration.as_str()),
             Self::ClassMembership { class_name } => ("assertion.class_name", class_name.as_str()),
             Self::Comment { text } => ("assertion.text", text.as_str()),
+            Self::StringLiteral { encoding, value } => {
+                if value.trim().is_empty() {
+                    return Err(ClaimValidationError::EmptyField("assertion.value"));
+                }
+                let valid = match encoding {
+                    StringEncoding::Ascii => {
+                        value.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
+                    }
+                    StringEncoding::Utf16Le => !value.chars().any(char::is_control),
+                };
+                if !valid {
+                    return Err(ClaimValidationError::InvalidStringLiteral {
+                        encoding: *encoding,
+                    });
+                }
+                return Ok(());
+            }
             Self::FunctionBoundary { size } => {
                 if *size == 0 {
                     return Err(ClaimValidationError::ZeroSize);
@@ -290,6 +342,14 @@ impl SymbolAssertion {
             Self::FunctionEntry => return Ok(()),
             Self::DirectCall { target, .. } | Self::ThunkTarget { target } => {
                 return target.validate();
+            }
+            Self::DataReference {
+                instruction_size, ..
+            } => {
+                if *instruction_size == 0 {
+                    return Err(ClaimValidationError::ZeroInstructionSize);
+                }
+                return Ok(());
             }
         };
 
@@ -312,6 +372,7 @@ impl EvidenceKind {
     pub const CONTROL_FLOW: &'static str = "control-flow";
     pub const DATA_FLOW: &'static str = "data-flow";
     pub const STRING_REFERENCE: &'static str = "string-reference";
+    pub const STRING_LITERAL: &'static str = "string-literal";
     pub const API_USAGE: &'static str = "api-usage";
     pub const MODEL_INFERENCE: &'static str = "model-inference";
     pub const USER_CONFIRMED: &'static str = "user-confirmed";
@@ -625,10 +686,14 @@ pub enum ClaimValidationError {
     InvalidBinaryId(String),
     #[error("invalid evidence kind `{0}`")]
     InvalidEvidenceKind(String),
+    #[error("string literal value is not valid printable {encoding} text")]
+    InvalidStringLiteral { encoding: StringEncoding },
     #[error("{0} must not be empty")]
     EmptyField(&'static str),
     #[error("symbol size must be greater than zero")]
     ZeroSize,
+    #[error("instruction size must be greater than zero")]
+    ZeroInstructionSize,
     #[error("symbol address range overflows")]
     AddressOverflow,
     #[error("a symbol claim must contain at least one evidence item")]
@@ -760,6 +825,15 @@ mod tests {
         )
         .expect_err("unknown nested target fields must fail");
         assert!(error.to_string().contains("unknown field `unexpected`"));
+
+        for assertion in [
+            r#"{"kind":"string-literal","encoding":"ascii","value":"hello","unexpected":true}"#,
+            r#"{"kind":"data-reference","instruction_rva":4096,"instruction_size":7,"target_rva":8192,"unexpected":true}"#,
+        ] {
+            let error = serde_json::from_str::<SymbolAssertion>(assertion)
+                .expect_err("unknown string/data-reference fields must fail");
+            assert!(error.to_string().contains("unknown field `unexpected`"));
+        }
     }
 
     #[test]
@@ -797,6 +871,144 @@ mod tests {
                 serde_json::from_str::<SymbolAssertion>(&encoded).expect("deserialize assertion");
             assert_eq!(decoded, assertion);
         }
+    }
+
+    #[test]
+    fn string_and_data_reference_assertions_have_canonical_tagged_shapes() {
+        for (encoding, wire_name) in [
+            (StringEncoding::Ascii, "ascii"),
+            (StringEncoding::Utf16Le, "utf-16-le"),
+        ] {
+            assert_eq!(encoding.as_str(), wire_name);
+            assert_eq!(encoding.to_string(), wire_name);
+            assert_eq!(
+                serde_json::to_value(encoding).expect("serialize string encoding"),
+                serde_json::json!(wire_name)
+            );
+            assert_eq!(
+                serde_json::from_value::<StringEncoding>(serde_json::json!(wire_name))
+                    .expect("deserialize string encoding"),
+                encoding
+            );
+        }
+        serde_json::from_value::<StringEncoding>(serde_json::json!("utf16-le"))
+            .expect_err("non-canonical encoding name must fail");
+
+        let assertions = [
+            SymbolAssertion::StringLiteral {
+                encoding: StringEncoding::Ascii,
+                value: "Recovered text".to_owned(),
+            },
+            SymbolAssertion::StringLiteral {
+                encoding: StringEncoding::Utf16Le,
+                value: "Recovered 世界".to_owned(),
+            },
+            SymbolAssertion::DataReference {
+                instruction_rva: 0x1010,
+                instruction_size: 7,
+                target_rva: 0x3000,
+            },
+        ];
+        let expected = [
+            serde_json::json!({
+                "kind": "string-literal",
+                "encoding": "ascii",
+                "value": "Recovered text"
+            }),
+            serde_json::json!({
+                "kind": "string-literal",
+                "encoding": "utf-16-le",
+                "value": "Recovered 世界"
+            }),
+            serde_json::json!({
+                "kind": "data-reference",
+                "instruction_rva": 0x1010,
+                "instruction_size": 7,
+                "target_rva": 0x3000
+            }),
+        ];
+        for (assertion, expected) in assertions.into_iter().zip(expected) {
+            assertion.validate().expect("valid assertion");
+            assert_eq!(
+                serde_json::to_value(&assertion).expect("serialize assertion"),
+                expected
+            );
+            assert_eq!(
+                serde_json::from_value::<SymbolAssertion>(expected).expect("deserialize assertion"),
+                assertion
+            );
+        }
+        assert_eq!(EvidenceKind::STRING_LITERAL, "string-literal");
+    }
+
+    #[test]
+    fn data_reference_rejects_zero_instruction_size() {
+        assert_eq!(
+            SymbolAssertion::DataReference {
+                instruction_rva: 0x1010,
+                instruction_size: 0,
+                target_rva: 0x3000,
+            }
+            .validate(),
+            Err(ClaimValidationError::ZeroInstructionSize)
+        );
+    }
+
+    #[test]
+    fn string_literal_validation_is_encoding_aware_and_survives_deserialization() {
+        for assertion in [
+            SymbolAssertion::StringLiteral {
+                encoding: StringEncoding::Ascii,
+                value: String::new(),
+            },
+            SymbolAssertion::StringLiteral {
+                encoding: StringEncoding::Utf16Le,
+                value: "  \t".to_owned(),
+            },
+        ] {
+            assert_eq!(
+                assertion.validate(),
+                Err(ClaimValidationError::EmptyField("assertion.value"))
+            );
+        }
+        for (encoding, value) in [
+            (StringEncoding::Ascii, "non-ASCII 世界"),
+            (StringEncoding::Ascii, "embedded\nnewline"),
+            (StringEncoding::Utf16Le, "embedded\0NUL"),
+        ] {
+            assert_eq!(
+                SymbolAssertion::StringLiteral {
+                    encoding,
+                    value: value.to_owned(),
+                }
+                .validate(),
+                Err(ClaimValidationError::InvalidStringLiteral { encoding })
+            );
+        }
+
+        let binary = binary_id();
+        let json = format!(
+            r#"{{
+                "subject": {{"kind":"global","binary":"{binary}","rva":12288}},
+                "assertion": {{
+                    "kind":"string-literal",
+                    "encoding":"ascii",
+                    "value":"non-ASCII 世界"
+                }},
+                "confidence": 0.8,
+                "evidence": [{{
+                    "kind":"string-literal",
+                    "summary":"decoded string bytes"
+                }}],
+                "provenance": {{
+                    "producer": {{"kind":"core","component":"test","version":"0.1"}},
+                    "method":"test"
+                }}
+            }}"#
+        );
+        let error = serde_json::from_str::<SymbolClaim>(&json)
+            .expect_err("deserialization must enforce string encoding validation");
+        assert!(error.to_string().contains("printable ascii"));
     }
 
     #[test]

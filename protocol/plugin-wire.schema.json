@@ -205,6 +205,10 @@
         }
       ]
     },
+    "stringEncoding": {
+      "type": "string",
+      "enum": ["ascii", "utf-16-le"]
+    },
     "symbolAssertion": {
       "oneOf": [
         {
@@ -267,6 +271,56 @@
           "properties": {
             "kind": { "const": "thunk-target" },
             "target": { "$ref": "#/$defs/controlFlowTarget" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "encoding", "value"],
+          "properties": {
+            "kind": { "const": "string-literal" },
+            "encoding": { "$ref": "#/$defs/stringEncoding" },
+            "value": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^(?=.*\\S)[^\\u0000-\\u001F\\u007F-\\u009F]*$"
+            }
+          },
+          "allOf": [
+            {
+              "if": {
+                "required": ["encoding"],
+                "properties": { "encoding": { "const": "ascii" } }
+              },
+              "then": {
+                "properties": {
+                  "value": { "pattern": "^[\\x20-\\x7E]+$" }
+                }
+              }
+            }
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "instruction_rva", "instruction_size", "target_rva"],
+          "properties": {
+            "kind": { "const": "data-reference" },
+            "instruction_rva": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 18446744073709551615
+            },
+            "instruction_size": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 255
+            },
+            "target_rva": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 18446744073709551615
+            }
           }
         },
         {

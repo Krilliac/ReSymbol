@@ -3,7 +3,7 @@ id = "dev.resymbol.example.managed-matcher"
 name = "Example Managed Function Matcher"
 version = "0.1.0"
 api = "^0.1.0"
-description = "Manifest-only example of a .NET managed plugin."
+description = "Minimal .NET plugin and typed recovery-claim construction example."
 capabilities = ["matcher.functions"]
 permissions = ["binary.read", "symbols.read", "claims.submit"]
 
@@ -13,3 +13,5 @@ entrypoint = "Example.ManagedMatcher.dll"
 
 # The managed runtime is hosted out of process. The shipped self-contained host
 # supplies .NET; end users do not install an SDK or compile this assembly.
+# Developers can build the adjacent project with the .NET 8 SDK; its claim
+# helpers emit canonical string-literal and data-reference assertion JSON.

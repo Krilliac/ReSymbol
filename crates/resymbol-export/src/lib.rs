@@ -20,8 +20,9 @@ pub use ida_python::{IdaPythonError, render_ida_python};
 pub use markdown::{MarkdownError, render_markdown};
 pub use model::{
     AttributedText, ExportAttribution, ExportBinary, ExportBinaryFormat, ExportControlFlowTarget,
-    ExportDirectCall, ExportFunction, ExportGlobal, ExportName, ExportProducer, ExportProjection,
-    ExportProvenance, ExportSubject, ExportThunk, ExportType, ProjectionWarning,
+    ExportDataReference, ExportDirectCall, ExportFunction, ExportGlobal, ExportName,
+    ExportProducer, ExportProjection, ExportProvenance, ExportRecoveredString,
+    ExportStringEncoding, ExportSubject, ExportThunk, ExportType, ProjectionWarning,
     ProjectionWarningCode,
 };
 

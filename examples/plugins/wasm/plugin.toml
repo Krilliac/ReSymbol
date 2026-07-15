@@ -13,3 +13,5 @@ entrypoint = "example-resolver.wasm"
 
 # WASM plugins receive no ambient filesystem, network, clock, or process access.
 # The host links only interfaces covered by permissions granted to this plugin.
+# sdk/wit/resymbol-plugin.wit includes typed recovery-assertion helpers while
+# protocol 1.0 continues to submit their canonical tagged claim-json form.

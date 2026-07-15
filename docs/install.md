@@ -130,16 +130,19 @@ printed in a readable form:
 resymbol inspect results/application.resym --json
 ```
 
-Both `analyze` and `inspect` report recovered direct-call and thunk counts and whether code recovery
-was complete or partial. They also report MSVC RTTI vftable, unique-type, base-record, and
-virtual-slot counts. An `MSVC RTTI scan: partial` line appears when a fixed scan or aggregate
-discovery budget was reached; the package preserves both partial-state flags for downstream review.
+Both `analyze` and `inspect` report recovered direct-call, thunk, string, and data-reference counts
+and whether each bounded recovery pass was complete or partial. They also report MSVC RTTI vftable,
+unique-type, base-record, and virtual-slot counts. A partial line appears when a fixed scan,
+retention, or aggregate discovery budget was reached; the package preserves the independent flags
+for downstream review.
 
-New analyses write package schema 2. `inspect` and `export` can also open schema 1 by migrating its
-persisted metadata and plugin ledger into a validated current in-memory session and rebuilding the
-base graph. This does not rewrite the legacy package. Because `.resym` does not contain the original
-executable, migration cannot run code recovery and its direct-call/thunk sets remain empty; analyze
-the exact original binary again to create a schema 2 package with those results.
+New analyses write package schema 3. `inspect` and `export` can also open schemas 1 and 2. Schema 1
+is migrated into a validated current in-memory session and its base graph is rebuilt; schema 2 uses
+the current model's validated defaults for fields introduced later. Neither path rewrites the
+legacy package. Because `.resym` does not contain the original executable, compatibility loading
+cannot run missing recovery passes: schema 1 has no direct-call or thunk records, and schemas 1 and
+2 have no string or data-reference records. Analyze the exact original binary again to create a
+schema 3 package with those results.
 
 Export a package to a specific destination with `--output`:
 
@@ -153,8 +156,8 @@ resymbol export results/application.resym --format ghidra-java --output results/
 Without `--output`, those formats write `application.symbols.json`, `application.symbols.md`,
 `application.ida.py`, and `ReSymbolImport_<first-12-binary-sha256>.java` beside the package,
 respectively. Markdown is a deterministic presentation report for human review, not a stable
-machine-interchange format; use JSON for integrations. Adding Markdown output does not change the
-`.resym` package schema (2) or neutral projection schema (3). A custom Ghidra filename must use a
+machine-interchange format; use JSON for integrations. Current exports use `.resym` package schema
+3 and neutral projection schema 4. A custom Ghidra filename must use a
 lowercase `.java` extension and a valid conservative Java-identifier stem; the generated public
 class uses that stem.
 

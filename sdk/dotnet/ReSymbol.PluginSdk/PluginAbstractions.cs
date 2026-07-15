@@ -18,7 +18,9 @@ public interface IPluginHost
         CancellationToken cancellationToken = default);
 
     /// <summary>
-    /// Proposes a claim for validation by the ReSymbol core.
+    /// Proposes a claim for validation by the ReSymbol core. Use
+    /// <see cref="ClaimAssertions"/> for canonical string-literal and
+    /// data-reference assertion JSON.
     /// </summary>
     ValueTask SubmitClaimAsync(
         SymbolClaim claim,
