@@ -4,12 +4,15 @@ ReSymbol writes analysis results to a portable `.resym` file. The initial format
 it is easy to inspect, deterministic for the same analysis payload, and independent from IDA,
 Ghidra, PDB, or DWARF data models.
 
-Create and inspect a package with the current CLI:
+Create, inspect, and export a package with the current CLI:
 
 ```console
 resymbol analyze application.exe
 resymbol inspect application.resym
 resymbol inspect application.resym --json
+resymbol export application.resym --format json
+resymbol export application.resym --format ida-python
+resymbol export application.resym --format ghidra-java
 ```
 
 Use `resymbol analyze application.exe --output another.resym` to select a different destination.
@@ -46,6 +49,10 @@ existing destination is never silently replaced.
 
 A package must not be applied to a loaded program until its SHA-256 identity has been compared with
 that program. A matching filename, product version, timestamp, or image size is insufficient.
+ReSymbol's generated IDAPython and Ghidra Java scripts perform that exact SHA-256 check inside the
+tool before making any database change. They then resolve projected RVAs against the loaded image
+base instead of assuming the package's preferred virtual address. See [exporting.md](exporting.md)
+for the application policy and current representational limits.
 
 Schema changes and plugin API changes are versioned separately. Before ReSymbol 1.0, payload fields
 may evolve between prereleases, but an incompatible reader must fail explicitly instead of guessing.
@@ -90,6 +97,20 @@ plugin could not complete successfully.
 
 The package does not contain the analyzed executable itself. It also does not claim to recover an
 original source name when only a reconstructed or inferred name is available.
+
+## Export projection
+
+`resymbol export` validates the package and reduces its combined symbol graph to a bounded,
+deterministic projection for one exact binary. The projection retains binary identity, selected and
+alternate names, confidence and provenance, supported function/global sizes, prototypes, type
+definitions, and structured warnings. Ordering and collision handling are stable so the same
+validated session produces the same projection.
+
+The JSON export is the loss-aware interchange form. IDAPython and Ghidra Java writers consume the
+same projection but currently apply only selected function/global names and conservative function
+boundaries. They do not silently imply that prototypes, types, competing names, or unsupported
+claims were installed in the debugger. Export files use create-new writes and never replace an
+existing destination.
 
 ## Future packaging
 

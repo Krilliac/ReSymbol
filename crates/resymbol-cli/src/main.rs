@@ -1,11 +1,12 @@
 use std::{
     collections::BTreeSet,
     fs,
+    io::Write as _,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, bail};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use resymbol_analysis::{
     AnalysisSession, BinaryAnalysis, PluginRunRecord, PluginRunStatus, analyze_bytes,
 };
@@ -16,6 +17,9 @@ use resymbol_core::{
         DiagnosticSeverity, PluginCapability, PluginHealthState, PluginId, PluginPermission,
         PluginRuntime, PluginRuntimeKind,
     },
+};
+use resymbol_export::{
+    ExportProjection, render_ghidra_java, render_ida_python, validate_ghidra_java_class_name,
 };
 use resymbol_package::{ResymPackage, read_file_bound, write_file_new_bound};
 use resymbol_plugin_runtime::{
@@ -52,6 +56,8 @@ enum Command {
     Analyze(AnalyzeArgs),
     /// Inspect and validate a `.resym` analysis package.
     Inspect(InspectArgs),
+    /// Export reconstructed symbols for a debugger or another tool.
+    Export(ExportArgs),
     /// Inspect and manage discovered plugins.
     Plugin(PluginArgs),
 }
@@ -82,6 +88,40 @@ struct InspectArgs {
     /// Print the complete package as pretty JSON.
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Debug, Args)]
+struct ExportArgs {
+    /// Validated `.resym` package to export.
+    package: PathBuf,
+
+    /// Destination representation to generate.
+    #[arg(long, value_enum)]
+    format: ExportFormat,
+
+    /// Destination file (defaults beside the package).
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ExportFormat {
+    #[value(name = "json")]
+    Json,
+    #[value(name = "ida-python")]
+    IdaPython,
+    #[value(name = "ghidra-java")]
+    GhidraJava,
+}
+
+impl ExportFormat {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Json => "debugger-neutral JSON",
+            Self::IdaPython => "IDA Python",
+            Self::GhidraJava => "Ghidra Java",
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -119,6 +159,7 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Analyze(args) => analyze(args, cli.safe_mode, cli.plugin_dir),
         Command::Inspect(args) => inspect(args),
+        Command::Export(args) => export(args),
         Command::Plugin(args) => plugins(args, cli.safe_mode, cli.plugin_dir),
     }
 }
@@ -236,6 +277,155 @@ fn inspect(args: InspectArgs) -> Result<()> {
     println!("generator: {}", package.generator_version());
     print_session_summary(package.payload())?;
 
+    Ok(())
+}
+
+fn export(args: ExportArgs) -> Result<()> {
+    let ExportArgs {
+        package,
+        format,
+        output,
+    } = args;
+    let package_path = package
+        .canonicalize()
+        .with_context(|| format!("cannot open package {}", package.display()))?;
+    let package_data: ResymPackage<AnalysisSession> = read_file_bound(&package_path)
+        .with_context(|| format!("cannot read package {}", package_path.display()))?;
+    let projection = ExportProjection::from_session(package_data.payload())
+        .context("cannot build debugger export projection")?;
+    let output = output
+        .unwrap_or_else(|| default_export_path(&package, format, projection.binary.id.as_str()));
+
+    // Render and validate everything before creating the destination. A failed
+    // writer therefore cannot leave a file that looks like a usable export.
+    let rendered = match format {
+        ExportFormat::Json => {
+            let mut json = serde_json::to_string_pretty(&projection)
+                .context("cannot serialize debugger-neutral export JSON")?;
+            json.push('\n');
+            json
+        }
+        ExportFormat::IdaPython => {
+            render_ida_python(&projection).context("cannot render IDA Python import script")?
+        }
+        ExportFormat::GhidraJava => {
+            let class_name = ghidra_java_class_name(&output)?;
+            render_ghidra_java(&projection, class_name)
+                .context("cannot render Ghidra Java import script")?
+        }
+    };
+    write_export_new(&output, rendered.as_bytes())?;
+
+    let warning_occurrences = projection
+        .warnings
+        .iter()
+        .map(|warning| warning.occurrences)
+        .sum::<u64>();
+    println!("package: {}", package_path.display());
+    println!("format: {}", format.label());
+    println!("output: {}", output.display());
+    println!("binary SHA-256: {}", projection.binary.id);
+    println!(
+        "symbols: {} function(s), {} global(s), {} type(s)",
+        projection.functions.len(),
+        projection.globals.len(),
+        projection.types.len()
+    );
+    println!(
+        "warnings: {} group(s), {warning_occurrences} occurrence(s)",
+        projection.warnings.len()
+    );
+    for warning in projection.warnings.iter().take(20) {
+        match &warning.subject {
+            Some(subject) => println!(
+                "  {:?} {:?} x{}: {}",
+                warning.code, subject, warning.occurrences, warning.message
+            ),
+            None => println!(
+                "  {:?} x{}: {}",
+                warning.code, warning.occurrences, warning.message
+            ),
+        }
+    }
+    if projection.warnings.len() > 20 {
+        println!(
+            "  ... {} additional warning group(s) omitted from terminal output",
+            projection.warnings.len() - 20
+        );
+    }
+    match format {
+        ExportFormat::Json => println!(
+            "identity binding: projection records the exact binary SHA-256; no debugger program was modified"
+        ),
+        ExportFormat::IdaPython | ExportFormat::GhidraJava => println!(
+            "identity gate: importer verifies the loaded program SHA-256 before any mutation"
+        ),
+    }
+
+    Ok(())
+}
+
+fn default_export_path(package: &Path, format: ExportFormat, binary_sha256: &str) -> PathBuf {
+    match format {
+        ExportFormat::Json => package.with_extension("symbols.json"),
+        ExportFormat::IdaPython => package.with_extension("ida.py"),
+        ExportFormat::GhidraJava => {
+            let prefix = binary_sha256
+                .get(..12)
+                .expect("a validated binary SHA-256 has at least 12 ASCII bytes");
+            let filename = format!("ReSymbolImport_{prefix}.java");
+            package
+                .parent()
+                .unwrap_or_else(|| Path::new(""))
+                .join(filename)
+        }
+    }
+}
+
+fn ghidra_java_class_name(output: &Path) -> Result<&str> {
+    if output.extension().and_then(|value| value.to_str()) != Some("java") {
+        bail!(
+            "Ghidra Java output must have a lowercase `.java` extension: {}",
+            output.display()
+        );
+    }
+    let class_name = output
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .with_context(|| {
+            format!(
+                "Ghidra Java output must have a UTF-8 class-name stem: {}",
+                output.display()
+            )
+        })?;
+    validate_ghidra_java_class_name(class_name).with_context(|| {
+        format!(
+            "Ghidra Java output filename stem must be a conservative Java identifier: {}",
+            output.display()
+        )
+    })?;
+    Ok(class_name)
+}
+
+fn write_export_new(output: &Path, bytes: &[u8]) -> Result<()> {
+    let mut file = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            bail!("refusing to overwrite existing export {}", output.display())
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("cannot create export {}", output.display()));
+        }
+    };
+    file.write_all(bytes)
+        .with_context(|| format!("cannot write export {}", output.display()))?;
+    file.sync_all()
+        .with_context(|| format!("cannot flush export {}", output.display()))?;
     Ok(())
 }
 
@@ -1495,6 +1685,32 @@ args = ["--stdio", "literal argument"]
     }
 
     #[test]
+    fn command_line_accepts_all_export_formats() {
+        for (value, expected) in [
+            ("json", ExportFormat::Json),
+            ("ida-python", ExportFormat::IdaPython),
+            ("ghidra-java", ExportFormat::GhidraJava),
+        ] {
+            let cli = Cli::try_parse_from([
+                "resymbol",
+                "export",
+                "analysis.resym",
+                "--format",
+                value,
+                "--output",
+                "symbols.out",
+            ])
+            .expect("export arguments parse");
+            let Command::Export(args) = cli.command else {
+                panic!("export command expected");
+            };
+            assert_eq!(args.package, PathBuf::from("analysis.resym"));
+            assert_eq!(args.format, expected);
+            assert_eq!(args.output, Some(PathBuf::from("symbols.out")));
+        }
+    }
+
+    #[test]
     fn command_line_accepts_exact_plugin_state_commands() {
         let fingerprint = "a".repeat(64);
         let cli = Cli::try_parse_from([
@@ -1535,6 +1751,116 @@ args = ["--stdio", "literal argument"]
             default_package_path(Path::new("build/application")),
             PathBuf::from("build/application.resym")
         );
+    }
+
+    #[test]
+    fn export_defaults_and_ghidra_class_names_are_predictable() {
+        let package = Path::new("build/application.resym");
+        let sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            default_export_path(package, ExportFormat::Json, sha256),
+            PathBuf::from("build/application.symbols.json")
+        );
+        assert_eq!(
+            default_export_path(package, ExportFormat::IdaPython, sha256),
+            PathBuf::from("build/application.ida.py")
+        );
+        let ghidra = default_export_path(package, ExportFormat::GhidraJava, sha256);
+        assert_eq!(
+            ghidra,
+            PathBuf::from("build/ReSymbolImport_0123456789ab.java")
+        );
+        assert_eq!(
+            ghidra_java_class_name(&ghidra).expect("valid default Ghidra class name"),
+            "ReSymbolImport_0123456789ab"
+        );
+        assert_eq!(
+            ghidra_java_class_name(Path::new("Re$Symbol.java"))
+                .expect("dollar is valid in the documented conservative subset"),
+            "Re$Symbol"
+        );
+
+        for invalid in ["Bad-Name.java", "class.java", "WrongExtension.py"] {
+            assert!(
+                ghidra_java_class_name(Path::new(invalid)).is_err(),
+                "{invalid} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn export_generates_all_formats_and_never_overwrites() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let binary = temp.path().join("fixture.exe");
+        let package = temp.path().join("fixture.resym");
+        let plugins = temp.path().join("plugins");
+        fs::create_dir(&plugins).expect("create plugin directory");
+        let bytes = pe_fixture();
+        fs::write(&binary, &bytes).expect("write PE fixture");
+        analyze(
+            AnalyzeArgs {
+                binary,
+                output: Some(package.clone()),
+                plugins: Vec::new(),
+                strict_plugins: false,
+            },
+            true,
+            plugins,
+        )
+        .expect("analyze fixture");
+
+        export(ExportArgs {
+            package: package.clone(),
+            format: ExportFormat::Json,
+            output: None,
+        })
+        .expect("export JSON");
+        let json_path = package.with_extension("symbols.json");
+        let json_bytes = fs::read(&json_path).expect("read JSON export");
+        let json: Value = serde_json::from_slice(&json_bytes).expect("parse JSON export");
+        assert_eq!(
+            json["binary"]["id"],
+            Value::String(BinaryId::digest(&bytes).to_string())
+        );
+
+        let error = export(ExportArgs {
+            package: package.clone(),
+            format: ExportFormat::Json,
+            output: None,
+        })
+        .expect_err("existing export must not be overwritten");
+        assert!(error.to_string().contains("refusing to overwrite"));
+        assert_eq!(
+            fs::read(&json_path).expect("read preserved JSON export"),
+            json_bytes
+        );
+
+        export(ExportArgs {
+            package: package.clone(),
+            format: ExportFormat::IdaPython,
+            output: None,
+        })
+        .expect("export IDA script");
+        let ida_script =
+            fs::read_to_string(package.with_extension("ida.py")).expect("read IDA Python export");
+        assert!(ida_script.contains("retrieve_input_file_sha256"));
+        assert!(ida_script.contains(BinaryId::digest(&bytes).as_str()));
+
+        export(ExportArgs {
+            package: package.clone(),
+            format: ExportFormat::GhidraJava,
+            output: None,
+        })
+        .expect("export Ghidra script");
+        let ghidra_path = default_export_path(
+            &package,
+            ExportFormat::GhidraJava,
+            BinaryId::digest(&bytes).as_str(),
+        );
+        let ghidra_script = fs::read_to_string(&ghidra_path).expect("read Ghidra Java export");
+        assert!(ghidra_script.contains("public class ReSymbolImport_"));
+        assert!(ghidra_script.contains("getExecutableSHA256"));
+        assert!(ghidra_script.contains(BinaryId::digest(&bytes).as_str()));
     }
 
     #[test]

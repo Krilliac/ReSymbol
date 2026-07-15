@@ -254,6 +254,12 @@ domain. A bridge should remain thin:
 
 The bridge never assumes that a matching filename means a matching binary hash.
 
+ReSymbol currently provides standalone IDAPython and Ghidra Java import-script exporters. Those
+scripts perform exact binary-identity checks and conservatively apply a small graph subset, but they
+are generated artifacts rather than persistent tool-hosted plugins. Interactive preview, selective
+application, and round-trip communication remain part of this planned bridge family. See
+[exporting.md](exporting.md).
+
 ## Claims, not direct mutation
 
 Plugins submit structured claims. A conceptual payload looks like:

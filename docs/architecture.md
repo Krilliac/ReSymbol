@@ -6,8 +6,10 @@ not necessarily behavior implemented in the current checkout.
 
 The current implementation covers bounded PE32+ x86-64 ingestion, a conservative metadata-derived
 symbol graph, canonical JSON `.resym` packages, plugin discovery/contracts, and the first trusted
-external-process analysis runtime. Disassembly, matching, semantic inference, debugger-specific
-export, and the WASM/native/managed execution hosts remain design work.
+external-process analysis runtime. It also includes a validated, debugger-neutral export
+projection and conservative standalone import-script generators for IDA and Ghidra. Disassembly,
+matching, semantic inference, interactive debugger bridges, PDB/MAP/DWARF writers, the workbench
+GUI, and the WASM/native/managed execution hosts remain design work.
 
 ## Goals
 
@@ -36,7 +38,9 @@ flowchart TD
     C --> S
     S --> R["Validation and reconciliation"]
     R --> G["Canonical symbol graph"]
-    G --> X["Packages, reports, and tool exports"]
+    G --> E["Validated export projection"]
+    E --> X["JSON and tool-specific writers"]
+    S --> K["Portable analysis package"]
 ```
 
 The Rust application owns identity, canonical state, validation, permissions, transactions, and
@@ -132,9 +136,27 @@ parts rather than allowing plugins to mutate the metadata graph. The serialized 
 migrations are the compatibility boundary; a richer storage backend may be added without changing
 the canonical graph into a debugger database.
 
-Exporters consume a read-only graph projection and report what information could not be represented
-by their target. PDB, DWARF, IDA, and Ghidra formats have different capabilities and should not
-force their assumptions into the canonical graph. These exporters are not implemented yet.
+Exporters consume a bounded, read-only projection of one validated session. The initial projection
+selects deterministic names and boundaries, preserves competing names, prototypes, type
+definitions, confidence, and provenance where representable, assigns collision-safe output names,
+and emits structured warnings when graph information must be reduced or omitted. Writers revalidate
+that projection before serializing it.
+
+The first writers serialize the projection as JSON or generate self-contained IDAPython and Ghidra
+Java import scripts. Each script checks the debugger's recorded input SHA-256 before mutation and
+maps RVAs through the loaded image base, so ordinary rebasing does not weaken exact-build binding.
+The scripts preserve existing IDA user-authored names and Ghidra names from sources other than
+`DEFAULT`/`ANALYSIS`, avoid replacing existing function bodies, and continue after an individual
+symbol cannot be applied. This is intentionally narrower than a long-lived tool-hosted bridge:
+selected collision-safe function/global names and safe function boundaries are applied, while
+source spellings, alternate names, confidence, provenance, prototypes, types, comments, and
+relationships remain available in the neutral JSON but are not yet fully represented in the tool
+database. The generated Ghidra Java writer has a documented 20,000-record ceiling so its output
+stays within practical Java/Ghidra compilation bounds.
+
+PDB, MAP, DWARF, IDA, Ghidra, and other targets have different capabilities and must not force
+their assumptions into the canonical graph. Native PDB/MAP/DWARF writers and interactive debugger
+bridges remain planned. See [exporting.md](exporting.md) for current behavior.
 
 ## Plugin boundary
 
@@ -167,7 +189,22 @@ execution. The unchanged fingerprint may autoload later; any update invalidates 
 Manifest permissions constrain ReSymbol's protocol operations and data projections, not the
 child's ambient operating-system access.
 
+The current standalone IDAPython and Ghidra Java exporters implement a small identity-checking,
+conservative application path without installing a persistent plugin in either tool. They do not
+make the planned interactive tool-host boundary complete.
+
 See [plugin-system.md](plugin-system.md) for discovery, health states, and contracts.
+
+## Workbench GUI (design)
+
+The approved GUI direction is a desktop analysis workbench organized around a central results and
+evidence view, project and symbol navigation, contextual details, and a persistent activity and
+diagnostics area. It must expose confidence, provenance, competing claims, plugin health, and
+export losses instead of hiding them behind a single resolved label.
+
+No GUI is implemented in the current alpha. [gui-design.md](gui-design.md) records the approved
+layout, theme presets, semantic-color invariants, and accessibility requirements that a future UI
+must preserve.
 
 ## Packaging boundary
 
