@@ -211,12 +211,14 @@ would be willing to execute directly. A future sandbox layer may make declared n
 filesystem permissions enforceable at the OS boundary. Sandboxed WASM already enforces the narrower
 linked-interface model described below; it exposes no WASI capability.
 
-The shared process runner controls and reaps only the direct external plugin or native/managed
-helper. It does not currently create a contained Unix process group or Windows Job Object. A plugin
-can therefore leave descendants running after its direct child is stopped, and an inherited stdout
-or stderr handle can keep a capture reader blocked after the bounded 50 ms result drain. Those
-readers finish only when the inherited handles close. Process-tree containment and stricter handle
-inheritance are tracked as future platform hardening.
+The shared process runner owns each external plugin or native/managed helper tree through a POSIX
+process group or Windows Job Object. It terminates the whole owned tree when the direct child
+completes, a deadline expires, a stdout/stderr capture worker fails, or the runtime guard drops, so
+ordinary descendants cannot retain capture pipes after their parent exits. This is lifecycle
+containment, not a filesystem, network, credential, process-authority, or general OS sandbox.
+Windows uses a safe Rust wrapper to assign the child to its Job Object immediately after spawn,
+leaving a narrow pre-assignment escape race. On POSIX a hostile plugin/helper or descendant can
+deliberately leave its process group or session and escape later group termination.
 
 The fingerprint proves only which local bytes were approved; it does not authenticate a publisher.
 There is also an unavoidable check-to-launch window while plugin files remain mutable. Keep the
@@ -452,13 +454,13 @@ identifiers, deadlines, bounded message counts and byte sizes, bounded stderr di
 strict descriptor/response validation. Claims require the `claims.submit` permission and are
 committed only if the entire run validates.
 
-The first host is one process per analysis request. It sends the host greeting and one `analyze`
-request, closes input, and waits for the direct child while capturing bounded output. On a deadline
-it stops and reaps that direct child subject to the shared descendant-process limitation above.
-Stderr already observed before a timeout is retained, followed by the bounded worker drain so a
-native or managed load marker does not depend on pipe EOF. The single request deadline covers helper
-startup, helper preflight, and plugin execution. Interactive plugin-to-host
-`binary.read`/`read-binary`, cancellation, streaming
+The first host is one process tree per analysis request. It sends the host greeting and one `analyze`
+request, closes input, and waits for the direct child while capturing bounded output. Direct-child
+completion, a deadline, a stdout/stderr capture failure, or runtime drop terminates the owned
+process tree subject to the deliberate-escape limits above. Stderr already observed before a timeout
+is retained, followed by the bounded worker drain so a native or managed load marker does not depend
+on pipe EOF. The single request deadline covers helper startup, helper preflight, and plugin
+execution. Interactive plugin-to-host `binary.read`/`read-binary`, cancellation, streaming
 backpressure, and a persistent lifecycle are reserved by the contracts but not implemented in this
 host. The process is not OS-sandboxed; fingerprint-bound trust is therefore mandatory before
 launch.

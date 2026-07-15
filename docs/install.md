@@ -348,10 +348,12 @@ closed.
 > verified custom load context governs ordinary dependency resolution, not all .NET process
 > authority. Manifest permissions limit ReSymbol protocol operations; they do not restrict ambient
 > OS or runtime access. Trust only exact plugin artifacts whose code and publisher you would run
-> directly. ReSymbol stops and reaps only the direct plugin/helper child: it does not yet contain
-> plugin-created descendants in a Unix process group or Windows Job Object. Descendants can outlive
-> a timeout, and inherited stdout/stderr handles can keep capture readers alive until those handles
-> close even after the bounded result drain.
+> directly. ReSymbol owns ordinary plugin/helper descendants through a POSIX process group or
+> Windows Job Object and terminates the tree when the direct child completes, a deadline or
+> stdout/stderr capture failure occurs, or the runtime drops. This is lifecycle containment, not
+> authority sandboxing. Windows uses a safe Rust wrapper to assign the child immediately after spawn
+> but retains a narrow pre-assignment escape race; a hostile POSIX plugin/helper or descendant can
+> deliberately leave its process group or session.
 
 > [!WARNING]
 > WASM components have no linked WASI filesystem, network, environment, clock, or process

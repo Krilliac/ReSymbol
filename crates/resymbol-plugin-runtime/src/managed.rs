@@ -19,6 +19,7 @@ use crate::{
     ExternalProcessRequest, PluginExecution, PluginMethod, PluginRuntimeError, ProcessDiagnostics,
     RuntimeLimits,
     host::{preserve_operating_system_environment, run_child_observing_stderr},
+    process_tree::ContainedChild,
     wire::encode_input,
 };
 
@@ -282,13 +283,12 @@ impl ManagedProcessHost {
             .env_clear()
             .env("DOTNET_BUNDLE_EXTRACT_BASE_DIR", extraction_base.path());
         preserve_operating_system_environment(&mut command);
-        let child =
-            command
-                .spawn()
-                .map_err(|error| PluginRuntimeError::ManagedHostUnavailable {
-                    path: helper.clone(),
-                    reason: error.to_string(),
-                })?;
+        let child = ContainedChild::spawn(&mut command).map_err(|error| {
+            PluginRuntimeError::ManagedHostUnavailable {
+                path: helper.clone(),
+                reason: error.to_string(),
+            }
+        })?;
         let (child_result, observed_stderr) =
             run_child_observing_stderr(child, input, manifest, request, &self.limits, deadline);
         let result = finish_managed_child_result(
@@ -1588,7 +1588,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn fake_helper_receives_private_environment_and_strict_input() {
+    fn fake_helper_receives_strict_input_and_cleans_up_descendants() {
         use resymbol_core::plugin_api::{PluginHealth, PluginHealthState};
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -1610,6 +1610,10 @@ mod tests {
                 "case \"$hello\" in *'\"kind\":\"hello\"'*) ;; *) exit 48 ;; esac\n",
                 "case \"$request\" in *'\"method\":\"analyze\"'*) ;; *) exit 49 ;; esac\n",
                 "printf '@resymbol-managed-host/load-attempted/v1@\\n' >&2\n",
+                "( printf spawned > \"${0%/*}/managed-descendant-ready.marker\"; ",
+                "/bin/sleep 2; printf survived > ",
+                "\"${0%/*}/managed-descendant-survived.marker\" ) &\n",
+                "while [ ! -f \"${0%/*}/managed-descendant-ready.marker\" ]; do :; done\n",
                 "printf '%s\\n' '{\"protocol\":\"resymbol.plugin-wire\",\"version\":{\"major\":1,\"minor\":0},\"kind\":\"hello-result\",\"descriptor\":{\"id\":\"dev.resymbol.managed-test\",\"name\":\"Managed test\",\"version\":\"0.1.0\",\"capabilities\":[\"analyzer.binary\"],\"requested_permissions\":[\"binary.read\",\"claims.submit\"],\"isolation\":{\"mode\":\"process\",\"required\":true}}}'\n",
                 "printf '%s\\n' '{\"protocol\":\"resymbol.plugin-wire\",\"version\":{\"major\":1,\"minor\":0},\"kind\":\"response\",\"direction\":\"plugin-to-host\",\"id\":\"request-1\",\"ok\":true,\"result\":null}'\n",
             ),
@@ -1634,7 +1638,11 @@ mod tests {
         let binary = temporary.path().join("input.exe");
         fs::write(&binary, b"M").unwrap();
         let image = image(b"M");
-        let host = ManagedProcessHost::new(&helper, RuntimeLimits::default()).unwrap();
+        let host = ManagedProcessHost::new(
+            &helper,
+            RuntimeLimits::default().with_request_timeout(std::time::Duration::from_secs(1)),
+        )
+        .unwrap();
 
         let execution = host
             .execute_trusted(
@@ -1647,5 +1655,20 @@ mod tests {
             .unwrap();
         assert_eq!(execution.response.id, "request-1");
         assert_eq!(execution.diagnostics.stderr, "");
+        assert!(
+            temporary
+                .path()
+                .join("managed-descendant-ready.marker")
+                .is_file(),
+            "managed helper did not spawn its descendant"
+        );
+        std::thread::sleep(std::time::Duration::from_secs(4));
+        assert!(
+            !temporary
+                .path()
+                .join("managed-descendant-survived.marker")
+                .exists(),
+            "managed completion cleanup left its descendant alive"
+        );
     }
 }

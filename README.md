@@ -73,6 +73,10 @@ The current alpha implements and tests an end-to-end, deliberately narrow analys
 - a first managed/.NET analysis runtime with a strongly typed SDK and self-contained,
   application-local `resymbol-managed-host` sibling process, exact assembly-closure and artifact
   verification, bounded host services, deadline enforcement, and transactional output;
+- executable-plugin process-tree lifecycle containment: external, native, and managed launches own
+  their descendants through POSIX process groups or Windows Job Objects, and terminate that tree
+  when the direct child completes, a deadline or stdout/stderr capture failure occurs, or the
+  runtime drops;
 - initial native C ABI, WIT, and process-wire contracts; and
 - CLI discovery, diagnosis, enablement, disablement, fingerprint trust/revocation, quarantine reset,
   plugin selection, and strict automation behavior, plus source-backed WASM and managed examples
@@ -289,9 +293,13 @@ External, native, and managed process plugins retain the ambient filesystem, net
 and process access of the launching account. Manifest permissions govern ReSymbol protocol
 operations; they are not restrictions enforced by the operating system. A fingerprint identifies
 reviewed local bytes, not a publisher, and mutable plugin files leave a check-to-launch window.
-Only trust artifacts whose code and publisher you would run directly. Official archives bundle both
-helpers beside `resymbol`; Linux archives pair the static musl main executable with a GNU native
-helper built on Ubuntu 22.04 for glibc 2.35 or newer so it can load ordinary glibc `.so` plugins.
+Process-tree ownership is lifecycle containment, not authority sandboxing. On Windows ReSymbol uses
+a safe Rust wrapper for immediate post-spawn Job Object assignment, but a narrow pre-assignment
+escape race remains. On POSIX a hostile plugin/helper or descendant can deliberately leave its
+process group or session. Only trust artifacts whose code and publisher you would run directly.
+Official archives bundle both helpers beside `resymbol`; Linux archives pair the static musl main
+executable with a GNU native helper built on Ubuntu 22.04 for glibc 2.35 or newer so it can load
+ordinary glibc `.so` plugins.
 
 ## Development
 

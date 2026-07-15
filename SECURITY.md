@@ -81,12 +81,14 @@ can autoload without a new approval prompt, anyone who can write the plugin dire
 next component presented to the in-process engine. Keep the plugin tree writable only by the
 intended account even when every installed plugin is WASM.
 
-The process runner currently owns, stops, and reaps only its direct plugin or helper child. It does
-not place that child in a contained Unix process group or Windows Job Object, so plugin-created
-descendants can outlive a timeout. A descendant that inherits the helper's stdout or stderr handle
-can also keep a capture reader blocked after the direct child exits; ReSymbol performs only a
-bounded 50 ms result drain and the reader remains until the inherited handle closes. Process-tree
-containment and inherited-handle hardening are future work, not current security guarantees.
+The process runner places each external plugin or native/managed helper and its descendants in an
+owned POSIX process group or Windows Job Object. It terminates the whole owned tree when the direct
+child completes, a deadline expires, a stdout/stderr capture worker fails, or the runtime guard
+drops. This is lifecycle containment only: it does not restrict filesystem, network, credentials,
+process APIs, or any other ambient authority. Windows uses a safe Rust wrapper to assign the child
+to its Job Object immediately after spawn, but a narrow pre-assignment escape race remains. On
+POSIX a hostile plugin/helper or descendant can deliberately leave its process group or session
+and escape later group termination.
 
 External-process, native, and managed plugins require approval bound to the complete plugin-directory
 fingerprint. This binds a decision to exact local bytes but does not authenticate a publisher, and

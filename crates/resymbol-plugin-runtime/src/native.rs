@@ -17,6 +17,7 @@ use sha2::{Digest as _, Sha256};
 use crate::{
     ExternalProcessRequest, PluginExecution, PluginRuntimeError, RuntimeLimits,
     host::{preserve_operating_system_environment, run_child_observing_stderr},
+    process_tree::ContainedChild,
     wire::encode_input,
 };
 
@@ -235,12 +236,12 @@ impl NativeProcessHost {
             .stderr(Stdio::piped())
             .env_clear();
         preserve_operating_system_environment(&mut command);
-        let child = command
-            .spawn()
-            .map_err(|error| PluginRuntimeError::NativeHostUnavailable {
+        let child = ContainedChild::spawn(&mut command).map_err(|error| {
+            PluginRuntimeError::NativeHostUnavailable {
                 path: helper.clone(),
                 reason: error.to_string(),
-            })?;
+            }
+        })?;
         let (child_result, observed_stderr) =
             run_child_observing_stderr(child, input, manifest, request, &self.limits, deadline);
         finish_native_child_result(
@@ -1395,14 +1396,22 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn hanging_marked_helper_retains_marker_before_descendant_pipe_eof() {
+    fn hanging_marked_helper_terminates_descendant_and_retains_marker() {
         use std::os::unix::fs::PermissionsExt as _;
 
         let temporary = TempDir::new().unwrap();
         let helper = temporary.path().join("fake-native-host");
         fs::write(
             &helper,
-            "#!/bin/sh\nprintf '@resymbol-native-host/load-attempted/v1@\\n' >&2\n/bin/sleep 1 &\nwait\n",
+            concat!(
+                "#!/bin/sh\n",
+                "printf '@resymbol-native-host/load-attempted/v1@\\n' >&2\n",
+                "( printf spawned > \"${0%/*}/native-descendant-ready.marker\"; ",
+                "/bin/sleep 2; printf survived > ",
+                "\"${0%/*}/native-descendant-survived.marker\" ) &\n",
+                "while [ ! -f \"${0%/*}/native-descendant-ready.marker\" ]; do :; done\n",
+                "wait\n",
+            ),
         )
         .unwrap();
         let mut permissions = fs::metadata(&helper).unwrap().permissions();
@@ -1430,7 +1439,7 @@ mod tests {
         let image = image(b"M");
         let host = NativeProcessHost::new(
             &helper,
-            RuntimeLimits::default().with_request_timeout(std::time::Duration::from_millis(100)),
+            RuntimeLimits::default().with_request_timeout(std::time::Duration::from_secs(1)),
         )
         .unwrap();
 
@@ -1445,6 +1454,21 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, PluginRuntimeError::Timeout { .. }));
         assert_eq!(error.diagnostics().unwrap().stderr, "");
+        assert!(
+            temporary
+                .path()
+                .join("native-descendant-ready.marker")
+                .is_file(),
+            "native helper did not spawn its descendant"
+        );
+        std::thread::sleep(std::time::Duration::from_secs(4));
+        assert!(
+            !temporary
+                .path()
+                .join("native-descendant-survived.marker")
+                .exists(),
+            "native timeout cleanup left its descendant alive"
+        );
     }
 
     #[test]

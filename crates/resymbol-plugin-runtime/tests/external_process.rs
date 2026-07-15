@@ -29,15 +29,34 @@ const PLUGIN_NAME: &str = "Cross-platform mock";
 const PLUGIN_VERSION: &str = "1.2.3";
 const LITERAL_SHELL_ARG: &str = "; echo this-must-remain-a-literal-argument && exit 99";
 const PIPE_HOLDER_SWITCH: &str = "--resymbol-pipe-holder";
-const DESCENDANT_READY_MARKER: &str = "descendant-ready.marker";
+const SUCCESS_DESCENDANT_READY_MARKER: &str = "success-descendant-ready.marker";
+const SUCCESS_DESCENDANT_SURVIVAL_MARKER: &str = "success-descendant-survived.marker";
+const TIMEOUT_DESCENDANT_READY_MARKER: &str = "timeout-descendant-ready.marker";
+const TIMEOUT_DESCENDANT_SURVIVAL_MARKER: &str = "timeout-descendant-survived.marker";
+const STREAM_LIMIT_DESCENDANT_READY_MARKER: &str = "stream-limit-descendant-ready.marker";
+const STREAM_LIMIT_DESCENDANT_SURVIVAL_MARKER: &str = "stream-limit-descendant-survived.marker";
+#[cfg(unix)]
+const ESCAPED_LEADER_READY_MARKER: &str = "escaped-leader-ready.marker";
+const DESCENDANT_NATURAL_LIFETIME: Duration = Duration::from_secs(5);
+const DESCENDANT_SURVIVAL_GRACE: Duration = Duration::from_secs(2);
 
 fn main() {
     let arguments = std::env::args().collect::<Vec<_>>();
-    if arguments
+    if let Some(pipe_holder_index) = arguments
         .iter()
-        .any(|argument| argument == PIPE_HOLDER_SWITCH)
+        .position(|argument| argument == PIPE_HOLDER_SWITCH)
     {
-        thread::sleep(Duration::from_millis(1_500));
+        let ready_marker = arguments
+            .get(pipe_holder_index + 1)
+            .expect("pipe holder requires a ready marker path");
+        let survival_marker = arguments
+            .get(pipe_holder_index + 2)
+            .expect("pipe holder requires a survival marker path");
+        fs::write(ready_marker, b"ready")
+            .expect("write pipe-holder ready marker before its natural lifetime");
+        thread::sleep(DESCENDANT_NATURAL_LIFETIME);
+        fs::write(survival_marker, b"survived")
+            .expect("write pipe-holder survival marker after its natural lifetime");
         return;
     }
     if arguments.iter().any(|argument| argument == MOCK_SWITCH) {
@@ -120,26 +139,56 @@ fn exercise_runtime() {
         .expect_err("hung plugin must be terminated");
     assert!(matches!(timeout, PluginRuntimeError::Timeout { .. }));
 
-    let descendant_limits =
-        RuntimeLimits::default().with_request_timeout(Duration::from_millis(500));
+    let descendant_limits = RuntimeLimits::default().with_request_timeout(Duration::from_secs(3));
     let descendant_host =
         ExternalProcessHost::new(descendant_limits).expect("valid descendant timeout limits");
-    let descendant_started = Instant::now();
     let held_pipes = descendant_host
         .execute_trusted(&fixture.plugin, &fixture.request("descendant-holds-pipes"))
-        .expect_err("inherited descendant pipes must not outlive the invocation deadline");
-    assert!(matches!(held_pipes, PluginRuntimeError::Timeout { .. }));
+        .expect("a completed direct child must tear down descendants holding inherited pipes");
+    assert_eq!(held_pipes.response.result, json!({ "accepted": true }));
     assert!(
-        fixture.plugin.path.join(DESCENDANT_READY_MARKER).is_file(),
-        "mock direct child did not spawn the pipe-holding descendant"
+        fixture
+            .plugin
+            .path
+            .join(SUCCESS_DESCENDANT_READY_MARKER)
+            .is_file(),
+        "successful invocation did not spawn its pipe-holding descendant"
     );
-    let descendant_elapsed = descendant_started.elapsed();
+    let descendant_timeout = descendant_host
+        .execute_trusted(&fixture.plugin, &fixture.request("descendant-timeout"))
+        .expect_err("a parent and descendant that exceed the deadline must be terminated");
+    assert!(matches!(
+        descendant_timeout,
+        PluginRuntimeError::Timeout { .. }
+    ));
     assert!(
-        descendant_elapsed < Duration::from_millis(1_100),
-        "execute blocked on detached pipe readers past its deadline"
+        fixture
+            .plugin
+            .path
+            .join(TIMEOUT_DESCENDANT_READY_MARKER)
+            .is_file(),
+        "timed-out invocation did not spawn its pipe-holding descendant"
     );
-    thread::sleep(Duration::from_millis(1_600).saturating_sub(descendant_elapsed));
-
+    #[cfg(unix)]
+    {
+        let escaped_leader_started = Instant::now();
+        let escaped_leader = descendant_host
+            .execute_trusted(&fixture.plugin, &fixture.request("leader-leaves-group"))
+            .expect_err("an escaped direct leader must still be terminated at the deadline");
+        assert!(matches!(escaped_leader, PluginRuntimeError::Timeout { .. }));
+        assert!(
+            fixture
+                .plugin
+                .path
+                .join(ESCAPED_LEADER_READY_MARKER)
+                .is_file(),
+            "mock direct leader did not leave its original process group"
+        );
+        assert!(
+            escaped_leader_started.elapsed() < Duration::from_secs(5),
+            "timeout waited for a direct leader after it left the contained process group"
+        );
+    }
     let output_limits = RuntimeLimits::default().with_output_limits(1_024, 2_048, 1_024);
     let output_host = ExternalProcessHost::new(output_limits).expect("valid output limits");
     let oversized = output_host
@@ -152,6 +201,38 @@ fn exercise_runtime() {
             ..
         }
     ));
+    let descendant_oversized = output_host
+        .execute_trusted(&fixture.plugin, &fixture.request("descendant-oversized"))
+        .expect_err("an over-limit child and its descendant must be terminated");
+    assert!(matches!(
+        descendant_oversized,
+        PluginRuntimeError::StreamLimit {
+            stream: StreamKind::Stdout,
+            ..
+        }
+    ));
+    assert!(
+        fixture
+            .plugin
+            .path
+            .join(STREAM_LIMIT_DESCENDANT_READY_MARKER)
+            .is_file(),
+        "over-limit invocation did not spawn its pipe-holding descendant"
+    );
+    assert_descendants_were_terminated(
+        &fixture.plugin.path,
+        &[
+            (
+                SUCCESS_DESCENDANT_SURVIVAL_MARKER,
+                "successful invocation cleanup",
+            ),
+            (TIMEOUT_DESCENDANT_SURVIVAL_MARKER, "timeout cleanup"),
+            (
+                STREAM_LIMIT_DESCENDANT_SURVIVAL_MARKER,
+                "stream-limit cleanup",
+            ),
+        ],
+    );
 
     let message_limits = RuntimeLimits::default().with_max_messages(1);
     let message_host = ExternalProcessHost::new(message_limits).expect("valid message limits");
@@ -348,11 +429,31 @@ fn run_mock_plugin() -> Result<(), Box<dyn std::error::Error>> {
             write_success(&mut output, request_id, json!({ "accepted": false }))?;
         }
         "descendant-holds-pipes" => {
-            let _descendant = Command::new(std::env::current_exe()?)
-                .args([MOCK_SWITCH, LITERAL_SHELL_ARG, PIPE_HOLDER_SWITCH])
-                .spawn()?;
-            fs::write(DESCENDANT_READY_MARKER, b"ready")?;
+            spawn_pipe_holder(
+                SUCCESS_DESCENDANT_READY_MARKER,
+                SUCCESS_DESCENDANT_SURVIVAL_MARKER,
+            )?;
             write_success(&mut output, request_id, json!({ "accepted": true }))?;
+        }
+        "descendant-timeout" => {
+            spawn_pipe_holder(
+                TIMEOUT_DESCENDANT_READY_MARKER,
+                TIMEOUT_DESCENDANT_SURVIVAL_MARKER,
+            )?;
+            thread::sleep(Duration::from_secs(6));
+        }
+        "descendant-oversized" => {
+            spawn_pipe_holder(
+                STREAM_LIMIT_DESCENDANT_READY_MARKER,
+                STREAM_LIMIT_DESCENDANT_SURVIVAL_MARKER,
+            )?;
+            write_success(&mut output, request_id, Value::String("x".repeat(8_192)))?;
+        }
+        #[cfg(unix)]
+        "leader-leaves-group" => {
+            join_parent_process_group()?;
+            fs::write(ESCAPED_LEADER_READY_MARKER, b"escaped")?;
+            thread::sleep(Duration::from_secs(6));
         }
         "reject" => write_json_line(
             &mut output,
@@ -382,6 +483,48 @@ fn run_mock_plugin() -> Result<(), Box<dyn std::error::Error>> {
     }
     output.flush()?;
     Ok(())
+}
+
+fn spawn_pipe_holder(
+    ready_marker: &str,
+    survival_marker: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let descendant = Command::new(std::env::current_exe()?)
+        .args([PIPE_HOLDER_SWITCH, ready_marker, survival_marker])
+        .spawn()?;
+    drop(descendant);
+    let ready_deadline = Instant::now() + Duration::from_secs(2);
+    while !Path::new(ready_marker).is_file() {
+        if Instant::now() >= ready_deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("pipe-holder descendant did not become ready at `{ready_marker}`"),
+            )
+            .into());
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn join_parent_process_group() -> Result<(), Box<dyn std::error::Error>> {
+    use rustix::process::{getpgid, getppid, setpgid};
+
+    let parent = getppid().ok_or_else(|| io::Error::other("mock process has no parent"))?;
+    let parent_group = getpgid(Some(parent))?;
+    setpgid(None, Some(parent_group))?;
+    Ok(())
+}
+
+fn assert_descendants_were_terminated(plugin_path: &Path, descendants: &[(&str, &str)]) {
+    thread::sleep(DESCENDANT_NATURAL_LIFETIME + DESCENDANT_SURVIVAL_GRACE);
+    for &(survival_marker, context) in descendants {
+        assert!(
+            !plugin_path.join(survival_marker).exists(),
+            "{context} left a descendant alive long enough to write `{survival_marker}`"
+        );
+    }
 }
 
 fn write_claim(output: &mut impl Write, invalid: bool) -> io::Result<()> {

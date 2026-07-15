@@ -4,8 +4,10 @@
 //! WASI. External-process manifests launch their entrypoint directly. Native and
 //! managed manifests launch versioned sibling helpers that contain library or
 //! runtime faults outside the main ReSymbol process. Process paths avoid a shell,
-//! exchange bounded newline-delimited JSON over pipes, and terminate processes
-//! that exceed their deadline. Every host converts claim events into validated
+//! exchange bounded newline-delimited JSON over pipes, and own ordinary descendants
+//! through POSIX process groups or Windows Job Objects. The owned tree is terminated
+//! when the direct child completes, a deadline or stdout/stderr capture failure occurs,
+//! or the runtime guard drops. Every host converts claim events into validated
 //! [`resymbol_core::SymbolClaim`] values.
 //!
 //! Process isolation is not a full operating-system sandbox. Protocol grants
@@ -24,6 +26,7 @@ mod error;
 mod host;
 mod managed;
 mod native;
+mod process_tree;
 mod types;
 mod wasm;
 mod wire;

@@ -36,6 +36,12 @@ prereleases; breaking changes remain explicit.
   CLR sandbox, and official archives require no separately installed .NET runtime. The managed SDK
   is also published as a compile-only NuGet release asset; `AnalysisRequest.BaseAnalysis` exposes
   the detached canonical base analysis only when `symbols.read` is granted.
+- Added executable-plugin process-tree lifecycle containment. External, native, and managed launches
+  own descendants through POSIX process groups or Windows Job Objects and terminate the owned tree
+  on direct-child completion, deadline, stdout/stderr capture failure, or runtime drop. This is not
+  filesystem, network, or authority sandboxing: Windows retains a narrow spawn-to-Job-assignment
+  escape race, and a hostile POSIX plugin/helper or descendant can deliberately leave its process
+  group or session.
 - Added bounded modern MSVC x64 Rev1 RTTI and vftable discovery, including validated stored type
   names, base-class records, virtual-slot targets, vftable names, and attributed function-to-class
   relationships.

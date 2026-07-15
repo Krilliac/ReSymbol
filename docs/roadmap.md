@@ -179,6 +179,8 @@ installation and debugger-hosted runtimes are still outstanding.
 - Safe mode and plugin diagnostics
 - Version negotiation, dependency compatibility diagnostics, limits, and permission records
 - Direct no-shell, timeout- and output-bounded one-shot external-process analysis
+- POSIX process-group and Windows Job Object lifecycle containment for external, native, and managed
+  process trees
 - No-WASI Component Model analysis with bounded WIT host services, enforced Wasmtime resource
   limits, sandboxed autoload, transactional claims, and exact-artifact quarantine
 - Disposable sibling-process native C/C++ analysis with bounded file-backed PE `binary.read`
@@ -197,10 +199,11 @@ The native and managed families are initial architecture requirements, not post-
 contracts, SDK foundations, and first out-of-process analysis hosts are implemented. Out-of-process
 hosting is the only supported path for both families even if an explicitly trusted fast path is
 eventually designed. A child process is a crash boundary, not an OS security sandbox; platform
-sandboxing remains separate work. The current runner also owns only its direct child. Containing the
-full descendant tree with Unix process groups and Windows Job Objects, and preventing inherited
-pipes from retaining capture readers after the bounded drain, remain explicit platform-hardening
-work.
+sandboxing remains separate work. The current runner owns ordinary descendants through POSIX
+process groups or Windows Job Objects and terminates the tree on direct-child completion, deadline,
+stdout/stderr capture failure, or runtime drop. This lifecycle containment does not restrict ambient
+authority. Windows retains a narrow pre-Job-assignment escape race, and a hostile POSIX
+plugin/helper or descendant can deliberately leave its process group or session.
 
 ## Milestone 2: useful native-binary MVP
 

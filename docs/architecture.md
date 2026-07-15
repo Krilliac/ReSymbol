@@ -272,9 +272,9 @@ high-performance native analysis, managed tooling, model experiments, and debugg
 | Family | Intended use | Host boundary |
 |---|---|---|
 | WebAssembly | Portable analyzers, matchers, rules, and exporters | In-process Wasmtime component; no WASI, bounded WIT imports |
-| Native C/C++ | Existing reversing libraries and performance-critical work | Disposable sibling helper; bounded C ABI callbacks, but no OS sandbox |
-| Managed/.NET | Managed analyzers, SDK consumers, and ecosystem integrations | App-local self-contained sibling helper; verified assembly snapshots, but no OS sandbox |
-| External process | Python, model runtimes, proprietary SDKs, or heavyweight tools | Child process; bounded protocol, but no OS sandbox |
+| Native C/C++ | Existing reversing libraries and performance-critical work | Disposable sibling-helper tree; bounded C ABI callbacks, but no OS sandbox |
+| Managed/.NET | Managed analyzers, SDK consumers, and ecosystem integrations | App-local self-contained sibling-helper tree; verified assembly snapshots, but no OS sandbox |
+| External process | Python, model runtimes, proprietary SDKs, or heavyweight tools | Owned process tree; bounded protocol, but no OS sandbox |
 | Tool-hosted bridge | IDA, Ghidra, Binary Ninja, and debugger adapters | The host tool's process and API |
 
 Native in-process loading is not implemented. It may eventually be available as an explicit trusted
@@ -347,6 +347,14 @@ load, where module initializers or type discovery can begin plugin-controlled ex
 strips exactly that marker from visible stderr and uses it to distinguish attributable failures,
 which quarantine the exact artifact, from conservative helper preflight failures. A killed,
 crashed, or rejected managed run cannot partially commit claims or prevent base package creation.
+
+External, native, and managed launches own ordinary descendants through a POSIX process group or
+Windows Job Object. The shared runner terminates the whole owned tree when the direct child
+completes, a deadline expires, a stdout/stderr capture worker fails, or the runtime guard drops.
+This is a lifecycle boundary, not an authority boundary. Windows uses a safe Rust wrapper to assign
+the child to its Job Object immediately after spawn, while retaining a narrow pre-assignment escape
+race. A hostile POSIX plugin/helper or descendant can deliberately leave its process group or
+session and escape later group termination.
 
 Process separation contains ordinary crashes, not authority. External, native, and managed child
 code still has the ambient filesystem, network, credential, and process access of the account

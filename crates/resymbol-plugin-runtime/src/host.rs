@@ -2,7 +2,7 @@ use std::{
     env, fs,
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
-    process::{Child, Command, ExitStatus, Stdio},
+    process::{Command, ExitStatus, Stdio},
     sync::{Arc, Mutex, mpsc},
     thread,
     time::{Duration, Instant},
@@ -16,6 +16,7 @@ use resymbol_core::{
 use crate::{
     ExternalProcessRequest, PluginExecution, PluginRuntimeError, ProcessDiagnostics, RuntimeLimits,
     StreamKind,
+    process_tree::ContainedChild,
     wire::{encode_input, parse_output},
 };
 
@@ -75,10 +76,11 @@ impl ExternalProcessHost {
             .env_clear();
         preserve_operating_system_environment(&mut command);
 
-        let child = command.spawn().map_err(|source| PluginRuntimeError::Io {
-            operation: "launch plugin entrypoint",
-            source,
-        })?;
+        let child =
+            ContainedChild::spawn(&mut command).map_err(|source| PluginRuntimeError::Io {
+                operation: "launch plugin entrypoint",
+                source,
+            })?;
         run_child(child, input, manifest, request, &self.limits, deadline)
     }
 }
@@ -185,17 +187,6 @@ pub(crate) fn preserve_operating_system_environment(command: &mut Command) {
     }
 }
 
-struct ChildGuard {
-    child: Child,
-}
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _kill_result = self.child.kill();
-        let _wait_result = self.child.wait();
-    }
-}
-
 enum CaptureFailure {
     Limit(Vec<u8>),
     Io(io::Error),
@@ -215,9 +206,10 @@ enum CaptureStream {
 
 /// Raw stderr observed so far, independent of pipe EOF.
 ///
-/// A timed-out plugin can leave a descendant holding the pipe open. Keeping a
-/// bounded live prefix lets native-host framing remain observable even when
-/// the final stderr worker result cannot arrive during cleanup.
+/// Tree termination and pipe EOF are asynchronous, and a deliberately escaped
+/// descendant can still retain an inherited handle. Keeping a bounded live
+/// prefix lets native-host framing remain observable even when the final stderr
+/// worker result cannot arrive during the cleanup grace period.
 #[derive(Clone, Default)]
 struct ObservedStderr {
     bytes: Arc<Mutex<Vec<u8>>>,
@@ -276,7 +268,7 @@ enum AwaitOutcome {
 }
 
 pub(crate) fn run_child(
-    child: Child,
+    child: ContainedChild,
     input: Vec<u8>,
     manifest: &PluginManifest,
     request: &ExternalProcessRequest,
@@ -290,7 +282,7 @@ pub(crate) fn run_child(
 /// from the structured result. Native-host stage framing must survive result
 /// variants that do not themselves carry [`ProcessDiagnostics`].
 pub(crate) fn run_child_observing_stderr(
-    child: Child,
+    child: ContainedChild,
     input: Vec<u8>,
     manifest: &PluginManifest,
     request: &ExternalProcessRequest,
@@ -311,7 +303,7 @@ pub(crate) fn run_child_observing_stderr(
 }
 
 fn run_child_inner(
-    child: Child,
+    mut child: ContainedChild,
     input: Vec<u8>,
     manifest: &PluginManifest,
     request: &ExternalProcessRequest,
@@ -319,22 +311,9 @@ fn run_child_inner(
     deadline: Instant,
     observed_stderr: &ObservedStderr,
 ) -> Result<PluginExecution, PluginRuntimeError> {
-    let mut guard = ChildGuard { child };
-    let stdin = guard
-        .child
-        .stdin
-        .take()
-        .expect("stdin was configured as piped");
-    let stdout = guard
-        .child
-        .stdout
-        .take()
-        .expect("stdout was configured as piped");
-    let stderr = guard
-        .child
-        .stderr
-        .take()
-        .expect("stderr was configured as piped");
+    let stdin = child.take_stdin().expect("stdin was configured as piped");
+    let stdout = child.take_stdout().expect("stdout was configured as piped");
+    let stderr = child.take_stderr().expect("stderr was configured as piped");
 
     let (result_sender, result_receiver) = mpsc::channel();
     spawn_stdin_worker(stdin, input, result_sender.clone());
@@ -354,7 +333,7 @@ fn run_child_inner(
     );
 
     let (status, mut workers) =
-        match await_child_and_workers(&mut guard.child, deadline, &result_receiver)? {
+        match await_child_and_workers(&mut child, deadline, &result_receiver)? {
             AwaitOutcome::Complete { status, workers } => (status, workers),
             AwaitOutcome::Deadline { workers } => {
                 return Err(PluginRuntimeError::Timeout {
@@ -496,7 +475,7 @@ fn read_bounded_observed(
 }
 
 fn await_child_and_workers(
-    child: &mut Child,
+    child: &mut ContainedChild,
     deadline: Instant,
     result_receiver: &mpsc::Receiver<WorkerMessage>,
 ) -> Result<AwaitOutcome, PluginRuntimeError> {
@@ -512,6 +491,13 @@ fn await_child_and_workers(
                 operation: "poll plugin process",
                 source,
             })?;
+            if status.is_some() {
+                // Pipe EOF is not a reliable direct-child completion signal:
+                // descendants may inherit the handles. Tear down the owned
+                // tree as soon as the direct leader exits so workers can
+                // finish without consuming the invocation deadline.
+                terminate(child)?;
+            }
         }
         // Stop immediately for failed/over-limit capture workers, but allow a
         // stdin BrokenPipe to race naturally with the child's bounded exit.
@@ -583,12 +569,19 @@ fn drain_worker_results_bounded(
     }
 }
 
-fn terminate(child: &mut Child) -> Result<(), PluginRuntimeError> {
-    match child.kill() {
+fn terminate(child: &mut ContainedChild) -> Result<(), PluginRuntimeError> {
+    match child.terminate() {
         Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::InvalidInput => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::InvalidInput | io::ErrorKind::NotFound
+            ) =>
+        {
+            Ok(())
+        }
         Err(source) => Err(PluginRuntimeError::Io {
-            operation: "terminate plugin process",
+            operation: "terminate plugin process tree",
             source,
         }),
     }
