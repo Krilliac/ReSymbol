@@ -129,7 +129,7 @@ fn string_and_data_reference_pe() -> Vec<u8> {
     put_u32(&mut bytes, exception_directory, 0x2080);
     put_u32(&mut bytes, exception_directory + 4, 12);
     put_u32(&mut bytes, RDATA_OFFSET + 0x80, 0x1000);
-    put_u32(&mut bytes, RDATA_OFFSET + 0x84, 0x1010);
+    put_u32(&mut bytes, RDATA_OFFSET + 0x84, 0x1020);
     put_u32(&mut bytes, RDATA_OFFSET + 0x88, 0x2060);
 
     let put_lea = |bytes: &mut [u8], raw_offset: usize, instruction_rva: u32, target_rva: u32| {
@@ -140,8 +140,10 @@ fn string_and_data_reference_pe() -> Vec<u8> {
         bytes[raw_offset + 3..raw_offset + 7].copy_from_slice(&displacement.to_le_bytes());
     };
     put_lea(&mut bytes, 0x200, 0x1000, 0x2000);
-    put_lea(&mut bytes, 0x207, 0x1007, 0x2020);
-    bytes[0x20e] = 0xc3;
+    put_lea(&mut bytes, 0x207, 0x1007, 0x2004);
+    put_lea(&mut bytes, 0x20e, 0x100e, 0x2022);
+    put_lea(&mut bytes, 0x215, 0x1015, 0x2021);
+    bytes[0x21c] = 0xc3;
 
     put_c_string(&mut bytes, RDATA_OFFSET, "Recovered ASCII");
     let mut offset = RDATA_OFFSET + 0x20;
@@ -323,7 +325,7 @@ fn recovered_direct_call_survives_json_but_entry_only_target_skips_writers() {
     let session = AnalysisSession::new(analysis, Vec::new(), Vec::new()).expect("valid session");
     let projection = ExportProjection::from_session(&session).expect("session projection");
 
-    assert_eq!(projection.schema_version, 4);
+    assert_eq!(projection.schema_version, 5);
     assert_eq!(projection.direct_calls.len(), 1);
     assert_eq!(projection.direct_calls[0].caller_rva, 0x1000);
     assert_eq!(projection.direct_calls[0].call_site_rva, 0x1000);
@@ -368,7 +370,7 @@ fn cfg_recovery_keeps_session_and_projection_shapes_stable() {
     let projection = ExportProjection::from_session(&session).expect("session projection");
     projection.validate().expect("projection remains valid");
 
-    assert_eq!(projection.schema_version, 4);
+    assert_eq!(projection.schema_version, 5);
     assert_eq!(
         projection
             .direct_calls
@@ -408,6 +410,10 @@ fn cfg_recovery_keeps_session_and_projection_shapes_stable() {
     assert_eq!(projection.data_references[0].instruction_rva, 0x1009);
     assert_eq!(projection.data_references[0].instruction_size, 7);
     assert_eq!(projection.data_references[0].target_rva, 0x2000);
+    assert_eq!(
+        projection.data_references[0].referenced_string_rva,
+        Some(0x2000)
+    );
     assert!(
         projection
             .direct_calls
@@ -429,7 +435,7 @@ fn cfg_recovery_keeps_session_and_projection_shapes_stable() {
     assert_eq!(projection, decoded_projection);
 
     let projection_json = serde_json::to_value(&projection).expect("serialize CFG projection");
-    assert_eq!(projection_json["schema_version"], serde_json::json!(4));
+    assert_eq!(projection_json["schema_version"], serde_json::json!(5));
     assert_eq!(
         projection_json["direct_calls"][0],
         serde_json::json!({
@@ -446,6 +452,7 @@ fn cfg_recovery_keeps_session_and_projection_shapes_stable() {
             "instruction_rva": 0x1009,
             "instruction_size": 7,
             "target_rva": 0x2000,
+            "referenced_string_rva": 0x2000,
             "attribution": projection_json["data_references"][0]["attribution"].clone(),
         })
     );
@@ -469,25 +476,42 @@ fn recovered_strings_and_data_references_flow_through_the_session_projection() {
             (0x2020, 26, "Recovered 世界"),
         ]
     );
-    assert_eq!(pe.data_references.len(), 2);
+    assert_eq!(pe.data_references.len(), 4);
 
     let session = AnalysisSession::new(analysis, Vec::new(), Vec::new()).expect("valid session");
     let projection = ExportProjection::from_session(&session).expect("session projection");
     projection.validate().expect("projection remains valid");
 
-    assert_eq!(projection.schema_version, 4);
+    assert_eq!(projection.schema_version, 5);
     assert_eq!(projection.strings.len(), 2);
     assert_eq!(projection.strings[0].rva, 0x2000);
     assert_eq!(projection.strings[0].value, "Recovered ASCII");
     assert_eq!(projection.strings[1].rva, 0x2020);
     assert_eq!(projection.strings[1].value, "Recovered 世界");
-    assert_eq!(projection.data_references.len(), 2);
+    assert_eq!(projection.data_references.len(), 4);
     assert_eq!(projection.data_references[0].caller_rva, 0x1000);
     assert_eq!(projection.data_references[0].instruction_rva, 0x1000);
     assert_eq!(projection.data_references[0].instruction_size, 7);
     assert_eq!(projection.data_references[0].target_rva, 0x2000);
+    assert_eq!(
+        projection.data_references[0].referenced_string_rva,
+        Some(0x2000)
+    );
     assert_eq!(projection.data_references[1].instruction_rva, 0x1007);
-    assert_eq!(projection.data_references[1].target_rva, 0x2020);
+    assert_eq!(projection.data_references[1].target_rva, 0x2004);
+    assert_eq!(
+        projection.data_references[1].referenced_string_rva,
+        Some(0x2000)
+    );
+    assert_eq!(projection.data_references[2].instruction_rva, 0x100e);
+    assert_eq!(projection.data_references[2].target_rva, 0x2022);
+    assert_eq!(
+        projection.data_references[2].referenced_string_rva,
+        Some(0x2020)
+    );
+    assert_eq!(projection.data_references[3].instruction_rva, 0x1015);
+    assert_eq!(projection.data_references[3].target_rva, 0x2021);
+    assert_eq!(projection.data_references[3].referenced_string_rva, None);
     assert!(projection.strings.iter().all(|value| {
         value.attribution.provenance.method == "pe-string-recovery"
             && value.attribution.confidence == 0.90
@@ -497,7 +521,16 @@ fn recovered_strings_and_data_references_flow_through_the_session_projection() {
             && value.attribution.confidence == 0.90
     }));
 
-    let json = serde_json::to_string(&projection).expect("JSON projection");
+    let projection_json = serde_json::to_value(&projection).expect("JSON projection");
+    assert_eq!(
+        projection_json["data_references"][0]["referenced_string_rva"],
+        serde_json::json!(0x2000)
+    );
+    assert_eq!(
+        projection_json["data_references"][3]["referenced_string_rva"],
+        serde_json::Value::Null
+    );
+    let json = serde_json::to_string(&projection_json).expect("serialized JSON projection");
     assert!(json.contains("\"utf-16-le\""));
     assert!(json.contains("\"data_references\""));
     render_ida_python(&projection).expect("IDA ignores new relationships safely");
@@ -519,7 +552,7 @@ fn msvc_rtti_names_and_relationships_flow_into_all_export_inputs() {
     let projection = ExportProjection::from_session(&session).expect("session projection");
     projection.validate().expect("projection remains valid");
 
-    assert_eq!(projection.schema_version, 4);
+    assert_eq!(projection.schema_version, 5);
     assert_eq!(projection.types.len(), 1);
     assert_eq!(
         projection.types[0].key,

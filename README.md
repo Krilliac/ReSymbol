@@ -50,7 +50,8 @@ The current alpha implements and tests an end-to-end, deliberately narrow analys
   projection as JSON, renders a bounded human-readable Markdown report, emits deterministic
   Microsoft-linker-style MAP text for compatible tools, creates an exact-RSDS public-symbol PDB
   from the exact original PE, or generates self-contained IDAPython and Ghidra Java import scripts
-  with exact-binary identity gates and RVA-aware rebasing;
+  with exact-binary identity gates and RVA-aware rebasing; the projection correlates supported data
+  references with retained strings at exact or valid content-interior targets;
 - versioned plugin manifests and health diagnostics for WASM, native, managed, external-process,
   and tool-adapter runtime families;
 - local plugin-directory discovery, manifest and entrypoint validation, API compatibility checks,
@@ -99,6 +100,10 @@ basic-block graph, infer erased identifiers, invent names or sizes, recover regi
 control flow, or claim a complete call graph. A separate bounded pass retains exact, fully
 terminated printable ASCII and valid UTF-16LE strings from eligible data, with deterministic
 overlap handling; it does not publish truncated prefixes or infer a variable type from a literal.
+The neutral projection correlates a data-reference target with a retained string only at the string
+start or within its encoded content. It excludes the NUL terminator and requires UTF-16LE interior
+targets to be code-unit aligned. An absent correlation means only that no retained projected string
+matched; it is not proof that the target bytes cannot contain a string.
 Its RTTI slice recovers
 names and relationships actually present in validated compiler metadata and deliberately supports
 only modern MSVC x64 Rev1 records whose base-class descriptors use the 28-byte form with an
@@ -218,7 +223,7 @@ The Markdown output is a deterministic, bounded presentation report for people t
 not a stable interchange format; integrations should consume the neutral JSON projection instead.
 Without `--output`, it is written as `application.symbols.md` beside the package. Package schema 3
 is used by new analyses, export also accepts package schemas 1 and 2 through validated compatibility
-paths, and neutral projection schema 4 remains unchanged by this presentation-only format. Export
+paths, and neutral projection schema 5 remains unchanged by this presentation-only format. Export
 does not rewrite the source package.
 
 The PE-only `map` format writes deterministic Microsoft-linker-style text to `application.map` by
@@ -226,7 +231,7 @@ default for tools that support that format. It maps selected names to one-based 
 `section:offset` values and preferred-image-base-plus-RVA addresses. Its semicolon-prefixed exact
 SHA-256 and file-size comments are informational: a MAP file cannot check the binary loaded by a
 consumer, so compare the executable with the recorded identity before using the symbols. MAP adds
-no fields to package schema 3 or neutral projection schema 4, and it does not rewrite legacy source
+no fields to package schema 3 or neutral projection schema 5, and it does not rewrite legacy source
 packages accepted through compatibility paths. The header module name is the package filename stem;
 for a valid UTF-8 stem, unsupported/non-ASCII encoded bytes become `_` and the result is capped at
 255 bytes. A non-UTF-8 or otherwise unusable stem falls back to `resymbol_<sha12>`.
@@ -245,8 +250,9 @@ database and calculate addresses from the tool's current image base plus each RV
 existing user-authored names and apply only the first projection subset: selected function/global
 names (including validated vftable global names) and conservative non-overlapping function
 boundaries. The neutral JSON projection retains attributed function entries, direct calls, thunks,
-recovered strings, data references, and class-membership relationships, while the current scripts
-ignore those relationship and literal records and do not synthesize virtual-method names. See the
+recovered strings, data references, their schema-5 string correlations, and class-membership
+relationships, while the current scripts ignore those relationship and literal records and do not
+synthesize virtual-method names. See the
 [export guide](docs/exporting.md) for report contents, usage, limitations, and in-tool
 instructions. Richer PDB records, DWARF, richer type application, and interactive preview bridges
 remain roadmap work. See the

@@ -358,6 +358,7 @@ fn render_data_references(
             "Instruction RVA",
             "Instruction size",
             "Target RVA",
+            "Referenced string RVA",
             "Confidence",
             "Source",
         ],
@@ -370,6 +371,9 @@ fn render_data_references(
                 hex(reference.instruction_rva),
                 reference.instruction_size.to_string(),
                 hex(reference.target_rva),
+                reference
+                    .referenced_string_rva
+                    .map_or_else(|| "-".to_owned(), hex),
                 confidence(&reference.attribution),
                 provenance(&reference.attribution),
             ],
@@ -636,7 +640,7 @@ mod tests {
 
     fn empty_projection() -> ExportProjection {
         ExportProjection {
-            schema_version: 4,
+            schema_version: 5,
             binary: ExportBinary {
                 id: BinaryId::from_sha256(
                     "0000000000000000000000000000000000000000000000000000000000000000",

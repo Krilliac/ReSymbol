@@ -43,7 +43,7 @@ Every package contains four top-level fields:
 This package envelope currently writes schema 3. The CLI can also inspect and export schema 1 and
 schema 2 packages through the compatibility paths described below, while other schema versions
 fail explicitly. The debugger-neutral JSON produced by `resymbol export --format json` is a
-different artifact with its own schema version; its current projection is schema 4.
+different artifact with its own schema version; its current projection is schema 5.
 
 Object keys are sorted recursively and no timestamp is inserted, so encoding the same deterministic
 payload produces the same bytes. Arrays preserve analysis order because source-table order can be
@@ -221,8 +221,9 @@ entry.
 The same instruction sweep retains exact RIP-relative data references from supported decoded
 instructions. It excludes call and jump operands already represented as control flow and accepts a
 target only when the computed RVA lies in file-backed, initialized, readable,
-non-executable section data. The relationship records caller, instruction RVA and size, and target
-RVA; it does not guess a target name, object size, access mode, or whether the target is a string.
+non-executable section data. The persisted relationship records caller, instruction RVA and size,
+and target RVA; it does not guess a target name, object size, or access mode. The independently
+versioned export projection derives string correlation later from the retained canonical strings.
 
 Thunk candidates come from metadata-backed entry points: runtime-function starts, the PE entry
 point, local executable exports, internal direct-call targets, and validated RTTI virtual slots.
@@ -265,8 +266,14 @@ alternate names, confidence and provenance, supported function/global sizes, pro
 definitions, attributed function-to-class memberships, and structured warnings. Ordering and
 collision handling are stable so the same validated session produces the same projection.
 
-The current neutral JSON projection is schema 4. It adds bounded, attributed `strings` and
-`data_references` arrays to schema 3's function-entry, direct-call, and thunk model.
+The current neutral JSON projection is schema 5. Schema 4 added bounded, attributed `strings` and
+`data_references` arrays to schema 3's function-entry, direct-call, and thunk model. Schema 5 adds
+`referenced_string_rva` to each data reference. Every schema-5 object emits the field as a string
+RVA or JSON `null`. A numeric value names the retained string when the target is its exact RVA or a
+content-interior address; the NUL terminator is excluded, and UTF-16LE interior targets must be
+code-unit aligned. `null` means only that no retained projected string matched, not that the target
+bytes cannot contain a string. Correlation occurs after deterministic string conflict and overlap
+reduction, so the field cannot name a discarded candidate.
 Internal relation targets must reference projected function entries; import targets retain their
 IAT RVA. Its projection/model bounds are intentionally separate from the lower built-in recovery
 caps: at most 65,536 strings, 32 MiB of retained string UTF-8 with 16 KiB per value, and 262,144
@@ -288,7 +295,7 @@ containing selected public function and global names and verbatim section header
 function/global collisions prefer the function; unnamed functions do not suppress globals. The
 writer does not synthesize private symbols, compilands, source lines, locals, prototypes, function
 extents, or type records, and it does not add fields to package schema 3 or neutral projection
-schema 4. Generating the file requires no separately installed Visual Studio, DIA, LLVM, or
+schema 5. Generating the file requires no separately installed Visual Studio, DIA, LLVM, or
 compiler toolchain; Windows compatibility CI validates it with native and DIA-backed
 `llvm-pdbutil` reads and a direct DIA identity/public-symbol probe.
 

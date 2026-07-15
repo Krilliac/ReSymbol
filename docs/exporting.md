@@ -108,8 +108,9 @@ The `json` format is the loss-aware interchange output. It retains:
 - attributed recovered strings and exact supported data-reference relationships; and
 - structured, counted warnings for information that was reduced or omitted.
 
-The current neutral export uses `schema_version: 4`. Schema 4 adds top-level attributed `strings`
-and `data_references` arrays to schema 3's function-entry, direct-call, and thunk model. This
+The current neutral export uses `schema_version: 5`. Schema 4 added top-level attributed `strings`
+and `data_references` arrays to schema 3's function-entry, direct-call, and thunk model; schema 5
+adds deterministic string correlation to each data reference. This
 projection schema is independent from the `.resym` package-envelope schema; consumers must validate
 the version of the artifact they are actually reading.
 
@@ -165,14 +166,19 @@ continues to use the existing conservative application policy.
 
 Each projected string records its encoding, RVA, encoded byte size, exact recovered value, and
 attribution. Each projected data reference records the enclosing caller entry, instruction RVA and
-decoded size, exact target RVA, and attribution. A reference is a supported decoded address
-relationship; it does not assert an access mode, target object size, target name, or that the target
-contains a recovered string.
+decoded size, exact target RVA, attribution, and `referenced_string_rva`. Every schema-5 data
+reference emits that field as the retained string RVA or JSON `null`. A numeric value means the
+target is the string's exact RVA or lies within its encoded content. The NUL terminator is excluded,
+and a UTF-16LE interior target must be aligned to a two-byte code unit relative to the string start.
+Correlation is computed after deterministic string conflict and overlap reduction. A `null` value
+means no retained projected string matched; it does not prove the target bytes are not a string.
+The relationship still does not assert an access mode, target object size, or target name.
 
 The Markdown `Strings` table uses `Encoding`, `RVA`, `Byte size`, `Value`, `Confidence`, and
 `Source` columns. `Data references` uses `Caller RVA`, `Instruction RVA`, `Instruction size`,
-`Target RVA`, `Confidence`, and `Source`. The `Source` cells retain producer/method provenance; the
-presentation report does not discard attribution.
+`Target RVA`, `Referenced string RVA`, `Confidence`, and `Source`. The correlation cell is `-` when
+no retained string matches. The `Source` cells retain producer/method provenance; the presentation
+report does not discard attribution.
 
 The neutral projection accepts at most 65,536 strings, 32 MiB of retained string UTF-8 in
 aggregate, 16 KiB of UTF-8 per string, and 262,144 data references. These model-validation bounds
@@ -267,7 +273,7 @@ Markdown is a human-facing presentation format, not a stable interchange contrac
 table layout, and section organization may evolve between alpha releases. Tools should consume the
 `json` output and validate its `schema_version` instead of parsing the report. New analyses write
 package schema 3; export also accepts package schemas 1 and 2 through validated compatibility paths
-without rewriting them. The current neutral projection is schema 4, and adding this writer changes
+without rewriting them. The current neutral projection is schema 5, and adding this writer changes
 neither version domain.
 
 The report writer applies limits in addition to the projection's own validation bounds:
@@ -298,7 +304,7 @@ every debugger or linker will accept it. ReSymbol currently rejects non-PE sessi
 projections, mismatched session/projection binary fields, selected symbol RVAs outside real PE
 sections, and a nonzero entry point outside those sections. New analyses write package schema 3;
 export also accepts package schemas 1 and 2 through validated compatibility paths without rewriting
-them. The current neutral projection is schema 4, and MAP adds no schema fields.
+them. The current neutral projection is schema 5, and MAP adds no schema fields.
 
 The writer emits the PE timestamp and preferred load address, one group for each final PE section,
 selected public names in RVA order, and the entry-point `section:offset`. Section numbers are

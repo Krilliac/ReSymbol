@@ -3185,6 +3185,7 @@ entrypoint = "Plugin.dll"
         let json_path = package.with_extension("symbols.json");
         let json_bytes = fs::read(&json_path).expect("read JSON export");
         let json: Value = serde_json::from_slice(&json_bytes).expect("parse JSON export");
+        assert_eq!(json["schema_version"], Value::from(5_u64));
         assert_eq!(
             json["binary"]["id"],
             Value::String(BinaryId::digest(&bytes).to_string())

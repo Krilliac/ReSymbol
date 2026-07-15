@@ -109,7 +109,9 @@ Microsoft-linker-style MAP text, an exact-RSDS public-symbol PDB, and standalone
 Ghidra Java import scripts. Markdown is presentation-only rather than a stable interchange schema;
 JSON remains the machine-consumable artifact. New analyses write package schema 3, while export also
 accepts package schemas 1 and 2 through validated compatibility paths. The neutral projection is
-schema 4; MAP and PDB add no schema fields, and no exporter rewrites its source package. The scripts
+schema 5; MAP and PDB add no schema fields, and no exporter rewrites its source package. Schema 5
+correlates exact or valid content-interior data-reference targets with retained strings while
+excluding NUL terminators and misaligned UTF-16LE interiors. The scripts
 bind to the exact loaded binary SHA-256, resolve addresses as loaded image base plus RVA, preserve
 user-authored names and existing function bodies, and continue past per-symbol application errors.
 They are deliberately narrower than the planned interactive debugger bridges: prototypes, types,
@@ -144,8 +146,8 @@ functions, direct calls, internal and MSVC `REX.W`-prefixed import thunks, ASCII
 data references, and modern RTTI/vftables without executing the fixture binaries.
 
 The remaining Milestone 2 work is deliberately substantial: broader disassembly-assisted candidate
-discovery, indirect control flow and richer call-graph analysis, string-reference correlation,
-persisted basic-block modeling, broader RTTI/ABI coverage, broader compiler/configuration fixtures,
+discovery, indirect control flow and richer call-graph analysis, persisted basic-block modeling,
+broader RTTI/ABI coverage, broader compiler/configuration fixtures,
 benchmarks, and continued malformed-input/resource-limit validation.
 The debugger-hosted execution paths remain future work; their contracts and architecture should not
 be mistaken for working hosts.
@@ -215,8 +217,8 @@ adversarial obfuscation.
   entries implemented)
 - Exception and unwind metadata ingestion
 - Strings, constants, references, call relationships, and thunks (bounded exact strings, supported
-  RIP-relative data references, direct calls, and one-instruction thunks implemented; broader
-  constants and reference correlation remain planned)
+  RIP-relative data references, direct calls, one-instruction thunks, and exact/content-interior
+  string-reference correlation implemented; broader constants remain planned)
 - Initial MSVC x64 Rev1 RTTI and vftable analysis (bounded modern-layout slice implemented)
 - Portable `.resym` analysis package
 - Deterministic, loss-aware JSON symbol projection
@@ -226,6 +228,7 @@ adversarial obfuscation.
 - Boundary, coverage, malformed-input, and resource-limit benchmarks
 
 The PE metadata, x64 exception ingestion, bounded string/data-reference/direct-call/thunk recovery,
+deterministic string-reference correlation,
 bounded modern MSVC x64 RTTI/vftable slice, portable package, canonical package encoding, neutral
 JSON export projection, bounded Markdown report, initial MSVC fixture pair, and related CLI portions
 are implemented. The unfinished parts of the bullets describe the remainder of this milestone.

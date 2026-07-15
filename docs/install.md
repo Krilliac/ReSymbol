@@ -205,7 +205,10 @@ Without `--output`, those formats write `application.symbols.json`, `application
 deterministic presentation report for human review, not a stable machine-interchange format; use
 JSON for integrations. New analyses write `.resym` package schema 3; export also accepts package
 schemas 1 and 2 through validated compatibility paths without rewriting them. The current neutral
-projection is schema 4, and MAP/PDB add no schema fields. A custom Ghidra filename must use a
+projection is schema 5, and MAP/PDB add no schema fields. Schema 5 correlates exact or
+content-interior data-reference targets with retained strings, excluding NUL terminators and
+requiring UTF-16LE code-unit alignment; a missing correlation does not prove the target is not a
+string. A custom Ghidra filename must use a
 lowercase `.java` extension and a valid conservative Java-identifier stem; the generated public
 class uses that stem.
 

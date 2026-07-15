@@ -204,6 +204,13 @@ memberships, confidence, and provenance where representable, assigns collision-s
 and emits structured warnings when graph information must be reduced or omitted. Writers revalidate
 that projection before serializing it.
 
+Neutral projection schema 5 correlates each retained data reference with a retained string when the
+target is exactly the string RVA or a valid content-interior address. The terminating NUL code unit
+is outside the correlation range, and a UTF-16LE interior target must be aligned to a two-byte code
+unit relative to the string start. Correlation is derived only after deterministic string conflict
+and overlap reduction. A missing `referenced_string_rva` means no retained projected string matched;
+it does not prove the target bytes are not string data, particularly after bounded recovery.
+
 The first writers serialize the projection as JSON, render bounded Markdown or
 Microsoft-linker-style MAP text, emit an exact-RSDS public-symbol PDB, or generate self-contained
 IDAPython and Ghidra Java import scripts. Each script checks the debugger's recorded input SHA-256
@@ -462,6 +469,9 @@ base graph from persisted legacy metadata, and never rewrites the source package
 records direct calls and thunks but predates recovered strings and data references. Because a
 package omits the analyzed binary bytes, compatibility loading cannot recreate absent recovery
 results; obtaining them requires reanalyzing the exact original binary into a schema 3 package.
+The independently versioned debugger-neutral projection is schema 5; its string-reference
+correlation is derived from already validated string and data-reference claims and therefore does
+not require a package-schema change or legacy package rewrite.
 
 ## Core invariants
 

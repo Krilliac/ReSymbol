@@ -485,7 +485,7 @@ fn control_flow_projection_is_canonical_and_keeps_strongest_attribution() {
     let reverse = project(claims.into_iter().rev());
 
     assert_eq!(forward, reverse);
-    assert_eq!(forward.schema_version, 4);
+    assert_eq!(forward.schema_version, 5);
     assert_eq!(
         forward
             .functions
@@ -532,15 +532,29 @@ fn strings_and_data_references_are_canonical_and_claim_order_invariant() {
         string_literal(0x500, StringEncoding::Ascii, "Hello", 0.8, true),
         string_literal(0x502, StringEncoding::Ascii, "Overlap", 1.0, false),
         string_literal(0x600, StringEncoding::Utf16Le, "Wide", 0.9, true),
-        data_reference(0x100, Some(0x40), 0x108, 7, 0x600, 1.0, false),
-        data_reference(0x100, Some(0x40), 0x108, 7, 0x500, 0.8, true),
+        // The core claim wins this duplicate site before correlation runs.
+        data_reference(0x100, Some(0x80), 0x108, 7, 0x600, 1.0, false),
+        data_reference(0x100, Some(0x80), 0x108, 7, 0x500, 0.8, true),
+        // ASCII content accepts byte-granular interior references.
+        data_reference(0x100, Some(0x80), 0x110, 7, 0x503, 0.9, true),
+        // Boundary and unrelated targets remain explicitly uncorrelated.
+        data_reference(0x100, Some(0x80), 0x118, 7, 0x4ff, 0.9, true),
+        data_reference(0x100, Some(0x80), 0x120, 7, 0x505, 0.9, true),
+        data_reference(0x100, Some(0x80), 0x128, 7, 0x506, 0.9, true),
+        // This target lies only in the tail of the discarded overlapping string.
+        data_reference(0x100, Some(0x80), 0x130, 7, 0x508, 0.9, true),
+        // UTF-16LE references must be aligned within encoded content.
+        data_reference(0x100, Some(0x80), 0x138, 7, 0x602, 0.9, true),
+        data_reference(0x100, Some(0x80), 0x140, 7, 0x603, 0.9, true),
+        data_reference(0x100, Some(0x80), 0x148, 7, 0x608, 0.9, true),
+        data_reference(0x100, Some(0x80), 0x150, 7, 0x700, 0.9, true),
     ];
 
     let forward = project(claims.clone());
     let reverse = project(claims.into_iter().rev());
 
     assert_eq!(forward, reverse);
-    assert_eq!(forward.schema_version, 4);
+    assert_eq!(forward.schema_version, 5);
     assert_eq!(forward.strings.len(), 2);
     assert_eq!(forward.strings[0].rva, 0x500);
     assert_eq!(forward.strings[0].byte_size, 6);
@@ -553,19 +567,52 @@ fn strings_and_data_references_are_canonical_and_claim_order_invariant() {
     assert_eq!(forward.strings[1].rva, 0x600);
     assert_eq!(forward.strings[1].byte_size, 10);
     assert_eq!(forward.strings[1].encoding, ExportStringEncoding::Utf16Le);
-    assert_eq!(forward.data_references.len(), 1);
+    assert_eq!(forward.data_references.len(), 10);
     assert_eq!(forward.data_references[0].caller_rva, 0x100);
     assert_eq!(forward.data_references[0].instruction_rva, 0x108);
     assert_eq!(forward.data_references[0].instruction_size, 7);
     assert_eq!(forward.data_references[0].target_rva, 0x500);
+    assert_eq!(
+        forward.data_references[0].referenced_string_rva,
+        Some(0x500)
+    );
     assert!(matches!(
         forward.data_references[0].attribution.provenance.producer,
         ExportProducer::Core { .. }
     ));
-    assert!(forward.functions[0].entry_attribution.is_some());
     assert_eq!(
-        serde_json::to_vec(&forward).expect("serialize schema-4 projection"),
-        serde_json::to_vec(&reverse).expect("serialize reversed schema-4 projection")
+        forward
+            .data_references
+            .iter()
+            .map(|reference| (reference.target_rva, reference.referenced_string_rva))
+            .collect::<Vec<_>>(),
+        [
+            (0x500, Some(0x500)),
+            (0x503, Some(0x500)),
+            (0x4ff, None),
+            (0x505, None),
+            (0x506, None),
+            (0x508, None),
+            (0x602, Some(0x600)),
+            (0x603, None),
+            (0x608, None),
+            (0x700, None),
+        ]
+    );
+    assert!(forward.functions[0].entry_attribution.is_some());
+    let wire = serde_json::to_value(&forward).expect("serialize schema-5 projection");
+    assert_eq!(wire["schema_version"], serde_json::json!(5));
+    assert_eq!(
+        wire["data_references"][0]["referenced_string_rva"],
+        serde_json::json!(0x500)
+    );
+    assert_eq!(
+        wire["data_references"][2]["referenced_string_rva"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        serde_json::to_vec(&forward).expect("serialize schema-5 projection"),
+        serde_json::to_vec(&reverse).expect("serialize reversed schema-5 projection")
     );
 }
 
@@ -575,6 +622,7 @@ fn string_and_data_reference_validation_rejects_tampering_and_caps_growth() {
         string_literal(0x500, StringEncoding::Ascii, "Hello", 0.8, true),
         string_literal(0x600, StringEncoding::Utf16Le, "Wide", 0.9, true),
         data_reference(0x100, Some(0x40), 0x108, 7, 0x500, 0.8, true),
+        data_reference(0x100, Some(0x40), 0x110, 7, 0x700, 0.8, true),
     ]);
 
     let mut unsorted_strings = projection.clone();
@@ -660,6 +708,33 @@ fn string_and_data_reference_validation_rejects_tampering_and_caps_growth() {
         duplicate_site.validate(),
         Err(ProjectionValidationError::UnsortedCollection {
             collection: "data_references"
+        })
+    ));
+
+    let mut missing_string_link = projection.clone();
+    missing_string_link.data_references[0].referenced_string_rva = None;
+    assert!(matches!(
+        missing_string_link.validate(),
+        Err(ProjectionValidationError::InvalidBinaryField {
+            field: "data_reference.referenced_string_rva"
+        })
+    ));
+
+    let mut wrong_string_link = projection.clone();
+    wrong_string_link.data_references[0].referenced_string_rva = Some(0x600);
+    assert!(matches!(
+        wrong_string_link.validate(),
+        Err(ProjectionValidationError::InvalidBinaryField {
+            field: "data_reference.referenced_string_rva"
+        })
+    ));
+
+    let mut spurious_string_link = projection.clone();
+    spurious_string_link.data_references[1].referenced_string_rva = Some(0x500);
+    assert!(matches!(
+        spurious_string_link.validate(),
+        Err(ProjectionValidationError::InvalidBinaryField {
+            field: "data_reference.referenced_string_rva"
         })
     ));
 
@@ -760,7 +835,7 @@ fn control_flow_projection_validation_rejects_noncanonical_or_dangling_relations
     ));
 
     let mut old_schema = projection.clone();
-    old_schema.schema_version = 2;
+    old_schema.schema_version = 4;
     assert!(matches!(
         old_schema.validate(),
         Err(ProjectionValidationError::InvalidBinaryField {
@@ -913,7 +988,7 @@ fn function_class_memberships_survive_projection_with_attribution() {
         class_membership(0x100, "demo::Base", 0.8, true),
     ]);
 
-    assert_eq!(projection.schema_version, 4);
+    assert_eq!(projection.schema_version, 5);
     assert_eq!(projection.functions.len(), 1);
     assert_eq!(
         projection.functions[0]

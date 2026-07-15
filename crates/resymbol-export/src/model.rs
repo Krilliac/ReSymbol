@@ -157,6 +157,9 @@ pub struct ExportDataReference {
     pub instruction_rva: u64,
     pub instruction_size: u8,
     pub target_rva: u64,
+    /// Retained string whose encoded content contains `target_rva`, if any.
+    /// UTF-16LE targets must address a code-unit boundary; terminators are excluded.
+    pub referenced_string_rva: Option<u64>,
     pub attribution: ExportAttribution,
 }
 
@@ -276,7 +279,7 @@ pub struct ExportProjection {
 }
 
 impl ExportProjection {
-    pub(crate) const SCHEMA_VERSION: u32 = 4;
+    pub(crate) const SCHEMA_VERSION: u32 = 5;
 
     /// Revalidate ordering, range, text, attribution, and uniqueness invariants.
     pub fn validate(&self) -> Result<(), ProjectionValidationError> {
@@ -491,7 +494,7 @@ impl ExportProjection {
             });
         }
         for reference in &self.data_references {
-            validate_data_reference(reference, &self.functions, &self.binary)?;
+            validate_data_reference(reference, &self.functions, &self.strings, &self.binary)?;
         }
 
         if self.warnings.windows(2).any(|pair| pair[0] >= pair[1]) {
@@ -594,6 +597,7 @@ fn validate_recovered_string(
 fn validate_data_reference(
     reference: &ExportDataReference,
     functions: &[ExportFunction],
+    strings: &[ExportRecoveredString],
     binary: &ExportBinary,
 ) -> Result<(), ProjectionValidationError> {
     if !(1..=MAX_X86_INSTRUCTION_BYTES).contains(&reference.instruction_size) {
@@ -624,7 +628,33 @@ fn validate_data_reference(
             field: "data_reference.instruction_rva",
         });
     }
+    if reference.referenced_string_rva != referenced_string_rva(strings, reference.target_rva) {
+        return Err(ProjectionValidationError::InvalidBinaryField {
+            field: "data_reference.referenced_string_rva",
+        });
+    }
     validate_attribution(&reference.attribution)
+}
+
+pub(crate) fn referenced_string_rva(
+    strings: &[ExportRecoveredString],
+    target_rva: u64,
+) -> Option<u64> {
+    let index = strings
+        .partition_point(|string| string.rva <= target_rva)
+        .checked_sub(1)?;
+    let string = strings.get(index)?;
+    let content_size = match string.encoding {
+        ExportStringEncoding::Ascii => string.byte_size.checked_sub(1)?,
+        ExportStringEncoding::Utf16Le => string.byte_size.checked_sub(2)?,
+    };
+    let offset = target_rva.checked_sub(string.rva)?;
+    if offset >= content_size
+        || matches!(string.encoding, ExportStringEncoding::Utf16Le) && offset % 2 != 0
+    {
+        return None;
+    }
+    Some(string.rva)
 }
 
 fn validate_point(rva: u64, image_size: u64) -> Result<(), ProjectionValidationError> {

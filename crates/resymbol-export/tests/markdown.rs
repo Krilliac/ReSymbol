@@ -37,7 +37,7 @@ fn name(source: &str, output_name: &str, method: &str) -> ExportName {
 
 fn base_projection() -> ExportProjection {
     ExportProjection {
-        schema_version: 4,
+        schema_version: 5,
         binary: ExportBinary {
             id: BinaryId::digest(b"public Markdown integration fixture"),
             file_size: 0x1800,
@@ -141,13 +141,24 @@ fn realistic_projection() -> ExportProjection {
             attribution: attribution("utf16-string"),
         },
     ];
-    projection.data_references = vec![ExportDataReference {
-        caller_rva: 0x100,
-        instruction_rva: 0x10c,
-        instruction_size: 7,
-        target_rva: 0x700,
-        attribution: attribution("rip-relative-data"),
-    }];
+    projection.data_references = vec![
+        ExportDataReference {
+            caller_rva: 0x100,
+            instruction_rva: 0x10c,
+            instruction_size: 7,
+            target_rva: 0x700,
+            referenced_string_rva: Some(0x700),
+            attribution: attribution("rip-relative-data"),
+        },
+        ExportDataReference {
+            caller_rva: 0x100,
+            instruction_rva: 0x114,
+            instruction_size: 7,
+            target_rva: 0x500,
+            referenced_string_rva: None,
+            attribution: attribution("rip-relative-global"),
+        },
+    ];
     projection.warnings = vec![ProjectionWarning {
         code: ProjectionWarningCode::NameRewritten,
         subject: Some(ExportSubject::Function { rva: 0x100 }),
@@ -188,10 +199,10 @@ fn public_writer_renders_every_category_deterministically() {
     for expected in [
         "| Functions | 3 |",
         "| Strings | 2 |",
-        "| Data references | 1 |",
+        "| Data references | 2 |",
         "| Warning groups | 1 |",
         "| Encoding | RVA | Byte size | Value | Confidence | Source |",
-        "| Caller RVA | Instruction RVA | Instruction size | Target RVA | Confidence | Source |",
+        "| Caller RVA | Instruction RVA | Instruction size | Target RVA | Referenced string RVA | Confidence | Source |",
         r"ReSymbol::recover\_symbols → ReSymbol\_\_recover\_symbols",
         "aliases: ResolveSymbols",
         "struct SymbolRecord { unsigned long long rva; };",
@@ -199,7 +210,8 @@ fn public_writer_renders_every_category_deterministically() {
         "| 0x100 | 0x108 | function 0x200 |",
         "| ASCII | 0x700 | 15 | ReSymbol ready | 0.925 | core:resymbol-analysis@0.1.0; method=ascii-string; run=analysis-001 |",
         "| UTF-16LE | 0x720 | 18 | Resolved | 0.925 | core:resymbol-analysis@0.1.0; method=utf16-string; run=analysis-001 |",
-        "| 0x100 | 0x10c | 7 | 0x700 | 0.925 | core:resymbol-analysis@0.1.0; method=rip-relative-data; run=analysis-001 |",
+        "| 0x100 | 0x10c | 7 | 0x700 | 0x700 | 0.925 | core:resymbol-analysis@0.1.0; method=rip-relative-data; run=analysis-001 |",
+        "| 0x100 | 0x114 | 7 | 0x500 | - | 0.925 | core:resymbol-analysis@0.1.0; method=rip-relative-global; run=analysis-001 |",
         "| 0x300 | import IAT 0x600 |",
         "name-rewritten",
         "function 0x100",

@@ -65,6 +65,10 @@ prereleases; breaking changes remain explicit.
   conservative and do not install those relationships.
 - Added attributed recovered strings and data references to the deterministic neutral projection.
   Neutral JSON preserves them, while the standalone debugger scripts do not install them yet.
+- Added deterministic string-reference correlation to the neutral projection. A data reference now
+  identifies a retained string when its target is the string start or a valid content-interior
+  address; NUL terminators are excluded, UTF-16LE interior targets must be code-unit aligned, and an
+  absent correlation does not prove the target bytes are not a string.
 - Added `resymbol export PACKAGE --format markdown`, a deterministic, bounded human-readable
   report with binary-identity, summary, function, global, type, string, direct-call,
   data-reference, thunk, and warning sections. Markdown is a presentation format rather than a
@@ -100,8 +104,10 @@ prereleases; breaking changes remain explicit.
 - New `.resym` analyses use package schema 3. The `PeAnalysis` public alpha model now carries
   recovered strings, data references, and independent partial-scan state in addition to code
   recovery records.
-- The debugger-neutral JSON projection now uses schema 4. Its public alpha model adds attributed
-  string and data-reference arrays to schema 3's entry attribution and control-flow relationships.
+- The debugger-neutral JSON projection now uses schema 5. Schema 4 added attributed string and
+  data-reference arrays to schema 3's entry attribution and control-flow relationships; schema 5
+  adds `referenced_string_rva` to each data reference for validated exact or content-interior
+  correlation. Every schema-5 data-reference object serializes the field as an RVA or JSON `null`.
 - `resymbol analyze` and `resymbol inspect` report recovered string, data-reference, direct-call,
   and thunk counts plus their applicable partial-recovery status.
 - Address-kind collision diagnostics and both standalone debugger writers now share one
@@ -116,7 +122,8 @@ prereleases; breaking changes remain explicit.
 - Code recovery now uses a deterministic ordered worklist for direct same-range branch targets,
   stops at terminal or indirect control flow, and refuses to decode branch targets inside an
   already decoded instruction. This suppresses unreachable post-return bytes and can recover valid
-  blocks after jump-over data without changing package schema 3 or projection schema 4.
+  blocks after jump-over data without changing package schema 3 or the projected control-flow
+  record shapes.
 - New direct-call graph evidence describes the control-flow-guided traversal accurately. Validated
   package reads continue accepting the exact legacy bounded-linear-sweep evidence summary without
   relaxing any other evidence field.
@@ -140,15 +147,15 @@ version and validate serialized schema versions independently.
   and are not evidence that no relationships or literals exist. Schema 2 retains its persisted
   direct calls and thunks, but predates strings and data references. Reanalyze the exact original
   binary to create a schema 3 package with current recovery.
-- Package schema 3 and neutral projection schema 4 are independent version domains. Generic
+- Package schema 3 and neutral projection schema 5 are independent version domains. Generic
   package readers still require an explicit compatibility range and application-defined payload
   migration to accept an older schema.
 - Markdown export is presentation-only and does not change either version domain: new analyses
-  continue to use package schema 3 and the neutral projection continues to use schema 4.
+  continue to use package schema 3 and the neutral projection continues to use schema 5.
 - MAP export consumes the current validated session and neutral projection without adding fields to
-  package schema 3 or projection schema 4.
+  package schema 3 or projection schema 5.
 - PDB export consumes the same current session and projection plus a byte-backed inspection of the
-  exact original PE. It does not add fields to package schema 3 or projection schema 4.
+  exact original PE. It does not add fields to package schema 3 or projection schema 5.
 - Managed-plugin execution adds no package-schema field: successful runs and validated claims use
   the existing `AnalysisSession` plugin ledger and claim representation.
 - WASM-plugin execution likewise adds no package-schema field. It uses the existing plugin ledger,

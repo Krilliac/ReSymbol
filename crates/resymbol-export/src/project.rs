@@ -21,7 +21,7 @@ use crate::{
         ExportDataReference, ExportRecoveredString, ExportStringEncoding, MAX_ARCHITECTURE_BYTES,
         MAX_CLAIMS, MAX_DATA_REFERENCES, MAX_DECLARATIONS_PER_ENTITY, MAX_ENTITIES,
         MAX_NAMES_PER_ENTITY, MAX_RECOVERED_STRING_BYTES, MAX_RECOVERED_STRINGS, MAX_WARNINGS,
-        candidate_order, producer_authority, require_text,
+        candidate_order, producer_authority, referenced_string_rva, require_text,
     },
 };
 
@@ -227,7 +227,10 @@ impl ExportProjection {
             })
             .collect::<Vec<_>>();
         let strings = select_non_overlapping_strings(strings.into_values().collect());
-        let data_references = data_references.into_values().collect::<Vec<_>>();
+        let mut data_references = data_references.into_values().collect::<Vec<_>>();
+        for reference in &mut data_references {
+            reference.referenced_string_rva = referenced_string_rva(&strings, reference.target_rva);
+        }
 
         remove_overlapping_function_sizes(&mut functions, &mut warnings)?;
         functions.retain(|value| {
@@ -569,6 +572,7 @@ fn project_data_reference(
             instruction_rva,
             instruction_size,
             target_rva,
+            referenced_string_rva: None,
             attribution,
         },
     )
