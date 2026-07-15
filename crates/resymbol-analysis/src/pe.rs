@@ -30,6 +30,8 @@ const OPTIONAL_HEADER_MIN_SIZE: usize = 112;
 const SECTION_HEADER_SIZE: usize = 40;
 const SECTION_HEADER_SIZE_U64: u64 = 40;
 const DATA_DIRECTORY_SIZE: usize = 8;
+const DEBUG_DIRECTORY_ENTRY_SIZE: usize = 28;
+const DEBUG_DIRECTORY_ENTRY_SIZE_U32: u32 = 28;
 const IMPORT_DESCRIPTOR_SIZE: usize = 20;
 const IMPORT_DESCRIPTOR_SIZE_U32: u32 = 20;
 const RUNTIME_FUNCTION_SIZE: usize = 12;
@@ -51,6 +53,9 @@ const MAX_EXPORT_FUNCTIONS: u64 = 65_536;
 const MAX_EXPORT_NAMES: u64 = 65_536;
 const MAX_EXPORT_NAME_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_RUNTIME_FUNCTIONS: u64 = 262_144;
+const MAX_DEBUG_DIRECTORY_ENTRIES: u64 = 4_096;
+const MAX_CODEVIEW_RECORD_BYTES: u64 = 64 * 1_024;
+const MAX_CODEVIEW_PATH_BYTES: u64 = 4_096;
 const MAX_STRING_BYTES: usize = 4_096;
 const MAX_STRING_CONTENT_BYTES: u64 = 4_095;
 const MAX_PROVENANCE_VERSION_BYTES: usize = 128;
@@ -58,6 +63,72 @@ const MAX_PROVENANCE_VERSION_BYTES: usize = 128;
 const EXPORT_DIRECTORY_INDEX: usize = 0;
 const IMPORT_DIRECTORY_INDEX: usize = 1;
 const EXCEPTION_DIRECTORY_INDEX: usize = 3;
+const DEBUG_DIRECTORY_INDEX: usize = 6;
+
+const IMAGE_DEBUG_TYPE_CODEVIEW: u32 = 2;
+const CODEVIEW_RSDS_HEADER_SIZE: usize = 24;
+
+/// Exact byte-backed PE metadata required to build a PDB for one input image.
+///
+/// This inspection is intentionally ephemeral: callers must retain or reopen
+/// the original binary and compare [`identity`](Self::identity) with the
+/// analysis session before exporting. The raw section headers are copied
+/// byte-for-byte from the validated PE section table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeCodeViewInspection {
+    identity: BinaryIdentity,
+    machine: u16,
+    section_headers: Vec<[u8; 40]>,
+    rsds: PeCodeViewRsds,
+}
+
+impl PeCodeViewInspection {
+    pub const fn identity(&self) -> &BinaryIdentity {
+        &self.identity
+    }
+
+    pub const fn machine(&self) -> u16 {
+        self.machine
+    }
+
+    pub fn section_headers(&self) -> &[[u8; 40]] {
+        &self.section_headers
+    }
+
+    pub const fn rsds(&self) -> &PeCodeViewRsds {
+        &self.rsds
+    }
+}
+
+/// One unambiguous CodeView PDB 7.0 (`RSDS`) identity from a PE debug directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeCodeViewRsds {
+    /// Zero-based position in the PE `IMAGE_DEBUG_DIRECTORY` array.
+    debug_directory_index: u32,
+    /// Exact 16 bytes stored after the `RSDS` signature; no GUID byte swapping is applied.
+    guid: [u8; 16],
+    age: u32,
+    /// Advisory PDB path bytes before the first NUL, retained without assuming an encoding.
+    pdb_path: Vec<u8>,
+}
+
+impl PeCodeViewRsds {
+    pub const fn debug_directory_index(&self) -> u32 {
+        self.debug_directory_index
+    }
+
+    pub const fn guid(&self) -> [u8; 16] {
+        self.guid
+    }
+
+    pub const fn age(&self) -> u32 {
+        self.age
+    }
+
+    pub fn pdb_path(&self) -> &[u8] {
+        &self.pdb_path
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum RecoveredEntrySource {
@@ -84,6 +155,7 @@ struct ParsedHeaders {
     subsystem: u16,
     dll_characteristics: u16,
     directories: PeDataDirectories,
+    debug_directory: Option<DataDirectory>,
     sections: Vec<PeSection>,
 }
 
@@ -138,14 +210,7 @@ pub fn analyze_pe(bytes: &[u8]) -> Result<PeAnalysis, AnalysisError> {
         msvc_rtti_vftables: &msvc_rtti_vftables,
     });
 
-    let identity = BinaryIdentity {
-        id: BinaryId::digest(bytes),
-        size: u64::try_from(bytes.len())
-            .map_err(|_| AnalysisError::IntegerConversion("binary size"))?,
-        format: BinaryFormat::Pe,
-        architecture: "x86_64".to_owned(),
-        image_base: headers.image_base,
-    };
+    let identity = pe_binary_identity(bytes, headers.image_base)?;
     let symbol_graph = build_symbol_graph(SymbolGraphInput {
         identity: &identity,
         entry_point_rva: headers.entry_point_rva,
@@ -189,6 +254,219 @@ pub fn analyze_pe(bytes: &[u8]) -> Result<PeAnalysis, AnalysisError> {
     };
     analysis.validate()?;
     Ok(analysis)
+}
+
+/// Inspect the exact original PE bytes for one unambiguous CodeView `RSDS` identity.
+///
+/// The same strict PE32+ x86-64 header and section invariants used by
+/// [`analyze_pe`] are applied. The debug-directory table and CodeView payload
+/// are bounded independently. A missing, malformed, or second `RSDS` record is
+/// rejected instead of selecting a candidate heuristically. When both
+/// `AddressOfRawData` and `PointerToRawData` are present they must resolve to
+/// the same file offset; a pointer-only overlay record is accepted when its RVA
+/// is zero.
+pub fn inspect_pe_codeview(bytes: &[u8]) -> Result<PeCodeViewInspection, AnalysisError> {
+    let reader = Reader::new(bytes);
+    let headers = parse_headers(&reader)?;
+    let identity = pe_binary_identity(bytes, headers.image_base)?;
+    let section_headers = copy_raw_section_headers(&reader, &headers)?;
+    let mapper = RvaMap::new(bytes, headers.size_of_headers, &headers.sections);
+    let rsds = parse_single_codeview_rsds(&reader, &mapper, headers.debug_directory)?;
+
+    Ok(PeCodeViewInspection {
+        identity,
+        machine: headers.coff.machine,
+        section_headers,
+        rsds,
+    })
+}
+
+fn pe_binary_identity(bytes: &[u8], image_base: u64) -> Result<BinaryIdentity, AnalysisError> {
+    Ok(BinaryIdentity {
+        id: BinaryId::digest(bytes),
+        size: u64::try_from(bytes.len())
+            .map_err(|_| AnalysisError::IntegerConversion("binary size"))?,
+        format: BinaryFormat::Pe,
+        architecture: "x86_64".to_owned(),
+        image_base,
+    })
+}
+
+fn copy_raw_section_headers(
+    reader: &Reader<'_>,
+    headers: &ParsedHeaders,
+) -> Result<Vec<[u8; 40]>, AnalysisError> {
+    let pe_offset = usize::try_from(headers.pe_header_offset)
+        .map_err(|_| AnalysisError::IntegerConversion("PE header offset"))?;
+    let coff_offset = checked_add(pe_offset, PE_SIGNATURE_SIZE, "COFF header offset")?;
+    let optional_offset = checked_add(coff_offset, COFF_HEADER_SIZE, "optional-header offset")?;
+    let sections_offset = checked_add(
+        optional_offset,
+        usize::from(headers.coff.optional_header_size),
+        "section-table offset",
+    )?;
+    let mut section_headers = Vec::with_capacity(headers.sections.len());
+    for index in 0..headers.sections.len() {
+        let offset = checked_add(
+            sections_offset,
+            checked_mul(index, SECTION_HEADER_SIZE, "section-header position")?,
+            "section-header offset",
+        )?;
+        let mut raw = [0_u8; SECTION_HEADER_SIZE];
+        raw.copy_from_slice(reader.bytes(offset, SECTION_HEADER_SIZE, "section header")?);
+        section_headers.push(raw);
+    }
+    Ok(section_headers)
+}
+
+fn parse_single_codeview_rsds(
+    reader: &Reader<'_>,
+    mapper: &RvaMap<'_>,
+    directory: Option<DataDirectory>,
+) -> Result<PeCodeViewRsds, AnalysisError> {
+    let directory = directory.ok_or_else(|| AnalysisError::InvalidField {
+        field: "PE CodeView debug directory",
+        reason: "the exact binary has no debug-directory entry".to_owned(),
+    })?;
+    enforce_directory_size("debug-directory byte", directory.size)?;
+    if directory.size % DEBUG_DIRECTORY_ENTRY_SIZE_U32 != 0 {
+        return invalid_field(
+            "debug directory size",
+            "must be a multiple of the 28-byte IMAGE_DEBUG_DIRECTORY size",
+        );
+    }
+    let entry_count = u64::from(directory.size / DEBUG_DIRECTORY_ENTRY_SIZE_U32);
+    enforce_limit(
+        "debug-directory entry",
+        entry_count,
+        MAX_DEBUG_DIRECTORY_ENTRIES,
+    )?;
+    let directory_size = usize::try_from(directory.size)
+        .map_err(|_| AnalysisError::IntegerConversion("debug-directory size"))?;
+    let directory_offset = mapper.offset(directory.rva, directory_size, "PE debug directory")?;
+
+    let mut rsds = None;
+    for index in 0..usize::try_from(entry_count)
+        .map_err(|_| AnalysisError::IntegerConversion("debug-directory entry count"))?
+    {
+        let entry_offset = checked_add(
+            directory_offset,
+            checked_mul(
+                index,
+                DEBUG_DIRECTORY_ENTRY_SIZE,
+                "debug-directory entry position",
+            )?,
+            "debug-directory entry offset",
+        )?;
+        let characteristics = reader.u32(entry_offset, "debug-directory characteristics")?;
+        let debug_type = reader.u32(entry_offset + 12, "debug-directory type")?;
+        if debug_type != IMAGE_DEBUG_TYPE_CODEVIEW {
+            continue;
+        }
+        if characteristics != 0 {
+            return invalid_field(
+                "CodeView debug-directory characteristics",
+                format!("entry {index} uses non-zero reserved characteristics"),
+            );
+        }
+
+        let size_of_data = reader.u32(entry_offset + 16, "CodeView data size")?;
+        enforce_limit(
+            "CodeView debug-data byte",
+            u64::from(size_of_data),
+            MAX_DIRECTORY_BYTES,
+        )?;
+        if size_of_data < 4 {
+            return invalid_field(
+                "CodeView debug data",
+                format!("entry {index} is too small to contain a signature"),
+            );
+        }
+        let address_of_raw_data = reader.u32(entry_offset + 20, "CodeView data RVA")?;
+        let pointer_to_raw_data = reader.u32(entry_offset + 24, "CodeView data file offset")?;
+        if pointer_to_raw_data == 0 {
+            return invalid_field(
+                "CodeView data file offset",
+                format!("entry {index} has no file-backed PointerToRawData"),
+            );
+        }
+        let data_size = usize::try_from(size_of_data)
+            .map_err(|_| AnalysisError::IntegerConversion("CodeView data size"))?;
+        let data_offset = usize::try_from(pointer_to_raw_data)
+            .map_err(|_| AnalysisError::IntegerConversion("CodeView data file offset"))?;
+        let data = reader.bytes(data_offset, data_size, "CodeView debug data")?;
+
+        if address_of_raw_data != 0 {
+            let mapped_offset =
+                mapper.offset(address_of_raw_data, data_size, "CodeView debug data")?;
+            if mapped_offset != data_offset {
+                return invalid_field(
+                    "CodeView debug-data location",
+                    format!(
+                        "entry {index} maps AddressOfRawData to file offset {mapped_offset:#x}, but PointerToRawData is {data_offset:#x}"
+                    ),
+                );
+            }
+        }
+
+        if data.get(..4) != Some(b"RSDS".as_slice()) {
+            continue;
+        }
+        enforce_limit(
+            "RSDS record byte",
+            u64::from(size_of_data),
+            MAX_CODEVIEW_RECORD_BYTES,
+        )?;
+        if data.len() < CODEVIEW_RSDS_HEADER_SIZE {
+            return invalid_field(
+                "RSDS record",
+                format!(
+                    "entry {index} is {} bytes; at least {CODEVIEW_RSDS_HEADER_SIZE} are required",
+                    data.len()
+                ),
+            );
+        }
+        if rsds.is_some() {
+            return invalid_field(
+                "RSDS identity",
+                format!(
+                    "multiple RSDS records are ambiguous; a second record appears at debug-directory index {index}"
+                ),
+            );
+        }
+
+        let mut guid = [0_u8; 16];
+        guid.copy_from_slice(&data[4..20]);
+        let mut age = [0_u8; 4];
+        age.copy_from_slice(&data[20..24]);
+        let raw_path = &data[CODEVIEW_RSDS_HEADER_SIZE..];
+        let path_end = raw_path.iter().position(|byte| *byte == 0).ok_or_else(|| {
+            AnalysisError::InvalidField {
+                field: "RSDS PDB path",
+                reason: format!(
+                    "entry {index} is not NUL-terminated within its declared CodeView record"
+                ),
+            }
+        })?;
+        enforce_limit(
+            "RSDS PDB-path byte",
+            u64::try_from(path_end)
+                .map_err(|_| AnalysisError::IntegerConversion("RSDS PDB-path length"))?,
+            MAX_CODEVIEW_PATH_BYTES,
+        )?;
+        rsds = Some(PeCodeViewRsds {
+            debug_directory_index: u32::try_from(index)
+                .map_err(|_| AnalysisError::IntegerConversion("debug-directory index"))?,
+            guid,
+            age: u32::from_le_bytes(age),
+            pdb_path: raw_path[..path_end].to_vec(),
+        });
+    }
+
+    rsds.ok_or_else(|| AnalysisError::InvalidField {
+        field: "RSDS identity",
+        reason: "the exact binary has no IMAGE_DEBUG_TYPE_CODEVIEW RSDS record".to_owned(),
+    })
 }
 
 pub(crate) fn validate_pe_analysis(analysis: &PeAnalysis) -> Result<(), AnalysisError> {
@@ -900,6 +1178,13 @@ fn parse_headers(reader: &Reader<'_>) -> Result<ParsedHeaders, AnalysisError> {
             "exception directory",
         )?,
     };
+    let debug_directory = read_directory(
+        reader,
+        optional_offset,
+        directory_count,
+        DEBUG_DIRECTORY_INDEX,
+        "debug directory",
+    )?;
 
     let sections_offset = checked_add(optional_offset, optional_size, "section-table offset")?;
     let section_table_size = checked_mul(
@@ -993,6 +1278,7 @@ fn parse_headers(reader: &Reader<'_>) -> Result<ParsedHeaders, AnalysisError> {
         subsystem,
         dll_characteristics,
         directories,
+        debug_directory,
         sections,
     })
 }

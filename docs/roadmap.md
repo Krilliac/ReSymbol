@@ -47,15 +47,16 @@ implemented.
 
 The first export checkpoint is implemented as a validated, debugger-neutral projection with
 deterministic JSON output, a bounded human-readable Markdown report, PE-only
-Microsoft-linker-style MAP text, and standalone IDAPython and Ghidra Java import scripts. Markdown
-is presentation-only rather than a stable interchange schema; JSON remains the machine-consumable
-artifact. The current formats use package schema 3 and neutral projection schema 4; MAP adds no
-schema fields. The scripts bind to the exact loaded binary SHA-256, resolve
-addresses as loaded image base plus RVA, preserve user-authored names and existing function bodies,
-and continue past per-symbol application errors. They are deliberately narrower than the planned
-interactive debugger bridges: prototypes, types, alternate names, provenance comments, and richer
-relationships are retained or diagnosed by the projection but are not yet fully applied inside the
-tools.
+Microsoft-linker-style MAP text, an exact-RSDS public-symbol PDB, and standalone IDAPython and
+Ghidra Java import scripts. Markdown is presentation-only rather than a stable interchange schema;
+JSON remains the machine-consumable artifact. New analyses write package schema 3, while export also
+accepts package schemas 1 and 2 through validated compatibility paths. The neutral projection is
+schema 4; MAP and PDB add no schema fields, and no exporter rewrites its source package. The scripts
+bind to the exact loaded binary SHA-256, resolve addresses as loaded image base plus RVA, preserve
+user-authored names and existing function bodies, and continue past per-symbol application errors.
+They are deliberately narrower than the planned interactive debugger bridges: prototypes, types,
+alternate names, provenance comments, and richer relationships are retained or diagnosed by the
+projection but are not yet fully applied inside the tools.
 
 The MAP writer emits selected named symbols in deterministic RVA order using one-based PE
 `section:offset` and preferred-image-base-plus-RVA values. A selected function wins over a selected
@@ -63,10 +64,21 @@ global at the same RVA; an unnamed function suppresses nothing. `<resymbol>` mar
 provenance, and unsafe raw section-name bytes are escaped. Exact SHA-256 and file-size comments are
 informational because MAP text cannot enforce the identity of a binary loaded by another tool.
 
+The first PDB slice emits only selected public function and global names. It requires the exact
+original PE at export time, verifies its bytes against the package, rejects ambiguous or malformed
+CodeView metadata, and copies the PE's one unambiguous RSDS GUID+age and raw section headers into a
+deterministic, bounded pure-Rust MSF/PDB. It does not rewrite the PE or require a user-installed
+Visual Studio, DIA, LLVM, or compiler toolchain. Windows compatibility CI reads the generated file
+with native and DIA-backed `llvm-pdbutil` paths plus a direct DIA identity/public-symbol probe.
+Private symbols, types, prototypes, compilands, source lines, and function extents remain outside
+this initial writer.
+
 The neutral projection intentionally retains larger model-validation caps of 262,144 direct calls,
 262,144 data references, 65,536 strings, and 65,536 thunks. Those bounds support combined or
 plugin-produced graphs and are separate from the built-in recovery passes' lower caps. MAP export
 separately accepts at most 262,144 selected named function/global candidates and 64 MiB of output.
+PDB export applies the same candidate ceiling before same-RVA reduction and independently bounds
+its logical streams and MSF container.
 
 The remaining Milestone 2 work is deliberately substantial: broader disassembly-assisted candidate
 discovery, indirect control flow and richer call-graph analysis, string-reference correlation,
@@ -127,8 +139,9 @@ adversarial obfuscation.
 - Executable-range and candidate function discovery (exception ranges, exports, calls, and seeded
   entries implemented)
 - Exception and unwind metadata ingestion
-- Strings, constants, references, call relationships, and thunks (bounded direct calls and
-  one-instruction thunks implemented)
+- Strings, constants, references, call relationships, and thunks (bounded exact strings, supported
+  RIP-relative data references, direct calls, and one-instruction thunks implemented; broader
+  constants and reference correlation remain planned)
 - Initial MSVC x64 Rev1 RTTI and vftable analysis (bounded modern-layout slice implemented)
 - Portable `.resym` analysis package
 - Deterministic, loss-aware JSON symbol projection
@@ -136,10 +149,10 @@ adversarial obfuscation.
 - Reproducible open-source fixture corpus compiled with and without symbols
 - Boundary, coverage, malformed-input, and resource-limit benchmarks
 
-The PE metadata, x64 exception ingestion, bounded direct-call/thunk recovery, bounded modern MSVC
-x64 Rev1 RTTI/vftable slice, portable package, canonical package encoding, neutral JSON export
-projection, bounded Markdown report, and related CLI portions are implemented. The unfinished
-parts of the bullets describe the remainder of this milestone.
+The PE metadata, x64 exception ingestion, bounded string/data-reference/direct-call/thunk recovery,
+bounded modern MSVC x64 RTTI/vftable slice, portable package, canonical package encoding, neutral
+JSON export projection, bounded Markdown report, and related CLI portions are implemented. The
+unfinished parts of the bullets describe the remainder of this milestone.
 
 The MVP should be useful without AI, a network connection, Ghidra, or IDA.
 
@@ -152,13 +165,16 @@ The MVP should be useful without AI, a network connection, Ghidra, or IDA.
 - Standalone Ghidra Java importer with equivalent identity checks (implemented)
 - Interactive IDA and Ghidra bridges for preview, selective application, and provenance comments
 - MAP or simple public-symbol export (PE MAP implemented for selected named symbols)
-- Synthetic PDB export for validated public functions
+- Synthetic PDB export for validated public functions and globals (exact-RSDS public-symbol slice
+  implemented)
 - Explicit lossy-export diagnostics
 
 The neutral projection already emits structured diagnostics for reductions such as unsupported
 assertions, name collisions, conflicting sizes, and overlapping ranges. Target-specific loss
 summaries and richer in-tool review remain part of this milestone. The first PE MAP writer is now a
-separate `resymbol export` format; synthetic PDB output and richer MAP coverage remain planned.
+separate `resymbol export` format, and the first synthetic PDB writer covers exact-RSDS public
+symbols. Richer MAP coverage, PDB private/type/line information, and interactive bridges remain
+planned.
 
 ## Milestone 4: richer reconstruction
 

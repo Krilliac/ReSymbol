@@ -13,6 +13,7 @@ mod ida_python;
 mod map;
 mod markdown;
 mod model;
+mod pdb;
 mod project;
 
 pub use error::{ExportError, ProjectionValidationError};
@@ -27,6 +28,7 @@ pub use model::{
     ExportStringEncoding, ExportSubject, ExportThunk, ExportType, ProjectionWarning,
     ProjectionWarningCode,
 };
+pub use pdb::{MAX_PDB_PUBLIC_SYMBOLS, PdbError, render_pdb};
 
 /// Maximum UTF-8 byte length accepted for a source symbol name.
 pub const MAX_NAME_BYTES: usize = 1_024;

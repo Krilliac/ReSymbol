@@ -21,7 +21,7 @@ use resymbol_core::{
 };
 use resymbol_export::{
     ExportProjection, MAX_MAP_MODULE_NAME_BYTES, render_ghidra_java, render_ida_python, render_map,
-    render_markdown, validate_ghidra_java_class_name,
+    render_markdown, render_pdb, validate_ghidra_java_class_name,
 };
 #[cfg(test)]
 use resymbol_package::read_file_bound;
@@ -109,6 +109,14 @@ struct ExportArgs {
     /// Destination file (defaults beside the package).
     #[arg(short, long)]
     output: Option<PathBuf>,
+
+    /// Exact original PE required by --format pdb; rejected for other formats.
+    #[arg(
+        long,
+        value_name = "EXACT_ORIGINAL_PE",
+        required_if_eq("format", "pdb")
+    )]
+    binary: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -119,6 +127,8 @@ enum ExportFormat {
     Markdown,
     #[value(name = "map")]
     Map,
+    #[value(name = "pdb")]
+    Pdb,
     #[value(name = "ida-python")]
     IdaPython,
     #[value(name = "ghidra-java")]
@@ -131,6 +141,7 @@ impl ExportFormat {
             Self::Json => "debugger-neutral JSON",
             Self::Markdown => "Markdown report",
             Self::Map => "Microsoft-linker-style MAP",
+            Self::Pdb => "exact-RSDS public-symbol PDB",
             Self::IdaPython => "IDA Python",
             Self::GhidraJava => "Ghidra Java",
         }
@@ -575,7 +586,14 @@ fn export(args: ExportArgs) -> Result<()> {
         package,
         format,
         output,
+        binary,
     } = args;
+    if format != ExportFormat::Pdb && binary.is_some() {
+        bail!("--binary is accepted only with --format pdb");
+    }
+    if format == ExportFormat::Pdb && binary.is_none() {
+        bail!("--format pdb requires --binary <EXACT_ORIGINAL_PE>");
+    }
     let package_path = package
         .canonicalize()
         .with_context(|| format!("cannot open package {}", package.display()))?;
@@ -583,6 +601,17 @@ fn export(args: ExportArgs) -> Result<()> {
         .with_context(|| format!("cannot read package {}", package_path.display()))?;
     let projection = ExportProjection::from_session(package_data.package.payload())
         .context("cannot build debugger export projection")?;
+    let source_binary = if format == ExportFormat::Pdb {
+        let binary = binary.context("--format pdb requires --binary <EXACT_ORIGINAL_PE>")?;
+        let canonical = binary
+            .canonicalize()
+            .with_context(|| format!("cannot open source binary {}", binary.display()))?;
+        let bytes = fs::read(&canonical)
+            .with_context(|| format!("cannot read source binary {}", canonical.display()))?;
+        Some((canonical, bytes))
+    } else {
+        None
+    };
     let output = output
         .unwrap_or_else(|| default_export_path(&package, format, projection.binary.id.as_str()));
 
@@ -593,27 +622,39 @@ fn export(args: ExportArgs) -> Result<()> {
             let mut json = serde_json::to_string_pretty(&projection)
                 .context("cannot serialize debugger-neutral export JSON")?;
             json.push('\n');
-            json
+            json.into_bytes()
         }
-        ExportFormat::Markdown => {
-            render_markdown(&projection).context("cannot render Markdown report")?
-        }
+        ExportFormat::Markdown => render_markdown(&projection)
+            .context("cannot render Markdown report")?
+            .into_bytes(),
         ExportFormat::Map => render_map(
             package_data.package.payload(),
             &projection,
             &map_module_name(&package, projection.binary.id.as_str()),
         )
-        .context("cannot render Microsoft-linker-style MAP")?,
-        ExportFormat::IdaPython => {
-            render_ida_python(&projection).context("cannot render IDA Python import script")?
-        }
+        .context("cannot render Microsoft-linker-style MAP")?
+        .into_bytes(),
+        ExportFormat::Pdb => render_pdb(
+            package_data.package.payload(),
+            &projection,
+            source_binary
+                .as_ref()
+                .expect("PDB source binary was required above")
+                .1
+                .as_slice(),
+        )
+        .context("cannot render exact-RSDS public-symbol PDB")?,
+        ExportFormat::IdaPython => render_ida_python(&projection)
+            .context("cannot render IDA Python import script")?
+            .into_bytes(),
         ExportFormat::GhidraJava => {
             let class_name = ghidra_java_class_name(&output)?;
             render_ghidra_java(&projection, class_name)
                 .context("cannot render Ghidra Java import script")?
+                .into_bytes()
         }
     };
-    write_export_new(&output, rendered.as_bytes())?;
+    write_export_new(&output, &rendered)?;
 
     let warning_occurrences = projection
         .warnings
@@ -621,6 +662,9 @@ fn export(args: ExportArgs) -> Result<()> {
         .map(|warning| warning.occurrences)
         .sum::<u64>();
     println!("package: {}", package_path.display());
+    if let Some((path, _)) = &source_binary {
+        println!("source binary: {}", path.display());
+    }
     println!("format: {}", format.label());
     println!("output: {}", output.display());
     println!("binary SHA-256: {}", projection.binary.id);
@@ -671,6 +715,9 @@ fn export(args: ExportArgs) -> Result<()> {
         ExportFormat::Map => println!(
             "identity notice: MAP comments record the exact binary SHA-256, but a MAP loader cannot enforce it; verify the input manually"
         ),
+        ExportFormat::Pdb => println!(
+            "identity gate: supplied PE SHA-256 matches the package, and the PDB copies its exact RSDS GUID and age; the PE was not modified"
+        ),
         ExportFormat::IdaPython | ExportFormat::GhidraJava => println!(
             "identity gate: importer verifies the loaded program SHA-256 before any mutation"
         ),
@@ -684,6 +731,7 @@ fn default_export_path(package: &Path, format: ExportFormat, binary_sha256: &str
         ExportFormat::Json => package.with_extension("symbols.json"),
         ExportFormat::Markdown => package.with_extension("symbols.md"),
         ExportFormat::Map => package.with_extension("map"),
+        ExportFormat::Pdb => package.with_extension("pdb"),
         ExportFormat::IdaPython => package.with_extension("ida.py"),
         ExportFormat::GhidraJava => {
             let prefix = binary_sha256
@@ -755,25 +803,45 @@ fn ghidra_java_class_name(output: &Path) -> Result<&str> {
 }
 
 fn write_export_new(output: &Path, bytes: &[u8]) -> Result<()> {
-    let mut file = match fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(output)
-    {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+    match fs::symlink_metadata(output) {
+        Ok(_) => bail!("refusing to overwrite existing export {}", output.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("cannot inspect export destination {}", output.display())
+            });
+        }
+    }
+
+    let parent = output
+        .parent()
+        .filter(|value| !value.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut staged = tempfile::Builder::new()
+        .prefix(".resymbol-export-")
+        .tempfile_in(parent)
+        .with_context(|| {
+            format!(
+                "cannot create a temporary export beside {}",
+                output.display()
+            )
+        })?;
+    staged
+        .write_all(bytes)
+        .with_context(|| format!("cannot stage export {}", output.display()))?;
+    staged
+        .as_file()
+        .sync_all()
+        .with_context(|| format!("cannot flush staged export {}", output.display()))?;
+
+    match staged.persist_noclobber(output) {
+        Ok(_) => Ok(()),
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
             bail!("refusing to overwrite existing export {}", output.display())
         }
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("cannot create export {}", output.display()));
-        }
-    };
-    file.write_all(bytes)
-        .with_context(|| format!("cannot write export {}", output.display()))?;
-    file.sync_all()
-        .with_context(|| format!("cannot flush export {}", output.display()))?;
-    Ok(())
+        Err(error) => Err(error.error)
+            .with_context(|| format!("cannot publish completed export {}", output.display())),
+    }
 }
 
 fn ensure_output_absent(output: &Path) -> Result<()> {
@@ -2021,6 +2089,40 @@ mod tests {
         bytes
     }
 
+    fn pe_pdb_fixture() -> Vec<u8> {
+        const RAW_GUID: [u8; 16] = [
+            0x33, 0x22, 0x11, 0x00, 0x55, 0x44, 0x77, 0x66, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ];
+        const DEBUG_DIRECTORY_RVA: u32 = 0x1380;
+        const CODEVIEW_RVA: u32 = 0x1400;
+
+        let mut bytes = pe_fixture();
+        let mut record = Vec::new();
+        record.extend_from_slice(b"RSDS");
+        record.extend_from_slice(&RAW_GUID);
+        record.extend_from_slice(&7_u32.to_le_bytes());
+        record.extend_from_slice(b"resymbol-rsds-x64.pdb\0");
+
+        set_directory(&mut bytes, 6, DEBUG_DIRECTORY_RVA, 28);
+        let debug = file_offset(DEBUG_DIRECTORY_RVA);
+        put_u32(&mut bytes, debug + 12, 2);
+        put_u32(
+            &mut bytes,
+            debug + 16,
+            u32::try_from(record.len()).expect("fixture CodeView record size"),
+        );
+        put_u32(&mut bytes, debug + 20, CODEVIEW_RVA);
+        put_u32(
+            &mut bytes,
+            debug + 24,
+            u32::try_from(file_offset(CODEVIEW_RVA)).expect("fixture CodeView file offset"),
+        );
+        let record_offset = file_offset(CODEVIEW_RVA);
+        bytes[record_offset..record_offset + record.len()].copy_from_slice(&record);
+        bytes
+    }
+
     fn pe_code_recovery_fixture() -> Vec<u8> {
         let mut bytes = pe_fixture();
 
@@ -2190,7 +2292,44 @@ args = ["--stdio", "literal argument"]
             assert_eq!(args.package, PathBuf::from("analysis.resym"));
             assert_eq!(args.format, expected);
             assert_eq!(args.output, Some(PathBuf::from("symbols.out")));
+            assert_eq!(args.binary, None);
         }
+
+        let error =
+            Cli::try_parse_from(["resymbol", "export", "analysis.resym", "--format", "pdb"])
+                .expect_err("PDB format requires its exact source PE at argument parsing time");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+        assert!(error.to_string().contains("--binary <EXACT_ORIGINAL_PE>"));
+
+        let cli = Cli::try_parse_from([
+            "resymbol",
+            "export",
+            "analysis.resym",
+            "--format",
+            "pdb",
+            "--binary",
+            "application.exe",
+        ])
+        .expect("PDB source binary argument parses");
+        let Command::Export(args) = cli.command else {
+            panic!("export command expected");
+        };
+        assert_eq!(args.binary, Some(PathBuf::from("application.exe")));
+    }
+
+    #[test]
+    fn source_binary_option_is_rejected_for_non_pdb_formats() {
+        let error = export(ExportArgs {
+            package: PathBuf::from("does-not-need-to-exist.resym"),
+            format: ExportFormat::Json,
+            output: None,
+            binary: Some(PathBuf::from("application.exe")),
+        })
+        .expect_err("non-PDB export must not accept a misleading source binary");
+        assert!(error.to_string().contains("only with --format pdb"));
     }
 
     #[test]
@@ -2385,6 +2524,10 @@ args = ["--stdio", "literal argument"]
             PathBuf::from("build/application.map")
         );
         assert_eq!(
+            default_export_path(package, ExportFormat::Pdb, sha256),
+            PathBuf::from("build/application.pdb")
+        );
+        assert_eq!(
             default_export_path(package, ExportFormat::IdaPython, sha256),
             PathBuf::from("build/application.ida.py")
         );
@@ -2428,11 +2571,11 @@ args = ["--stdio", "literal argument"]
         let package = temp.path().join("fixture.resym");
         let plugins = temp.path().join("plugins");
         fs::create_dir(&plugins).expect("create plugin directory");
-        let bytes = pe_fixture();
+        let bytes = pe_pdb_fixture();
         fs::write(&binary, &bytes).expect("write PE fixture");
         analyze(
             AnalyzeArgs {
-                binary,
+                binary: binary.clone(),
                 output: Some(package.clone()),
                 plugins: Vec::new(),
                 strict_plugins: false,
@@ -2446,6 +2589,7 @@ args = ["--stdio", "literal argument"]
             package: package.clone(),
             format: ExportFormat::Json,
             output: None,
+            binary: None,
         })
         .expect("export JSON");
         let json_path = package.with_extension("symbols.json");
@@ -2460,6 +2604,7 @@ args = ["--stdio", "literal argument"]
             package: package.clone(),
             format: ExportFormat::Json,
             output: None,
+            binary: None,
         })
         .expect_err("existing export must not be overwritten");
         assert!(error.to_string().contains("refusing to overwrite"));
@@ -2472,6 +2617,7 @@ args = ["--stdio", "literal argument"]
             package: package.clone(),
             format: ExportFormat::Markdown,
             output: None,
+            binary: None,
         })
         .expect("export Markdown report");
         let markdown_path = package.with_extension("symbols.md");
@@ -2483,6 +2629,7 @@ args = ["--stdio", "literal argument"]
             package: package.clone(),
             format: ExportFormat::Markdown,
             output: None,
+            binary: None,
         })
         .expect_err("existing Markdown export must not be overwritten");
         assert!(error.to_string().contains("refusing to overwrite"));
@@ -2495,6 +2642,7 @@ args = ["--stdio", "literal argument"]
             package: package.clone(),
             format: ExportFormat::Map,
             output: None,
+            binary: None,
         })
         .expect("export Microsoft-linker-style MAP");
         let map_path = package.with_extension("map");
@@ -2507,6 +2655,7 @@ args = ["--stdio", "literal argument"]
             package: package.clone(),
             format: ExportFormat::Map,
             output: None,
+            binary: None,
         })
         .expect_err("existing MAP export must not be overwritten");
         assert!(error.to_string().contains("refusing to overwrite"));
@@ -2515,10 +2664,60 @@ args = ["--stdio", "literal argument"]
             map_bytes
         );
 
+        let error = export(ExportArgs {
+            package: package.clone(),
+            format: ExportFormat::Pdb,
+            output: Some(temp.path().join("missing-source.pdb")),
+            binary: None,
+        })
+        .expect_err("PDB export requires the exact source PE");
+        assert!(error.to_string().contains("requires --binary"));
+
+        let wrong_binary = temp.path().join("wrong.exe");
+        let mut wrong_bytes = bytes.clone();
+        *wrong_bytes.last_mut().expect("non-empty PE fixture") ^= 1;
+        fs::write(&wrong_binary, wrong_bytes).expect("write mismatched PE fixture");
+        let mismatched_output = temp.path().join("mismatched.pdb");
+        let error = export(ExportArgs {
+            package: package.clone(),
+            format: ExportFormat::Pdb,
+            output: Some(mismatched_output.clone()),
+            binary: Some(wrong_binary),
+        })
+        .expect_err("PDB export binds the exact PE digest");
+        assert!(format!("{error:#}").contains("binary.id"));
+        assert!(!mismatched_output.exists());
+
+        export(ExportArgs {
+            package: package.clone(),
+            format: ExportFormat::Pdb,
+            output: None,
+            binary: Some(binary.clone()),
+        })
+        .expect("export exact-RSDS public-symbol PDB");
+        let pdb_path = package.with_extension("pdb");
+        let pdb_bytes = fs::read(&pdb_path).expect("read PDB export");
+        assert!(pdb_bytes.starts_with(b"Microsoft C/C++ MSF 7.00\r\n\x1aDS\0\0\0"));
+        assert_eq!(pdb_bytes.len() % 4_096, 0);
+
+        let error = export(ExportArgs {
+            package: package.clone(),
+            format: ExportFormat::Pdb,
+            output: None,
+            binary: Some(binary.clone()),
+        })
+        .expect_err("existing PDB export must not be overwritten");
+        assert!(error.to_string().contains("refusing to overwrite"));
+        assert_eq!(
+            fs::read(&pdb_path).expect("read preserved PDB export"),
+            pdb_bytes
+        );
+
         export(ExportArgs {
             package: package.clone(),
             format: ExportFormat::IdaPython,
             output: None,
+            binary: None,
         })
         .expect("export IDA script");
         let ida_script =
@@ -2530,6 +2729,7 @@ args = ["--stdio", "literal argument"]
             package: package.clone(),
             format: ExportFormat::GhidraJava,
             output: None,
+            binary: None,
         })
         .expect("export Ghidra script");
         let ghidra_path = default_export_path(
@@ -2541,6 +2741,21 @@ args = ["--stdio", "literal argument"]
         assert!(ghidra_script.contains("public class ReSymbolImport_"));
         assert!(ghidra_script.contains("getExecutableSHA256"));
         assert!(ghidra_script.contains(BinaryId::digest(&bytes).as_str()));
+
+        let staged_exports = fs::read_dir(temp.path())
+            .expect("read export test directory")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".resymbol-export-")
+            })
+            .count();
+        assert_eq!(
+            staged_exports, 0,
+            "completed exports leave no staging files"
+        );
     }
 
     #[test]

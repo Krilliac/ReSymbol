@@ -132,9 +132,14 @@ independent reconciliation path. The export surface should show:
 - existing-file/create-new behavior; and
 - a reviewable summary before writing.
 
-IDA/Ghidra script export and the current MAP text export, followed later by PDB export, should
-differ only in their target capability panels. An interactive debugger bridge may add preview and
-selective application, but it still uses the core identity and projection rules.
+IDA/Ghidra script export and the current MAP and exact-RSDS public-symbol PDB CLI targets should
+differ only in their target capability panels. A future PDB panel must require selection of the
+exact original PE, show that its SHA-256 matches the package, and report the unambiguous RSDS
+GUID+age gate before enabling the write action. It must describe the current output as public
+function/global names only, without implying that types, private symbols, source lines, or
+function extents are present. This records how the existing CLI capability should appear; it does
+not claim that the GUI exists. An interactive debugger bridge may add preview and selective
+application, but it still uses the core identity and projection rules.
 
 ## Theme system
 

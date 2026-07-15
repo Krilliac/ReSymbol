@@ -42,6 +42,16 @@ prereleases; breaking changes remain explicit.
   SHA-256/file-size identity as informational semicolon comments. The CLI defaults to
   `application.map`; for a valid UTF-8 package stem, unsupported bytes become `_` and the result is
   capped at 255 bytes. Non-UTF-8 or otherwise unusable stems use `resymbol_<sha12>`.
+- Added `resymbol export PACKAGE --format pdb --binary EXACT_ORIGINAL_PE`, a deterministic,
+  bounded, pure-Rust MSF 7.00 PDB writer for selected public function and global names. It verifies
+  the supplied PE bytes against the package, requires one unambiguous CodeView RSDS record, copies
+  its exact GUID+age and the PE's raw section headers, and never rewrites the executable. The first
+  slice deliberately omits private symbols, compilands, source lines, locals, prototypes, function
+  extents, and types; ordinary generation requires no Visual Studio, DIA, LLVM, or compiler
+  installation.
+- Added Windows PDB compatibility CI covering native `llvm-pdbutil` stream inspection, its
+  DIA-backed view, and a direct DIA probe for exact GUID+age validation and public function/global
+  enumeration.
 - Added `ResymPackage::try_map_payload` so applications can migrate a payload after validating and
   preserving its package envelope.
 
@@ -57,6 +67,12 @@ prereleases; breaking changes remain explicit.
 - Address-kind collision diagnostics and both standalone debugger writers now share one
   mutation-aware rule: a same-RVA global is suppressed only when the writer actually emits a
   function record. Entry-only function evidence does not become a debugger mutation.
+- Export artifacts are staged and flushed beside their destination, then published with a
+  no-clobber operation. Write failures no longer leave a truncated file at the requested final
+  path.
+- PDB's `--binary` requirement is enforced during CLI argument parsing, and the public Rust writer
+  accepts exact PE bytes and performs its own digest and CodeView inspection instead of trusting a
+  caller-constructed metadata summary.
 
 These public-struct field additions are source-breaking for downstream Rust code that constructs or
 destructures the structs directly. ReSymbol is not yet 1.0; downstream users should pin an alpha
@@ -83,7 +99,9 @@ version and validate serialized schema versions independently.
 - Markdown export is presentation-only and does not change either version domain: new analyses
   continue to use package schema 3 and the neutral projection continues to use schema 4.
 - MAP export consumes the current validated session and neutral projection without adding fields to
-  package schema 3 or projection schema 4. PDB output remains planned.
+  package schema 3 or projection schema 4.
+- PDB export consumes the same current session and projection plus a byte-backed inspection of the
+  exact original PE. It does not add fields to package schema 3 or projection schema 4.
 
 ### Safety and limits
 
@@ -117,3 +135,8 @@ version and validate serialized schema versions independently.
   reduction and at most 64 MiB of generated text. A selected function wins over a selected global
   at the same RVA; an unnamed function suppresses nothing. MAP comments cannot enforce exact-binary
   identity, so consumers must compare the recorded SHA-256 and file size independently.
+- PDB export accepts at most 262,144 selected named function/global candidates before same-RVA
+  reduction and bounds both its logical stream set and complete MSF container. It rejects a missing,
+  malformed, or second RSDS identity; a source/session mismatch; a selected symbol outside the PE
+  sections; and unsupported names or layouts before creating the destination. A selected function
+  wins over a selected global at the same RVA, while an unnamed function suppresses nothing.

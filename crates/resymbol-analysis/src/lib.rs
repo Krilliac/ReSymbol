@@ -13,7 +13,7 @@ mod string_recovery;
 mod types;
 
 pub use error::AnalysisError;
-pub use pe::analyze_pe;
+pub use pe::{PeCodeViewInspection, PeCodeViewRsds, analyze_pe, inspect_pe_codeview};
 pub use session::{AnalysisSession, PluginRunRecord, PluginRunStatus, SessionValidationError};
 pub use types::{
     BinaryAnalysis, CoffHeader, DataDirectory, ImportTarget, MsvcRttiBaseClass, MsvcRttiVftable,

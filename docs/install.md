@@ -1,7 +1,7 @@
 # Install ReSymbol
 
 ReSymbol prereleases are portable command-line downloads. You do not need Rust, .NET, Python,
-CMake, Visual Studio, or another compiler to run an official archive.
+CMake, Visual Studio, LLVM, DIA, or another compiler to run an official archive.
 
 > [!IMPORTANT]
 > Release artifacts appear on the GitHub Releases page only after a maintainer pushes a matching
@@ -15,7 +15,9 @@ metadata, imports, exports, forwarded exports, and x64 exception-directory recor
 names and metadata-backed `RUNTIME_FUNCTION` ranges become evidence-bearing symbol-graph claims.
 It also performs a bounded pure-Rust x86-64 linear sweep inside fully file-backed exception ranges
 and checks metadata-backed entry candidates for one-instruction internal or import thunks. It
-retains supported direct calls and thunks without inventing source names or function sizes.
+retains supported direct calls, RIP-relative data references, and thunks without inventing source
+names, function sizes, or target semantics. A separate bounded pass recovers exact NUL-terminated
+ASCII and UTF-16LE strings from eligible file-backed data.
 The built-in bounded RTTI pass also validates modern MSVC x64 Rev1 type descriptors, class and base
 records, vftables, and executable virtual-slot targets. Recovered class/type names, vftable names,
 and function-to-class relationships become evidence-bearing claims, and the result is written to a
@@ -27,23 +29,25 @@ name virtual functions merely because their targets appear in a vftable. RTTI su
 accepts only the modern x64 Rev1 layout with
 28-byte base-class descriptors carrying a nested class-hierarchy reference; older/x86 RTTI and
 other ABI variants remain unsupported. It can export a neutral JSON projection, a bounded
-human-readable Markdown report, deterministic Microsoft-linker-style MAP text, or self-contained
-import scripts for IDA and Ghidra, but it does not yet produce PDB, DWARF, or native
-debugger-database files. Packed binaries, .NET assemblies, other CPU architectures, ELF, Mach-O,
-and richer debugger integration are future
-analysis milestones.
+human-readable Markdown report, deterministic Microsoft-linker-style MAP text, an exact-RSDS
+public-symbol PDB, or self-contained import scripts for IDA and Ghidra. The PDB slice currently
+supports PE32+ x86-64 and public named functions/globals only; richer PDB records, DWARF, native
+debugger-database files, packed binaries, .NET assemblies, other CPU architectures, ELF, Mach-O,
+and richer debugger integration are future analysis milestones.
 
 The core PE/RTTI analysis is offline and never executes the input. Its narrow decoder is included
 in the executable and requires no native library or compiler. Code recovery decodes at most 64 MiB
-and 1,000,000 instructions, retaining at most 8,192 direct calls and 4,096 thunks. An internal
-target covered by known `RUNTIME_FUNCTION` metadata is suppressed unless its RVA matches a recorded
+and 1,000,000 instructions, retaining at most 8,192 direct calls, 32,768 data references, and 4,096
+thunks. String recovery has its own bounded scan and retention budgets. An internal target covered
+by known `RUNTIME_FUNCTION` metadata is suppressed unless its RVA matches a recorded
 runtime-function begin. Because this is a heuristic-confidence linear sweep rather than recursive
-disassembly, bytes after a terminator or embedded data can produce false positives, while an invalid
-encoding can stop a range and omit later calls. RTTI discovery scans at most 64 MiB of eligible
-read-only initialized data for candidate back-pointers; candidate validation then performs bounded
-reads of referenced metadata and contiguous executable slot candidates. It retains at most 16 MiB
-of RTTI name text, with additional record-count limits. If an aggregate limit is reached, the
-valid prefix is kept and explicitly marked partial rather than reported as a complete scan.
+disassembly, bytes after a terminator or embedded data can produce false positives, while an
+invalid encoding can stop a range and omit later calls or references. RTTI discovery scans at most
+64 MiB of eligible read-only initialized data for candidate back-pointers; candidate validation
+then performs bounded reads of referenced metadata and contiguous executable slot candidates. It
+retains at most 16 MiB of RTTI name text, with additional record-count limits. If an aggregate
+limit is reached, the valid prefix is kept and explicitly marked partial rather than reported as a
+complete scan.
 
 The current release also includes the first external-process analysis-plugin runtime. Dropped-in
 plugins are discovered automatically, but process code requires explicit approval bound to its
@@ -107,6 +111,7 @@ resymbol inspect path/to/application.resym
 resymbol export path/to/application.resym --format json
 resymbol export path/to/application.resym --format markdown
 resymbol export path/to/application.resym --format map
+resymbol export path/to/application.resym --format pdb --binary path/to/application.exe
 resymbol export path/to/application.resym --format ida-python
 resymbol export path/to/application.resym --format ghidra-java
 resymbol plugin list
@@ -152,17 +157,33 @@ Export a package to a specific destination with `--output`:
 resymbol export results/application.resym --format json --output results/application.symbols.json
 resymbol export results/application.resym --format markdown --output results/application.symbols.md
 resymbol export results/application.resym --format map --output results/application.map
+resymbol export results/application.resym \
+  --format pdb \
+  --binary path/to/application.exe \
+  --output results/application.pdb
 resymbol export results/application.resym --format ida-python --output results/application_ida.py
 resymbol export results/application.resym --format ghidra-java --output results/ReSymbolImport.java
 ```
 
 Without `--output`, those formats write `application.symbols.json`, `application.symbols.md`,
-`application.map`, `application.ida.py`, and `ReSymbolImport_<first-12-binary-sha256>.java` beside
-the package, respectively. Markdown is a deterministic presentation report for human review, not
-a stable machine-interchange format; use JSON for integrations. Current exports use `.resym`
-package schema 3 and neutral projection schema 4. Adding MAP output changes neither schema. A
-custom Ghidra filename must use a lowercase `.java` extension and a valid conservative
-Java-identifier stem; the generated public class uses that stem.
+`application.map`, `application.pdb`, `application.ida.py`, and
+`ReSymbolImport_<first-12-binary-sha256>.java` beside the package, respectively. Markdown is a
+deterministic presentation report for human review, not a stable machine-interchange format; use
+JSON for integrations. New analyses write `.resym` package schema 3; export also accepts package
+schemas 1 and 2 through validated compatibility paths without rewriting them. The current neutral
+projection is schema 4, and MAP/PDB add no schema fields. A custom Ghidra filename must use a
+lowercase `.java` extension and a valid conservative Java-identifier stem; the generated public
+class uses that stem.
+
+PDB export must reread the exact original PE because `.resym` intentionally does not contain its
+bytes. The source must match the package's SHA-256/session identity and contain exactly one valid
+modern RSDS CodeView record; a missing source, different build, NB10-only source, malformed record,
+or multiple RSDS records is rejected before output creation. ReSymbol copies the RSDS GUID and age
+and raw PE section headers into a deterministic public-symbol-only PDB. It does not emit types,
+private symbols, locals, line tables, or function extents, and it never rewrites the PE. Generation
+is offline and needs no Visual Studio, LLVM, or DIA installation. Load the PDB manually, or copy or
+rename it to the RSDS-recorded basename and place it in the debugger's symbol path. See the export
+guide for detailed bounds and loading advice.
 
 MAP export currently accepts PE analysis packages only. Its display module name comes from the
 package filename stem: unsupported and non-ASCII UTF-8 bytes become `_`, the result is capped at
