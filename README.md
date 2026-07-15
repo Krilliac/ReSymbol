@@ -34,8 +34,8 @@ The current alpha implements and tests an end-to-end, deliberately narrow analys
 - bounded pure-Rust x86-64 decoding inside fully file-backed `RUNTIME_FUNCTION` ranges, recovering
   supported direct calls to internal executable targets, exact parsed import-address-table slots,
   or targets resolved one hop through exact read-only in-image function-pointer slots;
-  one-instruction thunks to internal targets or exact parsed import slots; and exact supported
-  RIP-relative references into eligible data;
+  one-instruction thunks to internal targets, exact parsed import slots, or one-hop read-only
+  function-pointer targets; and exact supported RIP-relative references into eligible data;
 - bounded recovery of exact NUL-terminated ASCII and UTF-16LE strings from file-backed,
   initialized, readable, non-executable sections, including writable data;
 - a source-available, byte-reproducible four-artifact MSVC x64 PE fixture matrix spanning optimized
@@ -99,14 +99,17 @@ initialized, non-writable, non-executable data. Parsed IAT membership takes prec
 the slot's little-endian preferred-image VA is resolved exactly once to a file-backed executable
 target; pointer chains and writable slots remain unsupported. A resolved pointer call records its
 slot and endpoint explicitly and retains the same instruction as a paired data reference to the
-slot. Seeded `E9`, `EB`, or RIP-relative `FF 25` thunks remain supported, including the redundant
-`REX.W` prefix emitted by current MSVC for some import calls and thunks. The built-in pass discovers
-at most 262,144 block starts and retains at most 8,192 direct calls, 32,768 supported RIP-relative
-data references, and 4,096 thunks. These are heuristic-confidence findings: reachable embedded data
-can still decode as instructions, while an invalid encoding or unsupported branch can omit later
-relationships on that path. An internal target covered by known `RUNTIME_FUNCTION` metadata is
-suppressed unless its RVA matches a recorded runtime-function begin. The pass does not persist a
-basic-block graph, infer erased identifiers, invent names or sizes, recover register-indirect
+slot. Seeded `E9` and `EB` internal thunks remain supported. Exact RIP-relative `FF 25 disp32` and
+redundant-`REX.W` `48 FF 25 disp32` thunks use the same IAT-first policy: a parsed IAT slot remains
+an import target, while any other accepted slot resolves one read-only pointer hop to executable
+code. A pointer thunk records its slot and endpoint without requiring a paired data reference. The
+built-in pass discovers at most 262,144 block starts and retains at most 8,192 direct calls, 32,768
+supported RIP-relative data references, and 4,096 thunks. These are heuristic-confidence findings:
+reachable embedded data can still decode as instructions, while an invalid encoding or unsupported
+branch can omit later relationships on that path. An internal target covered by known
+`RUNTIME_FUNCTION` metadata is suppressed unless its RVA matches a recorded runtime-function
+begin. The pass does not persist a basic-block graph, infer erased identifiers, invent names or
+sizes, recover register-indirect
 control flow, or claim a complete call graph. A separate bounded pass retains exact, fully
 terminated printable ASCII and valid UTF-16LE strings from eligible data, with deterministic
 overlap handling; it does not publish truncated prefixes or infer a variable type from a literal.
@@ -221,8 +224,8 @@ validated in-memory compatibility paths. Migration does not rewrite the source p
 analysis because `.resym` does not embed the executable bytes. Schema 1 therefore has no available
 recovered calls, thunks, strings, or data references. Schema 2 retains calls and thunks but predates
 strings and data references. Schema 3 retains those string/data records, but schemas 2 and 3 both
-predate read-only function-pointer call resolution. Reanalyze the exact original binary to produce
-schema 4 with current recovery results. A schema 2 or 3 envelope containing a schema-4
+predate read-only function-pointer call and thunk resolution. Reanalyze the exact original binary
+to produce schema 4 with current recovery results. A schema 2 or 3 envelope containing a schema-4
 `function-pointer` target is rejected rather than treated as a relabeled legacy package.
 
 The `analyze` and `inspect` summaries report recovered strings, data references, direct calls, and

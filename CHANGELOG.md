@@ -53,19 +53,21 @@ prereleases; breaking changes remain explicit.
   archive contents; their byte-variable full PDBs remain local build outputs.
 - Added a pure-Rust x86-64 decoder that performs a bounded control-flow-guided block sweep of fully
   file-backed `RUNTIME_FUNCTION` ranges for supported direct calls and data references, and checks
-  metadata-backed entries for one-instruction internal or import thunks. No native disassembler
-  library or compiler is needed to run a release build.
+  seeded executable candidates for one-instruction internal, import, or read-only function-pointer
+  thunks. No native disassembler library or compiler is needed to run a release build.
 - Added bounded exact recovery of NUL-terminated printable ASCII and valid UTF-16LE strings from
   file-backed, initialized, readable, non-executable PE sections, with deterministic overlap
   handling and explicit partial-scan state.
 - Added supported x64 RIP-relative data-reference recovery to eligible file-backed data, recording
   the caller, instruction RVA and size, and exact target RVA without inventing access semantics or
   target names.
-- Added explicit resolution of exact `FF 15 disp32` and redundant-`REX.W` `48 FF 15 disp32` calls
-  through one complete eight-byte slot in read-only initialized PE data. Parsed IAT slots retain
-  precedence; accepted non-IAT slots resolve one preferred-image VA hop to executable code and
-  preserve both `slot_rva` and the endpoint plus a paired same-site data reference. Focused
-  synthetic PE fixtures cover both encodings, rejection policy, caps, packages, and exports without
+- Added explicit resolution of exact `FF 15 disp32`/`48 FF 15 disp32` calls and exact
+  `FF 25 disp32`/`48 FF 25 disp32` thunks through one complete eight-byte slot in read-only
+  initialized PE data. Parsed IAT slots retain precedence; accepted non-IAT slots resolve one
+  preferred-image VA hop to executable code and preserve both `slot_rva` and the endpoint. Pointer
+  calls also retain a paired same-site data reference, while pointer thunks preserve control-flow
+  provenance without inventing a data-reference record outside the instruction sweep. Focused
+  synthetic PE fixtures cover the encodings, rejection policy, caps, packages, and exports without
   regenerating or changing the hashes of the four checked-in MSVC corpus binaries.
 - Added `ControlFlowTarget` and the `FunctionEntry`, `DirectCall`, and `ThunkTarget` symbol
   assertions, plus PE recovery records and graph attribution for PE entry points, recovered targets,
@@ -119,8 +121,8 @@ prereleases; breaking changes remain explicit.
 - Raised the pinned Rust source-build toolchain and workspace MSRV to 1.86 for the Component Model
   host. Ordinary release users and users of the bundled WASM example still need no compiler.
 - New `.resym` analyses use package schema 4. The new `function-pointer` control-flow target
-  persists both the read-only slot RVA and resolved function RVA; schema 4 validation requires its
-  paired same-site slot data reference.
+  persists both the read-only slot RVA and resolved function RVA. Schema 4 validation requires the
+  paired same-site slot data reference for a direct call; a pointer thunk does not require one.
 - The debugger-neutral JSON projection now uses schema 6. Schema 4 added attributed string and
   data-reference arrays to schema 3's entry attribution and control-flow relationships; schema 5
   added `referenced_string_rva` correlation; and schema 6 adds explicit `function-pointer` targets.
@@ -165,7 +167,8 @@ schema versions independently.
   recovery passes. Migrated direct-call, thunk, string, and data-reference sets remain unavailable
   and are not evidence that no relationships or literals exist. Schema 2 retains its persisted
   direct calls and thunks but predates strings and data references. Schema 3 retains string/data
-  recovery, while schemas 2 and 3 both predate read-only function-pointer call resolution.
+  recovery, while schemas 2 and 3 both predate read-only function-pointer call and thunk
+  resolution.
   Reanalyze the exact original binary to create schema 4 with current recovery. The reader rejects
   schema 2 or 3 envelopes containing schema-4 function-pointer targets in base relationships,
   symbol graphs, or plugin claims instead of accepting a relabeled payload.
@@ -212,11 +215,12 @@ schema versions independently.
   matches a recorded runtime-function begin. A call to its own next instruction is not promoted to
   a function target. Overlapping runtime-function ranges may be traversed and charged to decoder
   budgets separately.
-- Read-only function-pointer calls are accepted only from exact supported RIP-relative encodings.
-  Their non-IAT slot must be eight fully backed bytes of initialized, readable, non-writable,
-  non-executable data, and its preferred-image VA must resolve in one hop to file-backed executable
-  code. The call is retained only with its exact paired data reference, so exhausting the
-  data-reference cap also marks pointer-call recovery partial.
+- Read-only function-pointer calls and thunks are accepted only from exact supported RIP-relative
+  encodings. Their non-IAT slot must be eight fully backed bytes of initialized, readable,
+  non-writable, non-executable data, and its preferred-image VA must resolve in one hop to
+  file-backed executable code. A call is retained only with its exact paired data reference, so
+  exhausting the data-reference cap also marks pointer-call recovery partial. A pointer thunk
+  preserves the slot and endpoint without requiring a data-reference record.
 - The decoder is heuristic-confidence evidence, not complete recursive disassembly or a persisted
   control-flow graph. It avoids unreachable post-terminal bytes and follows supported direct
   branches, but reachable embedded data can still produce false positives and invalid or unsupported

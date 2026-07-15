@@ -765,31 +765,13 @@ fn decode_call_target(
             && is_backed_executable(context.mapper, context.sections, rva, 1))
         .then_some(PeControlFlowTarget::Function { rva });
     }
-    if instruction.code() == Code::Call_rm64
-        && has_exact_rip_relative_indirect_encoding(raw, 0x15)
-        && instruction.is_ip_rel_memory_operand()
-    {
-        let slot_rva = va_to_rva(
-            instruction.ip_rel_memory_address(),
+    if instruction.code() == Code::Call_rm64 {
+        let call_end_rva = va_to_rva(
+            instruction.next_ip(),
             context.image_base,
             context.size_of_image,
-        )?;
-        if context.import_iat_rvas.contains(&slot_rva) {
-            return Some(PeControlFlowTarget::ImportIat { iat_rva: slot_rva });
-        }
-        if !is_backed_read_only_initialized_data(context.mapper, context.sections, slot_rva, 8) {
-            return None;
-        }
-        let target_va = context
-            .mapper
-            .read_u64(slot_rva, "read-only function-pointer slot")?;
-        if target_va == instruction.next_ip() {
-            return None;
-        }
-        let rva = va_to_rva(target_va, context.image_base, context.size_of_image)?;
-        return (context.runtime_targets.allows_function_target(rva)
-            && is_backed_executable(context.mapper, context.sections, rva, 1))
-        .then_some(PeControlFlowTarget::FunctionPointer { slot_rva, rva });
+        );
+        return decode_rip_relative_indirect_target(instruction, raw, 0x15, call_end_rva, context);
     }
     None
 }
@@ -814,21 +796,51 @@ fn decode_thunk_target(
             && is_backed_executable(context.mapper, context.sections, rva, 1))
         .then_some(PeControlFlowTarget::Function { rva });
     }
-    if instruction.code() == Code::Jmp_rm64
-        && has_exact_rip_relative_indirect_encoding(raw, 0x25)
-        && instruction.is_ip_rel_memory_operand()
-    {
-        let iat_rva = va_to_rva(
-            instruction.ip_rel_memory_address(),
-            context.image_base,
-            context.size_of_image,
-        )?;
-        return context
-            .import_iat_rvas
-            .contains(&iat_rva)
-            .then_some(PeControlFlowTarget::ImportIat { iat_rva });
+    if instruction.code() == Code::Jmp_rm64 {
+        return decode_rip_relative_indirect_target(
+            instruction,
+            raw,
+            0x25,
+            Some(source_rva),
+            context,
+        );
     }
     None
+}
+
+fn decode_rip_relative_indirect_target(
+    instruction: &Instruction,
+    raw: &[u8],
+    modrm: u8,
+    rejected_pointer_target_rva: Option<u32>,
+    context: &TargetContext<'_, '_>,
+) -> Option<PeControlFlowTarget> {
+    if !has_exact_rip_relative_indirect_encoding(raw, modrm)
+        || !instruction.is_ip_rel_memory_operand()
+    {
+        return None;
+    }
+    let slot_rva = va_to_rva(
+        instruction.ip_rel_memory_address(),
+        context.image_base,
+        context.size_of_image,
+    )?;
+    if context.import_iat_rvas.contains(&slot_rva) {
+        return Some(PeControlFlowTarget::ImportIat { iat_rva: slot_rva });
+    }
+    if !is_backed_read_only_initialized_data(context.mapper, context.sections, slot_rva, 8) {
+        return None;
+    }
+    let target_va = context
+        .mapper
+        .read_u64(slot_rva, "read-only function-pointer slot")?;
+    let rva = va_to_rva(target_va, context.image_base, context.size_of_image)?;
+    if rejected_pointer_target_rva == Some(rva) {
+        return None;
+    }
+    (context.runtime_targets.allows_function_target(rva)
+        && is_backed_executable(context.mapper, context.sections, rva, 1))
+    .then_some(PeControlFlowTarget::FunctionPointer { slot_rva, rva })
 }
 
 fn thunk_seeds(
@@ -988,12 +1000,6 @@ pub(crate) fn validate_code_recovery(analysis: &PeAnalysis) -> Result<(), Analys
                 "is not a file-backed executable metadata or call target candidate",
             );
         }
-        if matches!(thunk.target, PeControlFlowTarget::FunctionPointer { .. }) {
-            return invalid(
-                "thunk target",
-                "read-only function-pointer resolution is not supported for thunks",
-            );
-        }
         validate_target(
             analysis,
             &import_iat_rvas,
@@ -1009,7 +1015,12 @@ pub(crate) fn validate_code_recovery(analysis: &PeAnalysis) -> Result<(), Analys
                 matches!(thunk.instruction_size, 2 | 5)
             }
             PeControlFlowTarget::ImportIat { .. } => matches!(thunk.instruction_size, 6 | 7),
-            PeControlFlowTarget::FunctionPointer { .. } => false,
+            PeControlFlowTarget::FunctionPointer { rva, .. } => {
+                if rva == thunk.rva {
+                    return invalid("thunk target", "must differ from its source RVA");
+                }
+                matches!(thunk.instruction_size, 6 | 7)
+            }
         };
         if !supported_size {
             return invalid(

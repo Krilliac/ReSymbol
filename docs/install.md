@@ -14,13 +14,16 @@ The current analyzer accepts native Windows x86-64 PE32+ input. It safely extrac
 metadata, imports, exports, forwarded exports, and x64 exception-directory records. Exact export
 names and metadata-backed `RUNTIME_FUNCTION` ranges become evidence-bearing symbol-graph claims.
 It also performs a bounded pure-Rust x86-64 control-flow-guided block sweep inside fully file-backed
-exception ranges and checks metadata-backed entry candidates for one-instruction internal or import
-thunks. It follows supported direct same-range branches, stops paths at terminal or indirect flow,
-and retains supported direct calls, including one-hop exact RIP-relative calls through fully backed
-read-only eight-byte function-pointer slots, RIP-relative data references, and thunks without
-inventing source names or function sizes. Resolved pointer calls preserve both the slot and endpoint
-and retain a paired same-site data reference. A separate bounded pass recovers exact
-NUL-terminated ASCII and UTF-16LE strings from eligible file-backed data.
+exception ranges and checks seeded executable candidates for one-instruction internal, import,
+or read-only function-pointer thunks. It follows supported direct same-range branches, stops paths
+at terminal or indirect flow, and retains supported direct calls, including one-hop exact
+RIP-relative calls through fully backed read-only eight-byte function-pointer slots, RIP-relative
+data references, and thunks without inventing source names or function sizes. Exact
+`FF 25 disp32`/`48 FF 25 disp32` pointer thunks use the same IAT-first, one-hop slot policy as
+`FF 15 disp32`/`48 FF 15 disp32` calls. Resolved pointer control flow preserves both the slot and
+endpoint; calls retain a paired same-site data reference, while thunks do not require one. A
+separate bounded pass recovers exact NUL-terminated ASCII and UTF-16LE strings from eligible
+file-backed data.
 The built-in bounded RTTI pass also validates modern MSVC x64 Rev1 type descriptors, class and base
 records, vftables, and executable virtual-slot targets. Recovered class/type names, vftable names,
 and function-to-class relationships become evidence-bearing claims, and the result is written to a
@@ -184,9 +187,9 @@ Schema 1 is migrated into a validated current in-memory session and its base gra
 schemas 2 and 3 use explicit compatibility paths. None rewrites the legacy package. Because
 `.resym` does not contain the original executable, compatibility loading cannot run missing
 recovery passes: schema 1 has no direct-call or thunk records, schemas 1 and 2 have no string or
-data-reference records, and schemas 2 and 3 have no read-only function-pointer call results.
-Analyze the exact original binary again to create schema 4 with all current results. Relabeling a
-schema-4 pointer target beneath a schema 2 or 3 envelope is rejected.
+data-reference records, and schemas 2 and 3 have no read-only function-pointer call or thunk
+results. Analyze the exact original binary again to create schema 4 with all current results.
+Relabeling a schema-4 pointer target beneath a schema 2 or 3 envelope is rejected.
 
 Export a package to a specific destination with `--output`:
 

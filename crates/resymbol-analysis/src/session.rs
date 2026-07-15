@@ -479,11 +479,13 @@ pub enum SessionValidationError {
     )]
     FunctionPointerTargetNotExecutable { index: usize },
     #[error(
+        "plugin claim {index} read-only function-pointer thunk source is not backed by executable PE data"
+    )]
+    FunctionPointerThunkSourceNotExecutable { index: usize },
+    #[error(
         "plugin claim {index} read-only function-pointer call lacks a same-caller/site 6-or-7-byte data reference to slot RVA {slot_rva:#x}"
     )]
     FunctionPointerMissingDataReference { index: usize, slot_rva: u64 },
-    #[error("plugin claim {index} uses a read-only function-pointer target on a thunk assertion")]
-    FunctionPointerThunkUnsupported { index: usize },
     #[error("plugin claim {index} provenance is not plugin-owned")]
     NonPluginProducer { index: usize },
     #[error("plugin claim {index} provenance has no run id")]
@@ -598,19 +600,13 @@ fn validate_claim_ranges(
             validate_image_range(index, target_field, target.rva(), 1, image_size)?;
             validate_import_iat_target(index, "direct-call assertion", target, import_iat_rvas)?;
             if let ControlFlowTarget::FunctionPointer { slot_rva, .. } = target {
-                validate_image_range(
+                validate_function_pointer_range_policy(
                     index,
                     "direct-call function-pointer slot",
                     *slot_rva,
-                    8,
                     image_size,
+                    import_iat_rvas,
                 )?;
-                if import_iat_rvas.contains(slot_rva) {
-                    return Err(SessionValidationError::FunctionPointerSlotIsImportIat {
-                        index,
-                        slot_rva: *slot_rva,
-                    });
-                }
             }
         }
         SymbolAssertion::ThunkTarget { target } => {
@@ -627,8 +623,14 @@ fn validate_claim_ranges(
             };
             validate_image_range(index, target_field, target.rva(), 1, image_size)?;
             validate_import_iat_target(index, "thunk-target assertion", target, import_iat_rvas)?;
-            if matches!(target, ControlFlowTarget::FunctionPointer { .. }) {
-                return Err(SessionValidationError::FunctionPointerThunkUnsupported { index });
+            if let ControlFlowTarget::FunctionPointer { slot_rva, .. } = target {
+                validate_function_pointer_range_policy(
+                    index,
+                    "thunk function-pointer slot",
+                    *slot_rva,
+                    image_size,
+                    import_iat_rvas,
+                )?;
             }
             if target.is_function_at(*function_rva) {
                 return Err(SessionValidationError::ThunkSelfTarget {
@@ -757,6 +759,9 @@ fn validate_claim_section_policy(
         SymbolAssertion::DirectCall {
             target: ControlFlowTarget::FunctionPointer { slot_rva, rva },
             ..
+        }
+        | SymbolAssertion::ThunkTarget {
+            target: ControlFlowTarget::FunctionPointer { slot_rva, rva },
         } => {
             let (Ok(slot_rva), Ok(rva)) = (u32::try_from(*slot_rva), u32::try_from(*rva)) else {
                 return Err(SessionValidationError::FunctionPointerSlotNotReadOnly { index });
@@ -768,6 +773,25 @@ fn validate_claim_section_policy(
             }
             if !crate::code_recovery::model_range_is_backed_executable(analysis, rva, 1) {
                 return Err(SessionValidationError::FunctionPointerTargetNotExecutable { index });
+            }
+            if matches!(claim.assertion(), SymbolAssertion::ThunkTarget { .. }) {
+                let SymbolSubject::Function {
+                    rva: source_rva, ..
+                } = claim.subject()
+                else {
+                    return Err(SessionValidationError::ThunkTargetRequiresFunction { index });
+                };
+                let Ok(source_rva) = u32::try_from(*source_rva) else {
+                    return Err(
+                        SessionValidationError::FunctionPointerThunkSourceNotExecutable { index },
+                    );
+                };
+                if !crate::code_recovery::model_range_is_backed_executable(analysis, source_rva, 1)
+                {
+                    return Err(
+                        SessionValidationError::FunctionPointerThunkSourceNotExecutable { index },
+                    );
+                }
             }
         }
         SymbolAssertion::StringLiteral { .. } => {
@@ -878,6 +902,20 @@ fn validate_import_iat_target(
                 iat_rva: *iat_rva,
             });
         }
+    }
+    Ok(())
+}
+
+fn validate_function_pointer_range_policy(
+    index: usize,
+    field: &'static str,
+    slot_rva: u64,
+    image_size: u64,
+    import_iat_rvas: &BTreeSet<u64>,
+) -> Result<(), SessionValidationError> {
+    validate_image_range(index, field, slot_rva, 8, image_size)?;
+    if import_iat_rvas.contains(&slot_rva) {
+        return Err(SessionValidationError::FunctionPointerSlotIsImportIat { index, slot_rva });
     }
     Ok(())
 }

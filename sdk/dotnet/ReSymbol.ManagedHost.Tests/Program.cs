@@ -230,6 +230,18 @@ static Task ClaimValidationMatchesCoreAsync()
     });
     ClaimValidator.Validate(Claim(validSubject, functionPointerCall), binary);
 
+    var functionPointerThunk = JsonObject(new Dictionary<string, object?>
+    {
+        ["kind"] = "thunk-target",
+        ["target"] = new Dictionary<string, object?>
+        {
+            ["kind"] = "function-pointer",
+            ["slot_rva"] = 0x3000UL,
+            ["rva"] = 0x2000UL,
+        },
+    });
+    ClaimValidator.Validate(Claim(validSubject, functionPointerThunk), binary);
+
     var incompleteFunctionPointerCall = JsonObject(new Dictionary<string, object?>
     {
         ["kind"] = "direct-call",

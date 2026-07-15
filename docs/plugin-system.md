@@ -390,11 +390,12 @@ the transaction. Plugin-attributable failures quarantine only the exact artifact
 
 The managed SDK provides `StringEncoding`, validated `StringLiteralAssertion` and
 `DataReferenceAssertion` records, and `ClaimAssertions` helpers that emit canonical `JsonElement`
-payloads. It does not yet provide a typed helper for function-pointer direct-call targets. A
-managed plugin that constructs a raw direct-call assertion may use the additive
-`{"kind":"function-pointer","slot_rva":...,"rva":...}` target shape; the managed-host validator
+payloads. It does not yet provide a typed helper for function-pointer control-flow targets. A
+managed plugin that constructs a raw direct-call or thunk assertion may use the additive
+`{"kind":"function-pointer","slot_rva":...,"rva":...}` target shape. The managed-host validator
 checks its discriminator and required numeric fields, then the Rust session enforces the PE slot
-and endpoint section policy plus the required same-site companion data reference.
+and endpoint section policy. A direct call additionally requires the same-site companion data
+reference; a thunk does not.
 `examples/plugins/managed/` shows the typed payloads inside complete `SymbolClaim` values; the SDK
 rejects unsupported encoding names, invalid literal text, and zero instruction sizes before
 submission. `AnalysisRequest.BaseAnalysis` contains the detached canonical base analysis only when

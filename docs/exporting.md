@@ -119,9 +119,9 @@ The CLI can export package schemas 1 through 3 through validated in-memory compa
 Migration neither rewrites the package nor reruns analysis: the package does not embed executable
 bytes. Schema 1 therefore has no available direct calls, thunks, strings, or data references.
 Schema 2 retains its persisted calls and thunks but predates strings and data references. Schema 3
-retains those records, but schemas 2 and 3 both predate read-only function-pointer call resolution.
-Reanalyze the exact original binary to produce schema 4 before expecting all current recovery
-relationships in the export.
+retains those records, but schemas 2 and 3 both predate read-only function-pointer call and thunk
+resolution. Reanalyze the exact original binary to produce schema 4 before expecting all current
+recovery relationships in the export.
 
 Entries are emitted in stable order. Name and range conflicts are resolved conservatively, and
 colliding selected names receive deterministic output suffixes rather than silently referring to
@@ -153,14 +153,16 @@ not the built-in decoder's lower recovery caps of 8,192 direct calls and 4,096 t
 analysis, the built-in producer additionally checks exact parsed IAT membership, file-backed
 instruction bytes, and the section properties used to resolve any pointer slot.
 
-Built-in call recovery is a bounded control-flow-guided block sweep with heuristic confidence, not
-a complete recursive disassembler. It recognizes only exact RIP-relative `FF 15 disp32` and
-redundant-`REX.W` `48 FF 15 disp32` indirect-call encodings. Exact parsed IAT membership takes
-precedence. A non-IAT slot must be fully backed for all eight bytes in initialized, readable,
-non-writable, non-executable data; its little-endian preferred-image VA is resolved exactly one hop
-to file-backed executable code. The resolved call carries explicit slot provenance, and the same
-instruction is retained as a paired data reference to that slot. Pointer chains, writable slots,
-and other indirect-call forms are not projected as resolved calls.
+Built-in control-flow recovery is a bounded control-flow-guided block sweep with heuristic
+confidence, not a complete recursive disassembler. It recognizes only exact RIP-relative
+`FF 15 disp32` and redundant-`REX.W` `48 FF 15 disp32` indirect-call encodings. At a deterministic
+thunk seed it recognizes exact `FF 25 disp32` and `48 FF 25 disp32` indirect-jump encodings. Exact
+parsed IAT membership takes precedence. A non-IAT slot must be fully backed for all
+eight bytes in initialized, readable, non-writable, non-executable data; its little-endian
+preferred-image VA is resolved exactly one hop to file-backed executable code. The resolved call or
+thunk carries explicit slot provenance. A pointer call's instruction is also retained as a paired
+data reference to that slot; a pointer thunk does not require one. Pointer chains, writable slots,
+and other indirect forms are not projected as resolved control flow.
 
 Before pairing relations, projection deterministically reduces competing data references by caller
 and instruction site. A pointer call is retained only when the selected same-site reference targets

@@ -349,7 +349,7 @@ fn analysis_package_read_options() -> PackageOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CodeRecoveryAvailability {
     Recorded,
-    RecordedWithoutReadOnlyPointerCalls(u32),
+    RecordedWithoutReadOnlyPointerControlFlow(u32),
     UnavailableSchema1,
 }
 
@@ -357,8 +357,8 @@ impl CodeRecoveryAvailability {
     fn export_summary_line(self) -> Option<String> {
         match self {
             Self::Recorded => None,
-            Self::RecordedWithoutReadOnlyPointerCalls(schema_version) => Some(format!(
-                "read-only function-pointer call resolution: unavailable (schema {schema_version} package predates this recovery data; reanalyze the exact original binary)"
+            Self::RecordedWithoutReadOnlyPointerControlFlow(schema_version) => Some(format!(
+                "read-only function-pointer call/thunk resolution: unavailable (schema {schema_version} package predates this recovery data; reanalyze the exact original binary)"
             )),
             Self::UnavailableSchema1 => Some(
                 "code recovery: unavailable (schema 1 package predates decoder data; reanalyze the exact original binary)"
@@ -416,8 +416,8 @@ fn read_analysis_package(
     let schema_version = package.schema_version();
     let code_recovery_availability = match schema_version {
         1 => CodeRecoveryAvailability::UnavailableSchema1,
-        2 => CodeRecoveryAvailability::RecordedWithoutReadOnlyPointerCalls(2),
-        3 => CodeRecoveryAvailability::RecordedWithoutReadOnlyPointerCalls(3),
+        2 => CodeRecoveryAvailability::RecordedWithoutReadOnlyPointerControlFlow(2),
+        3 => CodeRecoveryAvailability::RecordedWithoutReadOnlyPointerControlFlow(3),
         CURRENT_SCHEMA_VERSION => CodeRecoveryAvailability::Recorded,
         _ => bail!("unsupported analysis package schema {schema_version}"),
     };
@@ -1983,7 +1983,7 @@ fn code_recovery_summary_lines(
                 "code recovery scan: complete".to_owned()
             },
         ],
-        CodeRecoveryAvailability::RecordedWithoutReadOnlyPointerCalls(schema_version) => vec![
+        CodeRecoveryAvailability::RecordedWithoutReadOnlyPointerControlFlow(schema_version) => vec![
             format!("recovered direct calls: {}", pe.direct_calls.len()),
             format!("recovered thunks: {}", pe.thunks.len()),
             if pe.code_recovery_scan_truncated {
@@ -1992,7 +1992,7 @@ fn code_recovery_summary_lines(
                 "code recovery scan: complete".to_owned()
             },
             format!(
-                "read-only function-pointer calls: unavailable (not recorded by schema {schema_version}; reanalyze the exact original binary)"
+                "read-only function-pointer calls/thunks: unavailable (not recorded by schema {schema_version}; reanalyze the exact original binary)"
             ),
         ],
         CodeRecoveryAvailability::UnavailableSchema1 => vec![
@@ -3051,7 +3051,8 @@ entrypoint = "Plugin.dll"
     }
 
     #[test]
-    fn schema_v2_and_v3_summaries_preserve_code_recovery_but_mark_pointer_calls_unavailable() {
+    fn schema_v2_and_v3_summaries_preserve_code_recovery_but_mark_pointer_control_flow_unavailable()
+    {
         let analysis = analyze_bytes(&pe_code_recovery_fixture()).expect("analyze fixture");
         let BinaryAnalysis::Pe(pe) = &analysis else {
             panic!("PE analysis expected");
@@ -3059,7 +3060,7 @@ entrypoint = "Plugin.dll"
 
         for schema_version in [2, 3] {
             let availability =
-                CodeRecoveryAvailability::RecordedWithoutReadOnlyPointerCalls(schema_version);
+                CodeRecoveryAvailability::RecordedWithoutReadOnlyPointerControlFlow(schema_version);
             assert_eq!(
                 code_recovery_summary_lines(pe, availability),
                 [
@@ -3067,14 +3068,14 @@ entrypoint = "Plugin.dll"
                     "recovered thunks: 1".to_owned(),
                     "code recovery scan: complete".to_owned(),
                     format!(
-                        "read-only function-pointer calls: unavailable (not recorded by schema {schema_version}; reanalyze the exact original binary)"
+                        "read-only function-pointer calls/thunks: unavailable (not recorded by schema {schema_version}; reanalyze the exact original binary)"
                     ),
                 ]
             );
             assert_eq!(
                 availability.export_summary_line(),
                 Some(format!(
-                    "read-only function-pointer call resolution: unavailable (schema {schema_version} package predates this recovery data; reanalyze the exact original binary)"
+                    "read-only function-pointer call/thunk resolution: unavailable (schema {schema_version} package predates this recovery data; reanalyze the exact original binary)"
                 ))
             );
         }
@@ -3947,7 +3948,7 @@ entrypoint = "Plugin.dll"
         assert_eq!(decoded.package.schema_version(), 2);
         assert_eq!(
             decoded.code_recovery_availability,
-            CodeRecoveryAvailability::RecordedWithoutReadOnlyPointerCalls(2)
+            CodeRecoveryAvailability::RecordedWithoutReadOnlyPointerControlFlow(2)
         );
         assert_eq!(
             decoded.string_data_recovery_availability,
@@ -4017,7 +4018,7 @@ entrypoint = "Plugin.dll"
         assert_eq!(decoded.package.schema_version(), 3);
         assert_eq!(
             decoded.code_recovery_availability,
-            CodeRecoveryAvailability::RecordedWithoutReadOnlyPointerCalls(3)
+            CodeRecoveryAvailability::RecordedWithoutReadOnlyPointerControlFlow(3)
         );
         assert_eq!(
             decoded.string_data_recovery_availability,
@@ -4053,7 +4054,7 @@ entrypoint = "Plugin.dll"
     }
 
     #[test]
-    fn schema_v2_and_v3_reject_relabeled_schema_v4_function_pointer_targets() {
+    fn schema_v2_and_v3_reject_relabeled_schema_v4_function_pointer_call_targets() {
         let temp = tempfile::tempdir().expect("create temporary directory");
         let base_analysis = analyze_bytes(&pe_code_recovery_fixture()).expect("analyze PE fixture");
         let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
@@ -4081,6 +4082,43 @@ entrypoint = "Plugin.dll"
 
             let error = match read_analysis_package(&path, false) {
                 Ok(_) => panic!("schema {schema_version} must reject schema-4 target semantics"),
+                Err(error) => error,
+            };
+            let diagnostic = format!("{error:#}");
+            assert!(diagnostic.contains("schema-4 function-pointer target"));
+            assert!(diagnostic.contains("cannot be relabeled"));
+        }
+    }
+
+    #[test]
+    fn schema_v2_and_v3_reject_relabeled_schema_v4_function_pointer_thunk_targets() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let base_analysis = analyze_bytes(&pe_code_recovery_fixture()).expect("analyze PE fixture");
+        let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
+            .expect("create base-only session");
+        let package = ResymPackage::from_bound_payload("0.1.0", session)
+            .expect("create current package value");
+        let current = serde_json::to_value(package).expect("serialize current package value");
+
+        for schema_version in [2, 3] {
+            let mut value = current.clone();
+            value["schema_version"] = serde_json::json!(schema_version);
+            value["payload"]["base_analysis"]["analysis"]["thunks"][0]["target"] = serde_json::json!({
+                "kind": "function-pointer",
+                "slot_rva": 0x1300,
+                "rva": 0x1040
+            });
+            let path = temp
+                .path()
+                .join(format!("relabeled-thunk-schema-{schema_version}.resym"));
+            fs::write(
+                &path,
+                serde_json::to_vec(&value).expect("encode relabeled package"),
+            )
+            .expect("write relabeled package");
+
+            let error = match read_analysis_package(&path, false) {
+                Ok(_) => panic!("schema {schema_version} must reject schema-4 thunk semantics"),
                 Err(error) => error,
             };
             let diagnostic = format!("{error:#}");

@@ -890,6 +890,24 @@ mod tests {
                 target: resymbol_core::ControlFlowTarget::Function { rva: 12288 },
             }
         ));
+
+        let pointer_thunk = parse(serde_json::json!({
+            "kind": "thunk-target",
+            "target": {
+                "kind": "function-pointer",
+                "slot_rva": 16384,
+                "rva": 12288
+            }
+        }));
+        assert!(matches!(
+            pointer_thunk.claim,
+            SymbolAssertion::ThunkTarget {
+                target: resymbol_core::ControlFlowTarget::FunctionPointer {
+                    slot_rva: 16384,
+                    rva: 12288,
+                },
+            }
+        ));
     }
 
     #[test]

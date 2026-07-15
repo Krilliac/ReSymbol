@@ -87,14 +87,14 @@ A `.resym` package does not contain the original binary
 bytes, so migration cannot retroactively run code recovery: direct-call and thunk arrays stay empty
 and the migrated session is not evidence that the decoder found no relationships. Schema 2 retains
 its recorded calls and thunks but predates recovered strings and data references. Schema 3 retains
-strings and data references. Schemas 2 and 3 both predate exact read-only function-pointer call
-resolution, so their recorded code recovery remains available while that newer result family is
-reported as unavailable. Reanalyze the exact original executable to create a schema 4 package with
-all current recovery results. The compatibility reader explicitly rejects a schema 2 or 3 envelope
-whose base analysis, base graph, or plugin claims contain a schema-4 `function-pointer` target;
-changing only the envelope label is not migration. `inspect --json` emits the validated original
-schema 1 representation rather than placing the migrated current payload beneath a legacy schema
-label.
+strings and data references. Schemas 2 and 3 both predate exact read-only function-pointer call and
+thunk resolution, so their recorded code recovery remains available while that newer result family
+is reported as unavailable. Reanalyze the exact original executable to create a schema 4 package
+with all current recovery results. The compatibility reader explicitly rejects a schema 2 or 3
+envelope whose base analysis, base graph, or plugin claims contain a schema-4 `function-pointer`
+target; changing only the envelope label is not migration. `inspect --json` emits the validated
+original schema 1 representation rather than placing the migrated current payload beneath a legacy
+schema label.
 
 ## Current `AnalysisSession` payload
 
@@ -121,8 +121,8 @@ The base analysis includes:
 - bounded section, import, export, and exception-directory records;
 - x64 `RUNTIME_FUNCTION` entries as evidence-backed candidate function boundaries;
 - bounded direct-call records with explicit internal-function, exact parsed import-IAT, or read-only
-  function-pointer targets; one-instruction thunks currently use only internal-function or exact
-  parsed import-IAT targets, with a persisted partial-scan flag;
+  function-pointer targets; one-instruction thunks may likewise target internal functions, exact
+  parsed import-IAT slots, or read-only function-pointer slots, with a persisted partial-scan flag;
 - bounded NUL-terminated ASCII and UTF-16LE strings plus exact x64 RIP-relative references to
   eligible data, each with independent persisted partial-scan state;
 - validated modern MSVC x64 Rev1 RTTI records, including type descriptors, class hierarchy and
@@ -216,34 +216,41 @@ ephemeral traversal is not a persisted basic-block graph or a general recursive 
 
 The pass recognizes exact five-byte `E8 rel32` calls to file-backed executable RVAs. It also
 recognizes exact RIP-relative `FF 15 disp32` and redundant-`REX.W` `48 FF 15 disp32` calls, with
-instruction sizes six and seven bytes respectively. If the computed slot RVA exactly matches a
-parsed import-IAT slot, import semantics take precedence and the slot is not dereferenced.
-Otherwise the complete eight-byte slot must lie in one file-backed, initialized, readable,
-non-writable, non-executable section. Its little-endian preferred-image VA is resolved exactly one
-hop to an in-image, file-backed executable RVA. Pointer chains, writable slots, other indirect-call
-forms, and targets merely located near an import table are not retained as resolved calls.
+instruction sizes six and seven bytes respectively. At a seeded executable thunk candidate it
+recognizes exact RIP-relative `FF 25 disp32` and redundant-`REX.W` `48 FF 25 disp32` jumps of those
+same sizes. If the computed slot RVA exactly matches a parsed import-IAT slot, import semantics take
+precedence and the slot is not dereferenced. Otherwise the complete eight-byte slot must lie in one
+file-backed, initialized, readable, non-writable, non-executable section. Its little-endian
+preferred-image VA is resolved exactly one hop to an in-image, file-backed executable RVA. Pointer
+chains, writable slots, other indirect forms, and targets merely located near an import table are
+not retained as resolved control flow.
 
-A resolved pointer call uses the explicit target shape
+A resolved pointer call or thunk uses the explicit target shape
 `{"kind":"function-pointer","slot_rva":...,"rva":...}` in both the base graph and package. Its
-control-flow evidence records the slot and resolved endpoint, and the same decoded instruction is
-retained as a paired data reference to `slot_rva`. This preserves both call semantics and the exact
-memory dependency. An internal endpoint covered by known `RUNTIME_FUNCTION` metadata is suppressed
+control-flow evidence records the slot and resolved endpoint. For a direct call, the same decoded
+instruction is retained as a paired data reference to `slot_rva`, preserving both call semantics
+and the exact memory dependency. A thunk is checked only at its seeded first instruction and does
+not require a paired data-reference record. If that instruction is also encountered during a
+runtime-function sweep, an ordinary same-site reference to the non-IAT slot may be retained
+independently. An internal endpoint covered by known `RUNTIME_FUNCTION` metadata is suppressed
 unless its RVA matches a recorded runtime-function begin, preventing an interior label from being
 promoted to a separate function entry.
 
 The same instruction sweep retains exact RIP-relative data references from supported decoded
-instructions. It excludes call and jump operands already represented as control flow except for the
-required same-site slot reference paired with a resolved read-only function-pointer call. A data
-target is accepted only when its computed RVA lies in file-backed, initialized, readable,
-non-executable section data. The persisted relationship records caller, instruction RVA and size,
-and target RVA; it does not guess a target name, object size, or access mode. The independently
-versioned export projection derives string correlation later from the retained canonical strings.
+instructions. It excludes exact parsed-IAT call and jump operands. A resolved read-only pointer
+call retains its required same-site slot reference; a resolved pointer thunk may independently have
+the same reference when runtime traversal encounters it, but thunk validity never depends on that
+record. A data target is accepted only when its computed RVA lies in file-backed, initialized,
+readable, non-executable section data. The persisted relationship records caller, instruction RVA
+and size, and target RVA; it does not guess a target name, object size, or access mode. The
+independently versioned export projection derives string correlation later from the retained
+canonical strings.
 
-Thunk candidates come from metadata-backed entry points: runtime-function starts, the PE entry
-point, local executable exports, internal direct-call targets, and validated RTTI virtual slots.
-Only a candidate's first instruction is considered. Exact `E9 rel32` and `EB rel8` jumps may target
-file-backed executable RVAs; exact RIP-relative `FF 25` jumps must target a parsed IAT slot. A
-self-targeting internal jump is not a thunk.
+Thunk candidates come from deterministic seeds: runtime-function starts, the PE entry point, local
+executable exports, internal direct-call targets, and validated RTTI virtual slots. Only a
+candidate's first instruction is considered. Exact `E9 rel32` and `EB rel8` jumps may target
+file-backed executable RVAs. Exact `FF 25 disp32` and `48 FF 25 disp32` jumps use the IAT-first,
+one-hop pointer policy above. A self-targeting internal jump is not a thunk.
 
 Decoding is deterministic and bounded to 64 MiB of instruction bytes, 1,000,000 instructions,
 262,144 discovered block starts, 8,192 retained direct calls, 32,768 retained data references, and
@@ -293,11 +300,11 @@ must be code-unit aligned. `null` means only that no retained projected string m
 target bytes cannot contain a string. Correlation occurs after deterministic string conflict and
 overlap reduction, so the field cannot name a discarded candidate. Schema 6 adds the explicit
 `function-pointer` control-flow target with both `slot_rva` and the resolved function `rva`. A
-retained pointer call preserves that slot provenance rather than flattening the call into an
-ordinary direct function target. Before pairing, projection deterministically reduces competing
-data references by caller and instruction site. If the selected same-site reference targets
-something other than the pointer slot, projection omits the pointer call and emits an
-`unsupported-assertion` warning.
+retained pointer call or thunk preserves that slot provenance rather than flattening the relation
+into an ordinary function target. Before pairing calls, projection deterministically reduces
+competing data references by caller and instruction site. If the selected same-site reference
+targets something other than the pointer slot, projection omits the pointer call and emits an
+`unsupported-assertion` warning. Pointer thunks do not require that companion relationship.
 Internal relation targets must reference projected function entries; import targets retain their
 IAT RVA. Its projection/model bounds are intentionally separate from the lower built-in recovery
 caps: at most 65,536 strings, 32 MiB of retained string UTF-8 with 16 KiB per value, and 262,144

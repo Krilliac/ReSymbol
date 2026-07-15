@@ -17,8 +17,8 @@ compatibility paths. Schema 1 is migrated in memory by revalidating persisted me
 rebuilding the base graph; schema 2 already contains direct-call and thunk recovery, and schema 3
 adds string/data recovery. Older packages do not embed executable bytes, so compatibility loading
 cannot reconstruct results that were never recorded. Reanalyzing the exact original binary is
-required for read-only function-pointer calls in schemas 2 and 3, for strings/data references in
-schemas 1 and 2, and for all code recovery when starting from schema 1.
+required for read-only function-pointer calls and thunks in schemas 2 and 3, for strings/data
+references in schemas 1 and 2, and for all code recovery when starting from schema 1.
 
 A bounded modern MSVC x64 Rev1 RTTI/vftable slice is now implemented. It validates compiler
 metadata through complete object locators, type descriptors, modern 28-byte base-class descriptors,
@@ -31,15 +31,17 @@ sweep starts at fully file-backed `RUNTIME_FUNCTION` entries, follows supported 
 branches with a deterministic ordered worklist, and stops paths at terminal, indirect, invalid,
 out-of-range, or ambiguous interior control flow. It records exact supported direct calls,
 including one-hop plain or redundant-`REX.W` RIP-relative calls through complete read-only
-eight-byte pointer slots, and RIP-relative data references; it checks the first instruction at
-metadata-backed entry candidates for internal or import thunks. It discovers at most 262,144 block
-starts and retains at most 8,192 direct calls, 32,768 data references, and 4,096 thunks; internal
-targets covered by known runtime-function metadata are suppressed unless their RVA matches a
-recorded runtime-function begin. A separate bounded pass recovers complete NUL-terminated ASCII and
-UTF-16LE literals from readable initialized non-executable file-backed data. These passes emit
-attributed claims without inventing names or extents and preserve independent partial-scan flags.
-The guided sweep suppresses unreachable post-terminal bytes and can reach valid blocks after
-jump-over data, but remains heuristic evidence:
+eight-byte pointer slots, and RIP-relative data references. At seeded executable candidates it
+checks internal thunks and exact `FF 25 disp32`/`48 FF 25 disp32` IAT or one-hop read-only pointer
+thunks. Parsed IAT membership takes precedence; each pointer relation preserves its slot and
+endpoint, while only a pointer call requires a paired data reference. It discovers at most 262,144
+block starts and retains at most 8,192 direct calls, 32,768 data references, and 4,096 thunks;
+internal targets covered by known runtime-function metadata are suppressed unless their RVA
+matches a recorded runtime-function begin. A separate bounded pass recovers complete
+NUL-terminated ASCII and UTF-16LE literals from readable initialized non-executable file-backed
+data. These passes emit attributed claims without inventing names or extents and preserve
+independent partial-scan flags. The guided sweep suppresses unreachable post-terminal bytes and can
+reach valid blocks after jump-over data, but remains heuristic evidence:
 reachable embedded data can produce false positives, and invalid or unsupported flow can omit later
 relationships on that path. It does not persist a basic-block graph.
 
@@ -150,12 +152,12 @@ to the optimization profile. The matrix covers imports/exports, unwind functions
 internal and MSVC `REX.W`-prefixed import thunks, ASCII/UTF-16LE strings,
 data references, and modern RTTI/vftables without executing the fixture binaries. These checked-in
 inputs are repository/source test data rather than portable runtime archive contents. Read-only
-function-pointer calls are covered by focused synthetic PE fixtures, so this slice does not change
-those four binaries or their recorded hashes.
+function-pointer calls and thunks are covered by focused synthetic PE fixtures, so this slice does
+not change those four binaries or their recorded hashes.
 
 The remaining Milestone 2 work is deliberately substantial: broader disassembly-assisted candidate
-discovery, indirect control flow and richer call-graph analysis, persisted basic-block modeling,
-broader RTTI/ABI coverage, broader compiler fixtures,
+discovery, broader indirect control flow and richer call-graph analysis, persisted basic-block
+modeling, broader RTTI/ABI coverage, broader compiler fixtures,
 benchmarks, and continued malformed-input/resource-limit validation.
 The debugger-hosted execution paths remain future work; their contracts and architecture should not
 be mistaken for working hosts.

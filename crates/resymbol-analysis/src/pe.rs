@@ -68,6 +68,16 @@ const READ_ONLY_POINTER_CALL_EVIDENCE_SUMMARY: &str = concat!(
     "exact RIP-relative x64 indirect call resolved through one fully backed read-only ",
     "in-image pointer slot during bounded runtime traversal",
 );
+const READ_ONLY_POINTER_THUNK_EVIDENCE_SUMMARY: &str = concat!(
+    "exact RIP-relative x64 indirect jump resolved through one fully backed read-only ",
+    "in-image pointer slot in the first instruction of a seeded executable candidate",
+);
+const THUNK_EVIDENCE_SUMMARY: &str =
+    "exact unconditional x64 jump in the first instruction of a seeded executable candidate";
+const LEGACY_THUNK_EVIDENCE_SUMMARY: &str = concat!(
+    "exact unconditional x64 jump in the first instruction of a metadata-seeded ",
+    "executable candidate",
+);
 const LEGACY_DIRECT_CALL_EVIDENCE_SUMMARY: &str = concat!(
     "exact supported x64 call encoding observed during a bounded linear sweep ",
     "of a file-backed runtime-function range",
@@ -154,6 +164,7 @@ enum RecoveredEntrySource {
     Thunk {
         source_rva: u32,
         instruction_size: u8,
+        slot_rva: Option<u32>,
     },
 }
 
@@ -1031,6 +1042,12 @@ fn evidence_semantically_matches(
                 || (provenance_method == "pe-x64-direct-call"
                     && expected.summary == DIRECT_CALL_EVIDENCE_SUMMARY
                     && actual.summary == LEGACY_DIRECT_CALL_EVIDENCE_SUMMARY
+                    && expected.kind == actual.kind
+                    && expected.confidence == actual.confidence
+                    && expected.artifacts == actual.artifacts)
+                || (provenance_method == "pe-x64-jump-thunk"
+                    && expected.summary == THUNK_EVIDENCE_SUMMARY
+                    && actual.summary == LEGACY_THUNK_EVIDENCE_SUMMARY
                     && expected.kind == actual.kind
                     && expected.confidence == actual.confidence
                     && expected.artifacts == actual.artifacts)
@@ -2210,10 +2227,17 @@ pub(crate) fn build_symbol_graph(
 
     for thunk in thunks {
         let target = core_control_flow_target(&thunk.target);
-        let mut evidence = Evidence::new(
-            control_flow_kind.clone(),
-            "exact unconditional x64 jump in the first instruction of a metadata-seeded executable candidate",
-        )?;
+        let (evidence_summary, provenance_method, slot_rva) = match thunk.target {
+            PeControlFlowTarget::FunctionPointer { slot_rva, .. } => (
+                READ_ONLY_POINTER_THUNK_EVIDENCE_SUMMARY,
+                "pe-x64-read-only-pointer-thunk",
+                Some(slot_rva),
+            ),
+            PeControlFlowTarget::Function { .. } | PeControlFlowTarget::ImportIat { .. } => {
+                (THUNK_EVIDENCE_SUMMARY, "pe-x64-jump-thunk", None)
+            }
+        };
+        let mut evidence = Evidence::new(control_flow_kind.clone(), evidence_summary)?;
         evidence.confidence = Some(thunk_confidence);
         evidence
             .artifacts
@@ -2225,6 +2249,11 @@ pub(crate) fn build_symbol_graph(
         evidence
             .artifacts
             .insert("target_rva".to_owned(), format!("{:#x}", target.rva()));
+        if let Some(slot_rva) = slot_rva {
+            evidence
+                .artifacts
+                .insert("slot_rva".to_owned(), format!("{slot_rva:#x}"));
+        }
         graph.submit_claim(SymbolClaim::new(
             SymbolSubject::Function {
                 binary: identity.id.clone(),
@@ -2234,13 +2263,16 @@ pub(crate) fn build_symbol_graph(
             SymbolAssertion::ThunkTarget { target },
             thunk_confidence,
             vec![evidence],
-            provenance("pe-x64-jump-thunk"),
+            provenance(provenance_method),
         )?)?;
 
-        if let PeControlFlowTarget::Function { rva } = thunk.target {
+        if let PeControlFlowTarget::Function { rva }
+        | PeControlFlowTarget::FunctionPointer { rva, .. } = thunk.target
+        {
             let source = RecoveredEntrySource::Thunk {
                 source_rva: thunk.rva,
                 instruction_size: thunk.instruction_size,
+                slot_rva,
             };
             recovered_entry_sources
                 .entry(rva)
@@ -2291,20 +2323,34 @@ pub(crate) fn build_symbol_graph(
             RecoveredEntrySource::Thunk {
                 source_rva,
                 instruction_size,
+                slot_rva,
             } => {
-                let mut evidence = Evidence::new(
-                    control_flow_kind.clone(),
-                    "conservative internal function candidate inferred from the deterministic first retained seeded-thunk edge",
-                )?;
+                let (summary, edge_kind) = if slot_rva.is_some() {
+                    (
+                        "conservative internal function candidate inferred from the deterministic first retained read-only pointer-thunk edge",
+                        "read-only-pointer-thunk",
+                    )
+                } else {
+                    (
+                        "conservative internal function candidate inferred from the deterministic first retained seeded-thunk edge",
+                        "seeded-thunk",
+                    )
+                };
+                let mut evidence = Evidence::new(control_flow_kind.clone(), summary)?;
                 evidence
                     .artifacts
-                    .insert("edge_kind".to_owned(), "seeded-thunk".to_owned());
+                    .insert("edge_kind".to_owned(), edge_kind.to_owned());
                 evidence
                     .artifacts
                     .insert("source_rva".to_owned(), format!("{source_rva:#x}"));
                 evidence
                     .artifacts
                     .insert("instruction_size".to_owned(), instruction_size.to_string());
+                if let Some(slot_rva) = slot_rva {
+                    evidence
+                        .artifacts
+                        .insert("slot_rva".to_owned(), format!("{slot_rva:#x}"));
+                }
                 evidence
             }
         };

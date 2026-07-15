@@ -27,6 +27,16 @@ const READ_ONLY_POINTER_CALL_EVIDENCE_SUMMARY: &str = concat!(
     "exact RIP-relative x64 indirect call resolved through one fully backed read-only ",
     "in-image pointer slot during bounded runtime traversal",
 );
+const READ_ONLY_POINTER_THUNK_EVIDENCE_SUMMARY: &str = concat!(
+    "exact RIP-relative x64 indirect jump resolved through one fully backed read-only ",
+    "in-image pointer slot in the first instruction of a seeded executable candidate",
+);
+const THUNK_EVIDENCE_SUMMARY: &str =
+    "exact unconditional x64 jump in the first instruction of a seeded executable candidate";
+const LEGACY_THUNK_EVIDENCE_SUMMARY: &str = concat!(
+    "exact unconditional x64 jump in the first instruction of a metadata-seeded ",
+    "executable candidate",
+);
 
 fn put_u16(bytes: &mut [u8], offset: usize, value: u16) {
     bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
@@ -536,6 +546,48 @@ fn prefixed_pointer_call_fixture(prefix: u8, slot_rva: u32, target_va: u64) -> V
     bytes
 }
 
+fn read_only_pointer_thunk_fixture() -> Vec<u8> {
+    let mut bytes = rtti_fixture();
+    bytes[rtti_file_offset(0x2100)..rtti_file_offset(0x2300)].fill(0);
+    bytes[rtti_file_offset(0x1000)..rtti_file_offset(0x1010)].fill(0x90);
+    bytes[rtti_file_offset(0x1020)..rtti_file_offset(0x1030)].fill(0x90);
+    put_rip_relative_instruction(&mut bytes, 0x1000, 0x25, 0x2301);
+    put_rex_w_rip_relative_instruction(&mut bytes, 0x1020, 0x25, 0x2311);
+    bytes[rtti_file_offset(0x1040)] = 0xc3;
+    put_rtti_rva_u64(&mut bytes, 0x2301, RTTI_IMAGE_BASE + 0x1040);
+    put_rtti_rva_u64(&mut bytes, 0x2311, RTTI_IMAGE_BASE + 0x1040);
+    bytes
+}
+
+fn single_pointer_thunk_fixture(slot_rva: u32, target_va: u64) -> Vec<u8> {
+    let mut bytes = rtti_fixture();
+    bytes[rtti_file_offset(0x2100)..rtti_file_offset(0x2300)].fill(0);
+    put_u32(&mut bytes, OPTIONAL_OFFSET + 16, 0x1040);
+    bytes[rtti_file_offset(0x1040)..rtti_file_offset(0x1050)].fill(0x90);
+    put_rip_relative_instruction(&mut bytes, 0x1040, 0x25, slot_rva);
+    bytes[rtti_file_offset(0x1060)] = 0xc3;
+    put_rtti_rva_u64(&mut bytes, slot_rva, target_va);
+    bytes
+}
+
+fn prefixed_pointer_thunk_fixture(prefix: u8, slot_rva: u32, target_va: u64) -> Vec<u8> {
+    let mut bytes = rtti_fixture();
+    bytes[rtti_file_offset(0x2100)..rtti_file_offset(0x2300)].fill(0);
+    put_u32(&mut bytes, OPTIONAL_OFFSET + 16, 0x1040);
+    bytes[rtti_file_offset(0x1040)..rtti_file_offset(0x1050)].fill(0x90);
+
+    let thunk_rva = 0x1040_u32;
+    let thunk_end_rva = thunk_rva.checked_add(7).expect("fixture thunk end");
+    let displacement = i64::from(slot_rva) - i64::from(thunk_end_rva);
+    let displacement = i32::try_from(displacement).expect("fixture RIP displacement");
+    let offset = rtti_file_offset(thunk_rva);
+    bytes[offset..offset + 3].copy_from_slice(&[prefix, 0xff, 0x25]);
+    bytes[offset + 3..offset + 7].copy_from_slice(&displacement.to_le_bytes());
+    bytes[rtti_file_offset(0x1060)] = 0xc3;
+    put_rtti_rva_u64(&mut bytes, slot_rva, target_va);
+    bytes
+}
+
 fn rtti_fixture_with_writable_type_descriptors() -> Vec<u8> {
     let mut bytes = rtti_fixture();
     bytes.resize(0xa00, 0);
@@ -910,7 +962,7 @@ fn recovers_bounded_direct_calls_and_exact_jump_thunks() {
         })
         .expect("retained thunk edge claim");
     assert_eq!(thunk_edge.confidence().get(), 0.95);
-    assert!(thunk_edge.evidence()[0].summary.contains("metadata-seeded"));
+    assert_eq!(thunk_edge.evidence()[0].summary, THUNK_EVIDENCE_SUMMARY);
 
     let recovered_target = claims
         .iter()
@@ -1204,6 +1256,14 @@ fn exact_iat_membership_precedes_read_only_pointer_resolution() {
             target: PeControlFlowTarget::ImportIat { iat_rva: 0x2340 },
         }]
     );
+    assert_eq!(
+        analysis.thunks,
+        [PeThunk {
+            rva: 0x1020,
+            instruction_size: 7,
+            target: PeControlFlowTarget::ImportIat { iat_rva: 0x2340 },
+        }]
+    );
     assert!(analysis.data_references.is_empty());
 }
 
@@ -1276,6 +1336,201 @@ fn read_only_pointer_resolution_rejects_executable_virtual_tail_targets() {
 }
 
 #[test]
+fn resolves_exact_six_and_seven_byte_thunks_through_unaligned_read_only_pointer_slots() {
+    let analysis = analyze_pe(&read_only_pointer_thunk_fixture())
+        .expect("valid PE with read-only function-pointer thunks");
+
+    assert_eq!(
+        analysis.thunks,
+        [
+            PeThunk {
+                rva: 0x1000,
+                instruction_size: 6,
+                target: PeControlFlowTarget::FunctionPointer {
+                    slot_rva: 0x2301,
+                    rva: 0x1040,
+                },
+            },
+            PeThunk {
+                rva: 0x1020,
+                instruction_size: 7,
+                target: PeControlFlowTarget::FunctionPointer {
+                    slot_rva: 0x2311,
+                    rva: 0x1040,
+                },
+            },
+        ]
+    );
+
+    let pointer_claim = analysis
+        .symbol_graph
+        .claims()
+        .iter()
+        .find(|claim| {
+            matches!(
+                (claim.subject(), claim.assertion()),
+                (
+                    SymbolSubject::Function { rva: 0x1000, .. },
+                    SymbolAssertion::ThunkTarget {
+                        target: ControlFlowTarget::FunctionPointer {
+                            slot_rva: 0x2301,
+                            rva: 0x1040,
+                        },
+                    },
+                )
+            )
+        })
+        .expect("typed read-only pointer-thunk claim");
+    assert_eq!(
+        pointer_claim.provenance().method,
+        "pe-x64-read-only-pointer-thunk"
+    );
+    assert_eq!(
+        pointer_claim.evidence()[0].summary,
+        READ_ONLY_POINTER_THUNK_EVIDENCE_SUMMARY
+    );
+    assert_eq!(
+        pointer_claim.evidence()[0].artifacts.get("slot_rva"),
+        Some(&"0x2301".to_owned())
+    );
+
+    let recovered_entry = analysis
+        .symbol_graph
+        .claims()
+        .iter()
+        .find(|claim| {
+            claim.provenance().method == "pe-x64-recovered-function-target"
+                && matches!(
+                    (claim.subject(), claim.assertion()),
+                    (
+                        SymbolSubject::Function { rva: 0x1040, .. },
+                        SymbolAssertion::FunctionEntry,
+                    )
+                )
+                && claim.evidence()[0].artifacts.get("slot_rva") == Some(&"0x2301".to_owned())
+        })
+        .expect("pointer-thunk-derived recovered entry preserves its slot");
+    assert_eq!(
+        recovered_entry.evidence()[0].artifacts.get("edge_kind"),
+        Some(&"read-only-pointer-thunk".to_owned())
+    );
+
+    assert_eq!(
+        analysis
+            .rebuild_symbol_graph()
+            .expect("rebuild pointer-thunk graph"),
+        analysis.symbol_graph
+    );
+    let encoded = serde_json::to_string(&analysis).expect("serialize pointer-thunk analysis");
+    let decoded = serde_json::from_str(&encoded).expect("deserialize pointer-thunk analysis");
+    assert_eq!(analysis, decoded);
+}
+
+#[test]
+fn prefixed_ff25_near_misses_are_not_resolved_as_pointer_thunks() {
+    for prefix in [0x40, 0x49, 0x66, 0x67, 0xf2, 0xf3] {
+        let analysis = analyze_pe(&prefixed_pointer_thunk_fixture(
+            prefix,
+            0x2301,
+            RTTI_IMAGE_BASE + 0x1060,
+        ))
+        .unwrap_or_else(|error| panic!("prefix 0x{prefix:02x}: {error}"));
+
+        assert!(
+            analysis
+                .thunks
+                .iter()
+                .all(|thunk| !matches!(thunk.target, PeControlFlowTarget::FunctionPointer { .. })),
+            "prefix 0x{prefix:02x}"
+        );
+    }
+}
+
+#[test]
+fn read_only_pointer_thunks_reject_invalid_slots_and_targets() {
+    let mut pointer_chain = single_pointer_thunk_fixture(0x2301, RTTI_IMAGE_BASE + 0x2320);
+    put_rtti_rva_u64(&mut pointer_chain, 0x2320, RTTI_IMAGE_BASE + 0x1060);
+    for (label, bytes) in [
+        (
+            "preferred VA below image base",
+            single_pointer_thunk_fixture(0x2301, RTTI_IMAGE_BASE - 1),
+        ),
+        (
+            "preferred VA at image end",
+            single_pointer_thunk_fixture(0x2301, RTTI_IMAGE_BASE + 0x3000),
+        ),
+        (
+            "non-executable target",
+            single_pointer_thunk_fixture(0x2301, RTTI_IMAGE_BASE + 0x2300),
+        ),
+        ("pointer chain", pointer_chain),
+        (
+            "runtime-function interior target",
+            single_pointer_thunk_fixture(0x2301, RTTI_IMAGE_BASE + 0x1008),
+        ),
+        (
+            "self target",
+            single_pointer_thunk_fixture(0x2301, RTTI_IMAGE_BASE + 0x1040),
+        ),
+    ] {
+        let analysis = analyze_pe(&bytes).unwrap_or_else(|error| panic!("{label}: {error}"));
+        assert!(
+            analysis
+                .thunks
+                .iter()
+                .all(|thunk| !matches!(thunk.target, PeControlFlowTarget::FunctionPointer { .. })),
+            "{label}"
+        );
+    }
+
+    for (label, characteristics) in [
+        ("writable slot", 0xc000_0040),
+        ("executable slot", 0x6000_0040),
+        ("unreadable slot", 0x0000_0040),
+        ("uninitialized slot", 0x4000_0000),
+    ] {
+        let mut bytes = single_pointer_thunk_fixture(0x2301, RTTI_IMAGE_BASE + 0x1060);
+        put_u32(&mut bytes, SECTION_OFFSET + 40 + 36, characteristics);
+        let analysis = analyze_pe(&bytes).unwrap_or_else(|error| panic!("{label}: {error}"));
+        assert!(analysis.thunks.is_empty(), "{label}");
+    }
+
+    let mut short = rtti_fixture();
+    put_u32(&mut short, OPTIONAL_OFFSET + 16, 0x1040);
+    short[rtti_file_offset(0x1040)..rtti_file_offset(0x1050)].fill(0x90);
+    put_rip_relative_instruction(&mut short, 0x1040, 0x25, 0x23fc);
+    put_u32(&mut short, rtti_file_offset(0x23fc), 0x1060);
+    let analysis = analyze_pe(&short).expect("short pointer slot remains unresolved");
+    assert!(analysis.thunks.is_empty());
+
+    let mut virtual_tail = single_pointer_thunk_fixture(0x2301, RTTI_IMAGE_BASE + 0x1200);
+    put_u32(&mut virtual_tail, SECTION_OFFSET + 8, 0x400);
+    let analysis =
+        analyze_pe(&virtual_tail).expect("executable virtual-tail target remains unresolved");
+    assert!(analysis.thunks.is_empty());
+}
+
+#[test]
+fn read_only_pointer_thunk_accepts_the_last_fully_backed_eight_byte_slot() {
+    let analysis = analyze_pe(&single_pointer_thunk_fixture(
+        0x23f8,
+        RTTI_IMAGE_BASE + 0x1060,
+    ))
+    .expect("last fully backed eight-byte slot is valid");
+    assert_eq!(
+        analysis.thunks,
+        [PeThunk {
+            rva: 0x1040,
+            instruction_size: 6,
+            target: PeControlFlowTarget::FunctionPointer {
+                slot_rva: 0x23f8,
+                rva: 0x1060,
+            },
+        }]
+    );
+}
+
+#[test]
 fn validated_deserialization_accepts_exact_legacy_direct_call_evidence_summary() {
     let analysis = analyze_pe(&code_recovery_fixture()).expect("valid recovered control flow");
     let direct_call_count = analysis.direct_calls.len();
@@ -1308,6 +1563,41 @@ fn validated_deserialization_accepts_exact_legacy_direct_call_evidence_summary()
             .iter()
             .filter(|claim| claim.provenance().method == "pe-x64-direct-call")
             .all(|claim| claim.evidence()[0].summary == LEGACY_DIRECT_CALL_EVIDENCE_SUMMARY)
+    );
+}
+
+#[test]
+fn validated_deserialization_accepts_exact_legacy_thunk_evidence_summary() {
+    let analysis = analyze_pe(&code_recovery_fixture()).expect("valid recovered control flow");
+    let thunk_count = analysis.thunks.len();
+    let mut value = serde_json::to_value(analysis).expect("serialize recovered control flow");
+    let mut legacy_summary_count = 0;
+
+    for claim in value["symbol_graph"]["claims"]
+        .as_array_mut()
+        .expect("serialized claims")
+    {
+        if claim["provenance"]["method"].as_str() == Some("pe-x64-jump-thunk") {
+            assert_eq!(
+                claim["evidence"][0]["summary"].as_str(),
+                Some(THUNK_EVIDENCE_SUMMARY)
+            );
+            claim["evidence"][0]["summary"] = serde_json::json!(LEGACY_THUNK_EVIDENCE_SUMMARY);
+            legacy_summary_count += 1;
+        }
+    }
+    assert_eq!(legacy_summary_count, thunk_count);
+
+    let decoded = serde_json::from_value::<resymbol_analysis::PeAnalysis>(value)
+        .expect("the exact prior seeded-thunk summary remains package-compatible");
+    assert_eq!(decoded.thunks.len(), thunk_count);
+    assert!(
+        decoded
+            .symbol_graph
+            .claims()
+            .iter()
+            .filter(|claim| claim.provenance().method == "pe-x64-jump-thunk")
+            .all(|claim| claim.evidence()[0].summary == LEGACY_THUNK_EVIDENCE_SUMMARY)
     );
 }
 
@@ -2242,17 +2532,49 @@ fn validated_deserialization_rejects_tampered_read_only_pointer_calls() {
     let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(iat_collision)
         .expect_err("IAT membership must take precedence in persisted models");
     assert!(error.to_string().contains("import-address-table slot"));
+}
 
-    let thunk_analysis = analyze_pe(&code_recovery_fixture()).expect("valid thunk analysis");
-    let mut pointer_thunk = serde_json::to_value(thunk_analysis).expect("serialize thunk analysis");
-    pointer_thunk["thunks"][0]["target"] = serde_json::json!({
+#[test]
+fn validated_deserialization_rejects_tampered_read_only_pointer_thunks() {
+    let analysis = analyze_pe(&read_only_pointer_thunk_fixture())
+        .expect("valid read-only pointer-thunk analysis");
+    let original = serde_json::to_value(analysis).expect("serialize pointer-thunk analysis");
+
+    let mut wrong_size = original.clone();
+    wrong_size["thunks"][0]["instruction_size"] = serde_json::json!(5);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(wrong_size)
+        .expect_err("a pointer thunk must retain its exact supported size");
+    assert!(error.to_string().contains("thunk instruction size"));
+
+    let mut interior_target = original.clone();
+    interior_target["thunks"][0]["target"]["rva"] = serde_json::json!(0x1008);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(interior_target)
+        .expect_err("a pointer thunk cannot promote a runtime-function interior");
+    assert!(error.to_string().contains("runtime-function metadata"));
+
+    let mut self_target = original.clone();
+    self_target["thunks"][0]["target"]["rva"] = serde_json::json!(0x1000);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(self_target)
+        .expect_err("a pointer thunk cannot target its own source");
+    assert!(error.to_string().contains("must differ"));
+
+    let mut writable_slot = original.clone();
+    writable_slot["sections"][1]["characteristics"] = serde_json::json!(0xc000_0040_u32);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(writable_slot)
+        .expect_err("a persisted pointer-thunk slot must remain read-only");
+    assert!(error.to_string().contains("eight fully backed bytes"));
+
+    let iat_analysis =
+        analyze_pe(&rtti_fixture_with_rex_w_iat_control_flow()).expect("valid IAT analysis");
+    let mut iat_collision = serde_json::to_value(iat_analysis).expect("serialize IAT analysis");
+    iat_collision["thunks"][0]["target"] = serde_json::json!({
         "kind": "function-pointer",
-        "slot_rva": 0x1260,
-        "rva": 0x1060,
+        "slot_rva": 0x2340,
+        "rva": 0x1040,
     });
-    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(pointer_thunk)
-        .expect_err("pointer-slot resolution is not a thunk model");
-    assert!(error.to_string().contains("not supported for thunks"));
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(iat_collision)
+        .expect_err("IAT membership must take precedence for persisted pointer thunks");
+    assert!(error.to_string().contains("import-address-table slot"));
 }
 
 #[test]
@@ -3152,33 +3474,149 @@ fn session_validates_read_only_pointer_call_targets_slots_and_companions() {
             slot_rva: 0x2340,
         }
     ));
+}
 
-    let thunk_claim = plugin_claim(
+#[test]
+fn session_validates_pointer_thunks_without_requiring_data_reference_companions() {
+    let base_analysis = analyze_bytes(&single_pointer_thunk_fixture(
+        0x2301,
+        RTTI_IMAGE_BASE + 0x1060,
+    ))
+    .expect("valid PE with a metadata-only pointer-thunk seed");
+    let BinaryAnalysis::Pe(base_pe) = &base_analysis else {
+        panic!("synthetic pointer-thunk fixture must parse as PE");
+    };
+    assert!(
+        base_pe.data_references.is_empty(),
+        "the seeded thunk must prove that no runtime-sweep companion is required"
+    );
+    let binary = base_analysis.identity().id.clone();
+    let producer = || ClaimProducer::Plugin {
+        id: plugin_id(),
+        version: "1.2.3".to_owned(),
+    };
+    let pointer_claim = |subject_rva, slot_rva, rva| {
+        plugin_claim(
+            SymbolSubject::Function {
+                binary: binary.clone(),
+                rva: subject_rva,
+                size: Some(0x10),
+            },
+            SymbolAssertion::ThunkTarget {
+                target: ControlFlowTarget::FunctionPointer { slot_rva, rva },
+            },
+            producer(),
+            Some("run-001"),
+        )
+    };
+
+    AnalysisSession::new(
+        base_analysis.clone(),
+        vec![plugin_run(PluginRunStatus::Succeeded, 1)],
+        vec![pointer_claim(0x1040, 0x2301, 0x1060)],
+    )
+    .expect("a valid pointer thunk needs no same-site data-reference claim");
+
+    let error = AnalysisSession::new(
+        base_analysis.clone(),
+        vec![plugin_run(PluginRunStatus::Succeeded, 1)],
+        vec![pointer_claim(0x1040, 0x2301, 0x2300)],
+    )
+    .expect_err("a pointer-thunk endpoint must be executable");
+    assert!(matches!(
+        error,
+        SessionValidationError::FunctionPointerTargetNotExecutable { index: 0 }
+    ));
+
+    let error = AnalysisSession::new(
+        base_analysis,
+        vec![plugin_run(PluginRunStatus::Succeeded, 1)],
+        vec![pointer_claim(0x1040, 0x2301, 0x1040)],
+    )
+    .expect_err("a pointer thunk cannot target itself");
+    assert!(matches!(
+        error,
+        SessionValidationError::ThunkSelfTarget {
+            index: 0,
+            rva: 0x1040,
+        }
+    ));
+
+    let mut writable_bytes = single_pointer_thunk_fixture(0x2301, RTTI_IMAGE_BASE + 0x1060);
+    put_u32(&mut writable_bytes, SECTION_OFFSET + 40 + 36, 0xc000_0040);
+    let writable_analysis = analyze_bytes(&writable_bytes)
+        .expect("writable pointer slots remain analyzable as ordinary data");
+    let writable_claim = plugin_claim(
         SymbolSubject::Function {
-            binary: binary.clone(),
-            rva: 0x1000,
+            binary: writable_analysis.identity().id.clone(),
+            rva: 0x1040,
             size: Some(0x10),
         },
         SymbolAssertion::ThunkTarget {
             target: ControlFlowTarget::FunctionPointer {
                 slot_rva: 0x2301,
-                rva: 0x1020,
+                rva: 0x1060,
             },
         },
         producer(),
         Some("run-001"),
     );
-    let base_analysis = analyze_bytes(&read_only_pointer_call_fixture())
-        .expect("valid PE for plugin thunk rejection");
     let error = AnalysisSession::new(
-        base_analysis,
+        writable_analysis,
         vec![plugin_run(PluginRunStatus::Succeeded, 1)],
-        vec![thunk_claim],
+        vec![writable_claim],
     )
-    .expect_err("pointer resolution is not supported on thunk assertions");
+    .expect_err("plugin pointer-thunk slots must be read-only");
     assert!(matches!(
         error,
-        SessionValidationError::FunctionPointerThunkUnsupported { index: 0 }
+        SessionValidationError::FunctionPointerSlotNotReadOnly { index: 0 }
+    ));
+
+    let iat_analysis = analyze_bytes(&rtti_fixture_with_rex_w_iat_control_flow())
+        .expect("valid PE with parsed imports");
+    let iat_claim = plugin_claim(
+        SymbolSubject::Function {
+            binary: iat_analysis.identity().id.clone(),
+            rva: 0x1020,
+            size: Some(0x10),
+        },
+        SymbolAssertion::ThunkTarget {
+            target: ControlFlowTarget::FunctionPointer {
+                slot_rva: 0x2340,
+                rva: 0x1040,
+            },
+        },
+        producer(),
+        Some("run-001"),
+    );
+    let error = AnalysisSession::new(
+        iat_analysis,
+        vec![plugin_run(PluginRunStatus::Succeeded, 1)],
+        vec![iat_claim],
+    )
+    .expect_err("a plugin cannot reinterpret an IAT thunk slot as a function pointer");
+    assert!(matches!(
+        error,
+        SessionValidationError::FunctionPointerSlotIsImportIat {
+            index: 0,
+            slot_rva: 0x2340,
+        }
+    ));
+
+    let data_source_analysis = analyze_bytes(&single_pointer_thunk_fixture(
+        0x2301,
+        RTTI_IMAGE_BASE + 0x1060,
+    ))
+    .expect("valid PE for a non-executable plugin source rejection");
+    let error = AnalysisSession::new(
+        data_source_analysis,
+        vec![plugin_run(PluginRunStatus::Succeeded, 1)],
+        vec![pointer_claim(0x2300, 0x2301, 0x1060)],
+    )
+    .expect_err("a plugin pointer thunk must originate in executable PE data");
+    assert!(matches!(
+        error,
+        SessionValidationError::FunctionPointerThunkSourceNotExecutable { index: 0 }
     ));
 }
 
