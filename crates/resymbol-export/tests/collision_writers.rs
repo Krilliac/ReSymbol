@@ -208,8 +208,8 @@ fn entry_only_function_keeps_same_rva_global_in_both_debugger_writers() {
 
     let ghidra =
         render_ghidra_java(&projection, "ReSymbolCollisionEntryOnly").expect("Ghidra script");
-    assert!(ghidra.contains("applyGlobalRecord(\"1000,c2FtZV9ydmFfZ2xvYmFs\");"));
-    assert!(!ghidra.contains("applyFunctionRecord(\"1000,"));
+    assert!(ghidra.contains("records.append(\"G,1000,c2FtZV9ydmFfZ2xvYmFs\\n\");"));
+    assert!(!ghidra.contains("F,1000,"));
 }
 
 #[test]
@@ -223,6 +223,6 @@ fn named_function_suppresses_same_rva_global_in_both_debugger_writers() {
     assert!(!ida.contains("    (0x1000, \"same_rva_global\"),"));
 
     let ghidra = render_ghidra_java(&projection, "ReSymbolCollisionNamed").expect("Ghidra script");
-    assert!(ghidra.contains("applyFunctionRecord(\"1000,,bmFtZWRfZnVuY3Rpb24=\");"));
-    assert!(!ghidra.contains("applyGlobalRecord(\"1000,c2FtZV9ydmFfZ2xvYmFs\");"));
+    assert!(ghidra.contains("records.append(\"F,1000,,bmFtZWRfZnVuY3Rpb24=\\n\");"));
+    assert!(!ghidra.contains("G,1000,c2FtZV9ydmFfZ2xvYmFs"));
 }

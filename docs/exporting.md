@@ -423,11 +423,12 @@ function bodies are never replaced. A Ghidra name is protected whenever its sour
 `DEFAULT` nor `ANALYSIS`; this includes user-defined and imported names and avoids overwriting other
 stronger or future source categories.
 
-One generated Ghidra Java script can contain at most 20,000 emitted function/global records after
-target-specific filtering. This is a deliberate writer limit that keeps the generated class within
-practical Java/Ghidra compilation bounds. If the limit is exceeded, export fails before creating
-the output file; the neutral JSON projection remains the loss-aware artifact for the complete
-projected set.
+Large projections are packed deterministically into bounded record-data literals and small batch
+methods. This avoids Java's per-class constant-pool and per-string limits without weakening the
+exact-binary gate; a 67,532-boundary PE such as `VNGame.exe` remains one self-contained script. The
+writer still fails before creating the output file if the generated source would exceed its 32 MiB
+output limit. The neutral JSON projection remains the loss-aware artifact for the complete projected
+set when a writer limit is reached.
 
 ## Current losses and conservative omissions
 

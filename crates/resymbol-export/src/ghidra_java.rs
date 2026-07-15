@@ -5,8 +5,11 @@ use thiserror::Error;
 use crate::{ExportFunction, ExportProjection, ProjectionValidationError};
 
 const MAX_SCRIPT_BYTES: usize = 32 * 1024 * 1024;
-const MAX_SYMBOL_RECORDS: usize = 20_000;
 const RECORDS_PER_METHOD: usize = 256;
+// Java class files encode each string constant with a u16 byte length. Keep
+// generated record-data constants comfortably below that hard limit while
+// packing many records into each constant-pool entry.
+const MAX_RECORD_DATA_LITERAL_BYTES: usize = 48 * 1024;
 const MAX_CLASS_NAME_BYTES: usize = 128;
 
 /// Failure to render a built-in Ghidra Java script.
@@ -17,8 +20,6 @@ pub enum GhidraJavaError {
     InvalidProjection(#[from] ProjectionValidationError),
     #[error("`{name}` is not a conservative Java class name")]
     InvalidClassName { name: String },
-    #[error("the Ghidra Java writer supports at most {limit} symbol records")]
-    SymbolLimitExceeded { limit: usize },
     #[error("the generated Ghidra Java script exceeds {limit} bytes")]
     OutputLimitExceeded { limit: usize },
 }
@@ -41,7 +42,7 @@ pub fn render_ghidra_java(
     projection.validate()?;
     validate_ghidra_java_class_name(class_name)?;
 
-    let records = collect_records(projection)?;
+    let records = collect_records(projection);
     let batch_count = records.len().div_ceil(RECORDS_PER_METHOD);
     let mut output = String::new();
     push_checked(
@@ -186,6 +187,30 @@ import ghidra.program.model.symbol.SymbolTable;\n\n",
         );
     }
 
+    private void applyRecordBatch(String records) {
+        int start = 0;
+        while (start < records.length()) {
+            int end = records.indexOf('\n', start);
+            if (end < 0) {
+                end = records.length();
+            }
+            String record = records.substring(start, end);
+            if (record.length() < 3 || record.charAt(1) != ',') {
+                printerr("[ReSymbol] invalid generated record envelope");
+            }
+            else if (record.charAt(0) == 'F') {
+                applyFunctionRecord(record.substring(2));
+            }
+            else if (record.charAt(0) == 'G') {
+                applyGlobalRecord(record.substring(2));
+            }
+            else {
+                printerr("[ReSymbol] invalid generated record kind");
+            }
+            start = end + 1;
+        }
+    }
+
     private void applyFunctionRecord(String record) {
         String[] fields = record.split(",", -1);
         if (fields.length != 3) {
@@ -271,28 +296,37 @@ import ghidra.program.model.symbol.SymbolTable;\n\n",
     )?;
 
     for (batch, records) in records.chunks(RECORDS_PER_METHOD).enumerate() {
+        let data = record_batch_data(records);
         push_checked(
             &mut output,
             &format!("    private void applyBatch{batch}() {{\n"),
         )?;
-        for record in records {
-            match record {
-                Record::Function(value) => push_checked(
-                    &mut output,
-                    &format!(
-                        "        applyFunctionRecord({});\n",
-                        java_string_literal(value)
-                    ),
-                )?,
-                Record::Global(value) => push_checked(
-                    &mut output,
-                    &format!(
-                        "        applyGlobalRecord({});\n",
-                        java_string_literal(value)
-                    ),
-                )?,
-            }
+        push_checked(
+            &mut output,
+            &format!(
+                "        StringBuilder records = new StringBuilder({});\n",
+                data.len()
+            ),
+        )?;
+        // The record envelope is ASCII-only, so byte slicing cannot split a
+        // UTF-8 code point. StringBuilder prevents javac from folding adjacent
+        // literals back into one oversized class-file string constant.
+        for chunk_start in (0..data.len()).step_by(MAX_RECORD_DATA_LITERAL_BYTES) {
+            let chunk_end = data
+                .len()
+                .min(chunk_start.saturating_add(MAX_RECORD_DATA_LITERAL_BYTES));
+            push_checked(
+                &mut output,
+                &format!(
+                    "        records.append({});\n",
+                    java_string_literal(&data[chunk_start..chunk_end])
+                ),
+            )?;
         }
+        push_checked(
+            &mut output,
+            "        applyRecordBatch(records.toString());\n",
+        )?;
         push_checked(&mut output, "    }\n\n")?;
     }
     push_checked(&mut output, "}\n")?;
@@ -300,14 +334,13 @@ import ghidra.program.model.symbol.SymbolTable;\n\n",
     Ok(output)
 }
 
-fn collect_records(projection: &ExportProjection) -> Result<Vec<Record>, GhidraJavaError> {
+fn collect_records(projection: &ExportProjection) -> Vec<Record> {
     let accepted_sizes = non_overlapping_sizes(&projection.functions);
     let mut records = Vec::new();
     for (function, size) in projection.functions.iter().zip(&accepted_sizes) {
         if !emits_function_record(function, *size) {
             continue;
         }
-        check_record_limit(records.len())?;
         let size = size.map_or_else(String::new, |value| format!("{value:x}"));
         let name = function
             .selected_name
@@ -333,28 +366,39 @@ fn collect_records(projection: &ExportProjection) -> Result<Vec<Record>, GhidraJ
         {
             continue;
         }
-        check_record_limit(records.len())?;
         records.push(Record::Global(format!(
             "{:x},{}",
             global.rva,
             base64_encode(name.output_name.as_bytes())
         )));
     }
-    Ok(records)
+    records
 }
 
 fn emits_function_record(function: &ExportFunction, accepted_size: Option<u64>) -> bool {
     function.selected_name.is_some() || accepted_size.is_some()
 }
 
-fn check_record_limit(current_length: usize) -> Result<(), GhidraJavaError> {
-    if current_length >= MAX_SYMBOL_RECORDS {
-        Err(GhidraJavaError::SymbolLimitExceeded {
-            limit: MAX_SYMBOL_RECORDS,
+fn record_batch_data(records: &[Record]) -> String {
+    let capacity = records
+        .iter()
+        .map(|record| match record {
+            Record::Function(value) | Record::Global(value) => value.len().saturating_add(3),
         })
-    } else {
-        Ok(())
+        .fold(0_usize, usize::saturating_add);
+    let mut data = String::with_capacity(capacity);
+    for record in records {
+        let (kind, value) = match record {
+            Record::Function(value) => ('F', value),
+            Record::Global(value) => ('G', value),
+        };
+        data.push(kind);
+        data.push(',');
+        data.push_str(value);
+        data.push('\n');
     }
+    debug_assert!(data.is_ascii());
+    data
 }
 
 fn non_overlapping_sizes(functions: &[ExportFunction]) -> Vec<Option<u64>> {
@@ -783,11 +827,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_more_records_than_ghidra_can_compile_practically() {
+    fn renders_vngame_scale_runtime_function_sets_in_bounded_literals() {
+        const VN_GAME_RUNTIME_FUNCTIONS: usize = 67_532;
         let mut projection = projection();
-        projection.functions = (0..=MAX_SYMBOL_RECORDS)
+        projection.globals.clear();
+        projection.binary.file_size = (VN_GAME_RUNTIME_FUNCTIONS as u64) * 2 + 1;
+        projection.binary.image_size = (VN_GAME_RUNTIME_FUNCTIONS as u64) * 2 + 1;
+        projection.functions = (0..VN_GAME_RUNTIME_FUNCTIONS)
             .map(|index| ExportFunction {
-                rva: u64::try_from(index).expect("test index fits u64"),
+                rva: u64::try_from(index).expect("test index fits u64") * 2,
                 entry_attribution: None,
                 size: Some(1),
                 size_attribution: Some(attribution()),
@@ -798,13 +846,24 @@ mod tests {
             })
             .collect();
 
-        let error = render_ghidra_java(&projection, "ReSymbolImport")
-            .expect_err("Ghidra record limit must fail closed");
+        let records = collect_records(&projection);
+        assert_eq!(records.len(), VN_GAME_RUNTIME_FUNCTIONS);
+        assert!(record_batch_data(&records[..RECORDS_PER_METHOD]).is_ascii());
+
+        let script =
+            render_ghidra_java(&projection, "ReSymbolImport").expect("VNGame-scale Ghidra export");
+        let expected_batches = VN_GAME_RUNTIME_FUNCTIONS.div_ceil(RECORDS_PER_METHOD);
         assert_eq!(
-            error,
-            GhidraJavaError::SymbolLimitExceeded {
-                limit: MAX_SYMBOL_RECORDS
-            }
+            script.matches("private void applyBatch").count(),
+            expected_batches
         );
+        assert!(script.contains(&format!("applyBatch{}();", expected_batches - 1)));
+        assert!(script.contains("StringBuilder records = new StringBuilder("));
+        assert!(script.contains("applyRecordBatch(records.toString());"));
+        assert!(script.len() < MAX_SCRIPT_BYTES);
+
+        let gate = script.find("verifyIdentity();").expect("identity gate");
+        let first_batch = script.find("applyBatch0();").expect("first batch");
+        assert!(gate < first_batch);
     }
 }

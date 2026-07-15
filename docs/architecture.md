@@ -211,8 +211,9 @@ relationships remain available in the neutral JSON but are not yet fully represe
 database. In particular, validated vftable global names can be applied, but function entries without
 a safe name or extent, direct calls, thunks, RTTI type creation, and function-to-class membership
 metadata remain JSON-only; no virtual-method names are invented. The
-generated Ghidra Java writer has a documented 20,000-record ceiling so its output stays within
-practical Java/Ghidra compilation bounds.
+generated Ghidra Java writer deterministically packs large projections into bounded record-data
+literals and small batch methods, avoiding Java class-file string and constant-pool limits while
+retaining a fixed 32 MiB source-output ceiling.
 
 The MAP writer consumes both the validated neutral projection and its matching PE analysis session
 because the projection intentionally does not duplicate PE section-table detail. It emits one
