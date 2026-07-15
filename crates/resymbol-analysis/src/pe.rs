@@ -60,6 +60,15 @@ const MAX_STRING_BYTES: usize = 4_096;
 const MAX_STRING_CONTENT_BYTES: u64 = 4_095;
 const MAX_PROVENANCE_VERSION_BYTES: usize = 128;
 
+const DIRECT_CALL_EVIDENCE_SUMMARY: &str = concat!(
+    "exact supported x64 call encoding observed during a bounded ",
+    "control-flow-guided traversal of a file-backed runtime-function range",
+);
+const LEGACY_DIRECT_CALL_EVIDENCE_SUMMARY: &str = concat!(
+    "exact supported x64 call encoding observed during a bounded linear sweep ",
+    "of a file-backed runtime-function range",
+);
+
 const EXPORT_DIRECTORY_INDEX: usize = 0;
 const IMPORT_DIRECTORY_INDEX: usize = 1;
 const EXCEPTION_DIRECTORY_INDEX: usize = 3;
@@ -987,16 +996,39 @@ fn symbol_graph_semantically_matches(expected: &SymbolGraph, actual: &SymbolGrap
         .iter()
         .zip(actual.claims())
         .all(|(expected, actual)| {
+            let provenance_method_matches =
+                expected.provenance().method == actual.provenance().method;
             expected.subject() == actual.subject()
                 && expected.assertion() == actual.assertion()
                 && expected.confidence() == actual.confidence()
-                && expected.evidence() == actual.evidence()
-                && expected.provenance().method == actual.provenance().method
+                && provenance_method_matches
+                && evidence_semantically_matches(
+                    expected.evidence(),
+                    actual.evidence(),
+                    &expected.provenance().method,
+                )
                 && expected.provenance().run_id == actual.provenance().run_id
                 && producers_semantically_match(
                     &expected.provenance().producer,
                     &actual.provenance().producer,
                 )
+        })
+}
+
+fn evidence_semantically_matches(
+    expected: &[Evidence],
+    actual: &[Evidence],
+    provenance_method: &str,
+) -> bool {
+    expected.len() == actual.len()
+        && expected.iter().zip(actual).all(|(expected, actual)| {
+            expected == actual
+                || (provenance_method == "pe-x64-direct-call"
+                    && expected.summary == DIRECT_CALL_EVIDENCE_SUMMARY
+                    && actual.summary == LEGACY_DIRECT_CALL_EVIDENCE_SUMMARY
+                    && expected.kind == actual.kind
+                    && expected.confidence == actual.confidence
+                    && expected.artifacts == actual.artifacts)
         })
 }
 
@@ -2109,10 +2141,7 @@ pub(crate) fn build_symbol_graph(
     let mut recovered_entry_sources = BTreeMap::<u32, RecoveredEntrySource>::new();
     for call in direct_calls {
         let target = core_control_flow_target(&call.target);
-        let mut evidence = Evidence::new(
-            control_flow_kind.clone(),
-            "exact supported x64 call encoding observed during a bounded linear sweep of a file-backed runtime-function range",
-        )?;
+        let mut evidence = Evidence::new(control_flow_kind.clone(), DIRECT_CALL_EVIDENCE_SUMMARY)?;
         evidence.confidence = Some(direct_call_confidence);
         evidence
             .artifacts

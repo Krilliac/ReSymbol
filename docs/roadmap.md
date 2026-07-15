@@ -25,17 +25,21 @@ class hierarchies, and executable virtual-slot targets. It recovers stored class
 vftable names and records function-to-class memberships without inventing virtual-method names.
 Fixed scan, record, slot, and name budgets surface partial discovery explicitly.
 
-A bounded pure-Rust x86-64 code-recovery slice is also implemented. Its linear sweep decodes fully
-file-backed `RUNTIME_FUNCTION` ranges for exact direct calls and RIP-relative data references, and
-checks the first instruction at metadata-backed entry candidates for internal or import thunks. It
-retains at most 8,192 direct calls, 32,768 data references, and 4,096 thunks; internal targets
-covered by known runtime-function metadata are suppressed unless their RVA matches a recorded
-runtime-function begin. A separate bounded pass recovers complete NUL-terminated ASCII and UTF-16LE
-literals from readable initialized non-executable file-backed data. These passes emit attributed
-claims without inventing names or extents and preserve independent partial-scan flags. The linear
-sweep remains heuristic-confidence evidence rather than recursive disassembly: post-terminator
-bytes or embedded data can produce false positives, and invalid bytes can omit later relationships
-in the affected range.
+A bounded pure-Rust x86-64 code-recovery slice is also implemented. Its control-flow-guided block
+sweep starts at fully file-backed `RUNTIME_FUNCTION` entries, follows supported direct same-range
+branches with a deterministic ordered worklist, and stops paths at terminal, indirect, invalid,
+out-of-range, or ambiguous interior control flow. It records exact supported direct calls and
+RIP-relative data references and checks the first instruction at metadata-backed entry candidates
+for internal or import thunks. It discovers at most 262,144 block starts and retains at most 8,192
+direct calls, 32,768 data references, and 4,096 thunks; internal targets covered by known
+runtime-function metadata are suppressed unless their RVA matches a recorded runtime-function
+begin. A separate
+bounded pass recovers complete NUL-terminated ASCII and UTF-16LE literals from readable initialized
+non-executable file-backed data. These passes emit attributed claims without inventing names or
+extents and preserve independent partial-scan flags. The guided sweep suppresses unreachable
+post-terminal bytes and can reach valid blocks after jump-over data, but remains heuristic evidence:
+reachable embedded data can produce false positives, and invalid or unsupported flow can omit later
+relationships on that path. It does not persist a basic-block graph.
 
 The first external-process analysis host is also implemented. Dropped-in process plugins require an
 explicit full-directory-fingerprint trust decision, then unchanged trusted artifacts can autoload.
@@ -82,8 +86,8 @@ its logical streams and MSF container.
 
 The remaining Milestone 2 work is deliberately substantial: broader disassembly-assisted candidate
 discovery, indirect control flow and richer call-graph analysis, string-reference correlation,
-broader RTTI/ABI coverage, an open fixture corpus, benchmarks, and continued
-malformed-input/resource-limit validation.
+persisted basic-block modeling, broader RTTI/ABI coverage, an open fixture corpus, benchmarks, and
+continued malformed-input/resource-limit validation.
 The WASM, native C/C++, managed/.NET, and debugger-hosted execution paths remain future work; their
 contracts and architecture are present, but should not be mistaken for working hosts.
 

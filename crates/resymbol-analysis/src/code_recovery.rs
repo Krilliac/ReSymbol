@@ -1,6 +1,9 @@
-use std::collections::BTreeSet;
+use std::{
+    cmp::Reverse,
+    collections::{BTreeSet, BinaryHeap, HashMap, HashSet},
+};
 
-use iced_x86::{Code, Decoder, DecoderOptions, Instruction, Register};
+use iced_x86::{Code, Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
 
 use crate::{
     AnalysisError, MsvcRttiVftable, PeAnalysis, PeControlFlowTarget, PeDataReference, PeDirectCall,
@@ -10,6 +13,7 @@ use crate::{
 
 const MAX_DECODED_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_DECODED_INSTRUCTIONS: u64 = 1_000_000;
+const MAX_CONTROL_FLOW_BLOCK_STARTS: usize = 262_144;
 const MAX_DIRECT_CALLS: usize = 8_192;
 const MAX_DATA_REFERENCES: usize = 32_768;
 const MAX_THUNKS: usize = 4_096;
@@ -126,6 +130,380 @@ impl DecodeBudget {
     }
 }
 
+#[derive(Default)]
+struct BlockBudget {
+    starts: usize,
+}
+
+impl BlockBudget {
+    fn consume(&mut self) -> bool {
+        if self.starts >= MAX_CONTROL_FLOW_BLOCK_STARTS {
+            return false;
+        }
+        self.starts += 1;
+        true
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueueResult {
+    Queued,
+    AlreadyKnown,
+    LimitExceeded,
+    AllocationFailed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecodedLocation {
+    InstructionStart,
+    InstructionInterior,
+}
+
+#[derive(Default)]
+struct FunctionTraversal {
+    pending: BinaryHeap<Reverse<u32>>,
+    discovered: HashSet<u32>,
+    instruction_lengths: HashMap<u32, u8>,
+}
+
+impl FunctionTraversal {
+    fn queue(&mut self, rva: u32, budget: &mut BlockBudget) -> QueueResult {
+        if self.discovered.contains(&rva) || self.decoded_location(rva).is_some() {
+            return QueueResult::AlreadyKnown;
+        }
+        if budget.starts >= MAX_CONTROL_FLOW_BLOCK_STARTS {
+            return QueueResult::LimitExceeded;
+        }
+        if self.pending.try_reserve(1).is_err() || self.discovered.try_reserve(1).is_err() {
+            return QueueResult::AllocationFailed;
+        }
+        if !budget.consume() {
+            return QueueResult::LimitExceeded;
+        }
+        self.discovered.insert(rva);
+        self.pending.push(Reverse(rva));
+        QueueResult::Queued
+    }
+
+    fn pop(&mut self) -> Option<u32> {
+        self.pending.pop().map(|Reverse(rva)| rva)
+    }
+
+    fn decoded_location(&self, rva: u32) -> Option<DecodedLocation> {
+        if self.instruction_lengths.contains_key(&rva) {
+            return Some(DecodedLocation::InstructionStart);
+        }
+        for delta in 1..MAX_X86_INSTRUCTION_BYTES {
+            let Some(start) = rva.checked_sub(u32::try_from(delta).ok()?) else {
+                break;
+            };
+            if self
+                .instruction_lengths
+                .get(&start)
+                .is_some_and(|length| usize::from(*length) > delta)
+            {
+                return Some(DecodedLocation::InstructionInterior);
+            }
+        }
+        None
+    }
+
+    fn retain_instruction(&mut self, rva: u32, length: u8) -> Result<(), ()> {
+        debug_assert!(length != 0);
+        debug_assert!(self.decoded_location(rva).is_none());
+        let end = rva.checked_add(u32::from(length)).ok_or(())?;
+        for interior in rva.checked_add(1).ok_or(())?..end {
+            if self.instruction_lengths.contains_key(&interior) {
+                return Err(());
+            }
+        }
+        self.instruction_lengths.try_reserve(1).map_err(|_| ())?;
+        self.instruction_lengths.insert(rva, length);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TraversalAction {
+    Continue,
+    ConditionalBranch { target: u64 },
+    UnconditionalBranch { target: u64 },
+    Stop,
+}
+
+fn traversal_action(instruction: &Instruction) -> TraversalAction {
+    let mnemonic = instruction.mnemonic();
+    let is_near_branch = matches!(
+        instruction.op0_kind(),
+        OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64
+    ) || matches!(
+        instruction.op1_kind(),
+        OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64
+    );
+    if mnemonic == Mnemonic::Jmp {
+        return if is_near_branch {
+            TraversalAction::UnconditionalBranch {
+                target: instruction.near_branch_target(),
+            }
+        } else {
+            TraversalAction::Stop
+        };
+    }
+    if is_near_branch && is_conditional_branch_mnemonic(mnemonic) {
+        return TraversalAction::ConditionalBranch {
+            target: instruction.near_branch_target(),
+        };
+    }
+    if mnemonic == Mnemonic::Jmpe || is_terminal_mnemonic(mnemonic) {
+        return TraversalAction::Stop;
+    }
+    TraversalAction::Continue
+}
+
+const fn is_conditional_branch_mnemonic(mnemonic: Mnemonic) -> bool {
+    matches!(
+        mnemonic,
+        Mnemonic::Ja
+            | Mnemonic::Jae
+            | Mnemonic::Jb
+            | Mnemonic::Jbe
+            | Mnemonic::Jcxz
+            | Mnemonic::Je
+            | Mnemonic::Jecxz
+            | Mnemonic::Jg
+            | Mnemonic::Jge
+            | Mnemonic::Jkzd
+            | Mnemonic::Jknzd
+            | Mnemonic::Jl
+            | Mnemonic::Jle
+            | Mnemonic::Jne
+            | Mnemonic::Jno
+            | Mnemonic::Jnp
+            | Mnemonic::Jns
+            | Mnemonic::Jo
+            | Mnemonic::Jp
+            | Mnemonic::Jrcxz
+            | Mnemonic::Js
+            | Mnemonic::Loop
+            | Mnemonic::Loope
+            | Mnemonic::Loopne
+            | Mnemonic::Xbegin
+    )
+}
+
+const fn is_terminal_mnemonic(mnemonic: Mnemonic) -> bool {
+    matches!(
+        mnemonic,
+        Mnemonic::Erets
+            | Mnemonic::Eretu
+            | Mnemonic::Hlt
+            | Mnemonic::Int
+            | Mnemonic::Int1
+            | Mnemonic::Int3
+            | Mnemonic::Into
+            | Mnemonic::Iret
+            | Mnemonic::Iretd
+            | Mnemonic::Iretq
+            | Mnemonic::Rdm
+            | Mnemonic::Ret
+            | Mnemonic::Retf
+            | Mnemonic::Rsm
+            | Mnemonic::Seamret
+            | Mnemonic::Skinit
+            | Mnemonic::Sysexit
+            | Mnemonic::Sysret
+            | Mnemonic::Ud0
+            | Mnemonic::Ud1
+            | Mnemonic::Ud2
+            | Mnemonic::Uiret
+            | Mnemonic::Xabort
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeScanResult {
+    Complete,
+    AllocationFailed,
+    DecodeBudgetExceeded,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_runtime_function(
+    begin_rva: u32,
+    end_rva: u32,
+    bytes: &[u8],
+    context: &TargetContext<'_, '_>,
+    decode_budget: &mut DecodeBudget,
+    block_budget: &mut BlockBudget,
+    direct_calls: &mut BTreeSet<PeDirectCall>,
+    data_references: &mut BTreeSet<PeDataReference>,
+    scan_truncated: &mut bool,
+    data_reference_scan_truncated: &mut bool,
+) -> RuntimeScanResult {
+    let mut traversal = FunctionTraversal::default();
+    match traversal.queue(begin_rva, block_budget) {
+        QueueResult::Queued => {}
+        QueueResult::LimitExceeded => {
+            *scan_truncated = true;
+            *data_reference_scan_truncated = true;
+            return RuntimeScanResult::Complete;
+        }
+        QueueResult::AllocationFailed => return RuntimeScanResult::AllocationFailed,
+        QueueResult::AlreadyKnown => unreachable!("fresh traversal has no queued block"),
+    }
+
+    while let Some(block_rva) = traversal.pop() {
+        // A target at an existing instruction start is a normal loop or merge.
+        // A target in an instruction interior is malformed or deliberately
+        // overlapping. In either case it must not start another decoder path.
+        if traversal.decoded_location(block_rva).is_some() {
+            continue;
+        }
+        let Some(block_delta) = block_rva.checked_sub(begin_rva) else {
+            continue;
+        };
+        let Ok(block_offset) = usize::try_from(block_delta) else {
+            continue;
+        };
+        let Some(block_bytes) = bytes.get(block_offset..) else {
+            continue;
+        };
+        let Some(ip) = context.image_base.checked_add(u64::from(block_rva)) else {
+            continue;
+        };
+        let mut decoder = Decoder::with_ip(64, block_bytes, ip, DecoderOptions::NONE);
+
+        while decoder.can_decode() {
+            let position = decoder.position();
+            let Ok(position_rva) = u32::try_from(position) else {
+                break;
+            };
+            let Some(instruction_rva) = block_rva.checked_add(position_rva) else {
+                break;
+            };
+            if instruction_rva >= end_rva || traversal.decoded_location(instruction_rva).is_some() {
+                break;
+            }
+
+            let instruction = decoder.decode();
+            let instruction_size = instruction.len();
+            if instruction_size == 0 {
+                break;
+            }
+            if !decode_budget.consume(instruction_size) {
+                return RuntimeScanResult::DecodeBudgetExceeded;
+            }
+            let Ok(instruction_size_u8) = u8::try_from(instruction_size) else {
+                break;
+            };
+            let Some(instruction_end) = instruction_rva.checked_add(u32::from(instruction_size_u8))
+            else {
+                break;
+            };
+            if instruction_end > end_rva {
+                break;
+            }
+            let Some(raw_start) = block_offset.checked_add(position) else {
+                break;
+            };
+            let Some(raw_end) = raw_start.checked_add(instruction_size) else {
+                break;
+            };
+            let Some(raw_instruction) = bytes.get(raw_start..raw_end) else {
+                break;
+            };
+
+            // A newly reached path may decode backwards into an instruction
+            // that was retained by another path. Reject that path atomically.
+            if traversal
+                .retain_instruction(instruction_rva, instruction_size_u8)
+                .is_err()
+            {
+                if (1..instruction_size)
+                    .filter_map(|delta| instruction_rva.checked_add(u32::try_from(delta).ok()?))
+                    .any(|rva| traversal.instruction_lengths.contains_key(&rva))
+                {
+                    break;
+                }
+                return RuntimeScanResult::AllocationFailed;
+            }
+            if instruction.is_invalid() {
+                break;
+            }
+
+            if let Some(reference) = decode_data_reference(
+                begin_rva,
+                instruction_rva,
+                instruction_size_u8,
+                &instruction,
+                raw_instruction,
+                context,
+            ) {
+                if !insert_bounded(data_references, reference, MAX_DATA_REFERENCES) {
+                    *data_reference_scan_truncated = true;
+                }
+            }
+
+            // Calls and data references share this decode pass, but their
+            // retention caps are independent. Reaching either cap must not
+            // hide whether the other relationship set also truncated.
+            if let Some(target) = decode_call_target(&instruction, raw_instruction, context) {
+                let call = PeDirectCall {
+                    caller_rva: begin_rva,
+                    call_site_rva: instruction_rva,
+                    instruction_size: instruction_size_u8,
+                    target,
+                };
+                if !insert_bounded(direct_calls, call, MAX_DIRECT_CALLS) {
+                    *scan_truncated = true;
+                }
+            }
+
+            let queue_target = |target: u64,
+                                traversal: &mut FunctionTraversal,
+                                block_budget: &mut BlockBudget|
+             -> QueueResult {
+                let Some(target_rva) = va_to_rva(target, context.image_base, context.size_of_image)
+                else {
+                    return QueueResult::AlreadyKnown;
+                };
+                if !(begin_rva..end_rva).contains(&target_rva)
+                    || !is_backed_executable(context.mapper, context.sections, target_rva, 1)
+                {
+                    return QueueResult::AlreadyKnown;
+                }
+                traversal.queue(target_rva, block_budget)
+            };
+            let queue_result = match traversal_action(&instruction) {
+                TraversalAction::Continue => continue,
+                TraversalAction::ConditionalBranch { target } => {
+                    Some((queue_target(target, &mut traversal, block_budget), false))
+                }
+                TraversalAction::UnconditionalBranch { target } => {
+                    Some((queue_target(target, &mut traversal, block_budget), true))
+                }
+                TraversalAction::Stop => break,
+            };
+            let Some((queue_result, stop_block)) = queue_result else {
+                continue;
+            };
+            match queue_result {
+                QueueResult::Queued | QueueResult::AlreadyKnown => {}
+                QueueResult::LimitExceeded => {
+                    *scan_truncated = true;
+                    *data_reference_scan_truncated = true;
+                }
+                QueueResult::AllocationFailed => return RuntimeScanResult::AllocationFailed,
+            }
+            if stop_block {
+                break;
+            }
+        }
+    }
+
+    RuntimeScanResult::Complete
+}
+
 pub(crate) fn recover_code(input: CodeRecoveryInput<'_, '_>) -> CodeRecovery {
     let import_iat_rvas = import_iat_rvas(input.imports);
     let runtime_targets = RuntimeTargetPolicy::new(input.runtime_functions);
@@ -143,14 +521,25 @@ pub(crate) fn recover_code(input: CodeRecoveryInput<'_, '_>) -> CodeRecovery {
     let mut direct_calls = BTreeSet::new();
     let mut data_references = BTreeSet::new();
 
-    let mut ranges = input
-        .runtime_functions
-        .iter()
-        .map(|function| (function.begin_rva, function.end_rva))
-        .collect::<Vec<_>>();
-    ranges.sort_unstable();
-    ranges.dedup();
+    let mut ranges = Vec::new();
+    if ranges
+        .try_reserve_exact(input.runtime_functions.len())
+        .is_err()
+    {
+        scan_truncated = true;
+        data_reference_scan_truncated = true;
+    } else {
+        ranges.extend(
+            input
+                .runtime_functions
+                .iter()
+                .map(|function| (function.begin_rva, function.end_rva)),
+        );
+        ranges.sort_unstable();
+        ranges.dedup();
+    }
 
+    let mut block_budget = BlockBudget::default();
     'runtime_functions: for (begin_rva, end_rva) in ranges {
         let Some(size) = end_rva.checked_sub(begin_rva) else {
             continue;
@@ -167,62 +556,23 @@ pub(crate) fn recover_code(input: CodeRecoveryInput<'_, '_>) -> CodeRecovery {
         else {
             continue;
         };
-        let Some(ip) = input.image_base.checked_add(u64::from(begin_rva)) else {
-            continue;
-        };
-        let mut decoder = Decoder::with_ip(64, bytes, ip, DecoderOptions::NONE);
-        while decoder.can_decode() {
-            let position = decoder.position();
-            let instruction = decoder.decode();
-            let instruction_size = instruction.len();
-            if instruction_size == 0 || !budget.consume(instruction_size) {
+        match scan_runtime_function(
+            begin_rva,
+            end_rva,
+            bytes,
+            &target_context,
+            &mut budget,
+            &mut block_budget,
+            &mut direct_calls,
+            &mut data_references,
+            &mut scan_truncated,
+            &mut data_reference_scan_truncated,
+        ) {
+            RuntimeScanResult::Complete => {}
+            RuntimeScanResult::AllocationFailed | RuntimeScanResult::DecodeBudgetExceeded => {
                 scan_truncated = true;
                 data_reference_scan_truncated = true;
                 break 'runtime_functions;
-            }
-            if instruction.is_invalid() {
-                break;
-            }
-            let Some(raw_instruction) = bytes.get(position..position + instruction_size) else {
-                break;
-            };
-            let Ok(position_rva) = u32::try_from(position) else {
-                break;
-            };
-            let Some(instruction_rva) = begin_rva.checked_add(position_rva) else {
-                break;
-            };
-            let Ok(instruction_size) = u8::try_from(instruction_size) else {
-                break;
-            };
-
-            if let Some(reference) = decode_data_reference(
-                begin_rva,
-                instruction_rva,
-                instruction_size,
-                &instruction,
-                raw_instruction,
-                &target_context,
-            ) {
-                if !insert_bounded(&mut data_references, reference, MAX_DATA_REFERENCES) {
-                    data_reference_scan_truncated = true;
-                }
-            }
-
-            // Calls and data references share this decode pass, but their
-            // retention caps are independent. Reaching either cap must not
-            // hide whether the other relationship set also truncated.
-            if let Some(target) = decode_call_target(&instruction, raw_instruction, &target_context)
-            {
-                let call = PeDirectCall {
-                    caller_rva: begin_rva,
-                    call_site_rva: instruction_rva,
-                    instruction_size,
-                    target,
-                };
-                if !insert_bounded(&mut direct_calls, call, MAX_DIRECT_CALLS) {
-                    scan_truncated = true;
-                }
             }
         }
     }
@@ -866,9 +1216,119 @@ mod tests {
 
     #[test]
     fn retained_record_caps_bound_graph_growth() {
+        assert_eq!(MAX_CONTROL_FLOW_BLOCK_STARTS, 262_144);
         assert_eq!(MAX_DIRECT_CALLS, 8_192);
         assert_eq!(MAX_DATA_REFERENCES, 32_768);
         assert_eq!(MAX_THUNKS, 4_096);
+    }
+
+    #[test]
+    fn block_worklist_is_smallest_first_deduplicated_and_exactly_bounded() {
+        let mut traversal = FunctionTraversal::default();
+        let mut budget = BlockBudget::default();
+        assert_eq!(traversal.queue(0x1030, &mut budget), QueueResult::Queued);
+        assert_eq!(traversal.queue(0x1010, &mut budget), QueueResult::Queued);
+        assert_eq!(traversal.queue(0x1020, &mut budget), QueueResult::Queued);
+        assert_eq!(
+            traversal.queue(0x1010, &mut budget),
+            QueueResult::AlreadyKnown
+        );
+        assert_eq!(traversal.pop(), Some(0x1010));
+        assert_eq!(traversal.pop(), Some(0x1020));
+        assert_eq!(traversal.pop(), Some(0x1030));
+        assert_eq!(traversal.pop(), None);
+
+        let mut exact = FunctionTraversal::default();
+        let mut exact_budget = BlockBudget {
+            starts: MAX_CONTROL_FLOW_BLOCK_STARTS - 1,
+        };
+        assert_eq!(exact.queue(0x2000, &mut exact_budget), QueueResult::Queued);
+        assert_eq!(exact_budget.starts, MAX_CONTROL_FLOW_BLOCK_STARTS);
+        assert_eq!(
+            exact.queue(0x2010, &mut exact_budget),
+            QueueResult::LimitExceeded
+        );
+        assert_eq!(
+            exact.queue(0x2000, &mut exact_budget),
+            QueueResult::AlreadyKnown
+        );
+    }
+
+    #[test]
+    fn decoded_instruction_map_distinguishes_boundaries_and_interiors() {
+        let mut traversal = FunctionTraversal::default();
+        traversal
+            .retain_instruction(0x1000, 5)
+            .expect("first instruction is retained");
+        assert_eq!(
+            traversal.decoded_location(0x1000),
+            Some(DecodedLocation::InstructionStart)
+        );
+        assert_eq!(
+            traversal.decoded_location(0x1001),
+            Some(DecodedLocation::InstructionInterior)
+        );
+        assert_eq!(
+            traversal.decoded_location(0x1004),
+            Some(DecodedLocation::InstructionInterior)
+        );
+        assert_eq!(traversal.decoded_location(0x1005), None);
+        traversal
+            .retain_instruction(0x1005, 2)
+            .expect("adjacent instruction is retained");
+
+        assert!(
+            traversal.retain_instruction(0x0fff, 2).is_err(),
+            "a later-retained instruction start cannot become another instruction's interior"
+        );
+        let mut budget = BlockBudget::default();
+        assert_eq!(
+            traversal.queue(0x1002, &mut budget),
+            QueueResult::AlreadyKnown,
+            "an interior target is dropped without consuming traversal budget"
+        );
+        assert_eq!(budget.starts, 0);
+    }
+
+    #[test]
+    fn traversal_actions_follow_direct_branches_and_stop_terminal_flow() {
+        let conditional = decode_one(&[0x75, 0x02], 0x1000);
+        assert_eq!(
+            traversal_action(&conditional),
+            TraversalAction::ConditionalBranch {
+                target: TEST_IMAGE_BASE + 0x1004,
+            }
+        );
+
+        let direct_jump = decode_one(&[0xeb, 0x02], 0x1000);
+        assert_eq!(
+            traversal_action(&direct_jump),
+            TraversalAction::UnconditionalBranch {
+                target: TEST_IMAGE_BASE + 0x1004,
+            }
+        );
+
+        for bytes in [&[0xff, 0xe0][..], &[0xc3][..], &[0xcc][..]] {
+            assert_eq!(
+                traversal_action(&decode_one(bytes, 0x1000)),
+                TraversalAction::Stop
+            );
+        }
+        for (bytes, code, mnemonic) in [
+            (&[0xf2, 0x0f, 0x01, 0xca][..], Code::Erets, Mnemonic::Erets),
+            (&[0xf3, 0x0f, 0x01, 0xca][..], Code::Eretu, Mnemonic::Eretu),
+        ] {
+            let instruction = decode_one(bytes, 0x1000);
+            assert_eq!(instruction.code(), code);
+            assert_eq!(instruction.mnemonic(), mnemonic);
+            assert_eq!(traversal_action(&instruction), TraversalAction::Stop);
+        }
+        for bytes in [&[0x90][..], &[0xe8, 0, 0, 0, 0][..], &[0xff, 0xd0][..]] {
+            assert_eq!(
+                traversal_action(&decode_one(bytes, 0x1000)),
+                TraversalAction::Continue
+            );
+        }
     }
 
     #[test]

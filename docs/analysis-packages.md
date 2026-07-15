@@ -203,12 +203,18 @@ record-count, or aggregate-text limit preserves the deterministic valid results 
 
 ### Bounded x86-64 control-flow boundary
 
-The built-in code-recovery pass is a bounded linear sweep over complete, file-backed executable
-ranges supplied by the PE x64 exception directory; it is not a recursive traversal of reachable
-basic blocks. It recognizes exact five-byte `E8 rel32` calls to file-backed executable RVAs and
-exact six-byte RIP-relative `FF 15` calls whose computed address is a parsed IAT slot. It does not
-retain other indirect-call forms or targets merely located near an import table. An internal target
-covered by known `RUNTIME_FUNCTION` metadata is suppressed unless its RVA matches a recorded
+The built-in code-recovery pass is a bounded control-flow-guided block sweep over complete,
+file-backed executable ranges supplied by the PE x64 exception directory. Each distinct range
+begins with its metadata-backed entry. Pending direct conditional and unconditional targets inside
+that same range are dequeued in smallest-RVA order, while fallthrough continues immediately where
+the instruction permits it. Returns, terminal or indirect control flow, invalid instructions,
+out-of-range targets, and targets inside an already decoded instruction stop the affected path. The
+ephemeral traversal is not a persisted basic-block graph or a general recursive disassembler.
+
+The pass recognizes exact five-byte `E8 rel32` calls to file-backed executable RVAs and exact
+six-byte RIP-relative `FF 15` calls whose computed address is a parsed IAT slot. It does not retain
+other indirect-call forms or targets merely located near an import table. An internal target covered
+by known `RUNTIME_FUNCTION` metadata is suppressed unless its RVA matches a recorded
 runtime-function begin, preventing an interior label from being promoted to a separate function
 entry.
 
@@ -225,18 +231,20 @@ file-backed executable RVAs; exact RIP-relative `FF 25` jumps must target a pars
 self-targeting internal jump is not a thunk.
 
 Decoding is deterministic and bounded to 64 MiB of instruction bytes, 1,000,000 instructions,
-8,192 retained direct calls, 32,768 retained data references, and 4,096 retained thunks. Each
-relationship family retains its deterministic canonical prefix when its record cap is reached;
-`code_recovery_scan_truncated` and `data_reference_scan_truncated` preserve the applicable partial
-state. Exhausting the shared decode budget makes both instruction-derived sets partial.
-Overlapping `RUNTIME_FUNCTION` ranges are preserved and may be swept and charged to these budgets
-separately, so adversarial overlap metadata can make the scan partial earlier.
+262,144 discovered block starts, 8,192 retained direct calls, 32,768 retained data references, and
+4,096 retained thunks. Each relationship family retains its deterministic traversal prefix when
+its record cap is reached; `code_recovery_scan_truncated` and
+`data_reference_scan_truncated` preserve the applicable partial state. Exhausting the shared
+decode or block-discovery budget makes both instruction-derived sets partial. Overlapping
+`RUNTIME_FUNCTION` ranges are preserved and traversed separately, with each decode charged to the
+shared budgets, so adversarial overlap metadata can make the scan partial earlier.
 
-Linear sweep is intentionally a heuristic-confidence source: it can decode bytes after a terminator
-or embedded data as instructions and therefore retain a false positive, while an invalid encoding
-stops the affected range and can omit valid control flow located later in that range. These records
-establish supported control-flow relationships and function-entry evidence only. They do not
-recover source names, basic blocks, function sizes, or a complete call graph.
+The guided sweep is intentionally a heuristic-confidence source. It suppresses unreachable bytes
+after terminal control flow and can reach a valid block after jump-over data, but reachable embedded
+data can still decode as instructions and therefore retain a false positive. Invalid or unsupported
+control flow can omit later relationships on that path. These records establish supported
+control-flow relationships and function-entry evidence only. They do not recover source names,
+persist basic blocks, infer function sizes, or provide a complete call graph.
 
 ### Persisted-record validation boundary
 
