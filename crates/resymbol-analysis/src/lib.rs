@@ -5,6 +5,7 @@
 //! limits throughout.
 
 mod error;
+mod msvc_rtti;
 mod pe;
 mod session;
 mod types;
@@ -13,8 +14,9 @@ pub use error::AnalysisError;
 pub use pe::analyze_pe;
 pub use session::{AnalysisSession, PluginRunRecord, PluginRunStatus, SessionValidationError};
 pub use types::{
-    BinaryAnalysis, CoffHeader, DataDirectory, ImportTarget, PeAnalysis, PeDataDirectories,
-    PeExport, PeExportName, PeImport, PeImportLibrary, PeSection, RuntimeFunction,
+    BinaryAnalysis, CoffHeader, DataDirectory, ImportTarget, MsvcRttiBaseClass, MsvcRttiVftable,
+    PeAnalysis, PeDataDirectories, PeExport, PeExportName, PeImport, PeImportLibrary, PeSection,
+    RuntimeFunction,
 };
 
 /// Detect and analyze a supported binary container.

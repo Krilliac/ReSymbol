@@ -590,7 +590,7 @@ mod tests {
 
     fn projection() -> ExportProjection {
         ExportProjection {
-            schema_version: 1,
+            schema_version: 2,
             binary: ExportBinary {
                 id: BinaryId::from_sha256("22".repeat(32)).expect("test digest"),
                 file_size: 0x3000,
@@ -606,6 +606,10 @@ mod tests {
                 selected_name: Some(name("quoted_\"_slash_\\_snowman_☃")),
                 alternate_names: Vec::new(),
                 prototypes: Vec::new(),
+                class_memberships: vec![AttributedText {
+                    text: "demo::Widget".to_owned(),
+                    attribution: attribution(),
+                }],
             }],
             globals: vec![ExportGlobal {
                 rva: 0x2000,
@@ -692,6 +696,7 @@ mod tests {
                 selected_name: None,
                 alternate_names: Vec::new(),
                 prototypes: Vec::new(),
+                class_memberships: Vec::new(),
             })
             .collect();
 

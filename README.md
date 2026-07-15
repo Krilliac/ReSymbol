@@ -24,6 +24,9 @@ The current alpha implements and tests an end-to-end, deliberately narrow analys
 
 - safe, bounded ingestion of PE32+ x86-64 binaries, including image metadata, sections, imports,
   exports, forwarded exports, and x64 exception-directory (`RUNTIME_FUNCTION`) records;
+- bounded discovery of modern MSVC x64 Rev1 RTTI and vftables from file-backed compiler metadata,
+  including validated class/type names, base-class records, and contiguous executable slot
+  candidates;
 - conservative symbol-graph generation from exact export names and metadata-backed function
   boundaries, with SHA-256 binary identity, evidence, provenance, confidence, and claim validation;
 - canonical JSON `.resym` packages whose `AnalysisSession` payload keeps deterministic base
@@ -47,12 +50,19 @@ The current alpha implements and tests an end-to-end, deliberately narrow analys
 - CLI discovery, diagnosis, enablement, disablement, fingerprint trust/revocation, quarantine reset,
   plugin selection, and strict automation behavior, plus manifest-only plugin examples.
 
-The analyzer does not disassemble or execute its input, and it does not yet infer erased source
-names, recover types, analyze RTTI/vtables, or build call graphs. The current process host supports
-one-shot analysis requests; interactive binary reads are reserved for a later protocol revision.
-Plugin package verification/extraction, WASM/native/managed execution hosts, cross-build matching,
-semantic inference, interactive debugger bridges, and PDB/MAP/DWARF export are also **not
-implemented yet**.
+The core PE/RTTI analyzer does not disassemble or execute its input and requires no network
+service. Its current RTTI slice recovers names and relationships that are actually present in
+validated compiler metadata; it does not infer erased source identifiers, reconstruct general C++
+layouts, invent names for virtual-function targets, or build call graphs. RTTI support is
+deliberately limited to modern MSVC x64 Rev1 records whose base-class descriptors use the 28-byte
+form with an embedded class-hierarchy reference. Candidate scanning and the vftable/back-pointer,
+COL, CHD, BCA, BCD, and nested-CHD records remain in file-backed readable, read-only initialized
+non-executable data. Referenced TypeDescriptors may also occupy file-backed readable initialized
+non-executable data marked writable, including normal `.data`; writable sections are never
+candidate-scanned. The current process host supports one-shot analysis requests; interactive
+binary reads are reserved for a later protocol revision. Plugin package verification/extraction,
+WASM/native/managed execution hosts, cross-build matching, semantic inference, interactive debugger
+bridges, and PDB/MAP/DWARF export are also **not implemented yet**.
 
 ## Why ReSymbol?
 
@@ -137,10 +147,17 @@ accident. `inspect` validates the package schema, payload, and embedded binary i
 displaying it. `export` also uses create-new writes; use `--output` to choose a destination instead
 of replacing an existing projection or script.
 
+The `analyze` and `inspect` summaries report discovered MSVC RTTI vftables, unique types,
+base-class records, and virtual slots. If a fixed discovery budget is reached, the summary prints
+`MSVC RTTI scan: partial`; the valid records found before that boundary remain available and the
+package records the truncation explicitly.
+
 The generated IDA and Ghidra scripts verify the exact loaded binary SHA-256 before changing a
 database and calculate addresses from the tool's current image base plus each RVA. They preserve
 existing user-authored names and apply only the first projection subset: selected function/global
-names and conservative non-overlapping function boundaries. See the
+names (including validated vftable global names) and conservative non-overlapping function
+boundaries. The neutral JSON projection retains attributed class-membership relationships, while
+the current scripts ignore that metadata and do not synthesize virtual-method names. See the
 [export guide](docs/exporting.md) for usage, limitations, and in-tool instructions. PDB, MAP,
 DWARF, richer type application, and interactive preview bridges remain roadmap work. See the
 [installation guide](docs/install.md) for portable prerelease archives and source-build steps.

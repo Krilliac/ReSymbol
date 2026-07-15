@@ -63,6 +63,12 @@ pub struct PeAnalysis {
     pub export_library_name: Option<String>,
     pub exports: Vec<PeExport>,
     pub runtime_functions: Vec<RuntimeFunction>,
+    /// Whether RTTI discovery stopped after its fixed read-only-data scan budget.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub msvc_rtti_scan_truncated: bool,
+    /// Validated MSVC x64 Rev1 RTTI records discovered through vftable back-pointers.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub msvc_rtti_vftables: Vec<MsvcRttiVftable>,
     /// Validated claims derived solely from exact PE metadata.
     pub symbol_graph: SymbolGraph,
 }
@@ -85,6 +91,7 @@ impl PeAnalysis {
             &self.sections,
             &self.exports,
             &self.runtime_functions,
+            &self.msvc_rtti_vftables,
         )
     }
 }
@@ -108,6 +115,10 @@ struct UncheckedPeAnalysis {
     export_library_name: Option<String>,
     exports: Vec<PeExport>,
     runtime_functions: Vec<RuntimeFunction>,
+    #[serde(default)]
+    msvc_rtti_scan_truncated: bool,
+    #[serde(default)]
+    msvc_rtti_vftables: Vec<MsvcRttiVftable>,
     symbol_graph: SymbolGraph,
 }
 
@@ -132,6 +143,8 @@ impl TryFrom<UncheckedPeAnalysis> for PeAnalysis {
             export_library_name: value.export_library_name,
             exports: value.exports,
             runtime_functions: value.runtime_functions,
+            msvc_rtti_scan_truncated: value.msvc_rtti_scan_truncated,
+            msvc_rtti_vftables: value.msvc_rtti_vftables,
             symbol_graph: value.symbol_graph,
         };
         analysis.validate()?;
@@ -232,4 +245,44 @@ pub struct RuntimeFunction {
     pub unwind_info_rva: u32,
     /// Zero-based position in the exception table. This preserves duplicates.
     pub table_index: u32,
+}
+
+/// One validated MSVC x64 vftable and its Rev1 RTTI metadata.
+///
+/// The vftable starts at `rva`; the preceding pointer-sized slot refers to the
+/// complete object locator. Virtual function entries remain in source order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MsvcRttiVftable {
+    pub rva: u32,
+    pub complete_object_locator_rva: u32,
+    pub type_descriptor_rva: u32,
+    pub class_hierarchy_descriptor_rva: u32,
+    pub base_class_array_rva: u32,
+    pub offset: u32,
+    pub constructor_displacement_offset: u32,
+    pub decorated_class_name: String,
+    pub class_name: String,
+    pub hierarchy_attributes: u32,
+    pub base_classes: Vec<MsvcRttiBaseClass>,
+    pub virtual_function_rvas: Vec<u32>,
+}
+
+/// One base-class descriptor from an MSVC RTTI base-class array.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MsvcRttiBaseClass {
+    pub array_index: u32,
+    pub descriptor_rva: u32,
+    pub type_descriptor_rva: u32,
+    pub decorated_name: String,
+    pub name: String,
+    pub num_contained_bases: u32,
+    pub member_displacement: i32,
+    pub vbtable_displacement: i32,
+    pub displacement_inside_vbtable: i32,
+    pub attributes: u32,
+    pub class_hierarchy_descriptor_rva: Option<u32>,
+}
+
+const fn is_false(value: &bool) -> bool {
+    !*value
 }

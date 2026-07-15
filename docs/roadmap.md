@@ -12,6 +12,12 @@ exception metadata, and derives conservative metadata-backed claims. Canonical `
 now carry an `AnalysisSession`: deterministic base analysis, an auditable plugin-run ledger, and
 separately validated plugin claims with a derived combined graph.
 
+A bounded modern MSVC x64 Rev1 RTTI/vftable slice is now implemented. It validates compiler
+metadata through complete object locators, type descriptors, modern 28-byte base-class descriptors,
+class hierarchies, and executable virtual-slot targets. It recovers stored class/type names and
+vftable names and records function-to-class memberships without inventing virtual-method names.
+Fixed scan, record, slot, and name budgets surface partial discovery explicitly.
+
 The first external-process analysis host is also implemented. Dropped-in process plugins require an
 explicit full-directory-fingerprint trust decision, then unchanged trusted artifacts can autoload.
 The host launches directly without a shell, exchanges bounded NDJSON for one analysis request,
@@ -29,10 +35,10 @@ alternate names, provenance comments, and richer relationships are retained or d
 projection but are not yet fully applied inside the tools.
 
 The remaining Milestone 2 work is deliberately substantial: disassembly-assisted candidate
-discovery, strings and references, call relationships and thunks, MSVC RTTI/vtables, an open fixture
-corpus, reports, benchmarks, and continued malformed-input/resource-limit validation. The WASM,
-native C/C++, managed/.NET, and debugger-hosted execution paths remain future work; their contracts
-and architecture are present, but should not be mistaken for working hosts.
+discovery, strings and references, call relationships and thunks, broader RTTI/ABI coverage, an
+open fixture corpus, reports, benchmarks, and continued malformed-input/resource-limit validation.
+The WASM, native C/C++, managed/.NET, and debugger-hosted execution paths remain future work; their
+contracts and architecture are present, but should not be mistaken for working hosts.
 
 ## Milestone 0: repository foundation
 
@@ -86,15 +92,16 @@ adversarial obfuscation.
 - Executable-range and candidate function discovery
 - Exception and unwind metadata ingestion
 - Strings, constants, references, call relationships, and thunks
-- Initial MSVC RTTI and vtable analysis
+- Initial MSVC x64 Rev1 RTTI and vftable analysis (bounded modern-layout slice implemented)
 - Portable `.resym` analysis package
 - Deterministic, loss-aware JSON symbol projection
 - Reproducible open-source fixture corpus compiled with and without symbols
 - Boundary, coverage, malformed-input, and resource-limit benchmarks
 
-The PE metadata, x64 exception ingestion, portable package, canonical package encoding, neutral
-JSON export projection, and related CLI portions are implemented. Human-readable reports and the
-other bullets describe the remainder of this milestone.
+The PE metadata, x64 exception ingestion, bounded modern MSVC x64 Rev1 RTTI/vftable slice, portable
+package, canonical package encoding, neutral JSON export projection, and related CLI portions are
+implemented. Human-readable reports and the other bullets describe the remainder of this
+milestone.
 
 The MVP should be useful without AI, a network connection, Ghidra, or IDA.
 

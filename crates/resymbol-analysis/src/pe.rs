@@ -10,8 +10,10 @@ use resymbol_core::{
 };
 
 use crate::{
-    AnalysisError, CoffHeader, DataDirectory, ImportTarget, PeAnalysis, PeDataDirectories,
-    PeExport, PeExportName, PeImport, PeImportLibrary, PeSection, RuntimeFunction,
+    AnalysisError, CoffHeader, DataDirectory, ImportTarget, MsvcRttiVftable, PeAnalysis,
+    PeDataDirectories, PeExport, PeExportName, PeImport, PeImportLibrary, PeSection,
+    RuntimeFunction,
+    msvc_rtti::{parse_msvc_rtti, validate_msvc_rtti},
 };
 
 const DOS_HEADER_SIZE: usize = 64;
@@ -86,6 +88,12 @@ pub fn analyze_pe(bytes: &[u8]) -> Result<PeAnalysis, AnalysisError> {
         headers.directories.exceptions,
         headers.size_of_image,
     )?;
+    let (msvc_rtti_vftables, msvc_rtti_scan_truncated) = parse_msvc_rtti(
+        &mapper,
+        &headers.sections,
+        headers.image_base,
+        headers.size_of_image,
+    )?;
 
     let identity = BinaryIdentity {
         id: BinaryId::digest(bytes),
@@ -95,8 +103,13 @@ pub fn analyze_pe(bytes: &[u8]) -> Result<PeAnalysis, AnalysisError> {
         architecture: "x86_64".to_owned(),
         image_base: headers.image_base,
     };
-    let symbol_graph =
-        build_symbol_graph(&identity, &headers.sections, &exports, &runtime_functions)?;
+    let symbol_graph = build_symbol_graph(
+        &identity,
+        &headers.sections,
+        &exports,
+        &runtime_functions,
+        &msvc_rtti_vftables,
+    )?;
 
     let analysis = PeAnalysis {
         identity,
@@ -115,6 +128,8 @@ pub fn analyze_pe(bytes: &[u8]) -> Result<PeAnalysis, AnalysisError> {
         export_library_name,
         exports,
         runtime_functions,
+        msvc_rtti_scan_truncated,
+        msvc_rtti_vftables,
         symbol_graph,
     };
     analysis.validate()?;
@@ -598,12 +613,15 @@ pub(crate) fn validate_pe_analysis(analysis: &PeAnalysis) -> Result<(), Analysis
         }
     }
 
+    validate_msvc_rtti(analysis)?;
+
     analysis.symbol_graph.validate()?;
     let rebuilt = build_symbol_graph(
         &analysis.identity,
         &analysis.sections,
         &analysis.exports,
         &analysis.runtime_functions,
+        &analysis.msvc_rtti_vftables,
     )?;
     if !symbol_graph_semantically_matches(&rebuilt, &analysis.symbol_graph) {
         return invalid_field(
@@ -1407,12 +1425,15 @@ pub(crate) fn build_symbol_graph(
     sections: &[PeSection],
     exports: &[PeExport],
     runtime_functions: &[RuntimeFunction],
+    msvc_rtti_vftables: &[MsvcRttiVftable],
 ) -> Result<SymbolGraph, AnalysisError> {
     let mut graph = SymbolGraph::default();
     let _ = graph.insert_binary(identity.clone())?;
     let exact_metadata_confidence = Confidence::new(1.0)?;
     let export_subject_confidence = Confidence::new(0.99)?;
     let runtime_boundary_confidence = Confidence::new(0.99)?;
+    let rtti_vftable_confidence = Confidence::new(0.99)?;
+    let rtti_slot_confidence = Confidence::new(0.95)?;
     let metadata_kind = EvidenceKind::new(EvidenceKind::METADATA)?;
     let provenance = |method: &str| ClaimProvenance {
         producer: ClaimProducer::Core {
@@ -1556,10 +1577,138 @@ pub(crate) fn build_symbol_graph(
             provenance("pe-exception-directory"),
         )?)?;
     }
+
+    let mut rtti_types = BTreeMap::<u32, (&str, &str, u32)>::new();
+    for vftable in msvc_rtti_vftables {
+        rtti_types.entry(vftable.type_descriptor_rva).or_insert((
+            &vftable.decorated_class_name,
+            &vftable.class_name,
+            vftable.rva,
+        ));
+        for base in &vftable.base_classes {
+            rtti_types.entry(base.type_descriptor_rva).or_insert((
+                &base.decorated_name,
+                &base.name,
+                vftable.rva,
+            ));
+        }
+    }
+    for (type_descriptor_rva, (decorated_name, name, source_vftable_rva)) in rtti_types {
+        let mut evidence = Evidence::new(
+            metadata_kind.clone(),
+            "exact class name from a validated MSVC RTTI type descriptor",
+        )?;
+        evidence.confidence = Some(exact_metadata_confidence);
+        evidence.artifacts.insert(
+            "type_descriptor_rva".to_owned(),
+            format!("{type_descriptor_rva:#x}"),
+        );
+        evidence
+            .artifacts
+            .insert("decorated_name".to_owned(), decorated_name.to_owned());
+        evidence.artifacts.insert(
+            "source_vftable_rva".to_owned(),
+            format!("{source_vftable_rva:#x}"),
+        );
+        graph.submit_claim(SymbolClaim::new(
+            SymbolSubject::Type {
+                binary: identity.id.clone(),
+                key: format!("msvc-rtti:type-descriptor:{type_descriptor_rva:08x}"),
+            },
+            SymbolAssertion::Name {
+                name: name.to_owned(),
+            },
+            exact_metadata_confidence,
+            vec![evidence],
+            provenance("msvc-rtti-type-descriptor"),
+        )?)?;
+    }
+
+    for vftable in msvc_rtti_vftables {
+        let mut evidence = Evidence::new(
+            metadata_kind.clone(),
+            "validated MSVC x64 Rev1 RTTI vftable back-pointer and object locator",
+        )?;
+        evidence.confidence = Some(rtti_vftable_confidence);
+        evidence.artifacts.insert(
+            "complete_object_locator_rva".to_owned(),
+            format!("{:#x}", vftable.complete_object_locator_rva),
+        );
+        evidence.artifacts.insert(
+            "type_descriptor_rva".to_owned(),
+            format!("{:#x}", vftable.type_descriptor_rva),
+        );
+        evidence.artifacts.insert(
+            "class_hierarchy_descriptor_rva".to_owned(),
+            format!("{:#x}", vftable.class_hierarchy_descriptor_rva),
+        );
+        evidence.artifacts.insert(
+            "slot_count".to_owned(),
+            vftable.virtual_function_rvas.len().to_string(),
+        );
+        graph.submit_claim(SymbolClaim::new(
+            SymbolSubject::Global {
+                binary: identity.id.clone(),
+                rva: u64::from(vftable.rva),
+                size: None,
+            },
+            SymbolAssertion::Name {
+                name: rtti_vftable_name(vftable),
+            },
+            rtti_vftable_confidence,
+            vec![evidence],
+            provenance("msvc-rtti-vftable"),
+        )?)?;
+
+        for (slot_index, function_rva) in vftable.virtual_function_rvas.iter().enumerate() {
+            let mut evidence = Evidence::new(
+                metadata_kind.clone(),
+                "contiguous executable slot candidate following a validated MSVC RTTI vftable address point",
+            )?;
+            evidence.confidence = Some(rtti_slot_confidence);
+            evidence
+                .artifacts
+                .insert("vftable_rva".to_owned(), format!("{:#x}", vftable.rva));
+            evidence
+                .artifacts
+                .insert("slot_index".to_owned(), slot_index.to_string());
+            evidence
+                .artifacts
+                .insert("target_rva".to_owned(), format!("{function_rva:#x}"));
+            graph.submit_claim(SymbolClaim::new(
+                SymbolSubject::Function {
+                    binary: identity.id.clone(),
+                    rva: u64::from(*function_rva),
+                    size: None,
+                },
+                SymbolAssertion::ClassMembership {
+                    class_name: vftable.class_name.clone(),
+                },
+                rtti_slot_confidence,
+                vec![evidence],
+                provenance("msvc-rtti-vftable-slot"),
+            )?)?;
+        }
+    }
     Ok(graph)
 }
 
-fn section_for_rva(rva: u32, sections: &[PeSection]) -> Option<(usize, &PeSection)> {
+fn rtti_vftable_name(vftable: &MsvcRttiVftable) -> String {
+    if vftable.offset == 0 && vftable.constructor_displacement_offset == 0 {
+        format!("{}::vftable", vftable.class_name)
+    } else {
+        let mut name = format!("{}::vftable@0x{:x}", vftable.class_name, vftable.offset);
+        if vftable.constructor_displacement_offset != 0 {
+            name.push_str(&format!(
+                "_cd_0x{:x}",
+                vftable.constructor_displacement_offset
+            ));
+        }
+        name
+    }
+}
+
+pub(crate) fn section_for_rva(rva: u32, sections: &[PeSection]) -> Option<(usize, &PeSection)> {
     sections.iter().enumerate().find(|(_, section)| {
         let start = u64::from(section.virtual_address);
         let size = u64::from(cmp::max(section.virtual_size, section.raw_data_size));
@@ -1568,7 +1717,7 @@ fn section_for_rva(rva: u32, sections: &[PeSection]) -> Option<(usize, &PeSectio
     })
 }
 
-struct RvaMap<'a> {
+pub(crate) struct RvaMap<'a> {
     bytes: &'a [u8],
     size_of_headers: u32,
     sections: &'a [PeSection],
@@ -1615,6 +1764,29 @@ impl<'a> RvaMap<'a> {
             }
         }
         Err(AnalysisError::UnmappedRva { context, rva, size })
+    }
+
+    pub(crate) fn read_u32(&self, rva: u32, context: &'static str) -> Option<u32> {
+        let offset = self.offset(rva, 4, context).ok()?;
+        let mut value = [0_u8; 4];
+        value.copy_from_slice(self.bytes.get(offset..offset + 4)?);
+        Some(u32::from_le_bytes(value))
+    }
+
+    pub(crate) fn read_i32(&self, rva: u32, context: &'static str) -> Option<i32> {
+        self.read_u32(rva, context)
+            .map(|value| i32::from_le_bytes(value.to_le_bytes()))
+    }
+
+    pub(crate) fn read_u64(&self, rva: u32, context: &'static str) -> Option<u64> {
+        let offset = self.offset(rva, 8, context).ok()?;
+        let mut value = [0_u8; 8];
+        value.copy_from_slice(self.bytes.get(offset..offset + 8)?);
+        Some(u64::from_le_bytes(value))
+    }
+
+    pub(crate) fn is_backed(&self, rva: u32, size: usize) -> bool {
+        self.offset(rva, size, "file-backed RVA check").is_ok()
     }
 
     fn contiguous_bytes(&self, rva: u32, context: &'static str) -> Result<&'a [u8], AnalysisError> {
@@ -1667,7 +1839,7 @@ impl<'a> RvaMap<'a> {
         })
     }
 
-    fn c_string(
+    pub(crate) fn c_string(
         &self,
         rva: u32,
         context: &'static str,

@@ -9,6 +9,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+msvc-demangler = "=0.11.0"
 resymbol-core = { path = "../resymbol-core" }
 resymbol-package = { path = "../resymbol-package" }
 semver = "1.0.26"

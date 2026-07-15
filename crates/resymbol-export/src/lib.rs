@@ -4,7 +4,8 @@
 //! crate reduces one validated binary's claim graph into a small, stable model
 //! that format writers can consume without independently reconciling claims.
 //! Competing names remain visible, every selected value retains attribution,
-//! and claims that cannot be represented become structured warnings.
+//! function-to-class relationships remain available to richer consumers, and
+//! claims that cannot be represented become structured warnings.
 
 mod error;
 mod ghidra_java;
@@ -31,3 +32,5 @@ pub const MAX_TYPE_KEY_BYTES: usize = 1_024;
 pub const MAX_DECLARATION_BYTES: usize = 16_384;
 /// Maximum UTF-8 byte length retained for each provenance field.
 pub const MAX_PROVENANCE_TEXT_BYTES: usize = 1_024;
+/// Maximum distinct class relationships retained for one function.
+pub const MAX_CLASS_MEMBERSHIPS_PER_FUNCTION: usize = 4_096;
