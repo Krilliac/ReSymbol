@@ -132,12 +132,16 @@ fn exercise_runtime() {
         PluginRuntimeError::Protocol { .. }
     ));
 
-    let timeout_limits = RuntimeLimits::default().with_request_timeout(Duration::from_millis(50));
+    let timeout_limits = RuntimeLimits::default().with_request_timeout(Duration::from_secs(3));
     let timeout_host = ExternalProcessHost::new(timeout_limits).expect("valid timeout limits");
     let timeout = timeout_host
         .execute_trusted(&fixture.plugin, &fixture.request("timeout"))
         .expect_err("hung plugin must be terminated");
-    assert!(matches!(timeout, PluginRuntimeError::Timeout { .. }));
+    assert!(matches!(&timeout, PluginRuntimeError::Timeout { .. }));
+    assert_eq!(
+        timeout.diagnostics().unwrap().stderr,
+        "timeout diagnostic\n"
+    );
 
     let descendant_limits = RuntimeLimits::default().with_request_timeout(Duration::from_secs(3));
     let descendant_host =
@@ -195,12 +199,16 @@ fn exercise_runtime() {
         .execute_trusted(&fixture.plugin, &fixture.request("oversized"))
         .expect_err("oversized stdout must terminate the plugin");
     assert!(matches!(
-        oversized,
+        &oversized,
         PluginRuntimeError::StreamLimit {
             stream: StreamKind::Stdout,
             ..
         }
     ));
+    assert_eq!(
+        oversized.diagnostics().unwrap().stderr,
+        "oversized diagnostic\n"
+    );
     let descendant_oversized = output_host
         .execute_trusted(&fixture.plugin, &fixture.request("descendant-oversized"))
         .expect_err("an over-limit child and its descendant must be terminated");
@@ -248,9 +256,13 @@ fn exercise_runtime() {
         .execute_trusted(&fixture.plugin, &fixture.request("fail"))
         .expect_err("nonzero process exit must fail");
     assert!(matches!(
-        failed,
+        &failed,
         PluginRuntimeError::ProcessFailed { code: Some(7), .. }
     ));
+    assert_eq!(
+        failed.diagnostics().unwrap().stderr,
+        "intentional mock failure\n"
+    );
 
     let mut disabled = fixture.plugin.clone();
     disabled.health.state = PluginHealthState::Disabled;
@@ -381,7 +393,8 @@ fn run_mock_plugin() -> Result<(), Box<dyn std::error::Error>> {
     let request_id = request["id"].as_str().ok_or("missing request id")?;
 
     if mode == "timeout" {
-        thread::sleep(Duration::from_secs(2));
+        write_diagnostic("timeout diagnostic")?;
+        thread::sleep(Duration::from_secs(6));
         return Ok(());
     }
 
@@ -419,7 +432,7 @@ fn run_mock_plugin() -> Result<(), Box<dyn std::error::Error>> {
             )?;
             write_claim(&mut output, false)?;
             write_success(&mut output, request_id, json!({ "accepted": true }))?;
-            writeln!(io::stderr(), "mock diagnostic")?;
+            write_diagnostic("mock diagnostic")?;
         }
         "invalid-claim" => {
             write_claim(&mut output, true)?;
@@ -472,10 +485,11 @@ fn run_mock_plugin() -> Result<(), Box<dyn std::error::Error>> {
             }),
         )?,
         "oversized" => {
+            write_diagnostic("oversized diagnostic")?;
             write_success(&mut output, request_id, Value::String("x".repeat(8_192)))?;
         }
         "fail" => {
-            writeln!(io::stderr(), "intentional mock failure")?;
+            write_diagnostic("intentional mock failure")?;
             output.flush()?;
             process::exit(7);
         }
@@ -483,6 +497,13 @@ fn run_mock_plugin() -> Result<(), Box<dyn std::error::Error>> {
     }
     output.flush()?;
     Ok(())
+}
+
+fn write_diagnostic(message: &str) -> io::Result<()> {
+    let stderr = io::stderr();
+    let mut diagnostic = stderr.lock();
+    writeln!(diagnostic, "{message}")?;
+    diagnostic.flush()
 }
 
 fn spawn_pipe_holder(

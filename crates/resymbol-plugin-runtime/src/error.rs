@@ -26,7 +26,8 @@ impl std::fmt::Display for StreamKind {
 }
 
 /// A host-side launch, resource, transport, protocol, or claim-validation
-/// failure. Variants retain stderr whenever the child produced diagnostics.
+/// failure. Post-launch process failures retain the bounded stderr prefix
+/// observed by the host.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum PluginRuntimeError {
@@ -179,11 +180,20 @@ pub enum PluginRuntimeError {
     LinkedEntrypoint,
     #[error("plugin entrypoint is not a regular file")]
     EntrypointNotFile,
+    /// I/O failure without captured process diagnostics.
     #[error("failed to {operation}: {source}")]
     Io {
         operation: &'static str,
         #[source]
         source: io::Error,
+    },
+    /// I/O failure after child-process execution began.
+    #[error("failed to {operation}: {source}")]
+    ProcessIo {
+        operation: &'static str,
+        #[source]
+        source: io::Error,
+        diagnostics: ProcessDiagnostics,
     },
     #[error("{stream} exceeded its {limit}-byte limit")]
     StreamLimit {
@@ -206,8 +216,15 @@ pub enum PluginRuntimeError {
         code: Option<i32>,
         diagnostics: ProcessDiagnostics,
     },
+    /// I/O-worker failure without attached process diagnostics.
     #[error("plugin I/O worker `{0}` panicked")]
     WorkerPanicked(&'static str),
+    /// I/O-worker failure after child-process execution began.
+    #[error("plugin I/O worker `{worker}` panicked")]
+    ProcessWorkerPanicked {
+        worker: &'static str,
+        diagnostics: ProcessDiagnostics,
+    },
     #[error("invalid plugin JSON on output line {line}: {source}")]
     InvalidJson {
         line: usize,
@@ -243,11 +260,13 @@ pub enum PluginRuntimeError {
 }
 
 impl PluginRuntimeError {
-    /// Captured stderr, when process execution had already begun.
+    /// Bounded captured child stderr attached to this error, when available.
     #[must_use]
     pub const fn diagnostics(&self) -> Option<&ProcessDiagnostics> {
         match self {
-            Self::StreamLimit { diagnostics, .. }
+            Self::ProcessIo { diagnostics, .. }
+            | Self::ProcessWorkerPanicked { diagnostics, .. }
+            | Self::StreamLimit { diagnostics, .. }
             | Self::MessageLimit { diagnostics, .. }
             | Self::PermissionDenied { diagnostics, .. }
             | Self::ClaimEventNotAllowed { diagnostics, .. }
@@ -275,7 +294,9 @@ impl PluginRuntimeError {
     /// framing that must be removed before diagnostics leave this crate.
     pub(crate) const fn diagnostics_mut(&mut self) -> Option<&mut ProcessDiagnostics> {
         match self {
-            Self::StreamLimit { diagnostics, .. }
+            Self::ProcessIo { diagnostics, .. }
+            | Self::ProcessWorkerPanicked { diagnostics, .. }
+            | Self::StreamLimit { diagnostics, .. }
             | Self::MessageLimit { diagnostics, .. }
             | Self::PermissionDenied { diagnostics, .. }
             | Self::ClaimEventNotAllowed { diagnostics, .. }

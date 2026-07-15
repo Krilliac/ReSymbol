@@ -457,13 +457,15 @@ committed only if the entire run validates.
 The first host is one process tree per analysis request. It sends the host greeting and one `analyze`
 request, closes input, and waits for the direct child while capturing bounded output. Direct-child
 completion, a deadline, a stdout/stderr capture failure, or runtime drop terminates the owned
-process tree subject to the deliberate-escape limits above. Stderr already observed before a timeout
-is retained, followed by the bounded worker drain so a native or managed load marker does not depend
-on pipe EOF. The single request deadline covers helper startup, helper preflight, and plugin
-execution. Interactive plugin-to-host `binary.read`/`read-binary`, cancellation, streaming
-backpressure, and a persistent lifecycle are reserved by the contracts but not implemented in this
-host. The process is not OS-sandboxed; fingerprint-bound trust is therefore mandatory before
-launch.
+process tree subject to the deliberate-escape limits above. Stderr already observed before a
+timeout, process-control failure, pipe I/O failure, or pipe-worker failure is retained. Deadline
+cleanup also performs a bounded worker drain so a native or managed load marker does not depend on
+pipe EOF. Process-control, pipe I/O, and pipe-worker failures are host infrastructure failures and
+do not quarantine; timeout attribution remains governed by the existing runtime and load-marker
+policy. The single request deadline covers helper startup, helper preflight, and plugin execution.
+Interactive plugin-to-host `binary.read`/`read-binary`, cancellation, streaming backpressure, and a
+persistent lifecycle are reserved by the contracts but not implemented in this host. The process
+is not OS-sandboxed; fingerprint-bound trust is therefore mandatory before launch.
 
 An interpreter is not assumed to exist. A plugin that needs Python either ships an appropriate
 runtime within its package, declares a clearly diagnosed external prerequisite, or is distributed

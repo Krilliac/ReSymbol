@@ -1518,6 +1518,48 @@ mod tests {
     }
 
     #[test]
+    fn process_worker_failure_keeps_diagnostics_and_marker_attribution() {
+        let marked_stderr = format!("{MANAGED_HOST_LOAD_ATTEMPTED_MARKER}worker detail");
+        let mut marked = Err(PluginRuntimeError::ProcessWorkerPanicked {
+            worker: "managed stderr worker",
+            diagnostics: ProcessDiagnostics {
+                stderr: marked_stderr.clone(),
+                stderr_was_lossy: false,
+            },
+        });
+        strip_managed_marker(&mut marked);
+        let marked =
+            classify_managed_child_result(marked, marked_stderr.as_bytes(), true).unwrap_err();
+        assert!(matches!(
+            marked,
+            PluginRuntimeError::ProcessWorkerPanicked { .. }
+        ));
+        assert_eq!(marked.diagnostics().unwrap().stderr, "worker detail");
+
+        let unmarked = classify_managed_child_result(
+            Err(PluginRuntimeError::ProcessWorkerPanicked {
+                worker: "managed stderr worker",
+                diagnostics: ProcessDiagnostics {
+                    stderr: "worker detail".to_owned(),
+                    stderr_was_lossy: false,
+                },
+            }),
+            b"worker detail",
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            unmarked,
+            PluginRuntimeError::ManagedHostFailed {
+                code: None,
+                ref reason,
+                ..
+            } if reason.contains("managed stderr worker")
+        ));
+        assert_eq!(unmarked.diagnostics().unwrap().stderr, "worker detail");
+    }
+
+    #[test]
     fn limits_reserve_marker_and_helper_is_explicit() {
         let too_small = RuntimeLimits {
             max_stderr_bytes: MANAGED_HOST_LOAD_ATTEMPTED_MARKER.len() - 1,

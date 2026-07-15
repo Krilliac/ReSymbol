@@ -91,6 +91,10 @@ prereleases; breaking changes remain explicit.
 
 ### Changed
 
+- Added diagnostic-bearing `ProcessIo` and `ProcessWorkerPanicked` runtime errors. Execution-stage
+  process polling, process-tree termination, reaping, pipe I/O, and pipe-worker failures now retain
+  the bounded stderr observed before the failure, are classified as host infrastructure failures,
+  and no longer quarantine the plugin artifact.
 - Raised the pinned Rust source-build toolchain and workspace MSRV to 1.86 for the Component Model
   host. Ordinary release users and users of the bundled WASM example still need no compiler.
 - New `.resym` analyses use package schema 3. The `PeAnalysis` public alpha model now carries

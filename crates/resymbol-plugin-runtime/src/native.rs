@@ -1371,18 +1371,22 @@ mod tests {
     }
 
     #[test]
-    fn out_of_band_stage_keeps_diagnosticless_errors_attributable() {
-        let marked = classify_native_child_result(
-            Err(PluginRuntimeError::WorkerPanicked("native stderr worker")),
-            true,
-        )
+    fn process_worker_failure_keeps_diagnostics_and_marker_attribution() {
+        let marked = classify_test_result(Err(PluginRuntimeError::ProcessWorkerPanicked {
+            worker: "native stderr worker",
+            diagnostics: test_diagnostics(true, "worker detail"),
+        }))
         .unwrap_err();
-        assert!(matches!(marked, PluginRuntimeError::WorkerPanicked(_)));
+        assert!(matches!(
+            marked,
+            PluginRuntimeError::ProcessWorkerPanicked { .. }
+        ));
+        assert_eq!(marked.diagnostics().unwrap().stderr, "worker detail");
 
-        let unmarked = classify_native_child_result(
-            Err(PluginRuntimeError::WorkerPanicked("native stderr worker")),
-            false,
-        )
+        let unmarked = classify_test_result(Err(PluginRuntimeError::ProcessWorkerPanicked {
+            worker: "native stderr worker",
+            diagnostics: test_diagnostics(false, "worker detail"),
+        }))
         .unwrap_err();
         assert!(matches!(
             unmarked,
@@ -1392,6 +1396,7 @@ mod tests {
                 ..
             } if reason.contains("native stderr worker")
         ));
+        assert_eq!(unmarked.diagnostics().unwrap().stderr, "worker detail");
     }
 
     #[cfg(unix)]

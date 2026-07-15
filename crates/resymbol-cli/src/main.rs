@@ -1450,6 +1450,8 @@ fn is_host_side_runtime_failure(error: &PluginRuntimeError) -> bool {
                     ..
                 }
                 | PluginRuntimeError::WorkerPanicked(_)
+                | PluginRuntimeError::ProcessIo { .. }
+                | PluginRuntimeError::ProcessWorkerPanicked { .. }
         )
 }
 
@@ -4241,6 +4243,28 @@ entrypoint = "Plugin.dll"
             assert_eq!(pre_attribution_host_runtime(error), Some("managed"));
             assert!(is_host_side_runtime_failure(error));
             assert!(!is_transient_plugin_response(error));
+        }
+
+        let diagnostics = |stderr: &str| {
+            let mut diagnostics = ProcessDiagnostics::default();
+            diagnostics.stderr = stderr.to_owned();
+            diagnostics
+        };
+        let process_host_side = [
+            PluginRuntimeError::ProcessIo {
+                operation: "poll plugin process",
+                source: std::io::Error::other("poll failed"),
+                diagnostics: diagnostics("plugin detail"),
+            },
+            PluginRuntimeError::ProcessWorkerPanicked {
+                worker: "plugin stderr worker",
+                diagnostics: diagnostics("worker detail"),
+            },
+        ];
+        for error in &process_host_side {
+            assert_eq!(pre_attribution_host_runtime(error), None);
+            assert!(is_host_side_runtime_failure(error));
+            assert!(plugin_runtime_error_detail(error).contains("stderr:"));
         }
 
         let attributable = [
