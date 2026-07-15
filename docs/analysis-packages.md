@@ -71,7 +71,8 @@ and the migrated session is not evidence that the decoder found no relationships
 original executable again to create a schema 2 package containing code-recovery results. The
 `inspect` and `export` terminal summaries therefore report code recovery as unavailable/not run for
 schema 1 and recommend reanalysis; they do not describe the migrated empty arrays as a complete
-scan.
+scan. `inspect --json` emits the validated original schema 1 representation rather than placing the
+migrated current payload beneath a legacy schema label.
 
 ## Current `AnalysisSession` payload
 

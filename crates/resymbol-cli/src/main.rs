@@ -267,12 +267,11 @@ fn inspect(args: InspectArgs) -> Result<()> {
         .package
         .canonicalize()
         .with_context(|| format!("cannot open package {}", args.package.display()))?;
-    let loaded = read_analysis_package(&package_path)
+    let loaded = read_analysis_package(&package_path, args.json)
         .with_context(|| format!("cannot read package {}", package_path.display()))?;
 
     if args.json {
-        let json = serde_json::to_string_pretty(&loaded.package)
-            .context("cannot serialize validated package as JSON")?;
+        let json = loaded.to_pretty_inspection_json()?;
         println!("{json}");
         return Ok(());
     }
@@ -312,9 +311,24 @@ impl CodeRecoveryAvailability {
 struct LoadedAnalysisPackage {
     package: ResymPackage<AnalysisSession>,
     code_recovery_availability: CodeRecoveryAvailability,
+    schema1_source: Option<ResymPackage<Value>>,
 }
 
-fn read_analysis_package(path: &Path) -> Result<LoadedAnalysisPackage> {
+impl LoadedAnalysisPackage {
+    fn to_pretty_inspection_json(&self) -> Result<String> {
+        match &self.schema1_source {
+            Some(source) => serde_json::to_string_pretty(source)
+                .context("cannot serialize validated schema-v1 package as JSON"),
+            None => serde_json::to_string_pretty(&self.package)
+                .context("cannot serialize validated package as JSON"),
+        }
+    }
+}
+
+fn read_analysis_package(
+    path: &Path,
+    preserve_schema1_source: bool,
+) -> Result<LoadedAnalysisPackage> {
     let package: ResymPackage<Value> =
         read_file_with_options(path, analysis_package_read_options())?;
     let schema_version = package.schema_version();
@@ -323,6 +337,7 @@ fn read_analysis_package(path: &Path) -> Result<LoadedAnalysisPackage> {
         CURRENT_SCHEMA_VERSION => CodeRecoveryAvailability::Recorded,
         _ => bail!("unsupported analysis package schema {schema_version}"),
     };
+    let schema1_source = (preserve_schema1_source && schema_version == 1).then(|| package.clone());
     let package = package.try_map_payload(|payload| match schema_version {
         1 => serde_json::from_value::<SchemaV1AnalysisSession>(payload)
             .context("cannot decode schema-v1 analysis payload")?
@@ -338,6 +353,7 @@ fn read_analysis_package(path: &Path) -> Result<LoadedAnalysisPackage> {
     Ok(LoadedAnalysisPackage {
         package,
         code_recovery_availability,
+        schema1_source,
     })
 }
 
@@ -445,7 +461,7 @@ fn export(args: ExportArgs) -> Result<()> {
     let package_path = package
         .canonicalize()
         .with_context(|| format!("cannot open package {}", package.display()))?;
-    let package_data = read_analysis_package(&package_path)
+    let package_data = read_analysis_package(&package_path, false)
         .with_context(|| format!("cannot read package {}", package_path.display()))?;
     let projection = ExportProjection::from_session(package_data.package.payload())
         .context("cannot build debugger export projection")?;
@@ -2279,7 +2295,7 @@ args = ["--stdio", "literal argument"]
         )
         .expect("write prior-schema package");
 
-        let decoded = read_analysis_package(&path)
+        let decoded = read_analysis_package(&path, true)
             .expect("CLI compatibility policy migrates a genuine schema-v1 payload");
         assert_eq!(decoded.package.schema_version(), 1);
         assert_eq!(
@@ -2293,6 +2309,31 @@ args = ["--stdio", "literal argument"]
         assert!(pe.direct_calls.is_empty());
         assert!(pe.thunks.is_empty());
         assert_eq!(pe.symbol_graph.claims().len(), current_claim_count);
+
+        let inspected: Value = serde_json::from_str(
+            &decoded
+                .to_pretty_inspection_json()
+                .expect("serialize validated original schema-v1 representation"),
+        )
+        .expect("inspection JSON is valid");
+        assert_eq!(inspected["schema_version"], 1);
+        let inspected_pe = inspected
+            .pointer("/payload/base_analysis/analysis")
+            .and_then(Value::as_object)
+            .expect("schema-v1 PE payload remains an object");
+        assert!(!inspected_pe.contains_key("code_recovery_scan_truncated"));
+        assert!(!inspected_pe.contains_key("direct_calls"));
+        assert!(!inspected_pe.contains_key("thunks"));
+        assert!(
+            inspected_pe["symbol_graph"]["claims"]
+                .as_array()
+                .expect("schema-v1 base claims")
+                .iter()
+                .all(|claim| !matches!(
+                    claim.pointer("/assertion/kind").and_then(Value::as_str),
+                    Some("function-entry" | "direct-call" | "thunk-target")
+                ))
+        );
 
         inspect(InspectArgs {
             package: path,

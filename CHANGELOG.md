@@ -44,7 +44,8 @@ version and validate serialized schema versions independently.
 
 - The CLI can inspect and export package schema 1 through an explicit, validated in-memory
   migration. It revalidates persisted metadata, plugin runs and claims, binary binding, and rebuilds
-  the deterministic base graph; it does not rewrite the legacy package.
+  the deterministic base graph; it does not rewrite the legacy package. `inspect --json` preserves
+  the validated original schema 1 representation instead of mislabeling migrated content.
 - Schema 1 packages do not contain the original executable bytes, so migration cannot run the new
   decoder. Migrated direct-call and thunk sets remain empty and are not evidence that no
   relationships exist. Reanalyze the exact original binary to create a schema 2 package with code
