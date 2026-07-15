@@ -224,8 +224,9 @@ already exist in C and C++. The first host supports out-of-process analysis plug
 sessions.
 
 - The public binary contract is a versioned C ABI, not the Rust ABI or a compiler-specific C++ ABI.
-- The same header is C++11-compatible and adds `noexcept` lifecycle types plus small
-  exception-containment helpers without changing the C ABI.
+- The same header is C++11-compatible and adds a `noexcept` declaration macro plus small
+  exception-containment helpers without changing the C ABI. C++17 and newer also encode
+  `noexcept` in the lifecycle pointer types; C++11/14 definitions must use the macro explicitly.
 - Native plugins run in the version-matched `resymbol-native-host[.exe]` process shipped beside
   `resymbol[.exe]`; the application never accepts a helper from a plugin directory.
 - The helper validates the manifest, C descriptor, ABI table, lifecycle status, callback bounds,
