@@ -79,13 +79,20 @@ The `json` format is the loss-aware interchange output. It retains:
 - competing names, confidence, and producer/run provenance;
 - supported function and global boundaries;
 - recovered function prototypes and type definitions that fit the neutral model;
-- attributed function-to-class membership relationships; and
+- attributed function entries, direct calls, one-instruction thunks, and function-to-class
+  membership relationships; and
 - structured, counted warnings for information that was reduced or omitted.
 
-The current neutral export uses `schema_version: 2`. Schema 2 adds the attributed
-`class_memberships` relationship array to each projected function. This projection schema is
-independent from the `.resym` package-envelope schema; consumers must validate the version of the
-artifact they are actually reading.
+The current neutral export uses `schema_version: 3`. Schema 3 adds function-entry attribution and
+top-level attributed `direct_calls` and `thunks` arrays to schema 2's `class_memberships` model.
+This projection schema is independent from the `.resym` package-envelope schema; consumers must
+validate the version of the artifact they are actually reading.
+
+The CLI can export a schema 1 `.resym` package after migrating its persisted legacy payload into a
+validated current in-memory session and rebuilding its deterministic base graph. Migration neither
+rewrites the package nor re-runs analysis: the package does not embed executable bytes, so its
+direct-call and thunk sets remain empty. Reanalyze the exact original binary to produce a schema 2
+package before expecting code-recovery relationships in the export.
 
 Entries are emitted in stable order. Name and range conflicts are resolved conservatively, and
 colliding selected names receive deterministic output suffixes rather than silently referring to
@@ -93,6 +100,30 @@ the same debugger symbol.
 
 The JSON projection is not a PDB, MAP file, IDA database, or Ghidra project. It is the common input
 to target-specific writers and a useful artifact for plugins, review tools, and future exporters.
+
+### Control-flow projection
+
+A projected function may carry `entry_attribution` even when no safe name or size is known. Each
+direct-call record identifies its caller entry, call-site RVA, target kind, and attribution. Each
+thunk record identifies its entry RVA, selected target kind, and attribution. Internal targets
+reference another projected function entry; import targets retain an IAT-slot RVA. Relations are
+canonical, bounded to 262,144 direct calls and 65,536 thunks, and validated against the binary's
+virtual image. These are neutral projection/model caps, not the built-in decoder's lower recovery
+caps of 8,192 direct calls and 4,096 thunks. The source `.resym` analysis additionally validates
+import targets against exact parsed IAT entries and instruction encodings against file-backed
+executable bytes.
+
+Built-in call recovery is a bounded linear sweep with heuristic confidence, not a recursive
+reachability analysis. Post-terminator bytes or embedded data can produce false positives, and an
+invalid encoding can omit later calls in the affected runtime range. Internal targets covered by
+known runtime-function metadata are suppressed unless their RVA matches a recorded runtime-function
+begin. Consumers must therefore treat the projected relation set as evidence, not as a complete
+call graph.
+
+Entry evidence is deliberately not a name or an extent. The standalone IDA and Ghidra writers skip
+entry-only functions and currently do not install call or thunk relationships; those records remain
+available in neutral JSON for review and future richer bridges. A normal named or bounded function
+continues to use the existing conservative application policy.
 
 ### RTTI-derived projection
 

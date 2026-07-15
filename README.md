@@ -27,8 +27,12 @@ The current alpha implements and tests an end-to-end, deliberately narrow analys
 - bounded discovery of modern MSVC x64 Rev1 RTTI and vftables from file-backed compiler metadata,
   including validated class/type names, base-class records, and contiguous executable slot
   candidates;
-- conservative symbol-graph generation from exact export names and metadata-backed function
-  boundaries, with SHA-256 binary identity, evidence, provenance, confidence, and claim validation;
+- bounded pure-Rust x86-64 decoding inside fully file-backed `RUNTIME_FUNCTION` ranges, recovering
+  supported direct calls and one-instruction thunks to internal executable targets or exact parsed
+  import-address-table slots;
+- conservative symbol-graph generation from exact export names, metadata-backed function
+  boundaries, function-entry candidates, direct calls, and thunks, with SHA-256 binary identity,
+  evidence, provenance, confidence, and claim validation;
 - canonical JSON `.resym` packages whose `AnalysisSession` payload keeps deterministic base
   analysis, plugin-run records, and plugin claims separate while exposing a validated combined
   graph;
@@ -50,13 +54,21 @@ The current alpha implements and tests an end-to-end, deliberately narrow analys
 - CLI discovery, diagnosis, enablement, disablement, fingerprint trust/revocation, quarantine reset,
   plugin selection, and strict automation behavior, plus manifest-only plugin examples.
 
-The core PE/RTTI analyzer does not disassemble or execute its input and requires no network
-service. Its current RTTI slice recovers names and relationships that are actually present in
-validated compiler metadata; it does not infer erased source identifiers, reconstruct general C++
-layouts, invent names for virtual-function targets, or build call graphs. RTTI support is
-deliberately limited to modern MSVC x64 Rev1 records whose base-class descriptors use the 28-byte
-form with an embedded class-hierarchy reference. Candidate scanning and the vftable/back-pointer,
-COL, CHD, BCA, BCD, and nested-CHD records remain in file-backed readable, read-only initialized
+The core PE analyzer never loads or executes its input and requires no network service. Its decoder
+is a bounded linear sweep, not a general recursive disassembler: it scans validated x64 exception
+ranges in RVA order and recognizes only `E8` direct calls, RIP-relative `FF 15` import calls, and
+seeded `E9`, `EB`, or RIP-relative `FF 25` thunks. The built-in pass retains at most 8,192 direct
+calls and 4,096 thunks. These are heuristic-confidence findings: bytes after a terminator or
+embedded data can be decoded as instructions and produce false positives, while an invalid
+encoding can stop the affected range and omit later control flow. An internal target covered by
+known `RUNTIME_FUNCTION` metadata is suppressed unless its RVA matches a recorded runtime-function
+begin. The pass
+does not infer erased identifiers, invent names or sizes, recover register-indirect control flow,
+or claim a complete call graph. Its RTTI slice recovers
+names and relationships actually present in validated compiler metadata and deliberately supports
+only modern MSVC x64 Rev1 records whose base-class descriptors use the 28-byte form with an
+embedded class-hierarchy reference. Candidate scanning and the vftable/back-pointer, COL, CHD,
+BCA, BCD, and nested-CHD records remain in file-backed readable, read-only initialized
 non-executable data. Referenced TypeDescriptors may also occupy file-backed readable initialized
 non-executable data marked writable, including normal `.data`; writable sections are never
 candidate-scanned. The current process host supports one-shot analysis requests; interactive
@@ -102,10 +114,10 @@ ReSymbol is growing from the working PE/package foundation toward:
 - automatic plugin validation, disablement, bounded execution, and quarantine so a faulty
   extension does not prevent the core application from starting.
 
-See the [analysis-package format](docs/analysis-packages.md), [export guide](docs/exporting.md),
-[architecture](docs/architecture.md), [plugin-system design](docs/plugin-system.md),
-[GUI design](docs/gui-design.md), and [roadmap](docs/roadmap.md) for the implemented boundaries and
-the remaining goals.
+See the [changelog](CHANGELOG.md), [analysis-package format](docs/analysis-packages.md),
+[export guide](docs/exporting.md), [architecture](docs/architecture.md),
+[plugin-system design](docs/plugin-system.md), [GUI design](docs/gui-design.md), and
+[roadmap](docs/roadmap.md) for implemented boundaries, release-facing changes, and remaining goals.
 
 ## Product principles
 
@@ -147,17 +159,25 @@ accident. `inspect` validates the package schema, payload, and embedded binary i
 displaying it. `export` also uses create-new writes; use `--output` to choose a destination instead
 of replacing an existing projection or script.
 
-The `analyze` and `inspect` summaries report discovered MSVC RTTI vftables, unique types,
-base-class records, and virtual slots. If a fixed discovery budget is reached, the summary prints
-`MSVC RTTI scan: partial`; the valid records found before that boundary remain available and the
-package records the truncation explicitly.
+New analyses write package schema 2. `inspect` and `export` also accept a schema 1 package by
+migrating its persisted metadata and plugin ledger to a validated current in-memory session and
+rebuilding the deterministic base graph. Migration does not rewrite the source package and cannot
+run the newer decoder because `.resym` does not embed the executable bytes; its recovered-call and
+thunk sets therefore remain empty. Reanalyze the exact original binary to create a schema 2 package
+with code-recovery results.
+
+The `analyze` and `inspect` summaries report recovered direct calls and thunks as well as discovered
+MSVC RTTI vftables, unique types, base-class records, and virtual slots. If a fixed control-flow or
+RTTI discovery budget is reached, the corresponding summary prints a `partial` status; the valid
+deterministic prefix remains available and the package records the truncation explicitly.
 
 The generated IDA and Ghidra scripts verify the exact loaded binary SHA-256 before changing a
 database and calculate addresses from the tool's current image base plus each RVA. They preserve
 existing user-authored names and apply only the first projection subset: selected function/global
 names (including validated vftable global names) and conservative non-overlapping function
-boundaries. The neutral JSON projection retains attributed class-membership relationships, while
-the current scripts ignore that metadata and do not synthesize virtual-method names. See the
+boundaries. The neutral JSON projection retains attributed function entries, direct calls, thunks,
+and class-membership relationships, while the current scripts ignore that relationship metadata
+and do not synthesize virtual-method names. See the
 [export guide](docs/exporting.md) for usage, limitations, and in-tool instructions. PDB, MAP,
 DWARF, richer type application, and interactive preview bridges remain roadmap work. See the
 [installation guide](docs/install.md) for portable prerelease archives and source-build steps.
@@ -185,7 +205,8 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
-Rust is the only required toolchain for the core workspace. The .NET SDK is needed only when
+Rust is the only required toolchain for the core workspace; x86-64 decoding uses a pure-Rust crate
+and does not require a native disassembler library. The .NET SDK is needed only when
 working on managed plugin SDK or host projects. Released managed components are intended to be
 self-contained. CI also syntax-checks the stable native header as both C11 and C++11 and validates
 the external-process protocol schema.

@@ -175,6 +175,36 @@
         }
       ]
     },
+    "controlFlowTarget": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "rva"],
+          "properties": {
+            "kind": { "const": "function" },
+            "rva": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 18446744073709551615
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "iat_rva"],
+          "properties": {
+            "kind": { "const": "import-iat" },
+            "iat_rva": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 18446744073709551615
+            }
+          }
+        }
+      ]
+    },
     "symbolAssertion": {
       "oneOf": [
         {
@@ -206,6 +236,37 @@
               "minimum": 1,
               "maximum": 18446744073709551615
             }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind"],
+          "properties": {
+            "kind": { "const": "function-entry" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "call_site_rva", "target"],
+          "properties": {
+            "kind": { "const": "direct-call" },
+            "call_site_rva": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 18446744073709551615
+            },
+            "target": { "$ref": "#/$defs/controlFlowTarget" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "target"],
+          "properties": {
+            "kind": { "const": "thunk-target" },
+            "target": { "$ref": "#/$defs/controlFlowTarget" }
           }
         },
         {

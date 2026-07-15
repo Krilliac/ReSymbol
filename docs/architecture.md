@@ -8,9 +8,9 @@ The current implementation covers bounded PE32+ x86-64 ingestion, a conservative
 symbol graph, modern MSVC x64 Rev1 RTTI/vftable discovery, canonical JSON `.resym` packages, plugin
 discovery/contracts, and the first trusted external-process analysis runtime. It also includes a
 validated, debugger-neutral export projection and conservative standalone import-script generators
-for IDA and Ghidra. Disassembly, matching, semantic inference, interactive debugger bridges,
-PDB/MAP/DWARF writers, the workbench GUI, and the WASM/native/managed execution hosts remain design
-work.
+for IDA and Ghidra. Broader disassembly-assisted discovery, matching, semantic inference,
+interactive debugger bridges, PDB/MAP/DWARF writers, the workbench GUI, and the
+WASM/native/managed execution hosts remain design work.
 
 ## Goals
 
@@ -76,11 +76,28 @@ unrelated signature index, and removing a plugin's results should not require re
 have no dependency on that plugin.
 
 The implemented slice extracts PE image/section metadata, imports, exports, forwarded exports, x64
-`RUNTIME_FUNCTION` records, and a bounded modern MSVC x64 RTTI/vftable subset without loading,
-executing, or disassembling the input. Exact export names, corroborated metadata-backed boundaries,
+`RUNTIME_FUNCTION` records, bounded direct calls and thunks, and a bounded modern MSVC x64
+RTTI/vftable subset without loading or executing the input. Exact export names, corroborated
+metadata-backed boundaries, supported decoded function entries and control-flow relationships,
 validated RTTI type/vftable names, and function-to-class relationships from virtual slots become
 evidence-bearing graph claims. Broader candidate discovery and the remaining evidence sources
 above are planned.
+
+The x86-64 decoder is a pure-Rust, bounded linear sweep used only over complete file-backed
+executable exception ranges and the first instruction at metadata-backed thunk seeds. The
+implemented forms are `E8` internal calls, RIP-relative `FF 15` calls to exact parsed IAT slots,
+`E9`/`EB` internal thunks, and RIP-relative `FF 25` import thunks. Internal targets covered by known
+runtime-function metadata are suppressed unless their RVA matches a recorded runtime-function
+begin. Aggregate limits of 64 MiB, 1,000,000 instructions, 8,192 retained direct calls, and 4,096
+retained thunks retain a canonical prefix and mark analysis partial when exhausted. Overlapping
+runtime-function ranges are preserved and may be swept and budgeted separately, so adversarial
+overlap metadata can make the bounded pass partial earlier.
+
+This sweep supplies heuristic-confidence evidence rather than a recursive, reachability-aware
+disassembly. It can decode post-terminator bytes or embedded data as instructions and retain false
+positives; an invalid encoding can stop one range and omit later control flow. The pass does not
+turn entry evidence into a fabricated source name, size, basic-block model, or complete
+control-flow graph.
 
 The RTTI pass candidate-scans only file-backed initialized data sections that are readable,
 non-writable, and non-executable. Vftables and their back-pointers, complete object locators,
@@ -164,9 +181,10 @@ the canonical graph into a debugger database.
 
 Exporters consume a bounded, read-only projection of one validated session. The initial projection
 selects deterministic names and boundaries, preserves competing names, prototypes, type
-definitions, attributed class memberships, confidence, and provenance where representable, assigns
-collision-safe output names, and emits structured warnings when graph information must be reduced
-or omitted. Writers revalidate that projection before serializing it.
+definitions, attributed function entries, direct calls, thunks, class memberships, confidence, and
+provenance where representable, assigns collision-safe output names, and emits structured warnings
+when graph information must be reduced or omitted. Writers revalidate that projection before
+serializing it.
 
 The first writers serialize the projection as JSON or generate self-contained IDAPython and Ghidra
 Java import scripts. Each script checks the debugger's recorded input SHA-256 before mutation and
@@ -177,8 +195,9 @@ symbol cannot be applied. This is intentionally narrower than a long-lived tool-
 selected collision-safe function/global names and safe function boundaries are applied, while
 source spellings, alternate names, confidence, provenance, prototypes, types, comments, and
 relationships remain available in the neutral JSON but are not yet fully represented in the tool
-database. In particular, validated vftable global names can be applied, but RTTI type creation and
-function-to-class membership metadata remain JSON-only; no virtual-method names are invented. The
+database. In particular, validated vftable global names can be applied, but function entries without
+a safe name or extent, direct calls, thunks, RTTI type creation, and function-to-class membership
+metadata remain JSON-only; no virtual-method names are invented. The
 generated Ghidra Java writer has a documented 20,000-record ceiling so its output stays within
 practical Java/Ghidra compilation bounds.
 
@@ -282,6 +301,12 @@ Compatibility is negotiated independently for:
 A plugin declares a supported API range. Unsupported plugins are marked incompatible rather than
 loaded optimistically. Schema migrations are explicit and must preserve provenance. Before 1.0,
 breaking changes are expected, but they still require version bumps and release notes.
+
+The current CLI writes analysis-package schema 2 and can migrate schema 1 into a validated current
+session for inspection or export. It rebuilds the base graph from persisted legacy metadata but
+does not rewrite the package. Because the package omits the analyzed binary bytes, migration cannot
+run code recovery; obtaining direct-call and thunk findings requires reanalyzing the exact original
+binary into a new schema 2 package.
 
 ## Core invariants
 

@@ -1,12 +1,13 @@
 use resymbol_analysis::{
-    AnalysisError, AnalysisSession, BinaryAnalysis, ImportTarget, PluginRunRecord, PluginRunStatus,
-    SessionValidationError, analyze_bytes, analyze_pe,
+    AnalysisError, AnalysisSession, BinaryAnalysis, ImportTarget, PeControlFlowTarget,
+    PeDirectCall, PeThunk, PluginRunRecord, PluginRunStatus, SessionValidationError, analyze_bytes,
+    analyze_pe,
 };
 use resymbol_core::{
-    BinaryId, ClaimProducer, ClaimProvenance, Confidence, Evidence, EvidenceKind, SymbolAssertion,
-    SymbolClaim, SymbolSubject, plugin_api::PluginId,
+    BinaryId, ClaimProducer, ClaimProvenance, Confidence, ControlFlowTarget, Evidence,
+    EvidenceKind, SymbolAssertion, SymbolClaim, SymbolSubject, plugin_api::PluginId,
 };
-use resymbol_package::BinaryBoundPayload;
+use resymbol_package::{BinaryBoundPayload, DEFAULT_MAX_PACKAGE_BYTES, ResymPackage, to_vec_bound};
 
 const PE_OFFSET: usize = 0x80;
 const COFF_OFFSET: usize = PE_OFFSET + 4;
@@ -122,6 +123,134 @@ fn fixture() -> Vec<u8> {
     bytes
 }
 
+fn put_rel32_instruction(bytes: &mut [u8], rva: u32, opcode: u8, target_rva: u32) {
+    let next_rva = rva.checked_add(5).expect("fixture instruction end");
+    let displacement = i64::from(target_rva) - i64::from(next_rva);
+    let displacement = i32::try_from(displacement).expect("fixture rel32 displacement");
+    let offset = file_offset(rva);
+    bytes[offset] = opcode;
+    bytes[offset + 1..offset + 5].copy_from_slice(&displacement.to_le_bytes());
+}
+
+fn put_rel8_instruction(bytes: &mut [u8], rva: u32, opcode: u8, target_rva: u32) {
+    let next_rva = rva.checked_add(2).expect("fixture instruction end");
+    let displacement = i64::from(target_rva) - i64::from(next_rva);
+    let displacement = i8::try_from(displacement).expect("fixture rel8 displacement");
+    let offset = file_offset(rva);
+    bytes[offset..offset + 2].copy_from_slice(&[opcode, displacement.to_le_bytes()[0]]);
+}
+
+fn put_rip_relative_instruction(bytes: &mut [u8], rva: u32, modrm: u8, target_rva: u32) {
+    let next_rva = rva.checked_add(6).expect("fixture instruction end");
+    let displacement = i64::from(target_rva) - i64::from(next_rva);
+    let displacement = i32::try_from(displacement).expect("fixture RIP displacement");
+    let offset = file_offset(rva);
+    bytes[offset..offset + 2].copy_from_slice(&[0xff, modrm]);
+    bytes[offset + 2..offset + 6].copy_from_slice(&displacement.to_le_bytes());
+}
+
+fn code_recovery_fixture() -> Vec<u8> {
+    let mut bytes = fixture();
+    bytes[file_offset(0x1000)..file_offset(0x1020)].fill(0x90);
+
+    put_rel32_instruction(&mut bytes, 0x1000, 0xe8, 0x1040);
+    put_rip_relative_instruction(&mut bytes, 0x1005, 0x15, 0x1260);
+    put_rel32_instruction(&mut bytes, 0x100b, 0xe8, 0x1080);
+    put_rel32_instruction(&mut bytes, 0x1010, 0xe8, 0x10a0);
+    put_rip_relative_instruction(&mut bytes, 0x1015, 0x15, 0x1270);
+    bytes[file_offset(0x101b)] = 0xc3;
+
+    put_rel32_instruction(&mut bytes, 0x1040, 0xe9, 0x1060);
+    bytes[file_offset(0x1060)] = 0xc3;
+    put_rip_relative_instruction(&mut bytes, 0x1080, 0x25, 0x1268);
+    bytes[file_offset(0x10a0)..file_offset(0x10a2)].copy_from_slice(&[0xeb, 0x0e]);
+    bytes[file_offset(0x10b0)] = 0xc3;
+    bytes
+}
+
+fn control_flow_suppression_fixture() -> Vec<u8> {
+    let mut bytes = fixture();
+    put_u32(&mut bytes, OPTIONAL_OFFSET + 16, 0x1040);
+    set_directory(&mut bytes, 3, 0x1300, 24);
+    let exception = file_offset(0x1300);
+    put_u32(&mut bytes, exception + 4, 0x1005);
+    put_u32(&mut bytes, exception + 12, 0x1010);
+    put_u32(&mut bytes, exception + 16, 0x1020);
+    put_u32(&mut bytes, exception + 20, 0x1360);
+
+    bytes[file_offset(0x1000)..file_offset(0x1020)].fill(0x90);
+    put_rel32_instruction(&mut bytes, 0x1000, 0xe8, 0x1005);
+    put_rel32_instruction(&mut bytes, 0x1010, 0xe8, 0x1018);
+    put_rel32_instruction(&mut bytes, 0x1015, 0xe8, 0x1060);
+    bytes[file_offset(0x101a)] = 0xc3;
+    put_rel32_instruction(&mut bytes, 0x1040, 0xe9, 0x1018);
+    bytes[file_offset(0x1060)] = 0xc3;
+    bytes
+}
+
+fn direct_call_cap_fixture(call_count: usize) -> Vec<u8> {
+    const TARGET_RVA: u32 = 0xb100;
+    const EXCEPTION_RVA: u32 = 0xb200;
+    const UNWIND_INFO_RVA: u32 = 0xb220;
+    const SECTION_RAW_SIZE: u32 = 0xa400;
+
+    let raw_size = usize::try_from(SECTION_RAW_SIZE).expect("fixture raw size");
+    let mut bytes = vec![0_u8; RAW_OFFSET + raw_size];
+    bytes[0..2].copy_from_slice(b"MZ");
+    put_u32(
+        &mut bytes,
+        0x3c,
+        u32::try_from(PE_OFFSET).expect("fixture offset"),
+    );
+    bytes[PE_OFFSET..PE_OFFSET + 4].copy_from_slice(b"PE\0\0");
+
+    put_u16(&mut bytes, COFF_OFFSET, 0x8664);
+    put_u16(&mut bytes, COFF_OFFSET + 2, 1);
+    put_u16(&mut bytes, COFF_OFFSET + 16, 0xf0);
+    put_u16(&mut bytes, COFF_OFFSET + 18, 0x2022);
+
+    put_u16(&mut bytes, OPTIONAL_OFFSET, 0x020b);
+    put_u64(&mut bytes, OPTIONAL_OFFSET + 24, 0x0000_0001_4000_0000);
+    put_u32(&mut bytes, OPTIONAL_OFFSET + 32, 0x1000);
+    put_u32(&mut bytes, OPTIONAL_OFFSET + 36, 0x200);
+    put_u32(&mut bytes, OPTIONAL_OFFSET + 56, 0xc000);
+    put_u32(&mut bytes, OPTIONAL_OFFSET + 60, 0x200);
+    put_u16(&mut bytes, OPTIONAL_OFFSET + 68, 3);
+    put_u16(&mut bytes, OPTIONAL_OFFSET + 70, 0x8160);
+    put_u32(&mut bytes, OPTIONAL_OFFSET + 108, 16);
+    set_directory(&mut bytes, 3, EXCEPTION_RVA, 12);
+
+    bytes[SECTION_OFFSET..SECTION_OFFSET + 6].copy_from_slice(b".text\0");
+    put_u32(&mut bytes, SECTION_OFFSET + 8, SECTION_RAW_SIZE);
+    put_u32(&mut bytes, SECTION_OFFSET + 12, SECTION_RVA);
+    put_u32(&mut bytes, SECTION_OFFSET + 16, SECTION_RAW_SIZE);
+    put_u32(
+        &mut bytes,
+        SECTION_OFFSET + 20,
+        u32::try_from(RAW_OFFSET).expect("fixture raw offset"),
+    );
+    put_u32(&mut bytes, SECTION_OFFSET + 36, 0x6000_0020);
+
+    for index in 0..call_count {
+        let byte_offset = index.checked_mul(5).expect("fixture call offset");
+        let call_rva = SECTION_RVA
+            .checked_add(u32::try_from(byte_offset).expect("fixture call RVA"))
+            .expect("fixture call RVA");
+        put_rel32_instruction(&mut bytes, call_rva, 0xe8, TARGET_RVA);
+    }
+    let code_size = call_count.checked_mul(5).expect("fixture code size");
+    let code_end_rva = SECTION_RVA
+        .checked_add(u32::try_from(code_size).expect("fixture code size RVA"))
+        .expect("fixture code end RVA");
+    bytes[file_offset(TARGET_RVA)] = 0xc3;
+
+    let exception = file_offset(EXCEPTION_RVA);
+    put_u32(&mut bytes, exception, SECTION_RVA);
+    put_u32(&mut bytes, exception + 4, code_end_rva);
+    put_u32(&mut bytes, exception + 8, UNWIND_INFO_RVA);
+    bytes
+}
+
 const RTTI_TEXT_RAW_OFFSET: usize = 0x200;
 const RTTI_TEXT_RVA: u32 = 0x1000;
 const RTTI_RDATA_RAW_OFFSET: usize = 0x400;
@@ -148,6 +277,15 @@ fn put_rtti_rva_u32(bytes: &mut [u8], rva: u32, value: u32) {
 
 fn put_rtti_rva_u64(bytes: &mut [u8], rva: u32, value: u64) {
     put_u64(bytes, rtti_file_offset(rva), value);
+}
+
+fn put_rel32_instruction_at_rtti_rva(bytes: &mut [u8], rva: u32, opcode: u8, target_rva: u32) {
+    let next_rva = rva.checked_add(5).expect("fixture instruction end");
+    let displacement = i64::from(target_rva) - i64::from(next_rva);
+    let displacement = i32::try_from(displacement).expect("fixture rel32 displacement");
+    let offset = rtti_file_offset(rva);
+    bytes[offset] = opcode;
+    bytes[offset + 1..offset + 5].copy_from_slice(&displacement.to_le_bytes());
 }
 
 fn rtti_data_file_offset(rva: u32) -> usize {
@@ -424,7 +562,7 @@ fn analyzes_minimal_pe_with_imports_exports_and_runtime_functions() {
     assert_eq!(analysis.runtime_functions[0].begin_rva, 0x1000);
     assert_eq!(analysis.runtime_functions[0].end_rva, 0x1020);
     assert_eq!(analysis.symbol_graph.binaries().len(), 1);
-    assert_eq!(analysis.symbol_graph.claims().len(), 3);
+    assert_eq!(analysis.symbol_graph.claims().len(), 5);
     assert!(matches!(
         analysis.symbol_graph.claims()[0].assertion(),
         SymbolAssertion::Name { name } if name == "ExportA"
@@ -437,6 +575,384 @@ fn analyzes_minimal_pe_with_imports_exports_and_runtime_functions() {
             .get(),
         1.0
     );
+}
+
+#[test]
+fn emits_one_metadata_claim_for_a_file_backed_executable_pe_entry_point() {
+    let analysis = analyze_pe(&fixture()).expect("valid PE entry point");
+    let entry_claims = analysis
+        .symbol_graph
+        .claims()
+        .iter()
+        .filter(|claim| claim.provenance().method == "pe-entry-point")
+        .collect::<Vec<_>>();
+
+    assert_eq!(entry_claims.len(), 1);
+    let entry = entry_claims[0];
+    assert!(matches!(
+        (entry.subject(), entry.assertion()),
+        (
+            SymbolSubject::Function {
+                rva: 0x1000,
+                size: None,
+                ..
+            },
+            SymbolAssertion::FunctionEntry,
+        )
+    ));
+    assert_eq!(entry.confidence().get(), 0.99);
+    assert_eq!(entry.evidence()[0].kind.as_str(), EvidenceKind::METADATA);
+    assert_eq!(entry.evidence()[0].artifacts["entry_point_rva"], "0x1000");
+}
+
+#[test]
+fn recovers_bounded_direct_calls_and_exact_jump_thunks() {
+    let bytes = code_recovery_fixture();
+    let analysis = analyze_pe(&bytes).expect("valid PE with recoverable control flow");
+
+    assert!(!analysis.code_recovery_scan_truncated);
+    assert_eq!(
+        analysis.direct_calls,
+        [
+            PeDirectCall {
+                caller_rva: 0x1000,
+                call_site_rva: 0x1000,
+                instruction_size: 5,
+                target: PeControlFlowTarget::Function { rva: 0x1040 },
+            },
+            PeDirectCall {
+                caller_rva: 0x1000,
+                call_site_rva: 0x1005,
+                instruction_size: 6,
+                target: PeControlFlowTarget::ImportIat { iat_rva: 0x1260 },
+            },
+            PeDirectCall {
+                caller_rva: 0x1000,
+                call_site_rva: 0x100b,
+                instruction_size: 5,
+                target: PeControlFlowTarget::Function { rva: 0x1080 },
+            },
+            PeDirectCall {
+                caller_rva: 0x1000,
+                call_site_rva: 0x1010,
+                instruction_size: 5,
+                target: PeControlFlowTarget::Function { rva: 0x10a0 },
+            },
+        ]
+    );
+    assert_eq!(
+        analysis.thunks,
+        [
+            PeThunk {
+                rva: 0x1040,
+                instruction_size: 5,
+                target: PeControlFlowTarget::Function { rva: 0x1060 },
+            },
+            PeThunk {
+                rva: 0x1080,
+                instruction_size: 6,
+                target: PeControlFlowTarget::ImportIat { iat_rva: 0x1268 },
+            },
+            PeThunk {
+                rva: 0x10a0,
+                instruction_size: 2,
+                target: PeControlFlowTarget::Function { rva: 0x10b0 },
+            },
+        ]
+    );
+
+    let claims = analysis.symbol_graph.claims();
+    let direct_edge = claims
+        .iter()
+        .find(|claim| {
+            matches!(
+                claim.assertion(),
+                SymbolAssertion::DirectCall {
+                    call_site_rva: 0x1000,
+                    ..
+                }
+            )
+        })
+        .expect("retained direct edge claim");
+    assert_eq!(direct_edge.confidence().get(), 0.90);
+    assert!(direct_edge.evidence()[0].summary.contains("linear sweep"));
+
+    let thunk_edge = claims
+        .iter()
+        .find(|claim| {
+            matches!(
+                (claim.subject(), claim.assertion()),
+                (
+                    SymbolSubject::Function { rva: 0x1040, .. },
+                    SymbolAssertion::ThunkTarget { .. },
+                )
+            )
+        })
+        .expect("retained thunk edge claim");
+    assert_eq!(thunk_edge.confidence().get(), 0.95);
+    assert!(thunk_edge.evidence()[0].summary.contains("metadata-seeded"));
+
+    let recovered_target = claims
+        .iter()
+        .find(|claim| {
+            claim.provenance().method == "pe-x64-recovered-function-target"
+                && matches!(
+                    (claim.subject(), claim.assertion()),
+                    (
+                        SymbolSubject::Function { rva: 0x1060, .. },
+                        SymbolAssertion::FunctionEntry,
+                    )
+                )
+        })
+        .expect("conservative recovered target entry");
+    assert_eq!(recovered_target.confidence().get(), 0.85);
+    assert!(claims.iter().any(|claim| matches!(
+        claim.assertion(),
+        SymbolAssertion::DirectCall {
+            call_site_rva: 0x1005,
+            target: ControlFlowTarget::ImportIat { iat_rva: 0x1260 },
+        }
+    )));
+    assert!(claims.iter().any(|claim| matches!(
+        (claim.subject(), claim.assertion()),
+        (
+            SymbolSubject::Function {
+                rva: 0x1040,
+                size: None,
+                ..
+            },
+            SymbolAssertion::ThunkTarget {
+                target: ControlFlowTarget::Function { rva: 0x1060 },
+            },
+        )
+    )));
+    assert!(claims.iter().any(|claim| matches!(
+        (claim.subject(), claim.assertion()),
+        (
+            SymbolSubject::Function {
+                rva: 0x10b0,
+                size: None,
+                ..
+            },
+            SymbolAssertion::FunctionEntry,
+        )
+    )));
+    assert!(
+        claims
+            .iter()
+            .filter(|claim| matches!(
+                claim.assertion(),
+                SymbolAssertion::DirectCall { .. } | SymbolAssertion::ThunkTarget { .. }
+            ))
+            .all(|claim| claim.evidence()[0].kind.as_str() == EvidenceKind::CONTROL_FLOW)
+    );
+    assert!(claims.iter().all(|claim| {
+        !matches!(
+            (claim.subject(), claim.assertion()),
+            (
+                SymbolSubject::Function {
+                    rva: 0x1040 | 0x1060 | 0x1080 | 0x10a0 | 0x10b0,
+                    ..
+                },
+                SymbolAssertion::Name { .. } | SymbolAssertion::FunctionBoundary { .. },
+            )
+        )
+    }));
+
+    assert_eq!(
+        analysis
+            .rebuild_symbol_graph()
+            .expect("rebuild recovery graph"),
+        analysis.symbol_graph
+    );
+    let encoded = serde_json::to_string(&analysis).expect("serialize recovered control flow");
+    let decoded = serde_json::from_str(&encoded).expect("deserialize recovered control flow");
+    assert_eq!(analysis, decoded);
+}
+
+#[test]
+fn deduplicates_recovered_function_entries_with_deterministic_edge_evidence() {
+    let mut bytes = code_recovery_fixture();
+    put_rel32_instruction(&mut bytes, 0x100b, 0xe8, 0x1040);
+    put_rel8_instruction(&mut bytes, 0x10a0, 0xeb, 0x1060);
+
+    let analysis = analyze_pe(&bytes).expect("valid repeated recovered targets");
+    assert_eq!(
+        analysis
+            .direct_calls
+            .iter()
+            .filter(|call| call.target == PeControlFlowTarget::Function { rva: 0x1040 })
+            .count(),
+        2
+    );
+    assert_eq!(
+        analysis
+            .thunks
+            .iter()
+            .filter(|thunk| thunk.target == PeControlFlowTarget::Function { rva: 0x1060 })
+            .count(),
+        2
+    );
+
+    let recovered_entry = |target_rva| {
+        analysis
+            .symbol_graph
+            .claims()
+            .iter()
+            .filter(|claim| {
+                claim.provenance().method == "pe-x64-recovered-function-target"
+                    && matches!(
+                        (claim.subject(), claim.assertion()),
+                        (
+                            SymbolSubject::Function { rva, .. },
+                            SymbolAssertion::FunctionEntry,
+                        ) if *rva == target_rva
+                    )
+            })
+            .collect::<Vec<_>>()
+    };
+    let call_target_entries = recovered_entry(0x1040);
+    assert_eq!(call_target_entries.len(), 1);
+    assert_eq!(
+        call_target_entries[0].evidence()[0].artifacts["call_site_rva"],
+        "0x1000"
+    );
+    let thunk_target_entries = recovered_entry(0x1060);
+    assert_eq!(thunk_target_entries.len(), 1);
+    assert_eq!(
+        thunk_target_entries[0].evidence()[0].artifacts["source_rva"],
+        "0x1040"
+    );
+}
+
+#[test]
+fn direct_call_retention_cap_bounds_graph_and_default_package_size() {
+    const ATTEMPTED_CALLS: usize = 8_193;
+    const RETAINED_CALLS: usize = 8_192;
+
+    let analysis = analyze_pe(&direct_call_cap_fixture(ATTEMPTED_CALLS))
+        .expect("valid PE reaching the direct-call cap");
+    assert!(analysis.code_recovery_scan_truncated);
+    assert_eq!(analysis.direct_calls.len(), RETAINED_CALLS);
+    assert_eq!(analysis.direct_calls[0].call_site_rva, 0x1000);
+    assert_eq!(
+        analysis
+            .direct_calls
+            .last()
+            .expect("retained canonical call prefix")
+            .call_site_rva,
+        0xaffb
+    );
+    assert_eq!(
+        analysis
+            .symbol_graph
+            .claims()
+            .iter()
+            .filter(|claim| {
+                claim.provenance().method == "pe-x64-recovered-function-target"
+                    && matches!(
+                        (claim.subject(), claim.assertion()),
+                        (
+                            SymbolSubject::Function { rva: 0xb100, .. },
+                            SymbolAssertion::FunctionEntry,
+                        )
+                    )
+            })
+            .count(),
+        1
+    );
+
+    let session = AnalysisSession::new(BinaryAnalysis::Pe(analysis), Vec::new(), Vec::new())
+        .expect("valid capped analysis session");
+    let package = ResymPackage::from_bound_payload(env!("CARGO_PKG_VERSION"), session)
+        .expect("valid bound analysis package");
+    let canonical = to_vec_bound(&package).expect("capped package fits the default limit");
+    assert!(canonical.len() < DEFAULT_MAX_PACKAGE_BYTES);
+}
+
+#[test]
+fn suppresses_call_next_and_runtime_interior_call_and_jump_targets() {
+    let analysis = analyze_pe(&control_flow_suppression_fixture())
+        .expect("valid PE with adversarial internal control flow");
+
+    assert_eq!(
+        analysis.direct_calls,
+        [PeDirectCall {
+            caller_rva: 0x1010,
+            call_site_rva: 0x1015,
+            instruction_size: 5,
+            target: PeControlFlowTarget::Function { rva: 0x1060 },
+        }]
+    );
+    assert!(analysis.thunks.is_empty());
+    assert!(!analysis.code_recovery_scan_truncated);
+    assert!(analysis.symbol_graph.claims().iter().all(|claim| {
+        !matches!(
+            claim.subject(),
+            SymbolSubject::Function {
+                rva: 0x1005 | 0x1018,
+                ..
+            }
+        )
+    }));
+}
+
+#[test]
+fn seeds_thunks_from_runtime_starts_entry_point_and_local_exports() {
+    let mut bytes = fixture();
+    put_u32(&mut bytes, OPTIONAL_OFFSET + 16, 0x1040);
+    put_u32(&mut bytes, file_offset(0x1144), 0x1080);
+    bytes[file_offset(0x1000)..file_offset(0x1020)].fill(0x90);
+    bytes[file_offset(0x1000)..file_offset(0x1002)].copy_from_slice(&[0xeb, 0x6e]);
+    put_rel32_instruction(&mut bytes, 0x1040, 0xe9, 0x1060);
+    put_rip_relative_instruction(&mut bytes, 0x1080, 0x25, 0x1260);
+
+    let analysis = analyze_pe(&bytes).expect("valid thunk seed sources");
+    assert_eq!(
+        analysis.thunks,
+        [
+            PeThunk {
+                rva: 0x1000,
+                instruction_size: 2,
+                target: PeControlFlowTarget::Function { rva: 0x1070 },
+            },
+            PeThunk {
+                rva: 0x1040,
+                instruction_size: 5,
+                target: PeControlFlowTarget::Function { rva: 0x1060 },
+            },
+            PeThunk {
+                rva: 0x1080,
+                instruction_size: 6,
+                target: PeControlFlowTarget::ImportIat { iat_rva: 0x1260 },
+            },
+        ]
+    );
+}
+
+#[test]
+fn invalid_decode_is_candidate_local_and_partially_backed_ranges_are_skipped() {
+    let mut invalid = rtti_fixture();
+    invalid[rtti_file_offset(0x1000)..rtti_file_offset(0x1002)].copy_from_slice(&[0xf0, 0x90]);
+    put_rel32_instruction_at_rtti_rva(&mut invalid, 0x1020, 0xe8, 0x1040);
+    invalid[rtti_file_offset(0x1040)] = 0xc3;
+    let analysis = analyze_pe(&invalid).expect("one invalid candidate does not reject the PE");
+    assert_eq!(analysis.direct_calls.len(), 1);
+    assert_eq!(analysis.direct_calls[0].caller_rva, 0x1020);
+
+    let mut partial = fixture();
+    put_u32(&mut partial, SECTION_OFFSET + 8, 0x700);
+    set_directory(&mut partial, 3, 0x1300, 24);
+    let table = file_offset(0x1300);
+    put_u32(&mut partial, table + 12, 0x15f0);
+    put_u32(&mut partial, table + 16, 0x1610);
+    put_u32(&mut partial, table + 20, 0x1354);
+    put_rel32_instruction(&mut partial, 0x15f0, 0xe8, 0x1040);
+    let analysis =
+        analyze_pe(&partial).expect("virtual-only function tail is retained as metadata");
+    assert_eq!(analysis.runtime_functions.len(), 2);
+    assert!(analysis.direct_calls.is_empty());
+    assert!(!analysis.code_recovery_scan_truncated);
 }
 
 #[test]
@@ -715,7 +1231,7 @@ fn analyze_bytes_exposes_format_independent_accessors() {
     let analysis = analyze_bytes(&bytes).expect("recognized PE");
     assert_eq!(analysis.identity().id, BinaryId::digest(&bytes));
     assert_eq!(analysis.binary_id(), &BinaryId::digest(&bytes));
-    assert_eq!(analysis.symbol_graph().claims().len(), 3);
+    assert_eq!(analysis.symbol_graph().claims().len(), 5);
     assert!(matches!(analysis, BinaryAnalysis::Pe(_)));
 }
 
@@ -729,6 +1245,106 @@ fn analysis_round_trips_through_serde() {
         analysis.rebuild_symbol_graph().expect("rebuild"),
         analysis.symbol_graph
     );
+}
+
+#[test]
+fn validated_deserialization_rejects_tampered_code_recovery() {
+    let analysis = analyze_pe(&code_recovery_fixture()).expect("valid recovered control flow");
+    let original = serde_json::to_value(analysis).expect("serialize analysis");
+
+    let mut wrong_size = original.clone();
+    wrong_size["direct_calls"][0]["instruction_size"] = serde_json::json!(6);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(wrong_size)
+        .expect_err("an internal E8 call must retain its exact size");
+    assert!(error.to_string().contains("direct-call instruction size"));
+
+    let mut unknown_iat = original.clone();
+    unknown_iat["direct_calls"][1]["target"]["iat_rva"] = serde_json::json!(0x1270);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(unknown_iat)
+        .expect_err("an indirect call must target an exact parsed IAT slot");
+    assert!(error.to_string().contains("direct-call target"));
+
+    let mut outside_runtime = original.clone();
+    outside_runtime["direct_calls"][3]["call_site_rva"] = serde_json::json!(0x101f);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(outside_runtime)
+        .expect_err("the decoded call must fit its matching runtime range");
+    assert!(
+        error
+            .to_string()
+            .contains("matching runtime-function range")
+    );
+
+    let mut unsorted = original.clone();
+    unsorted["direct_calls"]
+        .as_array_mut()
+        .expect("direct-call array")
+        .swap(0, 1);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(unsorted)
+        .expect_err("retained calls must stay canonical");
+    assert!(error.to_string().contains("strictly sorted"));
+
+    let mut duplicate_site = original.clone();
+    let calls = duplicate_site["direct_calls"]
+        .as_array_mut()
+        .expect("direct-call array");
+    let mut duplicate = calls[0].clone();
+    duplicate["target"]["rva"] = serde_json::json!(0x1041);
+    calls.insert(1, duplicate);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(duplicate_site)
+        .expect_err("one instruction cannot retain multiple targets");
+    assert!(error.to_string().contains("one caller and call site"));
+
+    let mut self_thunk = original.clone();
+    self_thunk["thunks"][0]["target"]["rva"] = serde_json::json!(0x1040);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(self_thunk)
+        .expect_err("an internal thunk cannot target itself");
+    assert!(error.to_string().contains("must differ"));
+
+    let mut unseeded_thunk = original.clone();
+    unseeded_thunk["thunks"][2]["rva"] = serde_json::json!(0x10c0);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(unseeded_thunk)
+        .expect_err("thunks must originate at retained candidates");
+    assert!(error.to_string().contains("thunk source"));
+
+    let mut interior_call_target = original.clone();
+    interior_call_target["direct_calls"][0]["target"]["rva"] = serde_json::json!(0x1010);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(interior_call_target)
+        .expect_err("a recovered call target cannot be a runtime-function interior label");
+    assert!(error.to_string().contains("runtime-function metadata"));
+
+    let mut interior_thunk_target = original.clone();
+    interior_thunk_target["thunks"][0]["target"]["rva"] = serde_json::json!(0x1010);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(interior_thunk_target)
+        .expect_err("a recovered jump target cannot be a runtime-function interior label");
+    assert!(error.to_string().contains("runtime-function metadata"));
+
+    let mut stale_graph = original;
+    stale_graph["direct_calls"][1]["target"]["iat_rva"] = serde_json::json!(0x1268);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(stale_graph)
+        .expect_err("the symbol graph must rebuild from retained control flow");
+    assert!(error.to_string().contains("symbol graph"));
+}
+
+#[test]
+fn validated_deserialization_rejects_call_next_outside_runtime_coverage() {
+    let analysis = analyze_pe(&control_flow_suppression_fixture())
+        .expect("valid analysis with a suppressed call-next encoding");
+    let mut value = serde_json::to_value(analysis).expect("serialize analysis");
+    let forged_call = serde_json::to_value(PeDirectCall {
+        caller_rva: 0x1000,
+        call_site_rva: 0x1000,
+        instruction_size: 5,
+        target: PeControlFlowTarget::Function { rva: 0x1005 },
+    })
+    .expect("serialize forged call-next record");
+    value["direct_calls"]
+        .as_array_mut()
+        .expect("direct-call array")
+        .insert(0, forged_call);
+
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(value)
+        .expect_err("a forged call-next model must fail validation before graph rebuild");
+    assert!(error.to_string().contains("call-next"));
 }
 
 #[test]
@@ -824,7 +1440,7 @@ fn validated_deserialization_accepts_prior_generator_provenance_versions() {
     let decoded = serde_json::from_value::<resymbol_analysis::PeAnalysis>(value)
         .expect("older producer version remains semantically compatible");
     assert_eq!(decoded.identity, analysis.identity);
-    assert_eq!(decoded.symbol_graph.claims().len(), 3);
+    assert_eq!(decoded.symbol_graph.claims().len(), 5);
 }
 
 #[test]
@@ -901,7 +1517,7 @@ fn preserves_duplicate_and_overlapping_runtime_metadata() {
     );
     assert_eq!(analysis.runtime_functions[0].table_index, 0);
     assert_eq!(analysis.runtime_functions[1].table_index, 1);
-    assert_eq!(analysis.symbol_graph.claims().len(), 5);
+    assert_eq!(analysis.symbol_graph.claims().len(), 7);
 }
 
 #[test]
@@ -958,6 +1574,37 @@ fn classifies_export_names_against_all_runtime_function_starts() {
 }
 
 #[test]
+fn classifies_executable_local_exports_without_unwind_metadata_as_function_candidates() {
+    let mut bytes = fixture();
+    put_u32(&mut bytes, file_offset(0x1144), 0x1040);
+    put_u16(&mut bytes, file_offset(0x1152), 1);
+
+    let analysis = analyze_pe(&bytes).expect("valid executable export candidate");
+    assert!(analysis.symbol_graph.claims().iter().any(|claim| matches!(
+        (claim.subject(), claim.assertion()),
+        (
+            SymbolSubject::Function {
+                rva: 0x1040,
+                size: None,
+                ..
+            },
+            SymbolAssertion::Name { name },
+        ) if name == "Alias"
+    )));
+    assert!(analysis.symbol_graph.claims().iter().any(|claim| matches!(
+        (claim.subject(), claim.assertion()),
+        (
+            SymbolSubject::Function {
+                rva: 0x1040,
+                size: None,
+                ..
+            },
+            SymbolAssertion::FunctionEntry,
+        )
+    )));
+}
+
+#[test]
 fn classifies_non_executable_exports_as_globals() {
     let mut bytes = fixture();
     set_directory(&mut bytes, 3, 0, 0);
@@ -998,11 +1645,27 @@ fn retains_forwarded_exports_without_creating_local_function_claims() {
         analysis.exports[0].forwarded_to.as_deref(),
         Some("OTHER.Forwarded")
     );
-    assert_eq!(analysis.symbol_graph.claims().len(), 1);
-    assert!(matches!(
-        analysis.symbol_graph.claims()[0].assertion(),
-        SymbolAssertion::FunctionBoundary { .. }
-    ));
+    assert_eq!(analysis.symbol_graph.claims().len(), 2);
+    assert!(analysis.symbol_graph.claims().iter().all(|claim| {
+        !matches!(
+            claim.provenance().method.as_str(),
+            "pe-export-directory" | "pe-export-function-candidate"
+        )
+    }));
+    assert!(
+        analysis
+            .symbol_graph
+            .claims()
+            .iter()
+            .any(|claim| matches!(claim.assertion(), SymbolAssertion::FunctionBoundary { .. }))
+    );
+    assert!(
+        analysis
+            .symbol_graph
+            .claims()
+            .iter()
+            .any(|claim| claim.provenance().method == "pe-entry-point")
+    );
 }
 
 #[test]

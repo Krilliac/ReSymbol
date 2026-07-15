@@ -27,7 +27,7 @@ Every package contains four top-level fields:
   "binary_sha256": "<64 lowercase hexadecimal characters>",
   "generator_version": "0.1.0-alpha.1",
   "payload": {},
-  "schema_version": 1
+  "schema_version": 2
 }
 ```
 
@@ -37,9 +37,11 @@ Every package contains four top-level fields:
 - `payload` contains one validated `AnalysisSession`: deterministic base analysis, a plugin-run
   ledger, and accepted plugin claims.
 
-This package envelope currently uses schema 1. The debugger-neutral JSON produced by
+This package envelope currently writes schema 2. The CLI can also inspect and export schema 1
+packages from the preceding alpha payload through the migration described below, while other
+schema versions fail explicitly. The debugger-neutral JSON produced by
 `resymbol export --format json` is a different artifact with its own schema version; its current
-relationship-bearing projection is schema 2.
+control-flow relationship projection is schema 3.
 
 Object keys are sorted recursively and no timestamp is inserted, so encoding the same deterministic
 payload produces the same bytes. Arrays preserve analysis order because source-table order can be
@@ -60,6 +62,16 @@ for the application policy and current representational limits.
 
 Schema changes and plugin API changes are versioned separately. Before ReSymbol 1.0, payload fields
 may evolve between prereleases, but an incompatible reader must fail explicitly instead of guessing.
+When the CLI opens schema 1, it decodes the legacy payload into a current in-memory
+`AnalysisSession`, revalidates the persisted PE metadata, plugin ledger, claims, and binary-identity
+binding, and rebuilds the deterministic base graph from the persisted schema 1 analysis. It does
+not rewrite or upgrade the package on disk. A `.resym` package does not contain the original binary
+bytes, so migration cannot retroactively run code recovery: direct-call and thunk arrays stay empty
+and the migrated session is not evidence that the decoder found no relationships. Analyze the exact
+original executable again to create a schema 2 package containing code-recovery results. The
+`inspect` and `export` terminal summaries therefore report code recovery as unavailable/not run for
+schema 1 and recommend reanalysis; they do not describe the migrated empty arrays as a complete
+scan.
 
 ## Current `AnalysisSession` payload
 
@@ -85,10 +97,13 @@ The base analysis includes:
 - COFF and optional-header fields used by analysis;
 - bounded section, import, export, and exception-directory records;
 - x64 `RUNTIME_FUNCTION` entries as evidence-backed candidate function boundaries;
+- bounded direct-call and one-instruction thunk records, with explicit internal-function or exact
+  parsed import-IAT targets and a persisted partial-scan flag;
 - validated modern MSVC x64 Rev1 RTTI records, including type descriptors, class hierarchy and
   base-class records, vftable locations, and executable virtual-slot targets; and
-- a symbol graph containing exact export names, metadata-derived boundaries, recovered RTTI type
-  names, vftable names, and class-membership claims for virtual-slot targets.
+- a symbol graph containing exact export names, metadata-derived boundaries, function entries,
+  direct calls, thunks, recovered RTTI type names, vftable names, and class-membership claims for
+  virtual-slot targets.
 
 ReSymbol derives the combined symbol graph from the base graph plus `plugin_claims`; it does not
 serialize a second independently mutable graph. Session validation rejects duplicate run IDs,
@@ -147,6 +162,35 @@ sets `msvc_rtti_scan_truncated` instead of pretending discovery was complete. `a
 `inspect` surface this state as `MSVC RTTI scan: partial` along with vftable, unique-type,
 base-record, and virtual-slot counts.
 
+### Bounded x86-64 control-flow boundary
+
+The built-in code-recovery pass is a bounded linear sweep over complete, file-backed executable
+ranges supplied by the PE x64 exception directory; it is not a recursive traversal of reachable
+basic blocks. It recognizes exact five-byte `E8 rel32` calls to file-backed executable RVAs and
+exact six-byte RIP-relative `FF 15` calls whose computed address is a parsed IAT slot. It does not
+retain other indirect-call forms or targets merely located near an import table. An internal target
+covered by known `RUNTIME_FUNCTION` metadata is suppressed unless its RVA matches a recorded
+runtime-function begin, preventing an interior label from being promoted to a separate function
+entry.
+
+Thunk candidates come from metadata-backed entry points: runtime-function starts, the PE entry
+point, local executable exports, internal direct-call targets, and validated RTTI virtual slots.
+Only a candidate's first instruction is considered. Exact `E9 rel32` and `EB rel8` jumps may target
+file-backed executable RVAs; exact RIP-relative `FF 25` jumps must target a parsed IAT slot. A
+self-targeting internal jump is not a thunk.
+
+Decoding is deterministic and bounded to 64 MiB of instruction bytes, 1,000,000 instructions,
+8,192 retained direct calls, and 4,096 retained thunks. Exhausting an aggregate budget retains the
+canonical RVA-ordered prefix and sets `code_recovery_scan_truncated`; the CLI reports the result as
+partial. Overlapping `RUNTIME_FUNCTION` ranges are preserved and may be swept and charged to these
+budgets separately, so adversarial overlap metadata can make the scan partial earlier.
+
+Linear sweep is intentionally a heuristic-confidence source: it can decode bytes after a terminator
+or embedded data as instructions and therefore retain a false positive, while an invalid encoding
+stops the affected range and can omit valid control flow located later in that range. These records
+establish supported control-flow relationships and function-entry evidence only. They do not
+recover source names, basic blocks, function sizes, or a complete call graph.
+
 ## Export projection
 
 `resymbol export` validates the package and reduces its combined symbol graph to a bounded,
@@ -155,17 +199,22 @@ alternate names, confidence and provenance, supported function/global sizes, pro
 definitions, attributed function-to-class memberships, and structured warnings. Ordering and
 collision handling are stable so the same validated session produces the same projection.
 
-The current neutral JSON projection is schema 2, which represents each attributed function-to-class
-relationship in that function's `class_memberships` array. A function retains at most 4,096
-distinct memberships. Overflow is loss-aware rather than order-dependent: ReSymbol keeps the
-deterministically strongest 4,096 and emits one `class-membership-limit-exceeded` warning group for
-the function, with `occurrences` counting the omitted distinct relationships.
+The current neutral JSON projection is schema 3. It adds optional function-entry attribution and
+bounded, attributed `direct_calls` and `thunks` arrays to the schema 2 class-membership model.
+Internal relation targets must reference projected function entries; import targets retain their
+IAT RVA. Its projection/model caps remain 262,144 direct calls and 65,536 thunks; those larger
+validation bounds are separate from the built-in decoder's 8,192-call and 4,096-thunk recovery
+caps. A function retains at most 4,096 distinct memberships. Overflow is loss-aware rather than
+order-dependent: ReSymbol keeps the deterministically strongest 4,096 and emits one
+`class-membership-limit-exceeded` warning group for the function, with `occurrences` counting the
+omitted distinct relationships.
 
 The JSON export is the loss-aware interchange form. IDAPython and Ghidra Java writers consume the
 same projection but currently apply only selected function/global names and conservative function
-boundaries. That includes safe vftable global names, but not RTTI type creation, class-membership
-metadata, or invented names for virtual functions. They do not silently imply that prototypes,
-types, competing names, relationships, or unsupported claims were installed in the debugger.
+boundaries. That includes safe vftable global names, but not entry-only candidates, call/thunk
+relationships, RTTI type creation, class-membership metadata, or invented names for virtual
+functions. They do not silently imply that prototypes, types, competing names, relationships, or
+unsupported claims were installed in the debugger.
 Export files use create-new writes and never replace an existing destination.
 
 ## Future packaging

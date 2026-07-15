@@ -63,13 +63,22 @@ pub struct PeAnalysis {
     pub export_library_name: Option<String>,
     pub exports: Vec<PeExport>,
     pub runtime_functions: Vec<RuntimeFunction>,
+    /// Whether bounded instruction decoding stopped before every eligible candidate was checked.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub code_recovery_scan_truncated: bool,
+    /// Canonical direct calls decoded from fully file-backed x64 runtime-function ranges.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub direct_calls: Vec<PeDirectCall>,
+    /// Canonical one-instruction jump thunks decoded from metadata-backed function candidates.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub thunks: Vec<PeThunk>,
     /// Whether RTTI discovery stopped after its fixed read-only-data scan budget.
     #[serde(default, skip_serializing_if = "is_false")]
     pub msvc_rtti_scan_truncated: bool,
     /// Validated MSVC x64 Rev1 RTTI records discovered through vftable back-pointers.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub msvc_rtti_vftables: Vec<MsvcRttiVftable>,
-    /// Validated claims derived solely from exact PE metadata.
+    /// Validated claims derived from exact PE metadata and bounded supported instruction encodings.
     pub symbol_graph: SymbolGraph,
 }
 
@@ -83,16 +92,21 @@ impl PeAnalysis {
     ///
     /// Export names carry exact metadata evidence, while their Function/Global
     /// subject classification is conservative. X64 exception records become
-    /// metadata boundary claims. Forwarders, empty EAT slots, and executable
-    /// exports without runtime-function metadata are not added to the graph.
+    /// metadata boundary claims; executable local exports and the backed entry
+    /// point become function candidates. Bounded control-flow recovery adds
+    /// lower-confidence edge and target-entry claims. Forwarders and empty EAT
+    /// slots are not added to the graph.
     pub fn rebuild_symbol_graph(&self) -> Result<SymbolGraph, crate::AnalysisError> {
-        crate::pe::build_symbol_graph(
-            &self.identity,
-            &self.sections,
-            &self.exports,
-            &self.runtime_functions,
-            &self.msvc_rtti_vftables,
-        )
+        crate::pe::build_symbol_graph(crate::pe::SymbolGraphInput {
+            identity: &self.identity,
+            entry_point_rva: self.entry_point_rva,
+            sections: &self.sections,
+            exports: &self.exports,
+            runtime_functions: &self.runtime_functions,
+            direct_calls: &self.direct_calls,
+            thunks: &self.thunks,
+            msvc_rtti_vftables: &self.msvc_rtti_vftables,
+        })
     }
 }
 
@@ -115,6 +129,12 @@ struct UncheckedPeAnalysis {
     export_library_name: Option<String>,
     exports: Vec<PeExport>,
     runtime_functions: Vec<RuntimeFunction>,
+    #[serde(default)]
+    code_recovery_scan_truncated: bool,
+    #[serde(default)]
+    direct_calls: Vec<PeDirectCall>,
+    #[serde(default)]
+    thunks: Vec<PeThunk>,
     #[serde(default)]
     msvc_rtti_scan_truncated: bool,
     #[serde(default)]
@@ -143,6 +163,9 @@ impl TryFrom<UncheckedPeAnalysis> for PeAnalysis {
             export_library_name: value.export_library_name,
             exports: value.exports,
             runtime_functions: value.runtime_functions,
+            code_recovery_scan_truncated: value.code_recovery_scan_truncated,
+            direct_calls: value.direct_calls,
+            thunks: value.thunks,
             msvc_rtti_scan_truncated: value.msvc_rtti_scan_truncated,
             msvc_rtti_vftables: value.msvc_rtti_vftables,
             symbol_graph: value.symbol_graph,
@@ -245,6 +268,36 @@ pub struct RuntimeFunction {
     pub unwind_info_rva: u32,
     /// Zero-based position in the exception table. This preserves duplicates.
     pub table_index: u32,
+}
+
+/// A statically resolved target used by the bounded PE control-flow model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum PeControlFlowTarget {
+    /// A file-backed executable address in the current image.
+    Function { rva: u32 },
+    /// An exact slot from the parsed PE import address table.
+    ImportIat { iat_rva: u32 },
+}
+
+/// One exact direct call decoded inside an x64 `RUNTIME_FUNCTION` range.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeDirectCall {
+    /// Start RVA of the containing runtime-function record.
+    pub caller_rva: u32,
+    pub call_site_rva: u32,
+    pub instruction_size: u8,
+    pub target: PeControlFlowTarget,
+}
+
+/// A candidate function whose first instruction is an exact unconditional jump.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeThunk {
+    pub rva: u32,
+    pub instruction_size: u8,
+    pub target: PeControlFlowTarget,
 }
 
 /// One validated MSVC x64 vftable and its Rev1 RTTI metadata.

@@ -17,9 +17,10 @@ pub use error::{ExportError, ProjectionValidationError};
 pub use ghidra_java::{GhidraJavaError, render_ghidra_java, validate_ghidra_java_class_name};
 pub use ida_python::{IdaPythonError, render_ida_python};
 pub use model::{
-    AttributedText, ExportAttribution, ExportBinary, ExportBinaryFormat, ExportFunction,
-    ExportGlobal, ExportName, ExportProducer, ExportProjection, ExportProvenance, ExportSubject,
-    ExportType, ProjectionWarning, ProjectionWarningCode,
+    AttributedText, ExportAttribution, ExportBinary, ExportBinaryFormat, ExportControlFlowTarget,
+    ExportDirectCall, ExportFunction, ExportGlobal, ExportName, ExportProducer, ExportProjection,
+    ExportProvenance, ExportSubject, ExportThunk, ExportType, ProjectionWarning,
+    ProjectionWarningCode,
 };
 
 /// Maximum UTF-8 byte length accepted for a source symbol name.
@@ -34,3 +35,7 @@ pub const MAX_DECLARATION_BYTES: usize = 16_384;
 pub const MAX_PROVENANCE_TEXT_BYTES: usize = 1_024;
 /// Maximum distinct class relationships retained for one function.
 pub const MAX_CLASS_MEMBERSHIPS_PER_FUNCTION: usize = 4_096;
+/// Maximum direct-call relationships retained by one neutral projection.
+pub const MAX_DIRECT_CALLS: usize = 262_144;
+/// Maximum thunk relationships retained by one neutral projection.
+pub const MAX_THUNKS: usize = 65_536;

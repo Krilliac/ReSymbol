@@ -1,8 +1,8 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use resymbol_core::{
-    BinaryId, ClaimProducer, ClaimValidationError, GraphValidationError, SymbolAssertion,
-    SymbolClaim, SymbolGraph, SymbolSubject, plugin_api::PluginId,
+    BinaryId, ClaimProducer, ClaimValidationError, ControlFlowTarget, GraphValidationError,
+    SymbolAssertion, SymbolClaim, SymbolGraph, SymbolSubject, plugin_api::PluginId,
 };
 use semver::Version;
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
@@ -198,6 +198,7 @@ impl AnalysisSession {
         let mut accepted_counts = BTreeMap::<&str, u64>::new();
         let expected_binary = &self.base_analysis.identity().id;
         let image_size = self.base_analysis.image_size();
+        let import_iat_rvas = import_iat_rvas(&self.base_analysis);
 
         for (index, claim) in self.plugin_claims.iter().enumerate() {
             claim
@@ -212,7 +213,7 @@ impl AnalysisSession {
                     found: found_binary.clone(),
                 });
             }
-            validate_claim_ranges(index, claim, image_size)?;
+            validate_claim_ranges(index, claim, image_size, &import_iat_rvas)?;
 
             let ClaimProducer::Plugin {
                 id: producer_id,
@@ -349,10 +350,11 @@ pub enum SessionValidationError {
         found: BinaryId,
     },
     #[error(
-        "plugin claim {index} range at RVA {rva:#x} with size {size:#x} exceeds image size {image_size:#x}"
+        "plugin claim {index} {field} range at RVA {rva:#x} with size {size:#x} exceeds image size {image_size:#x}"
     )]
     AddressOutsideImage {
         index: usize,
+        field: &'static str,
         rva: u64,
         size: u64,
         image_size: u64,
@@ -361,6 +363,12 @@ pub enum SessionValidationError {
     UnsupportedSubject { index: usize },
     #[error("plugin claim {index} has a function-boundary assertion on a non-function subject")]
     FunctionBoundaryRequiresFunction { index: usize },
+    #[error("plugin claim {index} has a function-entry assertion on a non-function subject")]
+    FunctionEntryRequiresFunction { index: usize },
+    #[error("plugin claim {index} has a direct-call assertion on a non-function subject")]
+    DirectCallRequiresFunction { index: usize },
+    #[error("plugin claim {index} has a thunk-target assertion on a non-function subject")]
+    ThunkTargetRequiresFunction { index: usize },
     #[error(
         "plugin claim {index} function size {subject_size:#x} does not match asserted boundary {boundary_size:#x}"
     )]
@@ -368,6 +376,33 @@ pub enum SessionValidationError {
         index: usize,
         subject_size: u64,
         boundary_size: u64,
+    },
+    #[error(
+        "plugin claim {index} direct-call site {call_site_rva:#x} precedes caller function {function_rva:#x}"
+    )]
+    DirectCallSiteBeforeFunction {
+        index: usize,
+        call_site_rva: u64,
+        function_rva: u64,
+    },
+    #[error(
+        "plugin claim {index} direct-call site {call_site_rva:#x} lies outside caller range {function_rva:#x}..{function_end_rva:#x}"
+    )]
+    DirectCallSiteOutsideFunction {
+        index: usize,
+        call_site_rva: u64,
+        function_rva: u64,
+        function_end_rva: u64,
+    },
+    #[error("plugin claim {index} thunk at {rva:#x} targets itself as an internal function")]
+    ThunkSelfTarget { index: usize, rva: u64 },
+    #[error(
+        "plugin claim {index} {assertion} targets import-IAT RVA {iat_rva:#x}, which is not present in the parsed PE imports"
+    )]
+    UnknownImportIatTarget {
+        index: usize,
+        assertion: &'static str,
+        iat_rva: u64,
     },
     #[error("plugin claim {index} provenance is not plugin-owned")]
     NonPluginProducer { index: usize },
@@ -397,44 +432,150 @@ fn validate_claim_ranges(
     index: usize,
     claim: &SymbolClaim,
     image_size: u64,
+    import_iat_rvas: &BTreeSet<u64>,
 ) -> Result<(), SessionValidationError> {
     match claim.subject() {
         SymbolSubject::Function { rva, size, .. } | SymbolSubject::Global { rva, size, .. } => {
             let size = size.unwrap_or(1);
-            validate_image_range(index, *rva, size, image_size)?;
+            validate_image_range(index, "subject", *rva, size, image_size)?;
         }
         SymbolSubject::Type { .. } => {}
         _ => return Err(SessionValidationError::UnsupportedSubject { index }),
     }
 
-    if let SymbolAssertion::FunctionBoundary {
-        size: boundary_size,
-    } = claim.assertion()
-    {
-        let SymbolSubject::Function {
-            rva,
-            size: subject_size,
-            ..
-        } = claim.subject()
-        else {
-            return Err(SessionValidationError::FunctionBoundaryRequiresFunction { index });
-        };
-        validate_image_range(index, *rva, *boundary_size, image_size)?;
-        if let Some(subject_size) = subject_size {
-            if subject_size != boundary_size {
-                return Err(SessionValidationError::FunctionBoundarySizeMismatch {
+    match claim.assertion() {
+        SymbolAssertion::FunctionBoundary {
+            size: boundary_size,
+        } => {
+            let SymbolSubject::Function {
+                rva,
+                size: subject_size,
+                ..
+            } = claim.subject()
+            else {
+                return Err(SessionValidationError::FunctionBoundaryRequiresFunction { index });
+            };
+            validate_image_range(index, "function boundary", *rva, *boundary_size, image_size)?;
+            if let Some(subject_size) = subject_size {
+                if subject_size != boundary_size {
+                    return Err(SessionValidationError::FunctionBoundarySizeMismatch {
+                        index,
+                        subject_size: *subject_size,
+                        boundary_size: *boundary_size,
+                    });
+                }
+            }
+        }
+        SymbolAssertion::FunctionEntry => {
+            if !matches!(claim.subject(), SymbolSubject::Function { .. }) {
+                return Err(SessionValidationError::FunctionEntryRequiresFunction { index });
+            }
+        }
+        SymbolAssertion::DirectCall {
+            call_site_rva,
+            target,
+        } => {
+            let SymbolSubject::Function {
+                rva: function_rva,
+                size: function_size,
+                ..
+            } = claim.subject()
+            else {
+                return Err(SessionValidationError::DirectCallRequiresFunction { index });
+            };
+            validate_image_range(index, "direct-call site", *call_site_rva, 1, image_size)?;
+            if *call_site_rva < *function_rva {
+                return Err(SessionValidationError::DirectCallSiteBeforeFunction {
                     index,
-                    subject_size: *subject_size,
-                    boundary_size: *boundary_size,
+                    call_site_rva: *call_site_rva,
+                    function_rva: *function_rva,
                 });
             }
+            if let Some(function_size) = function_size {
+                let function_end_rva = function_rva.checked_add(*function_size).ok_or(
+                    SessionValidationError::AddressOutsideImage {
+                        index,
+                        field: "caller function",
+                        rva: *function_rva,
+                        size: *function_size,
+                        image_size,
+                    },
+                )?;
+                if *call_site_rva >= function_end_rva {
+                    return Err(SessionValidationError::DirectCallSiteOutsideFunction {
+                        index,
+                        call_site_rva: *call_site_rva,
+                        function_rva: *function_rva,
+                        function_end_rva,
+                    });
+                }
+            }
+            let target_field = if target.is_function() {
+                "direct-call function target"
+            } else {
+                "direct-call import-IAT target"
+            };
+            validate_image_range(index, target_field, target.rva(), 1, image_size)?;
+            validate_import_iat_target(index, "direct-call assertion", target, import_iat_rvas)?;
+        }
+        SymbolAssertion::ThunkTarget { target } => {
+            let SymbolSubject::Function {
+                rva: function_rva, ..
+            } = claim.subject()
+            else {
+                return Err(SessionValidationError::ThunkTargetRequiresFunction { index });
+            };
+            let target_field = if target.is_function() {
+                "thunk function target"
+            } else {
+                "thunk import-IAT target"
+            };
+            validate_image_range(index, target_field, target.rva(), 1, image_size)?;
+            validate_import_iat_target(index, "thunk-target assertion", target, import_iat_rvas)?;
+            if target.is_function_at(*function_rva) {
+                return Err(SessionValidationError::ThunkSelfTarget {
+                    index,
+                    rva: *function_rva,
+                });
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_import_iat_target(
+    index: usize,
+    assertion: &'static str,
+    target: &ControlFlowTarget,
+    import_iat_rvas: &BTreeSet<u64>,
+) -> Result<(), SessionValidationError> {
+    if let ControlFlowTarget::ImportIat { iat_rva } = target {
+        if !import_iat_rvas.contains(iat_rva) {
+            return Err(SessionValidationError::UnknownImportIatTarget {
+                index,
+                assertion,
+                iat_rva: *iat_rva,
+            });
         }
     }
     Ok(())
 }
 
+fn import_iat_rvas(analysis: &BinaryAnalysis) -> BTreeSet<u64> {
+    match analysis {
+        BinaryAnalysis::Pe(analysis) => analysis
+            .imports
+            .iter()
+            .flat_map(|library| library.entries.iter())
+            .map(|entry| u64::from(entry.iat_rva))
+            .collect(),
+    }
+}
+
 fn validate_image_range(
     index: usize,
+    field: &'static str,
     rva: u64,
     size: u64,
     image_size: u64,
@@ -442,6 +583,7 @@ fn validate_image_range(
     if rva >= image_size || rva.checked_add(size).is_none_or(|end| end > image_size) {
         return Err(SessionValidationError::AddressOutsideImage {
             index,
+            field,
             rva,
             size,
             image_size,
@@ -462,4 +604,311 @@ fn is_canonical_sha256(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use resymbol_core::{
+        BinaryId, ClaimProvenance, Confidence, Evidence, EvidenceKind, SymbolAssertion,
+        SymbolClaim, SymbolSubject,
+    };
+
+    use super::{
+        SessionValidationError, validate_claim_ranges as validate_claim_ranges_with_imports,
+    };
+
+    fn validate_claim_ranges(
+        index: usize,
+        claim: &SymbolClaim,
+        image_size: u64,
+    ) -> Result<(), SessionValidationError> {
+        validate_claim_ranges_with_imports(
+            index,
+            claim,
+            image_size,
+            &BTreeSet::from([0x100, 0x300]),
+        )
+    }
+
+    fn assertion(value: serde_json::Value) -> SymbolAssertion {
+        serde_json::from_value(value).expect("valid control-flow assertion")
+    }
+
+    fn claim(subject: SymbolSubject, assertion: SymbolAssertion) -> SymbolClaim {
+        SymbolClaim::new(
+            subject,
+            assertion,
+            Confidence::new(0.9).expect("valid confidence"),
+            vec![
+                Evidence::new(
+                    EvidenceKind::new(EvidenceKind::CONTROL_FLOW).expect("valid evidence kind"),
+                    "decoded control-flow relationship",
+                )
+                .expect("valid evidence"),
+            ],
+            ClaimProvenance {
+                producer: resymbol_core::ClaimProducer::Core {
+                    component: "session-test".to_owned(),
+                    version: "0.1.0".to_owned(),
+                },
+                method: "unit-test".to_owned(),
+                run_id: None,
+            },
+        )
+        .expect("valid claim")
+    }
+
+    fn function_subject(rva: u64, size: Option<u64>) -> SymbolSubject {
+        SymbolSubject::Function {
+            binary: BinaryId::digest(b"session-test-binary"),
+            rva,
+            size,
+        }
+    }
+
+    fn global_subject() -> SymbolSubject {
+        SymbolSubject::Global {
+            binary: BinaryId::digest(b"session-test-binary"),
+            rva: 0x100,
+            size: Some(0x20),
+        }
+    }
+
+    #[test]
+    fn control_flow_assertions_require_function_subjects() {
+        let entry = claim(
+            global_subject(),
+            assertion(serde_json::json!({"kind": "function-entry"})),
+        );
+        assert!(matches!(
+            validate_claim_ranges(0, &entry, 0x400),
+            Err(SessionValidationError::FunctionEntryRequiresFunction { index: 0 })
+        ));
+
+        let direct_call = claim(
+            global_subject(),
+            assertion(serde_json::json!({
+                "kind": "direct-call",
+                "call_site_rva": 0x110,
+                "target": {"kind": "function", "rva": 0x200}
+            })),
+        );
+        assert!(matches!(
+            validate_claim_ranges(1, &direct_call, 0x400),
+            Err(SessionValidationError::DirectCallRequiresFunction { index: 1 })
+        ));
+
+        let thunk = claim(
+            SymbolSubject::Type {
+                binary: BinaryId::digest(b"session-test-binary"),
+                key: "type-key".to_owned(),
+            },
+            assertion(serde_json::json!({
+                "kind": "thunk-target",
+                "target": {"kind": "import-iat", "iat_rva": 0x300}
+            })),
+        );
+        assert!(matches!(
+            validate_claim_ranges(2, &thunk, 0x400),
+            Err(SessionValidationError::ThunkTargetRequiresFunction { index: 2 })
+        ));
+    }
+
+    #[test]
+    fn direct_call_sites_must_belong_to_the_caller_when_its_size_is_known() {
+        let before = claim(
+            function_subject(0x100, Some(0x20)),
+            assertion(serde_json::json!({
+                "kind": "direct-call",
+                "call_site_rva": 0xff,
+                "target": {"kind": "function", "rva": 0x200}
+            })),
+        );
+        assert!(matches!(
+            validate_claim_ranges(0, &before, 0x400),
+            Err(SessionValidationError::DirectCallSiteBeforeFunction {
+                call_site_rva: 0xff,
+                function_rva: 0x100,
+                ..
+            })
+        ));
+
+        let at_end = claim(
+            function_subject(0x100, Some(0x20)),
+            assertion(serde_json::json!({
+                "kind": "direct-call",
+                "call_site_rva": 0x120,
+                "target": {"kind": "function", "rva": 0x200}
+            })),
+        );
+        assert!(matches!(
+            validate_claim_ranges(1, &at_end, 0x400),
+            Err(SessionValidationError::DirectCallSiteOutsideFunction {
+                call_site_rva: 0x120,
+                function_rva: 0x100,
+                function_end_rva: 0x120,
+                ..
+            })
+        ));
+
+        let last_byte = claim(
+            function_subject(0x100, Some(0x20)),
+            assertion(serde_json::json!({
+                "kind": "direct-call",
+                "call_site_rva": 0x11f,
+                "target": {"kind": "function", "rva": 0x200}
+            })),
+        );
+        validate_claim_ranges(2, &last_byte, 0x400).expect("last caller byte is in range");
+
+        let unbounded = claim(
+            function_subject(0x100, None),
+            assertion(serde_json::json!({
+                "kind": "direct-call",
+                "call_site_rva": 0x300,
+                "target": {"kind": "function", "rva": 0x200}
+            })),
+        );
+        validate_claim_ranges(3, &unbounded, 0x400)
+            .expect("an unbounded caller only constrains the lower call-site address");
+    }
+
+    #[test]
+    fn control_flow_sites_and_targets_must_lie_inside_the_image() {
+        let outside_site = claim(
+            function_subject(0x100, None),
+            assertion(serde_json::json!({
+                "kind": "direct-call",
+                "call_site_rva": 0x400,
+                "target": {"kind": "function", "rva": 0x200}
+            })),
+        );
+        assert!(matches!(
+            validate_claim_ranges(0, &outside_site, 0x400),
+            Err(SessionValidationError::AddressOutsideImage {
+                field: "direct-call site",
+                rva: 0x400,
+                ..
+            })
+        ));
+
+        let outside_function_target = claim(
+            function_subject(0x100, None),
+            assertion(serde_json::json!({
+                "kind": "direct-call",
+                "call_site_rva": 0x110,
+                "target": {"kind": "function", "rva": 0x400}
+            })),
+        );
+        assert!(matches!(
+            validate_claim_ranges(1, &outside_function_target, 0x400),
+            Err(SessionValidationError::AddressOutsideImage {
+                field: "direct-call function target",
+                rva: 0x400,
+                ..
+            })
+        ));
+
+        let outside_iat_target = claim(
+            function_subject(0x100, Some(1)),
+            assertion(serde_json::json!({
+                "kind": "thunk-target",
+                "target": {"kind": "import-iat", "iat_rva": 0x400}
+            })),
+        );
+        assert!(matches!(
+            validate_claim_ranges(2, &outside_iat_target, 0x400),
+            Err(SessionValidationError::AddressOutsideImage {
+                field: "thunk import-IAT target",
+                rva: 0x400,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn internal_thunks_cannot_target_themselves() {
+        let self_target = claim(
+            function_subject(0x100, Some(6)),
+            assertion(serde_json::json!({
+                "kind": "thunk-target",
+                "target": {"kind": "function", "rva": 0x100}
+            })),
+        );
+        assert!(matches!(
+            validate_claim_ranges(0, &self_target, 0x400),
+            Err(SessionValidationError::ThunkSelfTarget {
+                index: 0,
+                rva: 0x100
+            })
+        ));
+
+        let other_function = claim(
+            function_subject(0x100, Some(6)),
+            assertion(serde_json::json!({
+                "kind": "thunk-target",
+                "target": {"kind": "function", "rva": 0x200}
+            })),
+        );
+        validate_claim_ranges(1, &other_function, 0x400)
+            .expect("an internal thunk may target another function");
+
+        let same_numeric_iat = claim(
+            function_subject(0x100, Some(6)),
+            assertion(serde_json::json!({
+                "kind": "thunk-target",
+                "target": {"kind": "import-iat", "iat_rva": 0x100}
+            })),
+        );
+        validate_claim_ranges(2, &same_numeric_iat, 0x400)
+            .expect("self-target rejection applies only to internal functions");
+    }
+
+    #[test]
+    fn import_iat_targets_must_match_a_parsed_import_slot() {
+        let unknown_direct_call_iat = claim(
+            function_subject(0x100, Some(0x20)),
+            assertion(serde_json::json!({
+                "kind": "direct-call",
+                "call_site_rva": 0x110,
+                "target": {"kind": "import-iat", "iat_rva": 0x350}
+            })),
+        );
+        assert!(matches!(
+            validate_claim_ranges(0, &unknown_direct_call_iat, 0x400),
+            Err(SessionValidationError::UnknownImportIatTarget {
+                index: 0,
+                assertion: "direct-call assertion",
+                iat_rva: 0x350,
+            })
+        ));
+
+        let unknown_thunk_iat = claim(
+            function_subject(0x100, Some(6)),
+            assertion(serde_json::json!({
+                "kind": "thunk-target",
+                "target": {"kind": "import-iat", "iat_rva": 0x350}
+            })),
+        );
+        assert!(matches!(
+            validate_claim_ranges(1, &unknown_thunk_iat, 0x400),
+            Err(SessionValidationError::UnknownImportIatTarget {
+                index: 1,
+                assertion: "thunk-target assertion",
+                iat_rva: 0x350,
+            })
+        ));
+
+        let exact_iat = claim(
+            function_subject(0x100, Some(6)),
+            assertion(serde_json::json!({
+                "kind": "thunk-target",
+                "target": {"kind": "import-iat", "iat_rva": 0x300}
+            })),
+        );
+        validate_claim_ranges(2, &exact_iat, 0x400)
+            .expect("an exact parsed import-IAT slot is accepted");
+    }
 }

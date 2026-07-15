@@ -1,8 +1,8 @@
 use resymbol_analysis::{AnalysisSession, BinaryAnalysis, analyze_bytes};
 use resymbol_core::BinaryId;
 use resymbol_export::{
-    ExportBinaryFormat, ExportProjection, ProjectionWarningCode, render_ghidra_java,
-    render_ida_python,
+    ExportBinaryFormat, ExportControlFlowTarget, ExportProjection, ProjectionWarningCode,
+    render_ghidra_java, render_ida_python,
 };
 
 const PE_OFFSET: usize = 0x80;
@@ -58,6 +58,21 @@ fn minimal_pe() -> Vec<u8> {
     bytes
 }
 
+fn control_flow_pe() -> Vec<u8> {
+    let mut bytes = minimal_pe();
+    let exception_directory = OPTIONAL_OFFSET + 112 + 3 * 8;
+    put_u32(&mut bytes, exception_directory, 0x1100);
+    put_u32(&mut bytes, exception_directory + 4, 12);
+
+    bytes[0x200..0x205].copy_from_slice(&[0xe8, 0x1b, 0x00, 0x00, 0x00]);
+    bytes[0x205] = 0xc3;
+    bytes[0x220] = 0xc3;
+    put_u32(&mut bytes, 0x300, 0x1000);
+    put_u32(&mut bytes, 0x304, 0x1010);
+    put_u32(&mut bytes, 0x308, 0x1130);
+    bytes
+}
+
 fn msvc_rtti_pe() -> Vec<u8> {
     const IMAGE_BASE: u64 = 0x0000_0001_4000_0000;
     const RDATA_RVA: u32 = 0x2000;
@@ -75,7 +90,9 @@ fn msvc_rtti_pe() -> Vec<u8> {
     put_u16(&mut bytes, COFF_OFFSET + 18, 0x2022);
 
     put_u16(&mut bytes, OPTIONAL_OFFSET, 0x020b);
-    put_u32(&mut bytes, OPTIONAL_OFFSET + 16, 0x1000);
+    // Keep the RTTI virtual slot independent of PE entry-point evidence so the
+    // projection proves that class membership alone establishes the function.
+    put_u32(&mut bytes, OPTIONAL_OFFSET + 16, 0);
     put_u64(&mut bytes, OPTIONAL_OFFSET + 24, IMAGE_BASE);
     put_u32(&mut bytes, OPTIONAL_OFFSET + 32, 0x1000);
     put_u32(&mut bytes, OPTIONAL_OFFSET + 36, 0x200);
@@ -132,7 +149,7 @@ fn msvc_rtti_pe() -> Vec<u8> {
 }
 
 #[test]
-fn analysis_session_projects_exact_pe_identity_and_virtual_image() {
+fn analysis_session_projects_exact_identity_and_keeps_entry_only_writers_empty() {
     let bytes = minimal_pe();
     let analysis = analyze_bytes(&bytes).expect("valid synthetic PE");
     let session = AnalysisSession::new(analysis, Vec::new(), Vec::new()).expect("valid session");
@@ -144,10 +161,77 @@ fn analysis_session_projects_exact_pe_identity_and_virtual_image() {
     assert_eq!(projection.binary.architecture, "x86_64");
     assert_eq!(projection.binary.image_base, 0x0000_0001_4000_0000);
     assert_eq!(projection.binary.image_size, 0x2000);
-    assert!(projection.functions.is_empty());
+    assert_eq!(projection.functions.len(), 1);
+    assert_eq!(projection.functions[0].rva, 0x1000);
+    assert_eq!(
+        projection.functions[0]
+            .entry_attribution
+            .as_ref()
+            .expect("PE entry-point attribution")
+            .provenance
+            .method,
+        "pe-entry-point"
+    );
+    assert!(projection.functions[0].size.is_none());
+    assert!(projection.functions[0].selected_name.is_none());
     assert!(projection.globals.is_empty());
     assert!(projection.types.is_empty());
+    assert!(projection.direct_calls.is_empty());
+    assert!(projection.thunks.is_empty());
     projection.validate().expect("projection remains valid");
+
+    let ida = render_ida_python(&projection).expect("IDA entry-only script");
+    assert!(ida.contains("FUNCTIONS = (\n)\n\nGLOBALS = (\n)"));
+    assert!(!ida.contains("    (0x1000,"));
+
+    let ghidra = render_ghidra_java(&projection, "ReSymbolEntryOnlyFixture")
+        .expect("Ghidra entry-only script");
+    assert!(!ghidra.contains("applyBatch0();"));
+    assert!(!ghidra.contains("1000,"));
+}
+
+#[test]
+fn recovered_direct_call_survives_json_but_entry_only_target_skips_writers() {
+    let bytes = control_flow_pe();
+    let analysis = analyze_bytes(&bytes).expect("valid PE with a direct call");
+    let session = AnalysisSession::new(analysis, Vec::new(), Vec::new()).expect("valid session");
+    let projection = ExportProjection::from_session(&session).expect("session projection");
+
+    assert_eq!(projection.schema_version, 3);
+    assert_eq!(projection.direct_calls.len(), 1);
+    assert_eq!(projection.direct_calls[0].caller_rva, 0x1000);
+    assert_eq!(projection.direct_calls[0].call_site_rva, 0x1000);
+    assert_eq!(
+        projection.direct_calls[0].target,
+        ExportControlFlowTarget::Function { rva: 0x1020 }
+    );
+    let target = projection
+        .functions
+        .iter()
+        .find(|function| function.rva == 0x1020)
+        .expect("direct target function entry");
+    assert!(target.entry_attribution.is_some());
+    assert!(target.size.is_none());
+    assert!(target.selected_name.is_none());
+    assert!(
+        projection
+            .warnings
+            .iter()
+            .all(|warning| warning.code != ProjectionWarningCode::UnsupportedAssertion)
+    );
+
+    let json = serde_json::to_string(&projection).expect("JSON projection");
+    assert!(json.contains("\"direct_calls\""));
+    assert!(json.contains("\"rva\":4128"));
+
+    let ida = render_ida_python(&projection).expect("IDA script");
+    assert!(ida.contains("(0x1000, 0x10, None)"));
+    assert!(!ida.contains("    (0x1020,"));
+
+    let ghidra =
+        render_ghidra_java(&projection, "ReSymbolControlFlowFixture").expect("Ghidra script");
+    assert!(ghidra.contains("1000,10,"));
+    assert!(!ghidra.contains("1020,"));
 }
 
 #[test]
@@ -164,7 +248,7 @@ fn msvc_rtti_names_and_relationships_flow_into_all_export_inputs() {
     let projection = ExportProjection::from_session(&session).expect("session projection");
     projection.validate().expect("projection remains valid");
 
-    assert_eq!(projection.schema_version, 2);
+    assert_eq!(projection.schema_version, 3);
     assert_eq!(projection.types.len(), 1);
     assert_eq!(
         projection.types[0].key,
@@ -189,6 +273,16 @@ fn msvc_rtti_names_and_relationships_flow_into_all_export_inputs() {
     assert_eq!(vftable_name.source.text, "Widget::vftable");
     assert_eq!(projection.functions.len(), 1);
     assert_eq!(projection.functions[0].rva, 0x1000);
+    assert!(projection.functions[0].entry_attribution.is_some());
+    assert_eq!(
+        projection.functions[0]
+            .entry_attribution
+            .as_ref()
+            .expect("RTTI slot establishes a function entry")
+            .provenance
+            .method,
+        "msvc-rtti-vftable-slot"
+    );
     assert_eq!(projection.functions[0].class_memberships.len(), 1);
     assert_eq!(projection.functions[0].class_memberships[0].text, "Widget");
     assert!(
@@ -205,7 +299,9 @@ fn msvc_rtti_names_and_relationships_flow_into_all_export_inputs() {
     let ida = render_ida_python(&projection).expect("IDA script");
     assert!(ida.contains("0x2288"));
     assert!(ida.contains(&vftable_name.output_name));
+    assert!(!ida.contains("    (0x1000,"));
 
     let ghidra = render_ghidra_java(&projection, "ReSymbolRttiFixture").expect("Ghidra script");
     assert!(ghidra.contains("2288,"));
+    assert!(!ghidra.contains("1000,"));
 }

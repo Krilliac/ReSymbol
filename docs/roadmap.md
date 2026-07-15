@@ -12,11 +12,26 @@ exception metadata, and derives conservative metadata-backed claims. Canonical `
 now carry an `AnalysisSession`: deterministic base analysis, an auditable plugin-run ledger, and
 separately validated plugin claims with a derived combined graph.
 
+The CLI writes package schema 2 and can inspect or export schema 1 through an explicit in-memory
+migration that revalidates persisted metadata and rebuilds the base graph. Legacy packages do not
+embed executable bytes, so migration cannot run the newer code-recovery pass; reanalyzing the exact
+original binary is required to populate direct calls and thunks in a new schema 2 package.
+
 A bounded modern MSVC x64 Rev1 RTTI/vftable slice is now implemented. It validates compiler
 metadata through complete object locators, type descriptors, modern 28-byte base-class descriptors,
 class hierarchies, and executable virtual-slot targets. It recovers stored class/type names and
 vftable names and records function-to-class memberships without inventing virtual-method names.
 Fixed scan, record, slot, and name budgets surface partial discovery explicitly.
+
+A bounded pure-Rust x86-64 code-recovery slice is also implemented. Its linear sweep decodes fully
+file-backed `RUNTIME_FUNCTION` ranges for exact direct calls and checks the first instruction at
+metadata-backed entry candidates for internal or import thunks. It retains at most 8,192 direct
+calls and 4,096 thunks; internal targets covered by known runtime-function metadata are suppressed
+unless their RVA matches a recorded runtime-function begin. The sweep is heuristic-confidence
+evidence rather than recursive disassembly: post-terminator bytes or embedded data can produce false
+positives, and invalid bytes can omit later calls in the affected range. It records attributed
+function-entry, direct-call, and thunk claims without inventing names or extents, and surfaces
+aggregate budget exhaustion as a partial scan.
 
 The first external-process analysis host is also implemented. Dropped-in process plugins require an
 explicit full-directory-fingerprint trust decision, then unchanged trusted artifacts can autoload.
@@ -34,9 +49,14 @@ They are deliberately narrower than the planned interactive debugger bridges: pr
 alternate names, provenance comments, and richer relationships are retained or diagnosed by the
 projection but are not yet fully applied inside the tools.
 
-The remaining Milestone 2 work is deliberately substantial: disassembly-assisted candidate
-discovery, strings and references, call relationships and thunks, broader RTTI/ABI coverage, an
-open fixture corpus, reports, benchmarks, and continued malformed-input/resource-limit validation.
+The neutral projection intentionally retains larger model-validation caps of 262,144 direct calls
+and 65,536 thunks. Those bounds support combined/plugin-produced graphs and are separate from the
+built-in decoder's lower 8,192-call and 4,096-thunk recovery caps.
+
+The remaining Milestone 2 work is deliberately substantial: broader disassembly-assisted candidate
+discovery, strings and data references, indirect control flow and richer call-graph analysis,
+broader RTTI/ABI coverage, an open fixture corpus, reports, benchmarks, and continued
+malformed-input/resource-limit validation.
 The WASM, native C/C++, managed/.NET, and debugger-hosted execution paths remain future work; their
 contracts and architecture are present, but should not be mistaken for working hosts.
 
@@ -89,19 +109,21 @@ The first intentionally narrow analysis target is native Windows x86-64 PE input
 adversarial obfuscation.
 
 - Format, section, import, export, and build-metadata extraction
-- Executable-range and candidate function discovery
+- Executable-range and candidate function discovery (exception ranges, exports, calls, and seeded
+  entries implemented)
 - Exception and unwind metadata ingestion
-- Strings, constants, references, call relationships, and thunks
+- Strings, constants, references, call relationships, and thunks (bounded direct calls and
+  one-instruction thunks implemented)
 - Initial MSVC x64 Rev1 RTTI and vftable analysis (bounded modern-layout slice implemented)
 - Portable `.resym` analysis package
 - Deterministic, loss-aware JSON symbol projection
 - Reproducible open-source fixture corpus compiled with and without symbols
 - Boundary, coverage, malformed-input, and resource-limit benchmarks
 
-The PE metadata, x64 exception ingestion, bounded modern MSVC x64 Rev1 RTTI/vftable slice, portable
-package, canonical package encoding, neutral JSON export projection, and related CLI portions are
-implemented. Human-readable reports and the other bullets describe the remainder of this
-milestone.
+The PE metadata, x64 exception ingestion, bounded direct-call/thunk recovery, bounded modern MSVC
+x64 Rev1 RTTI/vftable slice, portable package, canonical package encoding, neutral JSON export
+projection, and related CLI portions are implemented. Human-readable reports and the unfinished
+parts of the bullets describe the remainder of this milestone.
 
 The MVP should be useful without AI, a network connection, Ghidra, or IDA.
 

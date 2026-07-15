@@ -6,15 +6,16 @@ use std::{
 
 use resymbol_analysis::{AnalysisSession, BinaryAnalysis};
 use resymbol_core::{
-    BinaryFormat, BinaryIdentity, ClaimProducer, ClaimProvenance, SymbolAssertion, SymbolClaim,
-    SymbolGraph, SymbolSubject,
+    BinaryFormat, BinaryIdentity, ClaimProducer, ClaimProvenance, ControlFlowTarget,
+    SymbolAssertion, SymbolClaim, SymbolGraph, SymbolSubject,
 };
 
 use crate::{
-    AttributedText, ExportAttribution, ExportBinary, ExportBinaryFormat, ExportError,
-    ExportFunction, ExportGlobal, ExportName, ExportProducer, ExportProjection, ExportProvenance,
-    ExportSubject, ExportType, MAX_CLASS_MEMBERSHIPS_PER_FUNCTION, MAX_DECLARATION_BYTES,
-    MAX_NAME_BYTES, MAX_OUTPUT_NAME_BYTES, MAX_TYPE_KEY_BYTES, ProjectionWarning,
+    AttributedText, ExportAttribution, ExportBinary, ExportBinaryFormat, ExportControlFlowTarget,
+    ExportDirectCall, ExportError, ExportFunction, ExportGlobal, ExportName, ExportProducer,
+    ExportProjection, ExportProvenance, ExportSubject, ExportThunk, ExportType,
+    MAX_CLASS_MEMBERSHIPS_PER_FUNCTION, MAX_DECLARATION_BYTES, MAX_DIRECT_CALLS, MAX_NAME_BYTES,
+    MAX_OUTPUT_NAME_BYTES, MAX_THUNKS, MAX_TYPE_KEY_BYTES, ProjectionWarning,
     ProjectionWarningCode,
     model::{
         MAX_ARCHITECTURE_BYTES, MAX_CLAIMS, MAX_DECLARATIONS_PER_ENTITY, MAX_ENTITIES,
@@ -24,12 +25,16 @@ use crate::{
 
 #[derive(Debug, Default)]
 struct AddressAccumulator<'claims> {
+    entry_attribution: Option<ExportAttribution>,
     names: BTreeMap<String, AttributedText>,
     declarations: BTreeMap<String, AttributedText>,
     class_memberships: BTreeMap<String, AttributedText>,
     distinct_class_memberships: BTreeSet<&'claims str>,
     sizes: BTreeMap<u64, ExportAttribution>,
 }
+
+type DirectCallKey = (u64, u64, ExportControlFlowTarget);
+type ThunkValue = (ExportControlFlowTarget, ExportAttribution);
 
 #[derive(Debug, Default)]
 struct TypeAccumulator {
@@ -158,6 +163,8 @@ impl ExportProjection {
         let mut functions = BTreeMap::<u64, AddressAccumulator<'_>>::new();
         let mut globals = BTreeMap::<u64, AddressAccumulator<'_>>::new();
         let mut types = BTreeMap::<String, TypeAccumulator>::new();
+        let mut direct_calls = BTreeMap::<DirectCallKey, ExportAttribution>::new();
+        let mut thunks = BTreeMap::<u64, ThunkValue>::new();
         let mut entity_count = 0_usize;
         let mut warnings = WarningAccumulator::new();
 
@@ -168,6 +175,8 @@ impl ExportProjection {
                 &mut functions,
                 &mut globals,
                 &mut types,
+                &mut direct_calls,
+                &mut thunks,
                 &mut entity_count,
                 &mut warnings,
             )?;
@@ -191,10 +200,30 @@ impl ExportProjection {
             .into_iter()
             .filter_map(|(key, value)| finish_type(key, value))
             .collect::<Vec<_>>();
+        let direct_calls = direct_calls
+            .into_iter()
+            .map(
+                |((caller_rva, call_site_rva, target), attribution)| ExportDirectCall {
+                    caller_rva,
+                    call_site_rva,
+                    target,
+                    attribution,
+                },
+            )
+            .collect::<Vec<_>>();
+        let thunks = thunks
+            .into_iter()
+            .map(|(rva, (target, attribution))| ExportThunk {
+                rva,
+                target,
+                attribution,
+            })
+            .collect::<Vec<_>>();
 
         remove_overlapping_function_sizes(&mut functions, &mut warnings)?;
         functions.retain(|value| {
-            value.size.is_some()
+            value.entry_attribution.is_some()
+                || value.size.is_some()
                 || value.selected_name.is_some()
                 || !value.prototypes.is_empty()
                 || !value.class_memberships.is_empty()
@@ -210,6 +239,8 @@ impl ExportProjection {
             functions,
             globals,
             types,
+            direct_calls,
+            thunks,
             warnings: warnings.finish(),
         };
         projection.validate()?;
@@ -224,6 +255,8 @@ fn project_claim<'claims>(
     functions: &mut BTreeMap<u64, AddressAccumulator<'claims>>,
     globals: &mut BTreeMap<u64, AddressAccumulator<'claims>>,
     types: &mut BTreeMap<String, TypeAccumulator>,
+    direct_calls: &mut BTreeMap<DirectCallKey, ExportAttribution>,
+    thunks: &mut BTreeMap<u64, ThunkValue>,
     entity_count: &mut usize,
     warnings: &mut WarningAccumulator,
 ) -> Result<(), ExportError> {
@@ -246,16 +279,56 @@ fn project_claim<'claims>(
                 warnings.add(ProjectionWarningCode::AddressOutsideImage, subject)?;
                 return Ok(());
             }
-            let value = address_entry(functions, *rva, entity_count)?;
-            project_address_assertion(
-                claim.assertion(),
-                *size,
-                attribution,
-                value,
-                true,
-                ExportSubject::Function { rva: *rva },
-                warnings,
-            )
+            let function_subject = ExportSubject::Function { rva: *rva };
+            match claim.assertion() {
+                SymbolAssertion::FunctionEntry => {
+                    project_function_entry(functions, *rva, *size, attribution, entity_count)
+                }
+                SymbolAssertion::DirectCall {
+                    call_site_rva,
+                    target,
+                } => project_direct_call(
+                    functions,
+                    direct_calls,
+                    *rva,
+                    *size,
+                    *call_site_rva,
+                    target,
+                    attribution,
+                    image_size,
+                    entity_count,
+                    function_subject,
+                    warnings,
+                ),
+                SymbolAssertion::ThunkTarget { target } => project_thunk(
+                    functions,
+                    thunks,
+                    *rva,
+                    *size,
+                    target,
+                    attribution,
+                    image_size,
+                    entity_count,
+                    function_subject,
+                    warnings,
+                ),
+                _ => {
+                    let value = address_entry(functions, *rva, entity_count)?;
+                    let represented = project_address_assertion(
+                        claim.assertion(),
+                        *size,
+                        attribution.clone(),
+                        value,
+                        true,
+                        function_subject,
+                        warnings,
+                    )?;
+                    if represented {
+                        insert_entry_attribution(&mut value.entry_attribution, attribution);
+                    }
+                    Ok(())
+                }
+            }
         }
         SymbolSubject::Global { rva, size, .. } => {
             if !valid_range(*rva, *size, image_size) {
@@ -263,7 +336,7 @@ fn project_claim<'claims>(
                 return Ok(());
             }
             let value = address_entry(globals, *rva, entity_count)?;
-            project_address_assertion(
+            let _ = project_address_assertion(
                 claim.assertion(),
                 *size,
                 attribution,
@@ -271,7 +344,8 @@ fn project_claim<'claims>(
                 false,
                 ExportSubject::Global { rva: *rva },
                 warnings,
-            )
+            )?;
+            Ok(())
         }
         SymbolSubject::Type { key, .. } => {
             let type_subject = if valid_text(key, MAX_TYPE_KEY_BYTES) {
@@ -302,6 +376,119 @@ fn project_claim<'claims>(
     }
 }
 
+fn project_function_entry(
+    functions: &mut BTreeMap<u64, AddressAccumulator<'_>>,
+    rva: u64,
+    subject_size: Option<u64>,
+    attribution: ExportAttribution,
+    entity_count: &mut usize,
+) -> Result<(), ExportError> {
+    let value = address_entry(functions, rva, entity_count)?;
+    insert_entry_attribution(&mut value.entry_attribution, attribution.clone());
+    if let Some(size) = subject_size {
+        insert_size(&mut value.sizes, size, attribution);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn project_direct_call(
+    functions: &mut BTreeMap<u64, AddressAccumulator<'_>>,
+    direct_calls: &mut BTreeMap<DirectCallKey, ExportAttribution>,
+    caller_rva: u64,
+    subject_size: Option<u64>,
+    call_site_rva: u64,
+    target: &ControlFlowTarget,
+    attribution: ExportAttribution,
+    image_size: u64,
+    entity_count: &mut usize,
+    subject: ExportSubject,
+    warnings: &mut WarningAccumulator,
+) -> Result<(), ExportError> {
+    let Some(target) = export_control_flow_target(target) else {
+        warnings.add(ProjectionWarningCode::UnsupportedAssertion, Some(subject))?;
+        return Ok(());
+    };
+    if !valid_range(call_site_rva, None, image_size)
+        || !valid_control_flow_target(&target, image_size)
+    {
+        warnings.add(ProjectionWarningCode::AddressOutsideImage, Some(subject))?;
+        return Ok(());
+    }
+
+    {
+        let caller = address_entry(functions, caller_rva, entity_count)?;
+        insert_entry_attribution(&mut caller.entry_attribution, attribution.clone());
+        if let Some(size) = subject_size {
+            insert_size(&mut caller.sizes, size, attribution.clone());
+        }
+    }
+    if let ExportControlFlowTarget::Function { rva } = &target {
+        let target_function = address_entry(functions, *rva, entity_count)?;
+        insert_entry_attribution(&mut target_function.entry_attribution, attribution.clone());
+    }
+    insert_direct_call(
+        direct_calls,
+        (caller_rva, call_site_rva, target),
+        attribution,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn project_thunk(
+    functions: &mut BTreeMap<u64, AddressAccumulator<'_>>,
+    thunks: &mut BTreeMap<u64, ThunkValue>,
+    rva: u64,
+    subject_size: Option<u64>,
+    target: &ControlFlowTarget,
+    attribution: ExportAttribution,
+    image_size: u64,
+    entity_count: &mut usize,
+    subject: ExportSubject,
+    warnings: &mut WarningAccumulator,
+) -> Result<(), ExportError> {
+    let Some(target) = export_control_flow_target(target) else {
+        warnings.add(ProjectionWarningCode::UnsupportedAssertion, Some(subject))?;
+        return Ok(());
+    };
+    if !valid_control_flow_target(&target, image_size) {
+        warnings.add(ProjectionWarningCode::AddressOutsideImage, Some(subject))?;
+        return Ok(());
+    }
+
+    {
+        let source = address_entry(functions, rva, entity_count)?;
+        insert_entry_attribution(&mut source.entry_attribution, attribution.clone());
+        if let Some(size) = subject_size {
+            insert_size(&mut source.sizes, size, attribution.clone());
+        }
+    }
+    if let ExportControlFlowTarget::Function { rva: target_rva } = &target {
+        let target_function = address_entry(functions, *target_rva, entity_count)?;
+        insert_entry_attribution(&mut target_function.entry_attribution, attribution.clone());
+    }
+    insert_thunk(thunks, rva, target, attribution)
+}
+
+fn export_control_flow_target(target: &ControlFlowTarget) -> Option<ExportControlFlowTarget> {
+    match target {
+        ControlFlowTarget::Function { rva } => {
+            Some(ExportControlFlowTarget::Function { rva: *rva })
+        }
+        ControlFlowTarget::ImportIat { iat_rva } => {
+            Some(ExportControlFlowTarget::ImportIat { iat_rva: *iat_rva })
+        }
+        _ => None,
+    }
+}
+
+fn valid_control_flow_target(target: &ExportControlFlowTarget, image_size: u64) -> bool {
+    match target {
+        ExportControlFlowTarget::Function { rva } => valid_range(*rva, None, image_size),
+        ExportControlFlowTarget::ImportIat { iat_rva } => valid_range(*iat_rva, None, image_size),
+    }
+}
+
 fn project_address_assertion<'claims>(
     assertion: &'claims SymbolAssertion,
     subject_size: Option<u64>,
@@ -310,9 +497,10 @@ fn project_address_assertion<'claims>(
     is_function: bool,
     subject: ExportSubject,
     warnings: &mut WarningAccumulator,
-) -> Result<(), ExportError> {
-    match assertion {
+) -> Result<bool, ExportError> {
+    let represented = match assertion {
         SymbolAssertion::Name { name } => {
+            let represented = valid_text(name, MAX_NAME_BYTES);
             insert_text(
                 &mut value.names,
                 name,
@@ -326,8 +514,10 @@ fn project_address_assertion<'claims>(
             if let Some(size) = subject_size {
                 insert_size(&mut value.sizes, size, attribution);
             }
+            represented
         }
         SymbolAssertion::FunctionPrototype { declaration } if is_function => {
+            let represented = valid_text(declaration, MAX_DECLARATION_BYTES);
             insert_text(
                 &mut value.declarations,
                 declaration,
@@ -341,6 +531,7 @@ fn project_address_assertion<'claims>(
             if let Some(size) = subject_size {
                 insert_size(&mut value.sizes, size, attribution);
             }
+            represented
         }
         SymbolAssertion::FunctionBoundary { size } if is_function => {
             if subject_size.is_some_and(|subject_size| subject_size != *size) {
@@ -348,11 +539,14 @@ fn project_address_assertion<'claims>(
                     ProjectionWarningCode::AssertionSubjectMismatch,
                     Some(subject),
                 )?;
+                false
             } else {
                 insert_size(&mut value.sizes, *size, attribution);
+                true
             }
         }
         SymbolAssertion::ClassMembership { class_name } if is_function => {
+            let represented = valid_text(class_name, MAX_NAME_BYTES);
             insert_class_membership(
                 &mut value.class_memberships,
                 &mut value.distinct_class_memberships,
@@ -364,22 +558,31 @@ fn project_address_assertion<'claims>(
             if let Some(size) = subject_size {
                 insert_size(&mut value.sizes, size, attribution);
             }
+            represented
         }
         SymbolAssertion::FunctionPrototype { .. }
         | SymbolAssertion::FunctionBoundary { .. }
         | SymbolAssertion::ClassMembership { .. }
+        | SymbolAssertion::FunctionEntry
+        | SymbolAssertion::DirectCall { .. }
+        | SymbolAssertion::ThunkTarget { .. }
         | SymbolAssertion::TypeDefinition { .. } => {
             warnings.add(
                 ProjectionWarningCode::AssertionSubjectMismatch,
                 Some(subject),
             )?;
+            false
         }
         SymbolAssertion::Comment { .. } => {
             warnings.add(ProjectionWarningCode::UnsupportedAssertion, Some(subject))?;
+            false
         }
-        _ => warnings.add(ProjectionWarningCode::UnsupportedAssertion, Some(subject))?,
-    }
-    Ok(())
+        _ => {
+            warnings.add(ProjectionWarningCode::UnsupportedAssertion, Some(subject))?;
+            false
+        }
+    };
+    Ok(represented)
 }
 
 fn project_type_assertion(
@@ -412,7 +615,10 @@ fn project_type_assertion(
         ),
         SymbolAssertion::FunctionPrototype { .. }
         | SymbolAssertion::FunctionBoundary { .. }
-        | SymbolAssertion::ClassMembership { .. } => warnings.add(
+        | SymbolAssertion::ClassMembership { .. }
+        | SymbolAssertion::FunctionEntry
+        | SymbolAssertion::DirectCall { .. }
+        | SymbolAssertion::ThunkTarget { .. } => warnings.add(
             ProjectionWarningCode::AssertionSubjectMismatch,
             Some(subject),
         ),
@@ -521,6 +727,61 @@ fn insert_size(
     }
 }
 
+fn insert_entry_attribution(current: &mut Option<ExportAttribution>, candidate: ExportAttribution) {
+    if current
+        .as_ref()
+        .is_none_or(|current| attribution_order(&candidate, current).is_lt())
+    {
+        *current = Some(candidate);
+    }
+}
+
+fn insert_direct_call(
+    values: &mut BTreeMap<DirectCallKey, ExportAttribution>,
+    key: DirectCallKey,
+    attribution: ExportAttribution,
+) -> Result<(), ExportError> {
+    if let Some(current) = values.get_mut(&key) {
+        if attribution_order(&attribution, current).is_lt() {
+            *current = attribution;
+        }
+        return Ok(());
+    }
+    if values.len() == MAX_DIRECT_CALLS {
+        return Err(ExportError::LimitExceeded {
+            resource: "direct call",
+            limit: MAX_DIRECT_CALLS,
+        });
+    }
+    values.insert(key, attribution);
+    Ok(())
+}
+
+fn insert_thunk(
+    values: &mut BTreeMap<u64, ThunkValue>,
+    rva: u64,
+    target: ExportControlFlowTarget,
+    attribution: ExportAttribution,
+) -> Result<(), ExportError> {
+    if let Some((current_target, current_attribution)) = values.get_mut(&rva) {
+        let candidate_order = attribution_order(&attribution, current_attribution)
+            .then_with(|| target.cmp(current_target));
+        if candidate_order.is_lt() {
+            *current_target = target;
+            *current_attribution = attribution;
+        }
+        return Ok(());
+    }
+    if values.len() == MAX_THUNKS {
+        return Err(ExportError::LimitExceeded {
+            resource: "thunk",
+            limit: MAX_THUNKS,
+        });
+    }
+    values.insert(rva, (target, attribution));
+    Ok(())
+}
+
 fn finish_function(
     rva: u64,
     value: AddressAccumulator<'_>,
@@ -528,6 +789,7 @@ fn finish_function(
 ) -> Result<Option<ExportFunction>, ExportError> {
     let (size, size_attribution) =
         finish_size(&value.sizes, ExportSubject::Function { rva }, warnings)?;
+    let entry_attribution = value.entry_attribution;
     let (selected_name, alternate_names) = finish_names(value.names);
     let prototypes = finish_texts(value.declarations);
     let distinct_class_membership_count = value.distinct_class_memberships.len();
@@ -541,7 +803,8 @@ fn finish_function(
         u64::try_from(omitted_class_memberships)
             .expect("class membership count is bounded by the claim limit"),
     )?;
-    if selected_name.is_none()
+    if entry_attribution.is_none()
+        && selected_name.is_none()
         && size.is_none()
         && prototypes.is_empty()
         && class_memberships.is_empty()
@@ -550,6 +813,7 @@ fn finish_function(
     }
     Ok(Some(ExportFunction {
         rva,
+        entry_attribution,
         size,
         size_attribution,
         selected_name,

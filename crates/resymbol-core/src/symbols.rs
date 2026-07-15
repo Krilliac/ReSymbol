@@ -198,17 +198,77 @@ impl SymbolSubject {
     }
 }
 
+/// One resolved control-flow destination retained by a symbol claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+#[non_exhaustive]
+pub enum ControlFlowTarget {
+    /// An internal function entry in the analyzed image.
+    Function { rva: u64 },
+    /// An import address table slot in the analyzed image.
+    ImportIat { iat_rva: u64 },
+}
+
+impl ControlFlowTarget {
+    /// Return the target's canonical image-relative address.
+    #[must_use]
+    pub const fn rva(&self) -> u64 {
+        match self {
+            Self::Function { rva } => *rva,
+            Self::ImportIat { iat_rva } => *iat_rva,
+        }
+    }
+
+    /// Whether this target identifies an internal function rather than an IAT slot.
+    #[must_use]
+    pub const fn is_function(&self) -> bool {
+        matches!(self, Self::Function { .. })
+    }
+
+    /// Whether this target identifies the internal function at `rva`.
+    #[must_use]
+    pub const fn is_function_at(&self, rva: u64) -> bool {
+        matches!(self, Self::Function { rva: target_rva } if *target_rva == rva)
+    }
+
+    fn validate(&self) -> Result<(), ClaimValidationError> {
+        match self {
+            Self::Function { .. } | Self::ImportIat { .. } => Ok(()),
+        }
+    }
+}
+
 /// Information proposed for a subject. The core preserves competing claims.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 #[non_exhaustive]
 pub enum SymbolAssertion {
-    Name { name: String },
-    FunctionPrototype { declaration: String },
-    FunctionBoundary { size: u64 },
-    TypeDefinition { declaration: String },
-    ClassMembership { class_name: String },
-    Comment { text: String },
+    Name {
+        name: String,
+    },
+    FunctionPrototype {
+        declaration: String,
+    },
+    FunctionBoundary {
+        size: u64,
+    },
+    FunctionEntry,
+    DirectCall {
+        call_site_rva: u64,
+        target: ControlFlowTarget,
+    },
+    ThunkTarget {
+        target: ControlFlowTarget,
+    },
+    TypeDefinition {
+        declaration: String,
+    },
+    ClassMembership {
+        class_name: String,
+    },
+    Comment {
+        text: String,
+    },
 }
 
 impl SymbolAssertion {
@@ -226,6 +286,10 @@ impl SymbolAssertion {
                     return Err(ClaimValidationError::ZeroSize);
                 }
                 return Ok(());
+            }
+            Self::FunctionEntry => return Ok(()),
+            Self::DirectCall { target, .. } | Self::ThunkTarget { target } => {
+                return target.validate();
             }
         };
 
@@ -680,6 +744,59 @@ mod tests {
         )
         .expect_err("unknown assertion fields must fail");
         assert!(error.to_string().contains("unknown field `unexpected`"));
+
+        let error = serde_json::from_str::<ControlFlowTarget>(
+            r#"{"kind":"function","rva":8192,"unexpected":true}"#,
+        )
+        .expect_err("unknown control-flow target fields must fail");
+        assert!(error.to_string().contains("unknown field `unexpected`"));
+
+        let error = serde_json::from_str::<SymbolAssertion>(
+            r#"{
+                "kind":"direct-call",
+                "call_site_rva":4096,
+                "target":{"kind":"import-iat","iat_rva":8192,"unexpected":true}
+            }"#,
+        )
+        .expect_err("unknown nested target fields must fail");
+        assert!(error.to_string().contains("unknown field `unexpected`"));
+    }
+
+    #[test]
+    fn control_flow_assertions_have_canonical_tagged_shapes() {
+        let function_target = ControlFlowTarget::Function { rva: 0x2000 };
+        assert_eq!(function_target.rva(), 0x2000);
+        assert!(function_target.is_function());
+        assert!(function_target.is_function_at(0x2000));
+        assert!(!function_target.is_function_at(0x2001));
+        assert_eq!(
+            serde_json::to_value(function_target).expect("serialize function target"),
+            serde_json::json!({"kind": "function", "rva": 0x2000})
+        );
+
+        let iat_target = ControlFlowTarget::ImportIat { iat_rva: 0x3000 };
+        assert_eq!(iat_target.rva(), 0x3000);
+        assert!(!iat_target.is_function());
+        assert!(!iat_target.is_function_at(0x3000));
+        assert_eq!(
+            serde_json::to_value(iat_target).expect("serialize IAT target"),
+            serde_json::json!({"kind": "import-iat", "iat_rva": 0x3000})
+        );
+
+        let assertions = [
+            SymbolAssertion::FunctionEntry,
+            SymbolAssertion::DirectCall {
+                call_site_rva: 0x1010,
+                target: function_target,
+            },
+            SymbolAssertion::ThunkTarget { target: iat_target },
+        ];
+        for assertion in assertions {
+            let encoded = serde_json::to_string(&assertion).expect("serialize assertion");
+            let decoded =
+                serde_json::from_str::<SymbolAssertion>(&encoded).expect("deserialize assertion");
+            assert_eq!(decoded, assertion);
+        }
     }
 
     #[test]
