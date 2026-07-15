@@ -599,12 +599,7 @@ fn collect_managed_assemblies(
         } else {
             format!("{relative_parent}/{name}")
         };
-        if !traversal.portable_paths.insert(relative.to_lowercase()) {
-            return Err(closure_error(
-                &path,
-                "package contains a portable path alias or case collision".to_owned(),
-            ));
-        }
+        record_portable_path(traversal, &relative, &path)?;
 
         let metadata = fs::symlink_metadata(&path)
             .map_err(|error| closure_error(&path, format!("cannot inspect entry: {error}")))?;
@@ -663,6 +658,20 @@ fn collect_managed_assemblies(
             path: relative,
             sha256,
         });
+    }
+    Ok(())
+}
+
+fn record_portable_path(
+    traversal: &mut ClosureTraversal,
+    relative: &str,
+    path: &Path,
+) -> Result<(), PluginRuntimeError> {
+    if !traversal.portable_paths.insert(relative.to_lowercase()) {
+        return Err(closure_error(
+            path,
+            "package contains a portable path alias or case collision".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -1233,7 +1242,7 @@ fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
         use std::os::windows::fs::MetadataExt as _;
 
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
-        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
     }
     #[cfg(not(windows))]
     false
@@ -1451,7 +1460,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn closure_rejects_symlinks_and_case_aliases() {
+    fn closure_rejects_symlinks() {
         use std::os::unix::fs::symlink;
 
         let linked = TempDir::new().unwrap();
@@ -1461,13 +1470,31 @@ mod tests {
             discover_managed_assemblies(linked.path(), "Plugin.dll", MAX_MANAGED_CLOSURE_BYTES)
                 .is_err()
         );
+    }
 
-        let aliases = TempDir::new().unwrap();
-        fs::write(aliases.path().join("Plugin.dll"), b"entry").unwrap();
-        fs::write(aliases.path().join("plugin.DLL"), b"alias").unwrap();
+    #[test]
+    fn portable_path_aliases_are_rejected_without_filesystem_case_assumptions() {
+        let temporary = TempDir::new().unwrap();
+        let mut traversal = ClosureTraversal {
+            entries: 0,
+            total_bytes: 0,
+            maximum_bytes: MAX_MANAGED_CLOSURE_BYTES,
+            portable_paths: HashSet::new(),
+            assemblies: Vec::new(),
+        };
+        record_portable_path(
+            &mut traversal,
+            "lib/Plugin.dll",
+            &temporary.path().join("lib/Plugin.dll"),
+        )
+        .unwrap();
         assert!(
-            discover_managed_assemblies(aliases.path(), "Plugin.dll", MAX_MANAGED_CLOSURE_BYTES)
-                .is_err()
+            record_portable_path(
+                &mut traversal,
+                "LIB/plugin.DLL",
+                &temporary.path().join("LIB/plugin.DLL"),
+            )
+            .is_err()
         );
     }
 
