@@ -13,6 +13,7 @@ resymbol inspect application.resym --json
 resymbol export application.resym --format json
 resymbol export application.resym --format markdown
 resymbol export application.resym --format map
+resymbol export application.resym --format pdb --binary application.exe
 resymbol export application.resym --format ida-python
 resymbol export application.resym --format ghidra-java
 ```
@@ -60,6 +61,14 @@ ReSymbol's generated IDAPython and Ghidra Java scripts perform that exact SHA-25
 tool before making any database change. They then resolve projected RVAs against the loaded image
 base instead of assuming the package's preferred virtual address. See [exporting.md](exporting.md)
 for the application policy and current representational limits.
+
+PDB export also enforces byte-backed identity, but at generation time. Because the package omits
+the executable bytes, `--format pdb` requires `--binary` with the exact original PE. ReSymbol hashes
+the supplied bytes against the package and re-inspects their bounded PE headers and debug directory
+before it writes anything. The source must contain exactly one well-formed CodeView `RSDS` record;
+the output copies its GUID and age and copies the PE's raw section headers verbatim so normal symbol
+matching and section-relative public addresses refer to that exact image. The RSDS pathname is
+advisory, not an identity substitute, and the executable is never modified.
 
 Schema changes and plugin API changes are versioned separately. Before ReSymbol 1.0, payload fields
 may evolve between prereleases, but an incompatible reader must fail explicitly instead of guessing.
@@ -264,6 +273,17 @@ boundaries. That includes safe vftable global names, but not entry-only candidat
 relationships, RTTI type creation, class-membership metadata, or invented names for virtual
 functions. They do not silently imply that prototypes, types, competing names, relationships, or
 unsupported claims were installed in the debugger.
+
+The exact-RSDS PDB writer consumes the same validated session and projection plus an ephemeral
+inspection of the exact original PE. It emits deterministic, bounded, pure-Rust MSF 7.00 output
+containing selected public function and global names and verbatim section headers. Same-RVA
+function/global collisions prefer the function; unnamed functions do not suppress globals. The
+writer does not synthesize private symbols, compilands, source lines, locals, prototypes, function
+extents, or type records, and it does not add fields to package schema 3 or neutral projection
+schema 4. Generating the file requires no separately installed Visual Studio, DIA, LLVM, or
+compiler toolchain; Windows compatibility CI validates it with native and DIA-backed
+`llvm-pdbutil` reads and a direct DIA identity/public-symbol probe.
+
 Export files use create-new writes and never replace an existing destination.
 
 ## Future packaging

@@ -8,10 +8,10 @@ The current implementation covers bounded PE32+ x86-64 ingestion, a conservative
 symbol graph, modern MSVC x64 Rev1 RTTI/vftable discovery, canonical JSON `.resym` packages, plugin
 discovery/contracts, and the first trusted external-process analysis runtime. It also includes a
 validated, debugger-neutral export projection, deterministic Microsoft-linker-style MAP output,
-and conservative standalone import-script generators for IDA and Ghidra. Broader
-disassembly-assisted discovery, matching, semantic inference, interactive debugger bridges,
-PDB/DWARF writers, the workbench GUI, and the WASM/native/managed execution hosts remain design
-work.
+an exact-RSDS public-symbol PDB writer, and conservative standalone import-script generators for
+IDA and Ghidra. Broader disassembly-assisted discovery, matching, semantic inference, interactive
+debugger bridges, richer PDB and DWARF output, the workbench GUI, and the WASM/native/managed
+execution hosts remain design work.
 
 ## Goals
 
@@ -77,20 +77,23 @@ unrelated signature index, and removing a plugin's results should not require re
 have no dependency on that plugin.
 
 The implemented slice extracts PE image/section metadata, imports, exports, forwarded exports, x64
-`RUNTIME_FUNCTION` records, bounded direct calls and thunks, and a bounded modern MSVC x64
-RTTI/vftable subset without loading or executing the input. Exact export names, corroborated
-metadata-backed boundaries, supported decoded function entries and control-flow relationships,
-validated RTTI type/vftable names, and function-to-class relationships from virtual slots become
-evidence-bearing graph claims. Broader candidate discovery and the remaining evidence sources
-above are planned.
+`RUNTIME_FUNCTION` records, bounded exact strings, supported RIP-relative data references, bounded
+direct calls and thunks, and a bounded modern MSVC x64 RTTI/vftable subset without loading or
+executing the input. Exact export names, corroborated metadata-backed boundaries, supported decoded
+function entries and relationships, validated string literals, RTTI type/vftable names, and
+function-to-class relationships from virtual slots become evidence-bearing graph claims. Broader
+candidate discovery and unsupported evidence sources remain planned.
 
 The x86-64 decoder is a pure-Rust, bounded linear sweep used only over complete file-backed
 executable exception ranges and the first instruction at metadata-backed thunk seeds. The
 implemented forms are `E8` internal calls, RIP-relative `FF 15` calls to exact parsed IAT slots,
 `E9`/`EB` internal thunks, and RIP-relative `FF 25` import thunks. Internal targets covered by known
 runtime-function metadata are suppressed unless their RVA matches a recorded runtime-function
-begin. Aggregate limits of 64 MiB, 1,000,000 instructions, 8,192 retained direct calls, and 4,096
-retained thunks retain a canonical prefix and mark analysis partial when exhausted. Overlapping
+begin. Aggregate limits of 64 MiB, 1,000,000 instructions, 8,192 retained direct calls, 4,096
+retained thunks, and 32,768 retained data references retain canonical prefixes when exhausted;
+`code_recovery_scan_truncated` and `data_reference_scan_truncated` persist the applicable partial
+state independently. Exhausting the shared decode budget makes both instruction-derived sets
+partial. Overlapping
 runtime-function ranges are preserved and may be swept and budgeted separately, so adversarial
 overlap metadata can make the bounded pass partial earlier.
 
@@ -182,15 +185,16 @@ the canonical graph into a debugger database.
 
 Exporters consume a bounded, read-only projection of one validated session. The initial projection
 selects deterministic names and boundaries, preserves competing names, prototypes, type
-definitions, attributed function entries, direct calls, thunks, class memberships, confidence, and
-provenance where representable, assigns collision-safe output names, and emits structured warnings
-when graph information must be reduced or omitted. Writers revalidate that projection before
-serializing it.
+definitions, attributed function entries, strings, data references, direct calls, thunks, class
+memberships, confidence, and provenance where representable, assigns collision-safe output names,
+and emits structured warnings when graph information must be reduced or omitted. Writers revalidate
+that projection before serializing it.
 
 The first writers serialize the projection as JSON, render bounded Markdown or
-Microsoft-linker-style MAP text, or generate self-contained IDAPython and Ghidra Java import
-scripts. Each script checks the debugger's recorded input SHA-256 before mutation and maps RVAs
-through the loaded image base, so ordinary rebasing does not weaken exact-build binding.
+Microsoft-linker-style MAP text, emit an exact-RSDS public-symbol PDB, or generate self-contained
+IDAPython and Ghidra Java import scripts. Each script checks the debugger's recorded input SHA-256
+before mutation and maps RVAs through the loaded image base, so ordinary rebasing does not weaken
+exact-build binding.
 The scripts preserve existing IDA user-authored names and Ghidra names from sources other than
 `DEFAULT`/`ANALYSIS`, avoid replacing existing function bodies, and continue after an individual
 symbol cannot be applied. This is intentionally narrower than a long-lived tool-hosted bridge:
@@ -220,9 +224,30 @@ semicolon comments retain the exact SHA-256 and file size, but Microsoft does no
 comments as MAP fields and the text cannot enforce binary identity when consumed. This writer adds
 no package or neutral-projection schema fields.
 
+The initial PDB writer is a deliberately narrow PE-only path for selected public function and
+global names. `resymbol export --format pdb` requires `--binary` with the exact original PE because
+the `.resym` package does not embed executable bytes. Before writing, ReSymbol hashes those bytes
+against the package, applies the strict PE32+ x86-64 header checks, and inspects the bounded PE debug
+directory for exactly one well-formed CodeView `RSDS` record. Missing, malformed, or multiple RSDS
+records fail rather than being guessed. The resulting PDB copies that record's GUID and age and the
+PE's raw 40-byte section-table records verbatim; it does not trust the advisory PDB pathname as
+identity and never rewrites the PE.
+
+ReSymbol builds the deterministic, bounded MSF 7.00 container and its PDB, DBI, public-symbol,
+global/public-index, and section-header streams in pure Rust. Ordinary users therefore need no
+Visual Studio, DIA SDK, LLVM, or compiler installation to create the file. Selected names are
+emitted as `S_PUB32` records with function/global flags and one-based PE section-relative
+addresses. A selected function wins over a selected global at the same RVA, while an unnamed
+function suppresses nothing. The first slice does not synthesize private symbols, compilands,
+source files or lines, locals, prototypes, function extents, or type records. It is exercised on
+Windows CI through native `llvm-pdbutil` stream inspection, its DIA-backed view, and a direct DIA
+identity/public-symbol probe. Like MAP export, it adds no package or neutral-projection schema
+fields.
+
 PDB, MAP, DWARF, IDA, Ghidra, and other targets have different capabilities and must not force
-their assumptions into the canonical graph. PDB/DWARF writers and interactive debugger bridges
-remain planned. See [exporting.md](exporting.md) for current behavior.
+their assumptions into the canonical graph. Richer PDB types, private symbols, and line data;
+DWARF writers; and interactive debugger bridges remain planned. See
+[exporting.md](exporting.md) for current behavior.
 
 ## Plugin boundary
 
@@ -280,7 +305,7 @@ compiler, language runtime, build system, or package manager. In particular:
 
 - managed hosts are distributed self-contained;
 - ordinary plugins are distributed already compiled;
-- a PDB exporter must not require a separate Visual Studio installation; and
+- the implemented PDB exporter does not require a separate Visual Studio installation; and
 - optional external services remain optional rather than preventing deterministic analysis.
 
 Developer toolchains are a contributor concern, not an end-user installation step.

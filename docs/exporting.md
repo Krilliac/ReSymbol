@@ -2,22 +2,25 @@
 
 `resymbol export` turns one validated `.resym` analysis package into a deterministic,
 debugger-neutral JSON projection, a bounded human-readable Markdown report,
-Microsoft-linker-style MAP text, or a self-contained import script for IDA or Ghidra.
+Microsoft-linker-style MAP text, an exact-RSDS public-symbol PDB, or a self-contained import script
+for IDA or Ghidra.
 
 ```console
 resymbol export PACKAGE --format json [--output PATH]
 resymbol export PACKAGE --format markdown [--output PATH]
 resymbol export PACKAGE --format map [--output PATH]
+resymbol export PACKAGE --format pdb --binary EXACT_ORIGINAL_PE [--output PATH]
 resymbol export PACKAGE --format ida-python [--output PATH]
 resymbol export PACKAGE --format ghidra-java [--output PATH]
 ```
 
 The current formats are deliberately small and auditable. JSON is the machine-consumable
 interchange artifact, Markdown is a presentation-only report for review, MAP is PE-only text for
-tools that support the Microsoft-linker-style layout, and the scripts apply a conservative subset
-inside their target debugger. They do not require a ReSymbol plugin, compiler, or separately
-installed language runtime beyond the scripting support included with the target debugger. PDB
-generation, richer type application, and interactive in-tool bridges are later milestones.
+tools that support the Microsoft-linker-style layout, PDB is an exact-identity public-symbol export,
+and the scripts apply a conservative subset inside their target debugger. They do not require a
+ReSymbol plugin or compiler. Ordinary PDB generation is offline and requires no Visual Studio,
+LLVM, or DIA installation. Richer type application and interactive in-tool bridges are later
+milestones.
 
 ## Output paths and overwrite policy
 
@@ -28,6 +31,7 @@ Without `--output`, ReSymbol chooses a deterministic destination beside the pack
 | `json` | `application.resym` | `application.symbols.json` |
 | `markdown` | `application.resym` | `application.symbols.md` |
 | `map` | `application.resym` | `application.map` |
+| `pdb` | `application.resym` | `application.pdb` |
 | `ida-python` | `application.resym` | `application.ida.py` |
 | `ghidra-java` | `application.resym` | `ReSymbolImport_<sha12>.java` |
 
@@ -35,8 +39,10 @@ Without `--output`, ReSymbol chooses a deterministic destination beside the pack
 Ghidra name is stable for the exact binary and gives the generated script a conservative Java class
 name.
 
-All formats use create-new writes. ReSymbol refuses to replace an existing file; choose another
-path with `--output`, move the old export, or remove it intentionally before exporting again.
+All formats use create-new writes. ReSymbol stages and flushes the complete artifact beside its
+destination, then publishes it without replacing an existing path, so a failed write does not leave
+a truncated final export. Choose another path with `--output`, move the old export, or remove it
+intentionally before exporting again.
 
 A custom Ghidra output must use a lowercase `.java` extension. Its filename stem becomes the
 generated public class name and therefore must be a conservative Java identifier: 1 to 128 ASCII
@@ -82,6 +88,11 @@ A matching hash prevents accidental application to another build; it does not es
 claim in the package is trustworthy. Review the package's provenance and the generated source when
 using results from someone else. Running an import script changes the current IDA database or
 Ghidra program, so use the host tool's normal backup/versioning workflow for important projects.
+
+PDB export has an additional pre-write gate: `--binary` must name the exact original PE used to
+create the package. ReSymbol hashes those bytes, matches their identity and PE metadata against the
+session, and reads the CodeView identity and raw section headers directly from that file. The PE is
+opened read-only for inspection and is never patched or rewritten.
 
 ## JSON projection
 
@@ -254,9 +265,10 @@ from the same projection compare cleanly.
 
 Markdown is a human-facing presentation format, not a stable interchange contract. Its wording,
 table layout, and section organization may evolve between alpha releases. Tools should consume the
-`json` output and validate its `schema_version` instead of parsing the report. Adding this writer
-does not change the source `.resym` package schema or the neutral projection schema: current
-artifacts remain package schema 3 and projection schema 4, respectively.
+`json` output and validate its `schema_version` instead of parsing the report. New analyses write
+package schema 3; export also accepts package schemas 1 and 2 through validated compatibility paths
+without rewriting them. The current neutral projection is schema 4, and adding this writer changes
+neither version domain.
 
 The report writer applies limits in addition to the projection's own validation bounds:
 
@@ -284,9 +296,9 @@ resymbol export application.resym --format map
 The default destination is `application.map`. This is a deterministic text export, not a claim that
 every debugger or linker will accept it. ReSymbol currently rejects non-PE sessions and
 projections, mismatched session/projection binary fields, selected symbol RVAs outside real PE
-sections, and a nonzero entry point outside those sections. MAP does not change the `.resym`
-package or neutral projection schemas; current new artifacts remain package schema 3 and projection
-schema 4.
+sections, and a nonzero entry point outside those sections. New analyses write package schema 3;
+export also accepts package schemas 1 and 2 through validated compatibility paths without rewriting
+them. The current neutral projection is schema 4, and MAP adds no schema fields.
 
 The writer emits the PE timestamp and preferred load address, one group for each final PE section,
 selected public names in RVA order, and the entry-point `section:offset`. Section numbers are
@@ -314,7 +326,48 @@ MAP generation counts selected function/global candidates before same-RVA collis
 rejects more than 262,144. The complete UTF-8 output is capped at 64 MiB. Either condition fails
 before the create-new destination is written. MAP currently carries selected names and section
 addresses only; prototypes, types, alternate names, confidence, recovered strings, relationships,
-and other rich projection data remain available through JSON. Synthetic PDB output remains planned.
+and other rich projection data remain available through JSON.
+
+## Exact-RSDS public-symbol PDB
+
+Generate a synthetic PDB for the exact original PE represented by the package:
+
+```console
+resymbol export application.resym --format pdb --binary application.exe
+```
+
+Without `--output`, the destination is `application.pdb` beside the package. PDB uses the same
+create-new policy as every other export and never replaces an existing file. Supply `--output` to
+choose another filename or directory.
+
+This first PDB slice supports PE32+ x86-64 sessions only. The supplied PE must match the package's
+exact SHA-256 identity, file size, architecture, image base, machine, section count, and persisted
+section metadata. It must also contain exactly one valid modern `RSDS` record among its
+`IMAGE_DEBUG_TYPE_CODEVIEW` entries. ReSymbol copies that record's GUID and age into the PDB and
+copies the original 40-byte PE section-table records byte-for-byte into its section-header stream.
+Export fails before creating the destination when the source is missing, is a different binary or
+build, has only an older `NB10` CodeView record, has no RSDS record, or contains malformed or
+multiple RSDS records.
+
+The result contains CodeView `S_PUB32` records for selected named functions and globals. A named
+function wins over a named global at the same RVA; an unnamed function suppresses nothing. This is
+not a reconstructed compiler PDB: it carries no types, prototypes, private symbols, locals, line
+tables, compilands, or function extents. Confidence, alternate names, evidence, recovered strings,
+calls, thunks, data references, and relationships remain available in the neutral JSON projection.
+
+Generation is deterministic and offline. The PDB/MSF writer is built into ReSymbol, so ordinary
+users do not need Visual Studio, LLVM, DIA, a compiler, or a network service. The writer accepts at
+most 262,144 selected function/global candidates before same-RVA reduction, at most 511 bytes per
+emitted public name, and a final MSF container of at most 128 MiB. A bound violation aborts before
+the create-new destination is written.
+
+The generated PDB does not modify or relink the executable. Load it manually in IDA or another PDB
+consumer when that tool offers a symbol-file selection. For automatic discovery, use the PDB
+basename recorded in the PE's RSDS path when one is present: copy or rename the export to that
+basename and place it beside the binary or in the debugger's configured symbol path. Debuggers
+normally use the copied GUID and age to accept the PDB; the stronger SHA-256 check is enforced by
+ReSymbol at export time against `--binary`. Do not patch the PE merely to point at the generated
+file.
 
 ## Import into IDA
 
@@ -401,5 +454,5 @@ The initial scripts intentionally apply less information than the JSON projectio
 
 These omissions prevent a low-confidence or lossy conversion from masquerading as full symbol
 recovery. Future IDA/Ghidra bridges will add preview and selective application. The current MAP
-writer exposes only selected PE function/global names and addresses; a synthetic PDB writer remains
-planned separately.
+and PDB writers expose only selected PE function/global names and addresses; richer PDB records
+remain a separate milestone.

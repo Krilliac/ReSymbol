@@ -1,0 +1,201 @@
+name: PDB compatibility
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/resymbol-analysis/**"
+      - "crates/resymbol-export/**"
+      - "tools/pdb-compat/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/pdb-compat.yml"
+  pull_request:
+    paths:
+      - "crates/resymbol-analysis/**"
+      - "crates/resymbol-export/**"
+      - "tools/pdb-compat/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/pdb-compat.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pdb-compat-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  PDB_COMPAT_DIR: target/pdb-compat
+  PDB_COMPAT_FILE: target/pdb-compat/resymbol-rsds-x64.pdb
+
+jobs:
+  windows-dia:
+    name: Windows LLVM and DIA readers
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Select pinned Rust toolchain
+        shell: pwsh
+        run: rustup show active-toolchain
+
+      - name: Generate deterministic compatibility fixture
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Path $env:PDB_COMPAT_DIR -Force | Out-Null
+          $env:RESYMBOL_PDB_COMPAT_OUTPUT = Join-Path $PWD $env:PDB_COMPAT_FILE
+          cargo test --locked -p resymbol-export --test pdb writes_external_compatibility_fixture -- --exact --nocapture
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          if (-not (Test-Path -LiteralPath $env:RESYMBOL_PDB_COMPAT_OUTPUT -PathType Leaf)) {
+            throw "The Rust compatibility test did not create the requested PDB."
+          }
+
+      - name: Validate native streams with llvm-pdbutil
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $command = Get-Command llvm-pdbutil.exe -ErrorAction SilentlyContinue
+          $candidates = @()
+          if ($null -ne $command) {
+            $candidates += $command.Source
+          }
+          $candidates += @(
+            (Join-Path $env:ProgramFiles "LLVM\bin\llvm-pdbutil.exe"),
+            (Join-Path ${env:ProgramFiles(x86)} "LLVM\bin\llvm-pdbutil.exe")
+          )
+          $pdbutil = $candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+          if ($null -eq $pdbutil) {
+            throw "llvm-pdbutil.exe was not found on PATH or in the hosted runner LLVM directories."
+          }
+          "LLVM_PDBUTIL=$pdbutil" | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+
+          $dumpLog = Join-Path $env:PDB_COMPAT_DIR "llvm-dump.txt"
+          & $pdbutil dump -summary -publics -section-headers -section-map $env:PDB_COMPAT_FILE 2>&1 |
+            Tee-Object -FilePath $dumpLog
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+          $dump = Get-Content -LiteralPath $dumpLog -Raw
+          foreach ($required in @("reconstructed_function", "reconstructed_global")) {
+            if (-not $dump.Contains($required)) {
+              throw "llvm-pdbutil dump did not expose expected public '$required'."
+            }
+          }
+          if ($dump -notmatch "(?i)00112233-4455-6677-8899-aabbccddeeff") {
+            throw "llvm-pdbutil reported an unexpected PDB GUID."
+          }
+          if ($dump -notmatch "(?m)^\s*Age:\s*7\s*$") {
+            throw "llvm-pdbutil reported an unexpected PDB age."
+          }
+
+      - name: Validate DIA-backed llvm-pdbutil view
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $pdbutil = $env:LLVM_PDBUTIL
+          if (-not (Test-Path -LiteralPath $pdbutil -PathType Leaf)) {
+            throw "llvm-pdbutil.exe was not found for the DIA-backed view."
+          }
+
+          $prettyLog = Join-Path $env:PDB_COMPAT_DIR "llvm-pretty.txt"
+          & $pdbutil pretty -externals $env:PDB_COMPAT_FILE 2>&1 |
+            Tee-Object -FilePath $prettyLog
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+          $pretty = Get-Content -LiteralPath $prettyLog -Raw
+          foreach ($required in @("reconstructed_function", "reconstructed_global")) {
+            if (-not $pretty.Contains($required)) {
+              throw "DIA-backed llvm-pdbutil output did not expose expected public '$required'."
+            }
+          }
+
+      - name: Compile and run direct DIA validation probe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) {
+            throw "vswhere.exe was not found on the hosted runner."
+          }
+
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($vs)) {
+            throw "A Visual Studio installation with the x64 C++ toolchain was not found."
+          }
+          $vs = $vs.Trim()
+          $diaRoot = Join-Path $vs "DIA SDK"
+          $diaInclude = Join-Path $diaRoot "include"
+          $diaLibrary = Join-Path $diaRoot "lib\amd64"
+          $diaDll = Join-Path $diaRoot "bin\amd64\msdia140.dll"
+          foreach ($required in @(
+            (Join-Path $diaInclude "dia2.h"),
+            (Join-Path $diaInclude "diacreate.h"),
+            (Join-Path $diaLibrary "diaguids.lib"),
+            $diaDll
+          )) {
+            if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
+              throw "Required DIA SDK file is missing: $required"
+            }
+          }
+
+          $launchDevShell = Join-Path $vs "Common7\Tools\Launch-VsDevShell.ps1"
+          if (-not (Test-Path -LiteralPath $launchDevShell -PathType Leaf)) {
+            throw "Visual Studio developer-shell launcher was not found."
+          }
+          & $launchDevShell -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
+
+          $probe = Join-Path $env:PDB_COMPAT_DIR "dia_probe.exe"
+          $compileArguments = @(
+            "/nologo",
+            "/EHsc",
+            "/std:c++17",
+            "/W4",
+            "/DUNICODE",
+            "/D_UNICODE",
+            "/I$diaInclude",
+            "tools\pdb-compat\dia_probe.cpp",
+            "/Fe:$probe",
+            "/link",
+            "/LIBPATH:$diaLibrary",
+            "diaguids.lib",
+            "ole32.lib",
+            "oleaut32.lib"
+          )
+          & cl.exe @compileArguments 2>&1 |
+            Tee-Object -FilePath (Join-Path $env:PDB_COMPAT_DIR "dia-compile.txt")
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+          & $probe $env:PDB_COMPAT_FILE $diaDll 2>&1 |
+            Tee-Object -FilePath (Join-Path $env:PDB_COMPAT_DIR "dia-probe.txt")
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+      - name: Upload compatibility diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pdb-compat-windows-diagnostics
+          path: |
+            target/pdb-compat/*.txt
+            target/pdb-compat/*.pdb
+          if-no-files-found: ignore
+          retention-days: 7
