@@ -36,8 +36,11 @@ The current alpha implements and tests an end-to-end, deliberately narrow analys
   import-address-table slots, plus exact supported RIP-relative references into eligible data;
 - bounded recovery of exact NUL-terminated ASCII and UTF-16LE strings from file-backed,
   initialized, readable, non-executable sections, including writable data;
-- a source-available, byte-reproducible MSVC x64 PE fixture pair with and without CodeView metadata,
-  plus an exact hash and semantic oracle covering the implemented Milestone 2 evidence families;
+- a source-available, byte-reproducible four-artifact MSVC x64 PE fixture matrix spanning optimized
+  and unoptimized builds, each with and without CodeView metadata, plus exact hashes and a
+  profile-sensitive semantic oracle covering the implemented Milestone 2 evidence families; these
+  repository/source fixtures are analyzer test data and are not bundled in portable runtime
+  archives;
 - conservative symbol-graph generation from exact export names, metadata-backed function
   boundaries, function-entry candidates, direct calls, thunks, recovered strings, and data
   references, with SHA-256 binary identity, evidence, provenance, confidence, and claim validation;

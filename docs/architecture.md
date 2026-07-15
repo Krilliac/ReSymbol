@@ -85,11 +85,17 @@ function entries and relationships, validated string literals, RTTI type/vftable
 function-to-class relationships from virtual slots become evidence-bearing graph claims. Broader
 candidate discovery and unsupported evidence sources remain planned.
 
-The analyzer is exercised against a checked-in, source-available MSVC x64 fixture pair built with
-and without CodeView metadata. Exact SHA-256 values bind the byte-reproducible PE inputs, while a
-shared semantic oracle covers imports, exports, unwind functions, calls, internal and import
-thunks, ASCII/UTF-16LE strings, data references, and modern RTTI/vftables. The build script checks
-repeat PE determinism and keeps the byte-variable full PDB as a local `target/` artifact.
+The analyzer is exercised against a checked-in, source-available four-artifact MSVC x64 fixture
+matrix. The existing `milestone2-symbolized.exe` and `milestone2-stripped.exe` remain the optimized
+pair; `milestone2-unoptimized-symbolized.exe` and `milestone2-unoptimized-stripped.exe` add the
+unoptimized pair. Exact SHA-256 values bind every byte-reproducible PE input. A shared semantic
+oracle covers imports, exports, unwind functions, calls, internal and import thunks,
+ASCII/UTF-16LE strings, data references, and modern RTTI/vftables, while call-site offsets, thunk
+shapes, RTTI addresses, and other layout-sensitive requirements remain specific to the optimization
+profile. The build script checks repeat PE determinism and keeps the byte-variable
+`milestone2-symbolized.pdb` and `milestone2-unoptimized-symbolized.pdb` files as local `target/`
+artifacts. The checked-in executables are repository/source analyzer test data, not portable runtime
+archive contents.
 
 The x86-64 decoder is a pure-Rust, bounded control-flow-guided block sweep used only over complete
 file-backed executable exception ranges and the first instruction at metadata-backed thunk seeds.

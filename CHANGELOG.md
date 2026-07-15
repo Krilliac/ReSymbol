@@ -45,6 +45,12 @@ prereleases; breaking changes remain explicit.
 - Added bounded modern MSVC x64 Rev1 RTTI and vftable discovery, including validated stored type
   names, base-class records, virtual-slot targets, vftable names, and attributed function-to-class
   relationships.
+- Expanded the source-available, byte-reproducible MSVC x64 fixture corpus to four PE inputs:
+  optimized and unoptimized builds, each with and without CodeView metadata. The existing optimized
+  filenames remain stable, exact hashes bind every checked-in executable, and the semantic oracle
+  shares portable expectations while keeping layout-sensitive requirements specific to each
+  optimization profile. These fixtures are repository/source test data rather than portable runtime
+  archive contents; their byte-variable full PDBs remain local build outputs.
 - Added a pure-Rust x86-64 decoder that performs a bounded control-flow-guided block sweep of fully
   file-backed `RUNTIME_FUNCTION` ranges for supported direct calls and data references, and checks
   metadata-backed entries for one-instruction internal or import thunks. No native disassembler

@@ -62,6 +62,35 @@ function Assert-RecordedToolchain {
 
 Assert-RecordedToolchain
 
+$fixtureVariants = @(
+    [pscustomobject]@{
+        Name = "symbolized"
+        WithSymbols = $true
+        OptimizationArguments = @("/O2", "/Ob1", "/Oi")
+    },
+    [pscustomobject]@{
+        Name = "stripped"
+        WithSymbols = $false
+        OptimizationArguments = @("/O2", "/Ob1", "/Oi")
+    },
+    [pscustomobject]@{
+        Name = "unoptimized-symbolized"
+        WithSymbols = $true
+        OptimizationArguments = @("/Od", "/Ob0", "/Oi-")
+    },
+    [pscustomobject]@{
+        Name = "unoptimized-stripped"
+        WithSymbols = $false
+        OptimizationArguments = @("/Od", "/Ob0", "/Oi-")
+    }
+)
+
+$executableRelativePaths = @(
+    $fixtureVariants | ForEach-Object {
+        Join-Path $_.Name "milestone2-$($_.Name).exe"
+    }
+)
+
 function Invoke-Checked {
     param(
         [Parameter(Mandatory = $true)][string]$FilePath,
@@ -78,14 +107,15 @@ function Build-Variant {
     param(
         [Parameter(Mandatory = $true)][string]$PassDirectory,
         [Parameter(Mandatory = $true)][string]$Name,
-        [Parameter(Mandatory = $true)][bool]$WithSymbols
+        [Parameter(Mandatory = $true)][bool]$WithSymbols,
+        [Parameter(Mandatory = $true)][string[]]$OptimizationArguments
     )
 
     $variantDirectory = Join-Path $PassDirectory $Name
     New-Item -ItemType Directory -Path $variantDirectory -Force | Out-Null
     $object = Join-Path $variantDirectory "milestone2.obj"
     $executable = Join-Path $variantDirectory "milestone2-$Name.exe"
-    $pdb = Join-Path $variantDirectory "milestone2-symbolized.pdb"
+    $pdb = Join-Path $variantDirectory "milestone2-$Name.pdb"
     $importLibrary = [System.IO.Path]::ChangeExtension($executable, ".lib")
     $exportsObject = [System.IO.Path]::ChangeExtension($executable, ".exp")
 
@@ -104,10 +134,8 @@ function Build-Variant {
     $compileArguments = @(
         "/nologo",
         "/c",
-        "/std:c++17",
-        "/O2",
-        "/Ob1",
-        "/Oi",
+        "/std:c++17"
+    ) + $OptimizationArguments + @(
         "/Gy",
         "/Gw",
         "/GR",
@@ -162,8 +190,13 @@ function Build-Variant {
 function Build-Pass {
     param([Parameter(Mandatory = $true)][string]$PassDirectory)
 
-    Build-Variant -PassDirectory $PassDirectory -Name "symbolized" -WithSymbols $true
-    Build-Variant -PassDirectory $PassDirectory -Name "stripped" -WithSymbols $false
+    foreach ($variant in $fixtureVariants) {
+        Build-Variant `
+            -PassDirectory $PassDirectory `
+            -Name $variant.Name `
+            -WithSymbols $variant.WithSymbols `
+            -OptimizationArguments $variant.OptimizationArguments
+    }
 }
 
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
@@ -173,19 +206,13 @@ Build-Pass -PassDirectory $buildPass
 
 if ($CheckDeterminism) {
     $snapshot = Join-Path $OutputDirectory "snapshot"
-    foreach ($relativePath in @(
-        "symbolized\milestone2-symbolized.exe",
-        "stripped\milestone2-stripped.exe"
-    )) {
+    foreach ($relativePath in $executableRelativePaths) {
         $snapshotPath = Join-Path $snapshot $relativePath
         New-Item -ItemType Directory -Path (Split-Path -Parent $snapshotPath) -Force | Out-Null
         Copy-Item -LiteralPath (Join-Path $buildPass $relativePath) -Destination $snapshotPath -Force
     }
     Build-Pass -PassDirectory $buildPass
-    foreach ($relativePath in @(
-        "symbolized\milestone2-symbolized.exe",
-        "stripped\milestone2-stripped.exe"
-    )) {
+    foreach ($relativePath in $executableRelativePaths) {
         $first = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $snapshot $relativePath)).Hash
         $second = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $buildPass $relativePath)).Hash
         if ($first -ne $second) {
@@ -196,10 +223,25 @@ if ($CheckDeterminism) {
 
 if ($VerifyCheckedIn) {
     $artifactDirectory = Join-Path $fixtureRoot "artifacts"
-    foreach ($relativePath in @(
-        "symbolized\milestone2-symbolized.exe",
-        "stripped\milestone2-stripped.exe"
-    )) {
+    $expectedArtifactNames = @(
+        $executableRelativePaths |
+            ForEach-Object { [System.IO.Path]::GetFileName($_) } |
+            Sort-Object
+    )
+    $checkedInArtifactNames = @(
+        Get-ChildItem -LiteralPath $artifactDirectory -Filter "*.exe" -File |
+            ForEach-Object { $_.Name } |
+            Sort-Object
+    )
+    $artifactDifference = Compare-Object `
+        -ReferenceObject $expectedArtifactNames `
+        -DifferenceObject $checkedInArtifactNames
+    if ($artifactDifference) {
+        $inventory = $artifactDifference |
+            ForEach-Object { "$($_.SideIndicator) $($_.InputObject)" }
+        throw "checked-in fixture executable inventory differs from the build matrix: $($inventory -join ', ')"
+    }
+    foreach ($relativePath in $executableRelativePaths) {
         $artifactName = [System.IO.Path]::GetFileName($relativePath)
         $builtHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $buildPass $relativePath)).Hash
         $checkedInHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $artifactDirectory $artifactName)).Hash
@@ -212,14 +254,12 @@ if ($VerifyCheckedIn) {
 if ($Install) {
     $artifactDirectory = Join-Path $fixtureRoot "artifacts"
     New-Item -ItemType Directory -Path $artifactDirectory -Force | Out-Null
-    Copy-Item -LiteralPath (Join-Path $buildPass "symbolized\milestone2-symbolized.exe") -Destination $artifactDirectory -Force
-    Copy-Item -LiteralPath (Join-Path $buildPass "stripped\milestone2-stripped.exe") -Destination $artifactDirectory -Force
+    foreach ($relativePath in $executableRelativePaths) {
+        Copy-Item -LiteralPath (Join-Path $buildPass $relativePath) -Destination $artifactDirectory -Force
+    }
 }
 
-foreach ($relativePath in @(
-    "symbolized\milestone2-symbolized.exe",
-    "stripped\milestone2-stripped.exe"
-)) {
+foreach ($relativePath in $executableRelativePaths) {
     $generatedPath = Join-Path $buildPass $relativePath
     $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $generatedPath).Hash.ToLowerInvariant()
     Write-Output "$hash  $relativePath"

@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "toolchain": {
     "family": "Microsoft Visual C++",
     "target": "x86_64-pc-windows-msvc",
@@ -8,134 +8,283 @@
     "cl_file_version": "19.44.35228.0",
     "link_file_version": "14.44.35228.0"
   },
-  "artifacts": [
-    {
-      "file": "artifacts/milestone2-symbolized.exe",
-      "sha256": "f7f221b4de7c6e4f6f2e4e227840ffa8ecc3d92a3553d8763755a3fafadc1a5e",
-      "file_size": 5120,
-      "has_codeview_rsds": true
-    },
-    {
-      "file": "artifacts/milestone2-stripped.exe",
-      "sha256": "24f086632416f41b5eaf87a48c12cc83eb087a894cbe11357ae90f51b54d2b46",
-      "file_size": 4608,
-      "has_codeview_rsds": false
-    }
-  ],
-  "minimum_counts": {
-    "sections": 5,
-    "runtime_functions": 4,
-    "direct_calls": 10,
-    "thunks": 3,
-    "strings": 2,
-    "data_references": 4,
-    "msvc_rtti_vftables": 2
+  "shared_expectations": {
+    "imports": [
+      "ExitProcess",
+      "GetTickCount",
+      "free"
+    ],
+    "exports": [
+      "fixture_ascii",
+      "fixture_caller",
+      "fixture_import_thunk",
+      "fixture_leaf",
+      "fixture_sink",
+      "fixture_string_score",
+      "fixture_thunk",
+      "fixture_utf16",
+      "fixture_virtual_dispatch"
+    ],
+    "strings": [
+      {
+        "encoding": "ascii",
+        "value": "ReSymbol fixture ASCII sentinel!"
+      },
+      {
+        "encoding": "utf-16-le",
+        "value": "ReSymbol fixture UTF16 sentinel"
+      }
+    ],
+    "rtti_type_names": [
+      "resymbol_fixture::Base",
+      "resymbol_fixture::Derived",
+      "type_info"
+    ],
+    "required_unwind_exports": [
+      "fixture_caller",
+      "fixture_string_score"
+    ],
+    "required_data_references": [
+      {
+        "caller_export": "fixture_string_score",
+        "target_export": "fixture_ascii"
+      },
+      {
+        "caller_export": "fixture_string_score",
+        "target_export": "fixture_utf16"
+      }
+    ]
   },
-  "imports": [
-    "ExitProcess",
-    "GetTickCount",
-    "free"
-  ],
-  "exports": [
-    "fixture_ascii",
-    "fixture_caller",
-    "fixture_import_thunk",
-    "fixture_leaf",
-    "fixture_sink",
-    "fixture_string_score",
-    "fixture_thunk",
-    "fixture_utf16",
-    "fixture_virtual_dispatch"
-  ],
-  "strings": [
+  "configurations": [
     {
-      "encoding": "ascii",
-      "value": "ReSymbol fixture ASCII sentinel!"
-    },
-    {
-      "encoding": "utf-16-le",
-      "value": "ReSymbol fixture UTF16 sentinel"
-    }
-  ],
-  "rtti_type_names": [
-    "resymbol_fixture::Base",
-    "resymbol_fixture::Derived",
-    "type_info"
-  ],
-  "required_unwind_exports": [
-    "fixture_caller",
-    "fixture_string_score"
-  ],
-  "required_calls": [
-    {
-      "caller_export": "fixture_caller",
-      "call_site_offset": 15,
-      "instruction_size": 5,
-      "target": {
-        "kind": "export",
-        "name": "fixture_leaf"
-      }
-    },
-    {
-      "caller_export": "fixture_caller",
-      "call_site_offset": 24,
-      "instruction_size": 5,
-      "target": {
-        "kind": "export",
-        "name": "fixture_string_score"
-      }
-    }
-  ],
-  "required_data_references": [
-    {
-      "caller_export": "fixture_string_score",
-      "target_export": "fixture_ascii"
-    },
-    {
-      "caller_export": "fixture_string_score",
-      "target_export": "fixture_utf16"
-    }
-  ],
-  "required_thunks": [
-    {
-      "source_export": "fixture_thunk",
-      "instruction_size": 5,
-      "target": {
-        "kind": "export",
-        "name": "fixture_leaf"
-      }
-    },
-    {
-      "source_export": "fixture_import_thunk",
-      "instruction_size": 7,
-      "target": {
-        "kind": "import",
-        "name": "GetTickCount"
-      }
-    }
-  ],
-  "required_rtti_vftables": [
-    {
-      "rva": 8360,
-      "class_name": "resymbol_fixture::Derived",
-      "base_class_names": [
-        "resymbol_fixture::Derived",
-        "resymbol_fixture::Base"
+      "name": "optimized",
+      "compile_flags": [
+        "/O2",
+        "/Ob1",
+        "/Oi"
       ],
-      "virtual_function_rvas": [
-        4112,
-        4128
-      ]
+      "artifacts": [
+        {
+          "file": "artifacts/milestone2-symbolized.exe",
+          "sha256": "f7f221b4de7c6e4f6f2e4e227840ffa8ecc3d92a3553d8763755a3fafadc1a5e",
+          "file_size": 5120,
+          "codeview": {
+            "kind": "rsds",
+            "pdb_path": "milestone2-symbolized.pdb"
+          }
+        },
+        {
+          "file": "artifacts/milestone2-stripped.exe",
+          "sha256": "24f086632416f41b5eaf87a48c12cc83eb087a894cbe11357ae90f51b54d2b46",
+          "file_size": 4608,
+          "codeview": {
+            "kind": "absent"
+          }
+        }
+      ],
+      "expectations": {
+        "minimum_counts": {
+          "sections": 5,
+          "runtime_functions": 4,
+          "direct_calls": 10,
+          "thunks": 3,
+          "strings": 2,
+          "data_references": 4,
+          "msvc_rtti_vftables": 2
+        },
+        "required_calls": [
+          {
+            "caller_export": "fixture_caller",
+            "call_site_offset": 15,
+            "instruction_size": 5,
+            "target": {
+              "kind": "export",
+              "name": "fixture_leaf"
+            }
+          },
+          {
+            "caller_export": "fixture_caller",
+            "call_site_offset": 24,
+            "instruction_size": 5,
+            "target": {
+              "kind": "export",
+              "name": "fixture_string_score"
+            }
+          }
+        ],
+        "required_thunks": [
+          {
+            "source_export": "fixture_thunk",
+            "instruction_size": 5,
+            "target": {
+              "kind": "export",
+              "name": "fixture_leaf"
+            }
+          },
+          {
+            "source_export": "fixture_import_thunk",
+            "instruction_size": 7,
+            "target": {
+              "kind": "import",
+              "name": "GetTickCount"
+            }
+          }
+        ],
+        "required_internal_thunks": [
+          {
+            "rva": 4484,
+            "instruction_size": 5,
+            "target_rva": 4492
+          }
+        ],
+        "forbidden_thunks": [],
+        "required_rtti_vftables": [
+          {
+            "rva": 8360,
+            "class_name": "resymbol_fixture::Derived",
+            "base_class_names": [
+              "resymbol_fixture::Derived",
+              "resymbol_fixture::Base"
+            ],
+            "virtual_function_rvas": [
+              4112,
+              4128
+            ]
+          },
+          {
+            "rva": 8384,
+            "class_name": "type_info",
+            "base_class_names": [
+              "type_info"
+            ],
+            "virtual_function_rvas": [
+              4440
+            ]
+          }
+        ]
+      }
     },
     {
-      "rva": 8384,
-      "class_name": "type_info",
-      "base_class_names": [
-        "type_info"
+      "name": "unoptimized",
+      "compile_flags": [
+        "/Od",
+        "/Ob0",
+        "/Oi-"
       ],
-      "virtual_function_rvas": [
-        4440
-      ]
+      "artifacts": [
+        {
+          "file": "artifacts/milestone2-unoptimized-symbolized.exe",
+          "sha256": "281f3a80a648066e924a12cf18e3ba3b62a8e06efd7c3ae5c552c183fb878a14",
+          "file_size": 5632,
+          "codeview": {
+            "kind": "rsds",
+            "pdb_path": "milestone2-unoptimized-symbolized.pdb"
+          }
+        },
+        {
+          "file": "artifacts/milestone2-unoptimized-stripped.exe",
+          "sha256": "be8327451e3d118674f0c2c3eb84dca52e327aa96ce2646b733d995f3104e0de",
+          "file_size": 5632,
+          "codeview": {
+            "kind": "absent"
+          }
+        }
+      ],
+      "expectations": {
+        "minimum_counts": {
+          "sections": 5,
+          "runtime_functions": 8,
+          "direct_calls": 13,
+          "thunks": 1,
+          "strings": 2,
+          "data_references": 7,
+          "msvc_rtti_vftables": 3
+        },
+        "required_calls": [
+          {
+            "caller_export": "fixture_caller",
+            "call_site_offset": 17,
+            "instruction_size": 5,
+            "target": {
+              "kind": "export",
+              "name": "fixture_leaf"
+            }
+          },
+          {
+            "caller_export": "fixture_caller",
+            "call_site_offset": 30,
+            "instruction_size": 5,
+            "target": {
+              "kind": "export",
+              "name": "fixture_string_score"
+            }
+          },
+          {
+            "caller_export": "fixture_thunk",
+            "call_site_offset": 12,
+            "instruction_size": 5,
+            "target": {
+              "kind": "export",
+              "name": "fixture_leaf"
+            }
+          },
+          {
+            "caller_export": "fixture_import_thunk",
+            "call_site_offset": 4,
+            "instruction_size": 6,
+            "target": {
+              "kind": "import",
+              "name": "GetTickCount"
+            }
+          }
+        ],
+        "required_thunks": [],
+        "required_internal_thunks": [
+          {
+            "rva": 4796,
+            "instruction_size": 5,
+            "target_rva": 4804
+          }
+        ],
+        "forbidden_thunks": [
+          "fixture_thunk",
+          "fixture_import_thunk"
+        ],
+        "required_rtti_vftables": [
+          {
+            "rva": 8360,
+            "class_name": "resymbol_fixture::Base",
+            "base_class_names": [
+              "resymbol_fixture::Base"
+            ],
+            "virtual_function_rvas": [
+              4176
+            ]
+          },
+          {
+            "rva": 8376,
+            "class_name": "resymbol_fixture::Derived",
+            "base_class_names": [
+              "resymbol_fixture::Derived",
+              "resymbol_fixture::Base"
+            ],
+            "virtual_function_rvas": [
+              4208,
+              4240
+            ]
+          },
+          {
+            "rva": 8400,
+            "class_name": "type_info",
+            "base_class_names": [
+              "type_info"
+            ],
+            "virtual_function_rvas": [
+              4752
+            ]
+          }
+        ]
+      }
     }
   ]
 }
