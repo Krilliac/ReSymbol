@@ -32,10 +32,12 @@ portable `.resym` package bound to the input's SHA-256 identity.
 This is not yet a general disassembler or a full symbol-recovery pipeline. It does not infer names
 erased by compilation, reconstruct general C++ layouts, recover register-indirect control flow, or
 name virtual functions merely because their targets appear in a vftable. RTTI support deliberately
-accepts only the modern x64 Rev1 layout with
-28-byte base-class descriptors carrying a nested class-hierarchy reference; older/x86 RTTI and
-other ABI variants remain unsupported. It can export a neutral JSON projection, a bounded
-human-readable Markdown report, deterministic Microsoft-linker-style MAP text, an exact-RSDS
+accepts both MSVC x64 Rev1 base-class descriptor layouts: the legacy 24-byte form without `pCHD`
+and the 28-byte `BCD_HASPCHD` form with a required hierarchy reference. A hierarchy may mix them;
+an extended root must link to its owning hierarchy, while a legacy root is validated without
+inventing the absent field. x86 RTTI and other ABI variants remain unsupported. It can export a
+neutral JSON projection, a bounded human-readable Markdown report, deterministic
+Microsoft-linker-style MAP text, an exact-RSDS
 public-symbol PDB, or self-contained import scripts for IDA and Ghidra. The PDB slice currently
 supports PE32+ x86-64 and public named functions/globals only; richer PDB records, DWARF, native
 debugger-database files, packed binaries, .NET assemblies, other CPU architectures, ELF, Mach-O,
@@ -182,14 +184,17 @@ unique-type, base-record, and virtual-slot counts. A partial line appears when a
 retention, or aggregate discovery budget was reached; the package preserves the independent flags
 for downstream review.
 
-New analyses write package schema 4. `inspect` and `export` can also open schemas 1 through 3.
+New analyses write package schema 5. `inspect` and `export` can also open schemas 1 through 4.
 Schema 1 is migrated into a validated current in-memory session and its base graph is rebuilt;
-schemas 2 and 3 use explicit compatibility paths. None rewrites the legacy package. Because
+schemas 2 through 4 use explicit compatibility paths. None rewrites the legacy package. Because
 `.resym` does not contain the original executable, compatibility loading cannot run missing
 recovery passes: schema 1 has no direct-call or thunk records, schemas 1 and 2 have no string or
 data-reference records, and schemas 2 and 3 have no read-only function-pointer call or thunk
-results. Analyze the exact original binary again to create schema 4 with all current results.
-Relabeling a schema-4 pointer target beneath a schema 2 or 3 envelope is rejected.
+results. Schema 4 contains pointer control flow but lacks recovery of 24-byte RTTI base-class
+descriptors without `pCHD`; schemas 1 through 4 report that result family as unavailable. Analyze
+the exact original binary again to create schema 5 with all current results. Relabeling a schema-4
+pointer target beneath a schema 2 or 3 envelope is rejected, as is placing an RTTI base record with
+a missing or null `class_hierarchy_descriptor_rva` beneath any schema 1-through-4 envelope.
 
 Export a package to a specific destination with `--output`:
 
@@ -209,12 +214,13 @@ Without `--output`, those formats write `application.symbols.json`, `application
 `application.map`, `application.pdb`, `application.ida.py`, and
 `ReSymbolImport_<first-12-binary-sha256>.java` beside the package, respectively. Markdown is a
 deterministic presentation report for human review, not a stable machine-interchange format; use
-JSON for integrations. New analyses write `.resym` package schema 4; export also accepts package
-schemas 1 through 3 through validated compatibility paths without rewriting them. The current
-neutral projection is schema 6, and MAP/PDB add no schema fields. Schema 5 correlates exact or
-content-interior data-reference targets with retained strings, excluding NUL terminators and
-requiring UTF-16LE code-unit alignment; schema 6 adds explicit function-pointer slot and endpoint
-targets. A missing correlation does not prove the target is not a string. A custom Ghidra filename
+JSON for integrations. New analyses write `.resym` package schema 5; export also accepts package
+schemas 1 through 4 through validated compatibility paths without rewriting them. The current
+neutral projection is schema 6, and MAP/PDB add no schema fields. Projection schema 5 correlates
+exact or content-interior data-reference targets with retained strings, excluding NUL terminators
+and requiring UTF-16LE code-unit alignment; projection schema 6 adds explicit function-pointer slot
+and endpoint targets. A missing correlation does not prove the target is not a string. A custom
+Ghidra filename
 must use a lowercase `.java` extension and a valid conservative Java-identifier stem; the generated
 public class uses that stem.
 

@@ -29,8 +29,8 @@ The current alpha implements and tests an end-to-end, deliberately narrow analys
 - safe, bounded ingestion of PE32+ x86-64 binaries, including image metadata, sections, imports,
   exports, forwarded exports, and x64 exception-directory (`RUNTIME_FUNCTION`) records;
 - bounded discovery of modern MSVC x64 Rev1 RTTI and vftables from file-backed compiler metadata,
-  including validated class/type names, base-class records, and contiguous executable slot
-  candidates;
+  including both legacy 24-byte and `BCD_HASPCHD` 28-byte base-class descriptors, validated
+  class/type names, and contiguous executable slot candidates;
 - bounded pure-Rust x86-64 decoding inside fully file-backed `RUNTIME_FUNCTION` ranges, recovering
   supported direct calls to internal executable targets, exact parsed import-address-table slots,
   or targets resolved one hop through exact read-only in-image function-pointer slots;
@@ -117,15 +117,16 @@ The neutral projection correlates a data-reference target with a retained string
 start or within its encoded content. It excludes the NUL terminator and requires UTF-16LE interior
 targets to be code-unit aligned. An absent correlation means only that no retained projected string
 matched; it is not proof that the target bytes cannot contain a string.
-Its RTTI slice recovers
-names and relationships actually present in validated compiler metadata and deliberately supports
-only modern MSVC x64 Rev1 records whose base-class descriptors use the 28-byte form with an
-embedded class-hierarchy reference. Candidate scanning and the vftable/back-pointer, COL, CHD,
-BCA, BCD, and nested-CHD records remain in file-backed readable, read-only initialized
-non-executable data. Referenced TypeDescriptors may also occupy file-backed readable initialized
-non-executable data marked writable, including normal `.data`; writable sections are never
-candidate-scanned. The current external-process host supports one-shot analysis requests; its
-interactive binary reads are reserved for a later protocol revision. The native host instead
+Its RTTI slice recovers names and relationships actually present in validated compiler metadata.
+Modern MSVC x64 Rev1 base-class arrays may mix the legacy 24-byte descriptor, which has no `pCHD`
+field, with the 28-byte form, whose `BCD_HASPCHD` bit requires a valid class-hierarchy RVA.
+The root descriptor is required to point back to its owning hierarchy only when that field exists.
+Candidate scanning and the vftable/back-pointer, COL, CHD, BCA, BCD, and any referenced nested-CHD
+records remain in file-backed readable, read-only initialized non-executable data. Referenced
+TypeDescriptors may also occupy file-backed readable initialized non-executable data marked
+writable, including normal `.data`; writable sections are never candidate-scanned. The current
+external-process host supports one-shot analysis requests; its interactive binary reads are
+reserved for a later protocol revision. The native host instead
 provides a bounded synchronous C callback for file-backed RVAs in the exact PE. The managed host
 provides the equivalent bounded asynchronous SDK service for approved .NET plugins. Plugin package
 verification/extraction, cross-build matching, semantic inference, interactive debugger bridges,
@@ -219,14 +220,17 @@ accident. `inspect` validates the package schema, payload, and embedded binary i
 displaying it. `export` stages and flushes a complete artifact before a no-clobber publish; use
 `--output` to choose a destination instead of replacing an existing export artifact.
 
-New analyses write package schema 4. `inspect` and `export` also accept schemas 1, 2, and 3 through
+New analyses write package schema 5. `inspect` and `export` also accept schemas 1 through 4 through
 validated in-memory compatibility paths. Migration does not rewrite the source package or rerun
 analysis because `.resym` does not embed the executable bytes. Schema 1 therefore has no available
 recovered calls, thunks, strings, or data references. Schema 2 retains calls and thunks but predates
 strings and data references. Schema 3 retains those string/data records, but schemas 2 and 3 both
-predate read-only function-pointer call and thunk resolution. Reanalyze the exact original binary
-to produce schema 4 with current recovery results. A schema 2 or 3 envelope containing a schema-4
-`function-pointer` target is rejected rather than treated as a relabeled legacy package.
+predate read-only function-pointer call and thunk resolution; schema 4 records that control flow.
+Schemas 1 through 4 all predate recovery of legacy 24-byte base-class descriptors. Reanalyze the
+exact original binary to produce schema 5 with all current recovery results. A schema 2 or 3
+envelope containing a schema-4 `function-pointer` target, or any schema 1-through-4 envelope
+containing an RTTI base record whose `class_hierarchy_descriptor_rva` is missing or null, is
+rejected rather than treated as a relabeled legacy package.
 
 The `analyze` and `inspect` summaries report recovered strings, data references, direct calls, and
 thunks as well as discovered MSVC RTTI vftables, unique types, base-class records, and virtual
@@ -236,8 +240,8 @@ and the package records the truncation explicitly.
 
 The Markdown output is a deterministic, bounded presentation report for people to review. It is
 not a stable interchange format; integrations should consume the neutral JSON projection instead.
-Without `--output`, it is written as `application.symbols.md` beside the package. Package schema 4
-is used by new analyses, export also accepts package schemas 1 through 3 through validated
+Without `--output`, it is written as `application.symbols.md` beside the package. Package schema 5
+is used by new analyses, export also accepts package schemas 1 through 4 through validated
 compatibility paths, and neutral projection schema 6 remains unchanged by this presentation-only
 format. Export does not rewrite the source package.
 
@@ -246,7 +250,7 @@ default for tools that support that format. It maps selected names to one-based 
 `section:offset` values and preferred-image-base-plus-RVA addresses. Its semicolon-prefixed exact
 SHA-256 and file-size comments are informational: a MAP file cannot check the binary loaded by a
 consumer, so compare the executable with the recorded identity before using the symbols. MAP adds
-no fields to package schema 4 or neutral projection schema 6, and it does not rewrite legacy source
+no fields to package schema 5 or neutral projection schema 6, and it does not rewrite legacy source
 packages accepted through compatibility paths. The header module name is the package filename stem;
 for a valid UTF-8 stem, unsupported/non-ASCII encoded bytes become `_` and the result is capped at
 255 bytes. A non-UTF-8 or otherwise unusable stem falls back to `resymbol_<sha12>`.

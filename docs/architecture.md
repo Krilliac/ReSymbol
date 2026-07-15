@@ -136,14 +136,18 @@ model, or complete control-flow graph.
 
 The RTTI pass candidate-scans only file-backed initialized data sections that are readable,
 non-writable, and non-executable. Vftables and their back-pointers, complete object locators,
-class-hierarchy descriptors, base-class arrays, base-class descriptors, and nested hierarchy
-descriptors must remain in those read-only scan sections. A referenced TypeDescriptor may instead
+class-hierarchy descriptors, base-class arrays, base-class descriptors, and any referenced nested
+hierarchy descriptors must remain in those read-only scan sections. A referenced TypeDescriptor
+may instead
 occupy any file-backed initialized, readable, non-executable data section, including normal
 writable `.data`; writable sections are never candidate-scanned. A candidate is committed only
 after that section policy, the Rev1 structure chain, and executable file-backed virtual targets
-agree. The supported base-class descriptor is deliberately the modern 28-byte form with the
-`BCD_HASPCHD` layout bit and nested class-hierarchy RVA; older descriptors and other ABI variants
-are rejected rather than guessed.
+agree. Rev1 base-class arrays may mix descriptor layouts entry by entry: a clear `BCD_HASPCHD` bit
+selects the legacy 24-byte form with no class-hierarchy pointer, while a set bit selects the 28-byte
+form and requires a valid nested class-hierarchy RVA. An extended root must link to the hierarchy
+owned by its complete object locator; a legacy root is validated by its TypeDescriptor, PMD, and
+preorder invariants without fabricating the absent link. x86 RTTI and other ABI variants are
+rejected rather than guessed.
 
 The ABI does not encode a vftable slot count. ReSymbol therefore retains contiguous pointer-sized
 entries only while they resolve to file-backed executable bytes, stops at the first nonmatching
@@ -486,15 +490,18 @@ A plugin declares a supported API range. Unsupported plugins are marked incompat
 loaded optimistically. Schema migrations are explicit and must preserve provenance. Before 1.0,
 breaking changes are expected, but they still require version bumps and release notes.
 
-The current CLI writes analysis-package schema 4 and can inspect or export schemas 1 through 3
+The current CLI writes analysis-package schema 5 and can inspect or export schemas 1 through 4
 through explicit compatibility paths. It migrates schema 1 into a validated current session,
 rebuilds the base graph from persisted legacy metadata, and never rewrites the source package.
 Schema 2 already records direct calls and thunks but predates recovered strings and data references;
 schema 3 includes string/data recovery but predates read-only function-pointer call and thunk
-resolution.
+resolution; schema 4 records pointer control flow but predates 24-byte RTTI base-class descriptor
+recovery.
 Because a package omits the analyzed binary bytes, compatibility loading cannot recreate absent
-recovery results; obtaining them requires reanalyzing the exact original binary into schema 4.
+recovery results; obtaining them requires reanalyzing the exact original binary into schema 5.
 Schemas 2 and 3 are also semantically gated against relabeled schema-4 `function-pointer` targets.
+All schemas 1 through 4 are semantically gated against relabeled schema-5 base-class records whose
+`class_hierarchy_descriptor_rva` is missing or null.
 The independently versioned debugger-neutral projection is schema 6; its string-reference
 correlation is derived from already validated string and data-reference claims and therefore does
 not require a package-schema change or legacy package rewrite.

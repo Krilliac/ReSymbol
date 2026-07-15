@@ -43,6 +43,8 @@ use resymbol_plugin_state::{
 };
 use serde_json::{Map, Value};
 
+const NO_PCHD_BASE_DESCRIPTOR_SCHEMA_VERSION: u32 = 5;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "resymbol",
@@ -281,6 +283,7 @@ fn analyze(args: AnalyzeArgs, safe_mode: bool, plugin_dir: PathBuf) -> Result<()
         package.payload(),
         CodeRecoveryAvailability::Recorded,
         StringDataRecoveryAvailability::Recorded,
+        RttiRecoveryAvailability::Recorded,
     )?;
     println!("package: {}", output.display());
     println!("plugin directory: {}", plugin_dir.display());
@@ -334,6 +337,7 @@ fn inspect(args: InspectArgs) -> Result<()> {
         loaded.package.payload(),
         loaded.code_recovery_availability,
         loaded.string_data_recovery_availability,
+        loaded.rtti_recovery_availability,
     )?;
 
     Ok(())
@@ -389,10 +393,28 @@ impl StringDataRecoveryAvailability {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RttiRecoveryAvailability {
+    Recorded,
+    RecordedWithoutNoPchdBaseDescriptors(u32),
+}
+
+impl RttiRecoveryAvailability {
+    fn summary_line(self) -> Option<String> {
+        match self {
+            Self::Recorded => None,
+            Self::RecordedWithoutNoPchdBaseDescriptors(schema_version) => Some(format!(
+                "MSVC RTTI 24-byte base descriptors without pCHD: unavailable (schema {schema_version} predates this recovery; existing recorded RTTI remains available; reanalyze the exact original binary for current coverage)"
+            )),
+        }
+    }
+}
+
 struct LoadedAnalysisPackage {
     package: ResymPackage<AnalysisSession>,
     code_recovery_availability: CodeRecoveryAvailability,
     string_data_recovery_availability: StringDataRecoveryAvailability,
+    rtti_recovery_availability: RttiRecoveryAvailability,
     schema1_source: Option<ResymPackage<Value>>,
 }
 
@@ -418,6 +440,7 @@ fn read_analysis_package(
         1 => CodeRecoveryAvailability::UnavailableSchema1,
         2 => CodeRecoveryAvailability::RecordedWithoutReadOnlyPointerControlFlow(2),
         3 => CodeRecoveryAvailability::RecordedWithoutReadOnlyPointerControlFlow(3),
+        4 => CodeRecoveryAvailability::Recorded,
         CURRENT_SCHEMA_VERSION => CodeRecoveryAvailability::Recorded,
         _ => bail!("unsupported analysis package schema {schema_version}"),
     };
@@ -425,10 +448,19 @@ fn read_analysis_package(
         1 => StringDataRecoveryAvailability::UnavailableSchema1,
         2 => StringDataRecoveryAvailability::UnavailableSchema2,
         3 => StringDataRecoveryAvailability::Recorded,
+        4 => StringDataRecoveryAvailability::Recorded,
         CURRENT_SCHEMA_VERSION => StringDataRecoveryAvailability::Recorded,
         _ => bail!("unsupported analysis package schema {schema_version}"),
     };
+    let rtti_recovery_availability = match schema_version {
+        1..=4 => RttiRecoveryAvailability::RecordedWithoutNoPchdBaseDescriptors(schema_version),
+        CURRENT_SCHEMA_VERSION => RttiRecoveryAvailability::Recorded,
+        _ => bail!("unsupported analysis package schema {schema_version}"),
+    };
     let schema1_source = (preserve_schema1_source && schema_version == 1).then(|| package.clone());
+    if schema_version < NO_PCHD_BASE_DESCRIPTOR_SCHEMA_VERSION {
+        reject_pre_v5_no_pchd_base_descriptors(package.payload(), schema_version)?;
+    }
     if matches!(schema_version, 2 | 3) {
         reject_pre_v4_function_pointer_targets(package.payload(), schema_version)?;
     }
@@ -438,6 +470,7 @@ fn read_analysis_package(
             .migrate(),
         2 => serde_json::from_value(payload).context("cannot decode schema-v2 analysis payload"),
         3 => serde_json::from_value(payload).context("cannot decode schema-v3 analysis payload"),
+        4 => serde_json::from_value(payload).context("cannot decode schema-v4 analysis payload"),
         CURRENT_SCHEMA_VERSION => {
             serde_json::from_value(payload).context("cannot decode current analysis payload")
         }
@@ -450,7 +483,88 @@ fn read_analysis_package(
         package,
         code_recovery_availability,
         string_data_recovery_availability,
+        rtti_recovery_availability,
         schema1_source,
+    })
+}
+
+fn reject_pre_v5_no_pchd_base_descriptors(payload: &Value, schema_version: u32) -> Result<()> {
+    debug_assert!((1..NO_PCHD_BASE_DESCRIPTOR_SCHEMA_VERSION).contains(&schema_version));
+    if value_uses_no_pchd_base_descriptor(payload) {
+        bail!(
+            "package schema {schema_version} predates 24-byte MSVC RTTI base descriptors without pCHD but its payload contains schema-5 no-pCHD semantics; legacy envelopes cannot be relabeled, so reanalyze the exact original binary"
+        );
+    }
+    Ok(())
+}
+
+fn value_uses_no_pchd_base_descriptor(value: &Value) -> bool {
+    match value {
+        Value::Array(values) => values.iter().any(value_uses_no_pchd_base_descriptor),
+        Value::Object(object) => object.iter().any(|(key, nested)| {
+            if key == "msvc_rtti_vftables" {
+                rtti_vftable_array_uses_no_pchd_descriptor(nested)
+            } else {
+                value_uses_no_pchd_base_descriptor(nested)
+            }
+        }),
+        _ => false,
+    }
+}
+
+fn rtti_vftable_array_uses_no_pchd_descriptor(value: &Value) -> bool {
+    value.as_array().is_some_and(|vftables| {
+        vftables.iter().any(|vftable| {
+            vftable.as_object().is_some_and(|vftable| {
+                let is_msvc_rtti_vftable = [
+                    "rva",
+                    "complete_object_locator_rva",
+                    "type_descriptor_rva",
+                    "class_hierarchy_descriptor_rva",
+                    "base_class_array_rva",
+                    "offset",
+                    "constructor_displacement_offset",
+                    "decorated_class_name",
+                    "class_name",
+                    "hierarchy_attributes",
+                    "base_classes",
+                    "virtual_function_rvas",
+                ]
+                .iter()
+                .all(|key| vftable.contains_key(*key));
+                is_msvc_rtti_vftable
+                    && vftable
+                        .get("base_classes")
+                        .is_some_and(base_class_array_uses_no_pchd_descriptor)
+            })
+        })
+    })
+}
+
+fn base_class_array_uses_no_pchd_descriptor(value: &Value) -> bool {
+    value.as_array().is_some_and(|base_classes| {
+        base_classes.iter().any(|base| {
+            base.as_object().is_some_and(|base| {
+                let is_msvc_rtti_base_class = [
+                    "array_index",
+                    "descriptor_rva",
+                    "type_descriptor_rva",
+                    "decorated_name",
+                    "name",
+                    "num_contained_bases",
+                    "member_displacement",
+                    "vbtable_displacement",
+                    "displacement_inside_vbtable",
+                    "attributes",
+                ]
+                .iter()
+                .all(|key| base.contains_key(*key));
+                is_msvc_rtti_base_class
+                    && base
+                        .get("class_hierarchy_descriptor_rva")
+                        .is_none_or(Value::is_null)
+            })
+        })
     })
 }
 
@@ -775,6 +889,9 @@ fn export(args: ExportArgs) -> Result<()> {
         .string_data_recovery_availability
         .export_summary_line()
     {
+        println!("{line}");
+    }
+    if let Some(line) = package_data.rtti_recovery_availability.summary_line() {
         println!("{line}");
     }
     println!(
@@ -1839,11 +1956,13 @@ fn print_session_summary(
     session: &AnalysisSession,
     code_recovery_availability: CodeRecoveryAvailability,
     string_data_recovery_availability: StringDataRecoveryAvailability,
+    rtti_recovery_availability: RttiRecoveryAvailability,
 ) -> Result<()> {
     print_analysis_summary(
         session.base_analysis(),
         code_recovery_availability,
         string_data_recovery_availability,
+        rtti_recovery_availability,
     );
     let succeeded = session
         .plugin_runs()
@@ -1886,6 +2005,7 @@ fn print_analysis_summary(
     analysis: &BinaryAnalysis,
     code_recovery_availability: CodeRecoveryAvailability,
     string_data_recovery_availability: StringDataRecoveryAvailability,
+    rtti_recovery_availability: RttiRecoveryAvailability,
 ) {
     let identity = analysis.identity();
     println!("size: {} bytes", identity.size);
@@ -1959,6 +2079,9 @@ fn print_analysis_summary(
                 "MSVC RTTI: {} vftable(s), {rtti_type_count} type(s), {rtti_base_record_count} base record(s), {rtti_slot_count} virtual slot(s)",
                 pe.msvc_rtti_vftables.len()
             );
+            if let Some(line) = rtti_recovery_availability.summary_line() {
+                println!("{line}");
+            }
             if pe.msvc_rtti_scan_truncated {
                 println!("MSVC RTTI scan: partial (a fixed discovery budget was reached)");
             }
@@ -3162,6 +3285,21 @@ entrypoint = "Plugin.dll"
     }
 
     #[test]
+    fn prior_schema_summaries_preserve_rtti_but_mark_no_pchd_descriptors_unavailable() {
+        for schema_version in 1..=4 {
+            let availability =
+                RttiRecoveryAvailability::RecordedWithoutNoPchdBaseDescriptors(schema_version);
+            assert_eq!(
+                availability.summary_line(),
+                Some(format!(
+                    "MSVC RTTI 24-byte base descriptors without pCHD: unavailable (schema {schema_version} predates this recovery; existing recorded RTTI remains available; reanalyze the exact original binary for current coverage)"
+                ))
+            );
+        }
+        assert_eq!(RttiRecoveryAvailability::Recorded.summary_line(), None);
+    }
+
+    #[test]
     fn command_line_accepts_exact_plugin_state_commands() {
         let fingerprint = "a".repeat(64);
         let cli = Cli::try_parse_from([
@@ -3480,6 +3618,8 @@ entrypoint = "Plugin.dll"
 
         let package: ResymPackage<AnalysisSession> =
             read_file_bound(&output).expect("read bound package");
+        assert_eq!(CURRENT_SCHEMA_VERSION, 5);
+        assert_eq!(package.schema_version(), CURRENT_SCHEMA_VERSION);
         assert_eq!(
             package.binary_sha256(),
             &resymbol_core::BinaryId::digest(&bytes)
@@ -3853,6 +3993,10 @@ entrypoint = "Plugin.dll"
             decoded.string_data_recovery_availability,
             StringDataRecoveryAvailability::UnavailableSchema1
         );
+        assert_eq!(
+            decoded.rtti_recovery_availability,
+            RttiRecoveryAvailability::RecordedWithoutNoPchdBaseDescriptors(1)
+        );
         let BinaryAnalysis::Pe(pe) = decoded.package.payload().base_analysis() else {
             panic!("PE analysis expected");
         };
@@ -3954,6 +4098,10 @@ entrypoint = "Plugin.dll"
             decoded.string_data_recovery_availability,
             StringDataRecoveryAvailability::UnavailableSchema2
         );
+        assert_eq!(
+            decoded.rtti_recovery_availability,
+            RttiRecoveryAvailability::RecordedWithoutNoPchdBaseDescriptors(2)
+        );
         assert!(decoded.schema1_source.is_none());
         let BinaryAnalysis::Pe(pe) = decoded.package.payload().base_analysis() else {
             panic!("PE analysis expected");
@@ -4024,6 +4172,10 @@ entrypoint = "Plugin.dll"
             decoded.string_data_recovery_availability,
             StringDataRecoveryAvailability::Recorded
         );
+        assert_eq!(
+            decoded.rtti_recovery_availability,
+            RttiRecoveryAvailability::RecordedWithoutNoPchdBaseDescriptors(3)
+        );
         assert!(decoded.schema1_source.is_none());
         assert_eq!(
             serde_json::from_str::<Value>(
@@ -4051,6 +4203,214 @@ entrypoint = "Plugin.dll"
             serde_json::from_slice(&fs::read(output).expect("read schema-v3 JSON projection"))
                 .expect("projection JSON is valid");
         assert_eq!(projection["schema_version"], 6);
+    }
+
+    #[test]
+    fn inspect_and_json_export_accept_schema_v4_with_explicit_legacy_rtti_availability() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let path = temp.path().join("schema-v4.resym");
+        let output = temp.path().join("schema-v4.json");
+        let base_analysis = analyze_bytes(include_bytes!(
+            "../../../fixtures/pe-x64-msvc/artifacts/milestone2-stripped.exe"
+        ))
+        .expect("analyze modern-RTTI PE fixture");
+        let BinaryAnalysis::Pe(pe) = &base_analysis else {
+            panic!("PE analysis expected");
+        };
+        assert!(!pe.msvc_rtti_vftables.is_empty());
+        assert!(pe.msvc_rtti_vftables.iter().all(|vftable| {
+            vftable
+                .base_classes
+                .iter()
+                .all(|base| base.class_hierarchy_descriptor_rva.is_some())
+        }));
+        let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
+            .expect("create base-only session");
+        let package = ResymPackage::from_bound_payload("0.1.0-alpha.4", session)
+            .expect("create current package value");
+        let mut value = serde_json::to_value(package).expect("serialize package value");
+        value["schema_version"] = serde_json::json!(4);
+        fs::write(
+            &path,
+            serde_json::to_vec(&value).expect("encode schema-v4 package"),
+        )
+        .expect("write schema-v4 package");
+
+        let decoded = read_analysis_package(&path, true)
+            .expect("CLI compatibility policy accepts schema 4 explicitly");
+        assert_eq!(decoded.package.schema_version(), 4);
+        assert_eq!(
+            decoded.code_recovery_availability,
+            CodeRecoveryAvailability::Recorded
+        );
+        assert_eq!(
+            decoded.string_data_recovery_availability,
+            StringDataRecoveryAvailability::Recorded
+        );
+        assert_eq!(
+            decoded.rtti_recovery_availability,
+            RttiRecoveryAvailability::RecordedWithoutNoPchdBaseDescriptors(4)
+        );
+        assert!(decoded.schema1_source.is_none());
+        let BinaryAnalysis::Pe(decoded_pe) = decoded.package.payload().base_analysis() else {
+            panic!("PE analysis expected");
+        };
+        assert!(!decoded_pe.msvc_rtti_vftables.is_empty());
+        assert!(decoded_pe.msvc_rtti_vftables.iter().all(|vftable| {
+            vftable
+                .base_classes
+                .iter()
+                .all(|base| base.class_hierarchy_descriptor_rva.is_some())
+        }));
+
+        inspect(InspectArgs {
+            package: path.clone(),
+            json: false,
+        })
+        .expect("CLI inspection accepts schema 4");
+        export(ExportArgs {
+            package: path,
+            format: ExportFormat::Json,
+            output: Some(output.clone()),
+            binary: None,
+        })
+        .expect("JSON export accepts schema 4");
+        let projection: Value =
+            serde_json::from_slice(&fs::read(output).expect("read schema-v4 JSON projection"))
+                .expect("projection JSON is valid");
+        assert_eq!(projection["schema_version"], 6);
+    }
+
+    #[test]
+    fn schemas_v1_through_v4_reject_relabeled_schema_v5_no_pchd_rtti_semantics() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let base_analysis = analyze_bytes(include_bytes!(
+            "../../../fixtures/pe-x64-msvc/artifacts/milestone2-stripped.exe"
+        ))
+        .expect("analyze modern-RTTI PE fixture");
+        let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
+            .expect("create base-only session");
+        let package = ResymPackage::from_bound_payload("0.1.0", session)
+            .expect("create current package value");
+        let current = serde_json::to_value(package).expect("serialize current package value");
+
+        for schema_version in 1..=4 {
+            for omit_pchd_field in [false, true] {
+                let mut value = current.clone();
+                value["schema_version"] = serde_json::json!(schema_version);
+                let base_class = value
+                    .pointer_mut(
+                        "/payload/base_analysis/analysis/msvc_rtti_vftables/0/base_classes/0",
+                    )
+                    .expect("fixture contains a modern RTTI base descriptor");
+                base_class["attributes"] = serde_json::json!(0);
+                if omit_pchd_field {
+                    base_class
+                        .as_object_mut()
+                        .expect("base-class fixture is an object")
+                        .remove("class_hierarchy_descriptor_rva");
+                } else {
+                    base_class["class_hierarchy_descriptor_rva"] = Value::Null;
+                }
+                let representation = if omit_pchd_field { "missing" } else { "null" };
+                let path = temp.path().join(format!(
+                    "relabeled-rtti-schema-{schema_version}-{representation}.resym"
+                ));
+                fs::write(
+                    &path,
+                    serde_json::to_vec(&value).expect("encode relabeled package"),
+                )
+                .expect("write relabeled package");
+
+                let error = match read_analysis_package(&path, false) {
+                    Ok(_) => panic!(
+                        "schema {schema_version} must reject schema-5 RTTI semantics with a {representation} pCHD field"
+                    ),
+                    Err(error) => error,
+                };
+                let diagnostic = format!("{error:#}");
+                assert!(diagnostic.contains("schema-5 no-pCHD semantics"));
+                assert!(diagnostic.contains("cannot be relabeled"));
+            }
+        }
+    }
+
+    #[test]
+    fn no_pchd_rtti_gate_follows_wrappers_without_matching_unrelated_null_fields() {
+        let base = serde_json::json!({
+            "msvc_rtti_vftables": [{
+                "rva": 0x2300,
+                "complete_object_locator_rva": 0x2180,
+                "type_descriptor_rva": 0x2100,
+                "class_hierarchy_descriptor_rva": 0x21c0,
+                "base_class_array_rva": 0x2200,
+                "offset": 0,
+                "constructor_displacement_offset": 0,
+                "decorated_class_name": ".?AVLegacy@@",
+                "class_name": "Legacy",
+                "hierarchy_attributes": 0,
+                "base_classes": [{
+                    "array_index": 0,
+                    "descriptor_rva": 0x2220,
+                    "type_descriptor_rva": 0x2100,
+                    "decorated_name": ".?AVLegacy@@",
+                    "name": "Legacy",
+                    "num_contained_bases": 0,
+                    "member_displacement": 0,
+                    "vbtable_displacement": -1,
+                    "displacement_inside_vbtable": 0,
+                    "attributes": 0,
+                    "class_hierarchy_descriptor_rva": null
+                }],
+                "virtual_function_rvas": [0x1000]
+            }]
+        });
+        let mut omitted = base.clone();
+        omitted["msvc_rtti_vftables"][0]["base_classes"][0]
+            .as_object_mut()
+            .expect("base-class fixture is an object")
+            .remove("class_hierarchy_descriptor_rva");
+        for payload in [
+            base.clone(),
+            serde_json::json!({"wrapper": [{"nested": base.clone()}]}),
+            omitted.clone(),
+            serde_json::json!({"wrapper": [{"nested": omitted.clone()}]}),
+        ] {
+            reject_pre_v5_no_pchd_base_descriptors(&payload, 4)
+                .expect_err("wrapped schema-5 RTTI semantics must be rejected");
+        }
+
+        let unrelated = serde_json::json!({
+            "class_hierarchy_descriptor_rva": null,
+            "metadata": {
+                "class_hierarchy_descriptor_rva": null
+            }
+        });
+        reject_pre_v5_no_pchd_base_descriptors(&unrelated, 4)
+            .expect("unrelated null fields must not trigger the RTTI semantic gate");
+
+        let unrelated_base_classes = serde_json::json!({
+            "extension": {
+                "base_classes": [{"class_hierarchy_descriptor_rva": null}]
+            }
+        });
+        reject_pre_v5_no_pchd_base_descriptors(&unrelated_base_classes, 4)
+            .expect("an unrelated base_classes extension must not resemble an RTTI descriptor");
+
+        let full_base_descriptor = base["msvc_rtti_vftables"][0]["base_classes"][0].clone();
+        let unrelated_full_base_classes = serde_json::json!({
+            "extension": {"base_classes": [full_base_descriptor.clone()]},
+            "msvc_rtti_vftables": [{"base_classes": [full_base_descriptor]}]
+        });
+        reject_pre_v5_no_pchd_base_descriptors(&unrelated_full_base_classes, 4).expect(
+            "full base-descriptor shapes outside a complete RTTI vftable must not trigger the gate",
+        );
+
+        let mut recorded_legacy_descriptor = base;
+        recorded_legacy_descriptor["msvc_rtti_vftables"][0]["base_classes"][0]["class_hierarchy_descriptor_rva"] =
+            serde_json::json!(0x2400);
+        reject_pre_v5_no_pchd_base_descriptors(&recorded_legacy_descriptor, 4)
+            .expect("a recorded legacy pCHD RVA remains valid in a schema-4 payload");
     }
 
     #[test]

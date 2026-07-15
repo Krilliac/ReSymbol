@@ -30,7 +30,7 @@ Every package contains four top-level fields:
   "binary_sha256": "<64 lowercase hexadecimal characters>",
   "generator_version": "0.1.0-alpha.1",
   "payload": {},
-  "schema_version": 4
+  "schema_version": 5
 }
 ```
 
@@ -40,8 +40,8 @@ Every package contains four top-level fields:
 - `payload` contains one validated `AnalysisSession`: deterministic base analysis, a plugin-run
   ledger, and accepted plugin claims.
 
-This package envelope currently writes schema 4. The CLI can also inspect and export schemas 1, 2,
-and 3 through the compatibility paths described below, while other schema versions fail
+This package envelope currently writes schema 5. The CLI can also inspect and export schemas 1
+through 4 through the compatibility paths described below, while other schema versions fail
 explicitly. The debugger-neutral JSON produced by `resymbol export --format json` is a different
 artifact with its own schema version; its current projection is schema 6.
 
@@ -89,12 +89,16 @@ and the migrated session is not evidence that the decoder found no relationships
 its recorded calls and thunks but predates recovered strings and data references. Schema 3 retains
 strings and data references. Schemas 2 and 3 both predate exact read-only function-pointer call and
 thunk resolution, so their recorded code recovery remains available while that newer result family
-is reported as unavailable. Reanalyze the exact original executable to create a schema 4 package
-with all current recovery results. The compatibility reader explicitly rejects a schema 2 or 3
-envelope whose base analysis, base graph, or plugin claims contain a schema-4 `function-pointer`
-target; changing only the envelope label is not migration. `inspect --json` emits the validated
-original schema 1 representation rather than placing the migrated current payload beneath a legacy
-schema label.
+is reported as unavailable. Schema 4 records pointer control flow but predates recovery of legacy
+24-byte MSVC RTTI base-class descriptors without `pCHD`. Existing RTTI recorded by schemas 1
+through 4 remains available, but loading cannot discover omitted descriptors without the executable
+bytes. Reanalyze the exact original executable to create a schema 5 package with all current
+recovery results. The compatibility reader explicitly rejects a schema 2 or 3 envelope whose base
+analysis, base graph, or plugin claims contain a schema-4 `function-pointer` target. It also rejects
+any schema 1-through-4 payload whose RTTI base records have a missing or null
+`class_hierarchy_descriptor_rva`; changing only the envelope label is not migration.
+`inspect --json` emits the validated original schema 1 representation rather than placing the
+migrated current payload beneath a legacy schema label.
 
 ## Current `AnalysisSession` payload
 
@@ -126,7 +130,8 @@ The base analysis includes:
 - bounded NUL-terminated ASCII and UTF-16LE strings plus exact x64 RIP-relative references to
   eligible data, each with independent persisted partial-scan state;
 - validated modern MSVC x64 Rev1 RTTI records, including type descriptors, class hierarchy and
-  base-class records, vftable locations, and executable virtual-slot targets; and
+  legacy 24-byte or `BCD_HASPCHD` 28-byte base-class records, vftable locations, and executable
+  virtual-slot targets; and
 - a symbol graph containing exact export names, metadata-derived boundaries, function entries,
   direct calls, thunks, string literals, data references, recovered RTTI type names, vftable names,
   and class-membership claims for virtual-slot targets.
@@ -154,14 +159,23 @@ base descriptors, and executable file-backed slot targets agree. Invalid candida
 atomically; their partial data is not added to the package or graph. Repeated base-descriptor RVAs
 and shared complete object locators are preserved because both are valid compiler output.
 
-This initial slice deliberately supports the modern MSVC x64 Rev1 layout: a 24-byte complete object
-locator and 28-byte base-class descriptors carrying the `BCD_HASPCHD` bit and a nonzero nested
-class-hierarchy RVA. Older 24-byte base-class descriptors, x86 RTTI, and other ABI variants are not
-silently interpreted as this format.
+This slice deliberately supports both MSVC x64 Rev1 base-class descriptor layouts. When
+`BCD_HASPCHD` is clear, the descriptor is the legacy 24-byte form and
+`class_hierarchy_descriptor_rva` is null because no `pCHD` field exists. When the bit is set, the
+descriptor is 28 bytes and its `pCHD` must be nonzero, aligned, and point to a valid
+class-hierarchy descriptor. The choice is made independently for each base-class-array entry, so a
+validated hierarchy may mix both layouts.
+
+The root entry still has to match the complete object's TypeDescriptor, PMD shape, and preorder
+span. If the root uses the 28-byte form, its `pCHD` must equal the hierarchy referenced by the
+complete object locator; a 24-byte root is accepted without fabricating that absent link. Any
+non-root 28-byte descriptor retains its validated nested hierarchy, while a 24-byte descriptor has
+no nested-hierarchy claim. x86 RTTI and other ABI variants are not silently interpreted as Rev1.
 
 Candidate scanning and accepted vftables/back-pointers, complete object locators, class-hierarchy
-descriptors, base-class arrays, base-class descriptors, and nested hierarchy descriptors are
-restricted to file-backed, initialized, readable, read-only, non-executable data. Referenced
+descriptors, base-class arrays, base-class descriptors, and any referenced nested hierarchy
+descriptors are restricted to file-backed, initialized, readable, read-only, non-executable data.
+Referenced
 TypeDescriptors may be in file-backed initialized, readable, non-executable data that is either
 read-only or writable, including the normal `.data` placement. Writable sections are never added
 to the candidate scan plan.
@@ -325,7 +339,7 @@ inspection of the exact original PE. It emits deterministic, bounded, pure-Rust 
 containing selected public function and global names and verbatim section headers. Same-RVA
 function/global collisions prefer the function; unnamed functions do not suppress globals. The
 writer does not synthesize private symbols, compilands, source lines, locals, prototypes, function
-extents, or type records, and it does not add fields to package schema 4 or neutral projection
+extents, or type records, and it does not add fields to package schema 5 or neutral projection
 schema 6. Generating the file requires no separately installed Visual Studio, DIA, LLVM, or
 compiler toolchain; Windows compatibility CI validates it with native and DIA-backed
 `llvm-pdbutil` reads and a direct DIA identity/public-symbol probe.

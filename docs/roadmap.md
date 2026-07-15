@@ -12,19 +12,23 @@ exception metadata, and derives conservative metadata-backed claims. Canonical `
 now carry an `AnalysisSession`: deterministic base analysis, an auditable plugin-run ledger, and
 separately validated plugin claims with a derived combined graph.
 
-The CLI writes package schema 4 and can inspect or export schemas 1 through 3 through explicit
+The CLI writes package schema 5 and can inspect or export schemas 1 through 4 through explicit
 compatibility paths. Schema 1 is migrated in memory by revalidating persisted metadata and
 rebuilding the base graph; schema 2 already contains direct-call and thunk recovery, and schema 3
-adds string/data recovery. Older packages do not embed executable bytes, so compatibility loading
-cannot reconstruct results that were never recorded. Reanalyzing the exact original binary is
-required for read-only function-pointer calls and thunks in schemas 2 and 3, for strings/data
-references in schemas 1 and 2, and for all code recovery when starting from schema 1.
+adds string/data recovery. Schema 4 adds read-only pointer control flow but predates legacy 24-byte
+RTTI base-class descriptor recovery. Older packages do not embed executable bytes, so compatibility
+loading cannot reconstruct results that were never recorded. Reanalyzing the exact original binary
+is required for 24-byte descriptors in schemas 1 through 4, read-only function-pointer calls and
+thunks in schemas 2 and 3, strings/data references in schemas 1 and 2, and all code recovery when
+starting from schema 1.
 
 A bounded modern MSVC x64 Rev1 RTTI/vftable slice is now implemented. It validates compiler
-metadata through complete object locators, type descriptors, modern 28-byte base-class descriptors,
-class hierarchies, and executable virtual-slot targets. It recovers stored class/type names and
-vftable names and records function-to-class memberships without inventing virtual-method names.
-Fixed scan, record, slot, and name budgets surface partial discovery explicitly.
+metadata through complete object locators, type descriptors, legacy 24-byte and `BCD_HASPCHD`
+28-byte base-class descriptors, class hierarchies, and executable virtual-slot targets. Descriptor
+layouts may be mixed within one hierarchy; root and nested hierarchy links are required only when
+the corresponding `pCHD` field exists. It recovers stored class/type names and vftable names and
+records function-to-class memberships without inventing virtual-method names. Fixed scan, record,
+slot, and name budgets surface partial discovery explicitly.
 
 A bounded pure-Rust x86-64 code-recovery slice is also implemented. Its control-flow-guided block
 sweep starts at fully file-backed `RUNTIME_FUNCTION` entries, follows supported direct same-range
@@ -111,12 +115,12 @@ The first export checkpoint is implemented as a validated, debugger-neutral proj
 deterministic JSON output, a bounded human-readable Markdown report, PE-only
 Microsoft-linker-style MAP text, an exact-RSDS public-symbol PDB, and standalone IDAPython and
 Ghidra Java import scripts. Markdown is presentation-only rather than a stable interchange schema;
-JSON remains the machine-consumable artifact. New analyses write package schema 4, while export also
-accepts package schemas 1 through 3 through validated compatibility paths. The neutral projection is
-schema 6; MAP and PDB add no schema fields, and no exporter rewrites its source package. Schema 5
-correlates exact or valid content-interior data-reference targets with retained strings while
-excluding NUL terminators and misaligned UTF-16LE interiors; schema 6 preserves function-pointer
-slot and resolved-target RVAs. The scripts
+JSON remains the machine-consumable artifact. New analyses write package schema 5, while export also
+accepts package schemas 1 through 4 through validated compatibility paths. The neutral projection is
+schema 6; MAP and PDB add no schema fields, and no exporter rewrites its source package. Projection
+schema 5 correlates exact or valid content-interior data-reference targets with retained strings
+while excluding NUL terminators and misaligned UTF-16LE interiors; projection schema 6 preserves
+function-pointer slot and resolved-target RVAs. The scripts
 bind to the exact loaded binary SHA-256, resolve addresses as loaded image base plus RVA, preserve
 user-authored names and existing function bodies, and continue past per-symbol application errors.
 They are deliberately narrower than the planned interactive debugger bridges: prototypes, types,
@@ -152,8 +156,9 @@ to the optimization profile. The matrix covers imports/exports, unwind functions
 internal and MSVC `REX.W`-prefixed import thunks, ASCII/UTF-16LE strings,
 data references, and modern RTTI/vftables without executing the fixture binaries. These checked-in
 inputs are repository/source test data rather than portable runtime archive contents. Read-only
-function-pointer calls and thunks are covered by focused synthetic PE fixtures, so this slice does
-not change those four binaries or their recorded hashes.
+function-pointer calls and thunks, plus all-legacy and mixed 24/28-byte RTTI descriptor
+hierarchies, are covered by focused synthetic PE fixtures, so these slices do not change those four
+binaries or their recorded hashes.
 
 The remaining Milestone 2 work is deliberately substantial: broader disassembly-assisted candidate
 discovery, broader indirect control flow and richer call-graph analysis, persisted basic-block
@@ -229,7 +234,7 @@ adversarial obfuscation.
 - Strings, constants, references, call relationships, and thunks (bounded exact strings, supported
   RIP-relative data references, direct calls, one-instruction thunks, and exact/content-interior
   string-reference correlation implemented; broader constants remain planned)
-- Initial MSVC x64 Rev1 RTTI and vftable analysis (bounded modern-layout slice implemented)
+- Initial MSVC x64 Rev1 RTTI and vftable analysis (bounded dual-descriptor-layout slice implemented)
 - Portable `.resym` analysis package
 - Deterministic, loss-aware JSON symbol projection
 - Deterministic, bounded Markdown review report
@@ -239,9 +244,9 @@ adversarial obfuscation.
 - Boundary, coverage, malformed-input, and resource-limit benchmarks
 
 The PE metadata, x64 exception ingestion, bounded string/data-reference/direct-call/thunk recovery,
-deterministic string-reference correlation,
-bounded modern MSVC x64 RTTI/vftable slice, portable package, canonical package encoding, neutral
-JSON export projection, bounded Markdown report, initial MSVC fixture matrix, and related CLI
+deterministic string-reference correlation, bounded dual-layout MSVC x64 RTTI/vftable slice,
+portable package, canonical package encoding, neutral JSON export projection, bounded Markdown
+report, initial MSVC fixture matrix, and related CLI
 portions are implemented. The unfinished parts of the bullets describe the remainder of this
 milestone.
 

@@ -481,6 +481,8 @@ These assertion and target additions do not change the external-process protocol
 handshake remains `resymbol.plugin-wire` 1.0. Strict claim-event decoding accepts the additive
 tagged JSON shapes below and the raw
 `{"kind":"function-pointer","slot_rva":...,"rva":...}` control-flow target.
+Package schema 5's recovery of both MSVC x64 Rev1 base-class descriptor layouts likewise adds no
+plugin assertion or target shape; the wire handshake remains 1.0.
 
 ### Tool-hosted bridges (planned host)
 

@@ -396,6 +396,20 @@ fn put_base_class_descriptor(
     put_rtti_rva_u32(bytes, rva + 24, class_hierarchy_descriptor_rva);
 }
 
+fn put_legacy_base_class_descriptor(
+    bytes: &mut [u8],
+    rva: u32,
+    type_descriptor_rva: u32,
+    num_contained_bases: u32,
+) {
+    put_rtti_rva_u32(bytes, rva, type_descriptor_rva);
+    put_rtti_rva_u32(bytes, rva + 4, num_contained_bases);
+    put_rtti_rva_u32(bytes, rva + 8, 0);
+    put_rtti_rva_u32(bytes, rva + 12, u32::MAX);
+    put_rtti_rva_u32(bytes, rva + 16, 0);
+    put_rtti_rva_u32(bytes, rva + 20, 0);
+}
+
 fn rtti_fixture() -> Vec<u8> {
     let mut bytes = vec![0_u8; 0x800];
     bytes[0..2].copy_from_slice(b"MZ");
@@ -483,6 +497,30 @@ fn rtti_fixture() -> Vec<u8> {
 
     put_rtti_rva_u64(&mut bytes, 0x22c0, RTTI_IMAGE_BASE + 0x2180);
     put_rtti_rva_u64(&mut bytes, 0x22c8, RTTI_IMAGE_BASE + 0x1000);
+    bytes
+}
+
+fn legacy_base_class_rtti_fixture() -> Vec<u8> {
+    let mut bytes = rtti_fixture();
+    put_legacy_base_class_descriptor(&mut bytes, 0x2220, 0x2100, 1);
+    put_rtti_rva_u32(&mut bytes, 0x2238, 0xffff_fffc);
+    put_legacy_base_class_descriptor(&mut bytes, 0x2240, 0x2140, 0);
+    put_rtti_rva_u32(&mut bytes, 0x2258, 0xffff_fffc);
+    bytes
+}
+
+fn mixed_base_class_rtti_fixture() -> Vec<u8> {
+    let mut bytes = rtti_fixture();
+    put_legacy_base_class_descriptor(&mut bytes, 0x2240, 0x2140, 0);
+    put_rtti_rva_u32(&mut bytes, 0x2258, 0xffff_fffc);
+    bytes
+}
+
+fn last_backed_legacy_base_class_rtti_fixture() -> Vec<u8> {
+    let mut bytes = rtti_fixture();
+    put_rtti_rva_u32(&mut bytes, 0x2204, 0x23e8);
+    put_rtti_rva_u32(&mut bytes, 0x2210, 0x23e8);
+    put_legacy_base_class_descriptor(&mut bytes, 0x23e8, 0x2140, 0);
     bytes
 }
 
@@ -2178,6 +2216,111 @@ fn extracts_msvc_rtti_with_shared_locators_and_reused_base_descriptors() {
 }
 
 #[test]
+fn accepts_legacy_24_byte_msvc_base_class_descriptors_without_reading_pchd_bytes() {
+    let analysis = analyze_pe(&legacy_base_class_rtti_fixture())
+        .expect("valid PE with legacy 24-byte MSVC base descriptors");
+
+    assert_eq!(analysis.msvc_rtti_vftables.len(), 3);
+    let derived = &analysis.msvc_rtti_vftables[0];
+    assert_eq!(derived.class_name, "Derived");
+    assert_eq!(derived.base_classes.len(), 2);
+    assert!(derived.base_classes.iter().all(|base| {
+        base.attributes & 0x40 == 0 && base.class_hierarchy_descriptor_rva.is_none()
+    }));
+    let base = &analysis.msvc_rtti_vftables[1];
+    assert_eq!(base.class_name, "Base");
+    assert_eq!(base.base_classes[0].descriptor_rva, 0x2240);
+    assert_eq!(base.base_classes[0].class_hierarchy_descriptor_rva, None);
+    assert_eq!(
+        derived.base_classes[1].descriptor_rva, base.base_classes[0].descriptor_rva,
+        "a shared legacy descriptor remains canonical across hierarchy arrays",
+    );
+    assert_eq!(
+        analysis
+            .rebuild_symbol_graph()
+            .expect("rebuild legacy RTTI graph"),
+        analysis.symbol_graph
+    );
+
+    let json = serde_json::to_string(&analysis).expect("serialize legacy RTTI analysis");
+    let decoded = serde_json::from_str(&json).expect("deserialize legacy RTTI analysis");
+    assert_eq!(analysis, decoded);
+}
+
+#[test]
+fn accepts_mixed_24_and_28_byte_msvc_base_class_descriptors() {
+    let analysis = analyze_pe(&mixed_base_class_rtti_fixture())
+        .expect("valid PE with mixed MSVC base-descriptor layouts");
+
+    assert_eq!(analysis.msvc_rtti_vftables.len(), 3);
+    let derived = &analysis.msvc_rtti_vftables[0];
+    assert_eq!(
+        derived.base_classes[0].class_hierarchy_descriptor_rva,
+        Some(0x21c0)
+    );
+    assert_eq!(derived.base_classes[1].class_hierarchy_descriptor_rva, None);
+    assert_eq!(
+        analysis.msvc_rtti_vftables[1].base_classes[0].class_hierarchy_descriptor_rva,
+        None
+    );
+}
+
+#[test]
+fn legacy_base_class_descriptor_requires_exactly_24_backed_bytes() {
+    let exact = analyze_pe(&last_backed_legacy_base_class_rtti_fixture())
+        .expect("exact final 24-byte legacy descriptor is fully backed");
+    assert_eq!(exact.msvc_rtti_vftables.len(), 3);
+    assert_eq!(
+        exact.msvc_rtti_vftables[0].base_classes[1].descriptor_rva,
+        0x23e8
+    );
+    assert_eq!(
+        exact.msvc_rtti_vftables[0].base_classes[1].class_hierarchy_descriptor_rva,
+        None
+    );
+
+    let mut truncated = last_backed_legacy_base_class_rtti_fixture();
+    put_u32(&mut truncated, SECTION_OFFSET + 40 + 8, 0x3ff);
+    put_u32(&mut truncated, SECTION_OFFSET + 40 + 16, 0x3ff);
+    let analysis = analyze_pe(&truncated).expect("truncated RTTI candidates are skipped safely");
+    assert!(analysis.msvc_rtti_vftables.is_empty());
+
+    let mut modern_at_legacy_boundary = last_backed_legacy_base_class_rtti_fixture();
+    put_rtti_rva_u32(&mut modern_at_legacy_boundary, 0x23fc, 0x40);
+    let analysis = analyze_pe(&modern_at_legacy_boundary)
+        .expect("a 28-byte descriptor requires its full pCHD field");
+    assert!(analysis.msvc_rtti_vftables.is_empty());
+}
+
+#[test]
+fn validated_deserialization_rejects_base_descriptor_layout_bit_mismatches() {
+    let legacy = analyze_pe(&legacy_base_class_rtti_fixture()).expect("valid legacy RTTI analysis");
+    let legacy_value = serde_json::to_value(legacy).expect("serialize legacy RTTI analysis");
+
+    let mut bit_without_field = legacy_value.clone();
+    bit_without_field["msvc_rtti_vftables"][0]["base_classes"][0]["attributes"] =
+        serde_json::json!(0x40);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(bit_without_field)
+        .expect_err("BCD_HASPCHD requires a nested hierarchy RVA");
+    assert!(error.to_string().contains("base-class attributes"));
+
+    let mut field_without_bit = legacy_value;
+    field_without_bit["msvc_rtti_vftables"][0]["base_classes"][0]["class_hierarchy_descriptor_rva"] =
+        serde_json::json!(0x21c0);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(field_without_bit)
+        .expect_err("a legacy descriptor cannot carry a hidden pCHD field");
+    assert!(error.to_string().contains("base-class attributes"));
+
+    let modern = analyze_pe(&rtti_fixture()).expect("valid modern RTTI analysis");
+    let mut missing_modern_field = serde_json::to_value(modern).expect("serialize modern RTTI");
+    missing_modern_field["msvc_rtti_vftables"][0]["base_classes"][0]["class_hierarchy_descriptor_rva"] =
+        serde_json::Value::Null;
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(missing_modern_field)
+        .expect_err("a modern descriptor cannot omit its pCHD field");
+    assert!(error.to_string().contains("base-class attributes"));
+}
+
+#[test]
 fn accepts_writable_non_executable_msvc_type_descriptors() {
     let bytes = rtti_fixture_with_writable_type_descriptors();
     let analysis = analyze_pe(&bytes).expect("writable TypeDescriptors are valid MSVC metadata");
@@ -2283,7 +2426,7 @@ fn an_rtti_free_pe_produces_no_rtti_records() {
 #[test]
 fn skips_a_corrupt_rtti_locator_without_partially_retaining_its_vftables() {
     let mut bytes = rtti_fixture();
-    put_rtti_rva_u32(&mut bytes, 0x2220 + 20, 0);
+    put_rtti_rva_u32(&mut bytes, 0x2220 + 20, 0x80);
 
     let analysis = analyze_pe(&bytes).expect("invalid RTTI candidates are non-fatal");
     assert_eq!(analysis.msvc_rtti_vftables.len(), 1);

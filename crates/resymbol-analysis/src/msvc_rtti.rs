@@ -9,7 +9,8 @@ use crate::{
 
 const COMPLETE_OBJECT_LOCATOR_SIZE: usize = 24;
 const CLASS_HIERARCHY_DESCRIPTOR_SIZE: usize = 16;
-const BASE_CLASS_DESCRIPTOR_SIZE: usize = 28;
+const BASE_CLASS_DESCRIPTOR_COMMON_SIZE: usize = 24;
+const BASE_CLASS_DESCRIPTOR_WITH_PCHD_SIZE: usize = 28;
 const TYPE_DESCRIPTOR_HEADER_SIZE: u32 = 16;
 const POINTER_SIZE: u32 = 8;
 
@@ -410,8 +411,9 @@ fn parse_locator(
         || first_base.member_displacement != 0
         || first_base.vbtable_displacement != -1
         || first_base.displacement_inside_vbtable != 0
-        || first_base.attributes & BCD_HAS_CLASS_HIERARCHY_DESCRIPTOR == 0
-        || first_base.class_hierarchy_descriptor_rva != Some(class_hierarchy_descriptor_rva)
+        || first_base
+            .class_hierarchy_descriptor_rva
+            .is_some_and(|nested| nested != class_hierarchy_descriptor_rva)
     {
         return None;
     }
@@ -544,22 +546,23 @@ fn parse_base_class(
         add_rva(descriptor_rva, 20)?,
         "MSVC RTTI base-class descriptor",
     )?;
-    if attributes & !BCD_KNOWN_ATTRIBUTES != 0
-        || attributes & BCD_HAS_CLASS_HIERARCHY_DESCRIPTOR == 0
-    {
+    if attributes & !BCD_KNOWN_ATTRIBUTES != 0 {
         return None;
     }
-    let nested_hierarchy_rva = mapper.read_u32(
-        add_rva(descriptor_rva, 24)?,
-        "MSVC RTTI base-class descriptor",
-    )?;
-    let class_hierarchy_descriptor_rva = if nested_hierarchy_rva == 0
-        || nested_hierarchy_rva % 4 != 0
-        || mapper.read_u32(nested_hierarchy_rva, "MSVC RTTI nested hierarchy")? != CHD_SIGNATURE
-    {
-        return None;
-    } else {
+    let class_hierarchy_descriptor_rva = if attributes & BCD_HAS_CLASS_HIERARCHY_DESCRIPTOR != 0 {
+        let nested_hierarchy_rva = mapper.read_u32(
+            add_rva(descriptor_rva, 24)?,
+            "MSVC RTTI base-class descriptor",
+        )?;
+        if nested_hierarchy_rva == 0
+            || nested_hierarchy_rva % 4 != 0
+            || mapper.read_u32(nested_hierarchy_rva, "MSVC RTTI nested hierarchy")? != CHD_SIGNATURE
+        {
+            return None;
+        }
         Some(nested_hierarchy_rva)
+    } else {
+        None
     };
     let type_name = caches.type_name(mapper, type_descriptor_rva)?;
 
@@ -759,13 +762,13 @@ pub(crate) fn validate_msvc_rtti(analysis: &PeAnalysis) -> Result<(), AnalysisEr
                     "has invalid source order or alignment",
                 );
             }
+            let has_pchd = base.attributes & BCD_HAS_CLASS_HIERARCHY_DESCRIPTOR != 0;
             if base.attributes & !BCD_KNOWN_ATTRIBUTES != 0
-                || base.attributes & BCD_HAS_CLASS_HIERARCHY_DESCRIPTOR == 0
-                || base.class_hierarchy_descriptor_rva.is_none()
+                || has_pchd != base.class_hierarchy_descriptor_rva.is_some()
             {
                 return invalid(
                     "MSVC RTTI base-class attributes",
-                    "do not describe the supported modern descriptor with a hierarchy link",
+                    "do not agree with the optional class-hierarchy link",
                 );
             }
             if !has_valid_pmd(
@@ -789,8 +792,12 @@ pub(crate) fn validate_msvc_rtti(analysis: &PeAnalysis) -> Result<(), AnalysisEr
             require_scan_metadata(
                 analysis,
                 base.descriptor_rva,
-                u32::try_from(BASE_CLASS_DESCRIPTOR_SIZE)
-                    .map_err(|_| AnalysisError::IntegerConversion("base descriptor size"))?,
+                u32::try_from(if has_pchd {
+                    BASE_CLASS_DESCRIPTOR_WITH_PCHD_SIZE
+                } else {
+                    BASE_CLASS_DESCRIPTOR_COMMON_SIZE
+                })
+                .map_err(|_| AnalysisError::IntegerConversion("base descriptor size"))?,
                 "MSVC RTTI base-class descriptor",
             )?;
             if let Some(nested) = base.class_hierarchy_descriptor_rva {
@@ -845,8 +852,9 @@ pub(crate) fn validate_msvc_rtti(analysis: &PeAnalysis) -> Result<(), AnalysisEr
             || root.member_displacement != 0
             || root.vbtable_displacement != -1
             || root.displacement_inside_vbtable != 0
-            || root.attributes & BCD_HAS_CLASS_HIERARCHY_DESCRIPTOR == 0
-            || root.class_hierarchy_descriptor_rva != Some(vftable.class_hierarchy_descriptor_rva)
+            || root
+                .class_hierarchy_descriptor_rva
+                .is_some_and(|nested| nested != vftable.class_hierarchy_descriptor_rva)
         {
             return invalid(
                 "MSVC RTTI hierarchy",
@@ -1055,7 +1063,13 @@ fn locator_metadata_is_in_scan_sections(locator: &Locator, sections: &[PeSection
     let Some(hierarchy_size) = u32::try_from(CLASS_HIERARCHY_DESCRIPTOR_SIZE).ok() else {
         return false;
     };
-    let Some(base_descriptor_size) = u32::try_from(BASE_CLASS_DESCRIPTOR_SIZE).ok() else {
+    let Some(base_descriptor_common_size) = u32::try_from(BASE_CLASS_DESCRIPTOR_COMMON_SIZE).ok()
+    else {
+        return false;
+    };
+    let Some(base_descriptor_with_pchd_size) =
+        u32::try_from(BASE_CLASS_DESCRIPTOR_WITH_PCHD_SIZE).ok()
+    else {
         return false;
     };
     let Some(root_type_size) = type_descriptor_record_size(&locator.root_type.decorated) else {
@@ -1088,11 +1102,16 @@ fn locator_metadata_is_in_scan_sections(locator: &Locator, sections: &[PeSection
             let Some(type_size) = type_descriptor_record_size(&base.decorated_name) else {
                 return false;
             };
-            scan_range_is_backed(base.descriptor_rva, base_descriptor_size, sections)
+            let descriptor_size = if base.class_hierarchy_descriptor_rva.is_some() {
+                base_descriptor_with_pchd_size
+            } else {
+                base_descriptor_common_size
+            };
+            scan_range_is_backed(base.descriptor_rva, descriptor_size, sections)
                 && type_descriptor_range_is_backed(base.type_descriptor_rva, type_size, sections)
                 && base
                     .class_hierarchy_descriptor_rva
-                    .is_some_and(|rva| scan_range_is_backed(rva, hierarchy_size, sections))
+                    .is_none_or(|rva| scan_range_is_backed(rva, hierarchy_size, sections))
         })
 }
 

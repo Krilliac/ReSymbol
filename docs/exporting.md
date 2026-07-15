@@ -115,13 +115,15 @@ added deterministic string correlation to each data reference. Schema 6 adds the
 projection schema is independent from the `.resym` package-envelope schema; consumers must validate
 the version of the artifact they are actually reading.
 
-The CLI can export package schemas 1 through 3 through validated in-memory compatibility paths.
+The CLI can export package schemas 1 through 4 through validated in-memory compatibility paths.
 Migration neither rewrites the package nor reruns analysis: the package does not embed executable
 bytes. Schema 1 therefore has no available direct calls, thunks, strings, or data references.
 Schema 2 retains its persisted calls and thunks but predates strings and data references. Schema 3
 retains those records, but schemas 2 and 3 both predate read-only function-pointer call and thunk
-resolution. Reanalyze the exact original binary to produce schema 4 before expecting all current
-recovery relationships in the export.
+resolution. Schema 4 retains pointer control flow but predates legacy 24-byte MSVC RTTI base-class
+descriptor recovery. Reanalyze the exact original binary to produce schema 5 before expecting all
+current recovery relationships in the export. Schemas 1 through 4 reject relabeled RTTI base
+records whose `class_hierarchy_descriptor_rva` is missing or null.
 
 Entries are emitted in stable order. Name and range conflicts are resolved conservatively, and
 colliding selected names receive deterministic output suffixes rather than silently referring to
@@ -234,6 +236,7 @@ for vftables, and attributed class-membership relationships for executable virtu
 The neutral JSON projection retains those function-to-class relationships with confidence and
 provenance. The complete base-class/PMD records remain in the source `.resym` package; the current
 neutral projection does not yet turn them into a general inheritance type model.
+Supporting the legacy descriptor therefore does not change neutral projection schema 6.
 
 Each function retains at most 4,096 distinct class memberships. If more are projected, ReSymbol
 deterministically keeps the strongest 4,096 according to the normal producer-authority,
@@ -241,10 +244,12 @@ confidence, and stable tie-break ordering. The remaining distinct relationships 
 one `class-membership-limit-exceeded` warning group for that function, whose `occurrences` value
 counts the overflow reductions.
 
-The source records are deliberately limited to modern MSVC x64 Rev1 RTTI with 28-byte base-class
-descriptors carrying `BCD_HASPCHD`; older 24-byte descriptors and other ABI variants are not
-reinterpreted. Candidate scanning and the vftable/back-pointer, COL, CHD, BCA, BCD, and nested-CHD
-records remain restricted to file-backed read-only initialized non-executable data. Referenced
+The source records deliberately support both MSVC x64 Rev1 base-class descriptor layouts. A clear
+`BCD_HASPCHD` bit selects the legacy 24-byte form with no `pCHD`; a set bit selects the 28-byte form
+and requires a valid nonzero `pCHD`. A hierarchy may mix the forms. An extended root must point to
+its owning CHD, while a legacy root is validated without inventing a link. Candidate scanning and
+the vftable/back-pointer, COL, CHD, BCA, BCD, and any referenced nested-CHD records remain
+restricted to file-backed read-only initialized non-executable data. Referenced
 TypeDescriptors may occupy file-backed initialized readable non-executable data, including normal
 writable `.data`, but writable sections are never candidate-scanned. Discovery is bounded and may
 be partial: when the section-scan or aggregate model budget is exhausted, the package retains
@@ -294,7 +299,7 @@ schema-6 JSON record.
 Markdown is a human-facing presentation format, not a stable interchange contract. Its wording,
 table layout, and section organization may evolve between alpha releases. Tools should consume the
 `json` output and validate its `schema_version` instead of parsing the report. New analyses write
-package schema 4; export also accepts package schemas 1 through 3 through validated compatibility
+package schema 5; export also accepts package schemas 1 through 4 through validated compatibility
 paths without rewriting them. The current neutral projection is schema 6, and adding this writer
 changes neither version domain.
 
@@ -324,8 +329,8 @@ resymbol export application.resym --format map
 The default destination is `application.map`. This is a deterministic text export, not a claim that
 every debugger or linker will accept it. ReSymbol currently rejects non-PE sessions and
 projections, mismatched session/projection binary fields, selected symbol RVAs outside real PE
-sections, and a nonzero entry point outside those sections. New analyses write package schema 4;
-export also accepts package schemas 1 through 3 through validated compatibility paths without
+sections, and a nonzero entry point outside those sections. New analyses write package schema 5;
+export also accepts package schemas 1 through 4 through validated compatibility paths without
 rewriting them. The current neutral projection is schema 6, and MAP adds no schema fields.
 
 The writer emits the PE timestamp and preferred load address, one group for each final PE section,

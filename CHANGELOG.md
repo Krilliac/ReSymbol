@@ -44,13 +44,18 @@ prereleases; breaking changes remain explicit.
   group or session.
 - Added bounded modern MSVC x64 Rev1 RTTI and vftable discovery, including validated stored type
   names, base-class records, virtual-slot targets, vftable names, and attributed function-to-class
-  relationships.
+  relationships. Base-class arrays may mix the legacy 24-byte descriptor with the 28-byte
+  `BCD_HASPCHD` form. A hierarchy link is absent for the legacy form and required for the extended
+  form; an extended root must link to its owning hierarchy.
 - Expanded the source-available, byte-reproducible MSVC x64 fixture corpus to four PE inputs:
   optimized and unoptimized builds, each with and without CodeView metadata. The existing optimized
   filenames remain stable, exact hashes bind every checked-in executable, and the semantic oracle
   shares portable expectations while keeping layout-sensitive requirements specific to each
   optimization profile. These fixtures are repository/source test data rather than portable runtime
   archive contents; their byte-variable full PDBs remain local build outputs.
+- Added focused synthetic RTTI fixtures for all-legacy and mixed base-class descriptor hierarchies
+  alongside the existing extended-form coverage, without regenerating or changing the hashes of
+  the four checked-in MSVC corpus binaries.
 - Added a pure-Rust x86-64 decoder that performs a bounded control-flow-guided block sweep of fully
   file-backed `RUNTIME_FUNCTION` ranges for supported direct calls and data references, and checks
   seeded executable candidates for one-instruction internal, import, or read-only function-pointer
@@ -120,9 +125,12 @@ prereleases; breaking changes remain explicit.
   and no longer quarantine the plugin artifact.
 - Raised the pinned Rust source-build toolchain and workspace MSRV to 1.86 for the Component Model
   host. Ordinary release users and users of the bundled WASM example still need no compiler.
-- New `.resym` analyses use package schema 4. The new `function-pointer` control-flow target
-  persists both the read-only slot RVA and resolved function RVA. Schema 4 validation requires the
-  paired same-site slot data reference for a direct call; a pointer thunk does not require one.
+- New `.resym` analyses use package schema 5. Schema 4 introduced the `function-pointer`
+  control-flow target, which persists both the read-only slot RVA and resolved function RVA and
+  requires a paired same-site slot data reference for a direct call but not for a pointer thunk.
+  Schema 5 preserves a legacy 24-byte RTTI base-class descriptor with a null
+  `class_hierarchy_descriptor_rva`; the 28-byte `BCD_HASPCHD` form retains its validated nonzero
+  hierarchy link.
 - The debugger-neutral JSON projection now uses schema 6. Schema 4 added attributed string and
   data-reference arrays to schema 3's entry attribution and control-flow relationships; schema 5
   added `referenced_string_rva` correlation; and schema 6 adds explicit `function-pointer` targets.
@@ -155,7 +163,7 @@ schema versions independently.
 
 ### Compatibility
 
-- The CLI can inspect and export package schemas 1 through 3 through explicit, validated in-memory
+- The CLI can inspect and export package schemas 1 through 4 through explicit, validated in-memory
   compatibility paths. It revalidates persisted metadata, plugin runs and claims, binary binding,
   and rebuilds the deterministic base graph; it does not rewrite a legacy package. `inspect --json`
   preserves the validated original representation instead of mislabeling migrated content.
@@ -168,19 +176,24 @@ schema versions independently.
   and are not evidence that no relationships or literals exist. Schema 2 retains its persisted
   direct calls and thunks but predates strings and data references. Schema 3 retains string/data
   recovery, while schemas 2 and 3 both predate read-only function-pointer call and thunk
-  resolution.
-  Reanalyze the exact original binary to create schema 4 with current recovery. The reader rejects
+  resolution. Schema 4 retains those pointer relationships but predates legacy 24-byte base-class
+  descriptor recovery. Schemas 1 through 4 cannot gain that missing result family during loading.
+  Reanalyze the exact original binary to create schema 5 with current recovery. The reader rejects
   schema 2 or 3 envelopes containing schema-4 function-pointer targets in base relationships,
-  symbol graphs, or plugin claims instead of accepting a relabeled payload.
-- Package schema 4 and neutral projection schema 6 are independent version domains. Generic
+  symbol graphs, or plugin claims. It also rejects a schema 1-through-4 payload containing an RTTI
+  base record whose `class_hierarchy_descriptor_rva` is missing or null instead of accepting
+  relabeled schema-5 semantics.
+- Package schema 5 and neutral projection schema 6 are independent version domains. Generic
   package readers still require an explicit compatibility range and application-defined payload
   migration to accept an older schema.
 - Markdown export is presentation-only and does not change either version domain: new analyses
-  continue to use package schema 4 and the neutral projection continues to use schema 6.
+  continue to use package schema 5 and the neutral projection continues to use schema 6.
 - MAP export consumes the current validated session and neutral projection without adding fields to
-  package schema 4 or projection schema 6.
+  package schema 5 or projection schema 6.
 - PDB export consumes the same current session and projection plus a byte-backed inspection of the
-  exact original PE. It does not add fields to package schema 4 or projection schema 6.
+  exact original PE. It does not add fields to package schema 5 or projection schema 6.
+- The external plugin wire remains protocol 1.0. Dual-layout RTTI recovery changes deterministic
+  base-analysis/package content but adds no plugin assertion or control-flow target shape.
 - Managed-plugin execution adds no package-schema field: successful runs and validated claims use
   the existing `AnalysisSession` plugin ledger and claim representation.
 - WASM-plugin execution likewise adds no package-schema field. It uses the existing plugin ledger,
