@@ -10,12 +10,14 @@
 mod error;
 mod ghidra_java;
 mod ida_python;
+mod markdown;
 mod model;
 mod project;
 
 pub use error::{ExportError, ProjectionValidationError};
 pub use ghidra_java::{GhidraJavaError, render_ghidra_java, validate_ghidra_java_class_name};
 pub use ida_python::{IdaPythonError, render_ida_python};
+pub use markdown::{MarkdownError, render_markdown};
 pub use model::{
     AttributedText, ExportAttribution, ExportBinary, ExportBinaryFormat, ExportControlFlowTarget,
     ExportDirectCall, ExportFunction, ExportGlobal, ExportName, ExportProducer, ExportProjection,

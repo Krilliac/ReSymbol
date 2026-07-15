@@ -1,18 +1,22 @@
 # Export ReSymbol results
 
-`resymbol export` turns one validated `.resym` analysis package into either a deterministic,
-debugger-neutral JSON projection or a self-contained import script for IDA or Ghidra.
+`resymbol export` turns one validated `.resym` analysis package into a deterministic,
+debugger-neutral JSON projection, a bounded human-readable Markdown report, or a self-contained
+import script for IDA or Ghidra.
 
 ```console
 resymbol export PACKAGE --format json [--output PATH]
+resymbol export PACKAGE --format markdown [--output PATH]
 resymbol export PACKAGE --format ida-python [--output PATH]
 resymbol export PACKAGE --format ghidra-java [--output PATH]
 ```
 
-The current formats are deliberately small and auditable. They do not require a ReSymbol plugin,
-compiler, or separately installed language runtime beyond the scripting support included with the
-target debugger. PDB and MAP generation, richer type application, and interactive in-tool bridges
-are later milestones.
+The current formats are deliberately small and auditable. JSON is the machine-consumable
+interchange artifact, Markdown is a presentation-only report for review, and the scripts apply a
+conservative subset inside their target debugger. They do not require a ReSymbol plugin, compiler,
+or separately installed language runtime beyond the scripting support included with the target
+debugger. PDB and MAP generation, richer type application, and interactive in-tool bridges are
+later milestones.
 
 ## Output paths and overwrite policy
 
@@ -21,6 +25,7 @@ Without `--output`, ReSymbol chooses a deterministic destination beside the pack
 | Format | Package | Default output |
 |---|---|---|
 | `json` | `application.resym` | `application.symbols.json` |
+| `markdown` | `application.resym` | `application.symbols.md` |
 | `ida-python` | `application.resym` | `application.ida.py` |
 | `ghidra-java` | `application.resym` | `ReSymbolImport_<sha12>.java` |
 
@@ -158,6 +163,53 @@ The IDA and Ghidra scripts can apply a projected vftable global name when the ad
 tool state permit it. They do not create RTTI types, install class-membership metadata, or invent
 names for virtual functions. This keeps compiler metadata distinct from a source-level method name
 that may no longer exist in the binary.
+
+## Markdown report
+
+Generate a report for review in a text editor, repository, or Markdown viewer:
+
+```console
+resymbol export application.resym --format markdown
+```
+
+The default destination is `application.symbols.md`. The writer renders the already validated
+neutral projection in deterministic order; it does not reanalyze the executable, modify a debugger
+database, or add claims to the package. Its fixed section order is:
+
+1. `# ReSymbol Analysis Report`
+2. `## Binary identity`
+3. `## Summary`
+4. `## Functions`
+5. `## Globals`
+6. `## Types`
+7. `## Direct calls`
+8. `## Thunks`
+9. `## Warnings`
+
+The report is a presentation of the existing projection and does not add a new symbol or
+relationship model. Missing categories and row counts are represented consistently so two reports
+from the same projection compare cleanly.
+
+Markdown is a human-facing presentation format, not a stable interchange contract. Its wording,
+table layout, and section organization may evolve between alpha releases. Tools should consume the
+`json` output and validate its `schema_version` instead of parsing the report. Adding this writer
+does not change the source `.resym` package schema or the neutral projection schema: current
+artifacts remain package schema 2 and projection schema 3, respectively.
+
+The report writer applies limits in addition to the projection's own validation bounds:
+
+- each tabular section contains at most 1,024 rows;
+- projection text supplied to each table cell has a 256-byte pre-escape budget; and
+- the complete UTF-8 report cannot exceed 16 MiB.
+
+Each row-bearing section includes a deterministic notice in this form, including when zero rows are
+omitted: `_Showing N of T rows; O omitted by the 1,024-row report limit._` Projection text is
+UTF-8-truncated before escaping, with the 256-byte cell budget including the explicit
+`… [truncated]` marker. GitHub-Flavored Markdown control punctuation is backslash-escaped, while
+`&`, `<`, and `>` are emitted as entities. This prevents projection text from creating table
+columns, raw HTML, or unintended entities. If the complete rendered document would exceed 16 MiB,
+export fails before creating the output file. These are report-writer limits only; they do not
+silently reduce the JSON projection or rewrite the `.resym` package.
 
 ## Import into IDA
 

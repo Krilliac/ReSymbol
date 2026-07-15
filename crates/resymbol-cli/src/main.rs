@@ -19,7 +19,8 @@ use resymbol_core::{
     },
 };
 use resymbol_export::{
-    ExportProjection, render_ghidra_java, render_ida_python, validate_ghidra_java_class_name,
+    ExportProjection, render_ghidra_java, render_ida_python, render_markdown,
+    validate_ghidra_java_class_name,
 };
 #[cfg(test)]
 use resymbol_package::read_file_bound;
@@ -113,6 +114,8 @@ struct ExportArgs {
 enum ExportFormat {
     #[value(name = "json")]
     Json,
+    #[value(name = "markdown")]
+    Markdown,
     #[value(name = "ida-python")]
     IdaPython,
     #[value(name = "ghidra-java")]
@@ -123,6 +126,7 @@ impl ExportFormat {
     const fn label(self) -> &'static str {
         match self {
             Self::Json => "debugger-neutral JSON",
+            Self::Markdown => "Markdown report",
             Self::IdaPython => "IDA Python",
             Self::GhidraJava => "Ghidra Java",
         }
@@ -477,6 +481,9 @@ fn export(args: ExportArgs) -> Result<()> {
             json.push('\n');
             json
         }
+        ExportFormat::Markdown => {
+            render_markdown(&projection).context("cannot render Markdown report")?
+        }
         ExportFormat::IdaPython => {
             render_ida_python(&projection).context("cannot render IDA Python import script")?
         }
@@ -532,7 +539,7 @@ fn export(args: ExportArgs) -> Result<()> {
         );
     }
     match format {
-        ExportFormat::Json => println!(
+        ExportFormat::Json | ExportFormat::Markdown => println!(
             "identity binding: projection records the exact binary SHA-256; no debugger program was modified"
         ),
         ExportFormat::IdaPython | ExportFormat::GhidraJava => println!(
@@ -546,6 +553,7 @@ fn export(args: ExportArgs) -> Result<()> {
 fn default_export_path(package: &Path, format: ExportFormat, binary_sha256: &str) -> PathBuf {
     match format {
         ExportFormat::Json => package.with_extension("symbols.json"),
+        ExportFormat::Markdown => package.with_extension("symbols.md"),
         ExportFormat::IdaPython => package.with_extension("ida.py"),
         ExportFormat::GhidraJava => {
             let prefix = binary_sha256
@@ -1948,6 +1956,7 @@ args = ["--stdio", "literal argument"]
     fn command_line_accepts_all_export_formats() {
         for (value, expected) in [
             ("json", ExportFormat::Json),
+            ("markdown", ExportFormat::Markdown),
             ("ida-python", ExportFormat::IdaPython),
             ("ghidra-java", ExportFormat::GhidraJava),
         ] {
@@ -2074,6 +2083,10 @@ args = ["--stdio", "literal argument"]
             PathBuf::from("build/application.symbols.json")
         );
         assert_eq!(
+            default_export_path(package, ExportFormat::Markdown, sha256),
+            PathBuf::from("build/application.symbols.md")
+        );
+        assert_eq!(
             default_export_path(package, ExportFormat::IdaPython, sha256),
             PathBuf::from("build/application.ida.py")
         );
@@ -2145,6 +2158,29 @@ args = ["--stdio", "literal argument"]
         assert_eq!(
             fs::read(&json_path).expect("read preserved JSON export"),
             json_bytes
+        );
+
+        export(ExportArgs {
+            package: package.clone(),
+            format: ExportFormat::Markdown,
+            output: None,
+        })
+        .expect("export Markdown report");
+        let markdown_path = package.with_extension("symbols.md");
+        let markdown_bytes = fs::read(&markdown_path).expect("read Markdown export");
+        let markdown = std::str::from_utf8(&markdown_bytes).expect("Markdown export is UTF-8");
+        assert!(markdown.contains(BinaryId::digest(&bytes).as_str()));
+
+        let error = export(ExportArgs {
+            package: package.clone(),
+            format: ExportFormat::Markdown,
+            output: None,
+        })
+        .expect_err("existing Markdown export must not be overwritten");
+        assert!(error.to_string().contains("refusing to overwrite"));
+        assert_eq!(
+            fs::read(&markdown_path).expect("read preserved Markdown export"),
+            markdown_bytes
         );
 
         export(ExportArgs {

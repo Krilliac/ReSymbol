@@ -26,10 +26,11 @@ erased by compilation, reconstruct general C++ layouts, recover register-indirec
 name virtual functions merely because their targets appear in a vftable. RTTI support deliberately
 accepts only the modern x64 Rev1 layout with
 28-byte base-class descriptors carrying a nested class-hierarchy reference; older/x86 RTTI and
-other ABI variants remain unsupported. It can export a neutral JSON projection or self-contained
-import scripts for IDA and Ghidra, but it does not yet produce PDB, MAP, DWARF, or native
-debugger-database files. Packed binaries, .NET assemblies, other CPU architectures, ELF, Mach-O,
-and richer debugger integration are future analysis milestones.
+other ABI variants remain unsupported. It can export a neutral JSON projection, a bounded
+human-readable Markdown report, or self-contained import scripts for IDA and Ghidra, but it does
+not yet produce PDB, MAP, DWARF, or native debugger-database files. Packed binaries, .NET
+assemblies, other CPU architectures, ELF, Mach-O, and richer debugger integration are future
+analysis milestones.
 
 The core PE/RTTI analysis is offline and never executes the input. Its narrow decoder is included
 in the executable and requires no native library or compiler. Code recovery decodes at most 64 MiB
@@ -103,6 +104,7 @@ resymbol --version
 resymbol analyze path/to/application.exe
 resymbol inspect path/to/application.resym
 resymbol export path/to/application.resym --format json
+resymbol export path/to/application.resym --format markdown
 resymbol export path/to/application.resym --format ida-python
 resymbol export path/to/application.resym --format ghidra-java
 resymbol plugin list
@@ -143,14 +145,18 @@ Export a package to a specific destination with `--output`:
 
 ```console
 resymbol export results/application.resym --format json --output results/application.symbols.json
+resymbol export results/application.resym --format markdown --output results/application.symbols.md
 resymbol export results/application.resym --format ida-python --output results/application_ida.py
 resymbol export results/application.resym --format ghidra-java --output results/ReSymbolImport.java
 ```
 
-Without `--output`, those formats write `application.symbols.json`, `application.ida.py`, and
-`ReSymbolImport_<first-12-binary-sha256>.java` beside the package, respectively. A custom Ghidra
-filename must use a lowercase `.java` extension and a valid conservative Java-identifier stem; the
-generated public class uses that stem.
+Without `--output`, those formats write `application.symbols.json`, `application.symbols.md`,
+`application.ida.py`, and `ReSymbolImport_<first-12-binary-sha256>.java` beside the package,
+respectively. Markdown is a deterministic presentation report for human review, not a stable
+machine-interchange format; use JSON for integrations. Adding Markdown output does not change the
+`.resym` package schema (2) or neutral projection schema (3). A custom Ghidra filename must use a
+lowercase `.java` extension and a valid conservative Java-identifier stem; the generated public
+class uses that stem.
 
 Exports use the same create-new policy as analysis packages and refuse to replace an existing
 file. The generated debugger scripts verify the loaded program's exact SHA-256 before making any
