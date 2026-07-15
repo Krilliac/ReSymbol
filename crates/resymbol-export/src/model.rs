@@ -238,7 +238,7 @@ impl ProjectionWarningCode {
                 "function boundary overlaps a stronger boundary and was omitted"
             }
             Self::AddressKindCollision => {
-                "function and global claims share an RVA; debugger bridges prefer the function"
+                "function and global claims share an RVA; debugger bridges suppress the global only when they emit a function record"
             }
             Self::NameRewritten => "selected name was rewritten to a portable debugger identifier",
             Self::AmbiguousName => {

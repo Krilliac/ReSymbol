@@ -7,10 +7,11 @@ not necessarily behavior implemented in the current checkout.
 The current implementation covers bounded PE32+ x86-64 ingestion, a conservative metadata-derived
 symbol graph, modern MSVC x64 Rev1 RTTI/vftable discovery, canonical JSON `.resym` packages, plugin
 discovery/contracts, and the first trusted external-process analysis runtime. It also includes a
-validated, debugger-neutral export projection and conservative standalone import-script generators
-for IDA and Ghidra. Broader disassembly-assisted discovery, matching, semantic inference,
-interactive debugger bridges, PDB/MAP/DWARF writers, the workbench GUI, and the
-WASM/native/managed execution hosts remain design work.
+validated, debugger-neutral export projection, deterministic Microsoft-linker-style MAP output,
+and conservative standalone import-script generators for IDA and Ghidra. Broader
+disassembly-assisted discovery, matching, semantic inference, interactive debugger bridges,
+PDB/DWARF writers, the workbench GUI, and the WASM/native/managed execution hosts remain design
+work.
 
 ## Goals
 
@@ -186,9 +187,10 @@ provenance where representable, assigns collision-safe output names, and emits s
 when graph information must be reduced or omitted. Writers revalidate that projection before
 serializing it.
 
-The first writers serialize the projection as JSON or generate self-contained IDAPython and Ghidra
-Java import scripts. Each script checks the debugger's recorded input SHA-256 before mutation and
-maps RVAs through the loaded image base, so ordinary rebasing does not weaken exact-build binding.
+The first writers serialize the projection as JSON, render bounded Markdown or
+Microsoft-linker-style MAP text, or generate self-contained IDAPython and Ghidra Java import
+scripts. Each script checks the debugger's recorded input SHA-256 before mutation and maps RVAs
+through the loaded image base, so ordinary rebasing does not weaken exact-build binding.
 The scripts preserve existing IDA user-authored names and Ghidra names from sources other than
 `DEFAULT`/`ANALYSIS`, avoid replacing existing function bodies, and continue after an individual
 symbol cannot be applied. This is intentionally narrower than a long-lived tool-hosted bridge:
@@ -201,9 +203,26 @@ metadata remain JSON-only; no virtual-method names are invented. The
 generated Ghidra Java writer has a documented 20,000-record ceiling so its output stays within
 practical Java/Ghidra compilation bounds.
 
+The MAP writer consumes both the validated neutral projection and its matching PE analysis session
+because the projection intentionally does not duplicate PE section-table detail. It emits one
+group per final PE section, one-based `section:offset` addresses, and
+preferred-image-base-plus-RVA values. Raw section-name bytes unsafe for the whitespace-delimited
+layout are escaped deterministically, and `<resymbol>` identifies synthetic provenance instead of
+inventing source object filenames. Only selected named symbols are candidates; when a selected
+function and global share an RVA, the function wins, while an unnamed function suppresses nothing.
+This is distinct from the mutation-aware IDA/Ghidra rule, where a global is suppressed only when a
+function record is actually emitted.
+
+MAP generation is currently PE-only and rejects a mismatched session/projection pair or a selected
+symbol outside the real PE sections. It validates at most 262,144 selected function/global
+candidates before same-RVA reduction and limits the complete output to 64 MiB. Conventional
+semicolon comments retain the exact SHA-256 and file size, but Microsoft does not document those
+comments as MAP fields and the text cannot enforce binary identity when consumed. This writer adds
+no package or neutral-projection schema fields.
+
 PDB, MAP, DWARF, IDA, Ghidra, and other targets have different capabilities and must not force
-their assumptions into the canonical graph. Native PDB/MAP/DWARF writers and interactive debugger
-bridges remain planned. See [exporting.md](exporting.md) for current behavior.
+their assumptions into the canonical graph. PDB/DWARF writers and interactive debugger bridges
+remain planned. See [exporting.md](exporting.md) for current behavior.
 
 ## Plugin boundary
 

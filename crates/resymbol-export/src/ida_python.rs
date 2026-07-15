@@ -53,7 +53,7 @@ import ida_ua\n\n",
 
     push_checked(&mut output, "FUNCTIONS = (\n")?;
     for (function, accepted_size) in projection.functions.iter().zip(&accepted_sizes) {
-        if function.selected_name.is_none() && accepted_size.is_none() {
+        if !emits_function_record(function, *accepted_size) {
             continue;
         }
         let size = accepted_size.map_or_else(|| "None".to_owned(), |value| format!("0x{value:x}"));
@@ -75,8 +75,7 @@ import ida_ua\n\n",
             .functions
             .binary_search_by_key(&global.rva, |function| function.rva)
             .is_ok_and(|index| {
-                projection.functions[index].selected_name.is_some()
-                    || accepted_sizes[index].is_some()
+                emits_function_record(&projection.functions[index], accepted_sizes[index])
             })
         {
             continue;
@@ -233,6 +232,10 @@ if __name__ == "__main__":
     )?;
 
     Ok(output)
+}
+
+fn emits_function_record(function: &ExportFunction, accepted_size: Option<u64>) -> bool {
+    function.selected_name.is_some() || accepted_size.is_some()
 }
 
 fn non_overlapping_sizes(functions: &[ExportFunction]) -> Vec<Option<u64>> {
@@ -519,5 +522,45 @@ mod tests {
         let script = render_ida_python(&projection).expect("render");
         assert!(!script.contains("(0x1000, \"global_name\")"));
         assert!(script.contains("(0x1000, 0x20, \"quoted_safe_name\")"));
+    }
+
+    #[test]
+    fn entry_only_function_does_not_suppress_same_rva_named_global() {
+        let mut projection = projection();
+        projection.functions[0] = ExportFunction {
+            rva: 0x1000,
+            entry_attribution: Some(attribution()),
+            size: None,
+            size_attribution: None,
+            selected_name: None,
+            alternate_names: Vec::new(),
+            prototypes: Vec::new(),
+            class_memberships: Vec::new(),
+        };
+        projection.globals[0].rva = 0x1000;
+
+        let script = render_ida_python(&projection).expect("render shared-RVA entry evidence");
+        assert!(script.contains("FUNCTIONS = (\n)\n\nGLOBALS = (\n"));
+        assert!(script.contains("    (0x1000, \"global_name\"),"));
+    }
+
+    #[test]
+    fn named_or_sized_function_record_suppresses_same_rva_global() {
+        let mut named = projection();
+        named.functions[0].size = None;
+        named.functions[0].size_attribution = None;
+        named.globals[0].rva = 0x1000;
+
+        let named_script = render_ida_python(&named).expect("render named function collision");
+        assert!(named_script.contains("(0x1000, None, \"quoted_safe_name\")"));
+        assert!(!named_script.contains("(0x1000, \"global_name\")"));
+
+        let mut sized = projection();
+        sized.functions[0].selected_name = None;
+        sized.globals[0].rva = 0x1000;
+
+        let sized_script = render_ida_python(&sized).expect("render sized function collision");
+        assert!(sized_script.contains("(0x1000, 0x20, None)"));
+        assert!(!sized_script.contains("(0x1000, \"global_name\")"));
     }
 }

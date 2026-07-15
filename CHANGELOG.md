@@ -35,6 +35,13 @@ prereleases; breaking changes remain explicit.
   report with binary-identity, summary, function, global, type, string, direct-call,
   data-reference, thunk, and warning sections. Markdown is a presentation format rather than a
   stable interchange contract; neutral JSON remains the machine-consumable artifact.
+- Added `resymbol export PACKAGE --format map`, a deterministic PE-only
+  Microsoft-linker-style text writer for tools that support that layout. It emits selected named
+  functions and globals as one-based PE `section:offset` and preferred-image-base-plus-RVA values,
+  uses `<resymbol>` synthetic provenance, escapes unsafe raw section-name bytes, and retains exact
+  SHA-256/file-size identity as informational semicolon comments. The CLI defaults to
+  `application.map`; for a valid UTF-8 package stem, unsupported bytes become `_` and the result is
+  capped at 255 bytes. Non-UTF-8 or otherwise unusable stems use `resymbol_<sha12>`.
 - Added `ResymPackage::try_map_payload` so applications can migrate a payload after validating and
   preserving its package envelope.
 
@@ -47,6 +54,9 @@ prereleases; breaking changes remain explicit.
   string and data-reference arrays to schema 3's entry attribution and control-flow relationships.
 - `resymbol analyze` and `resymbol inspect` report recovered string, data-reference, direct-call,
   and thunk counts plus their applicable partial-recovery status.
+- Address-kind collision diagnostics and both standalone debugger writers now share one
+  mutation-aware rule: a same-RVA global is suppressed only when the writer actually emits a
+  function record. Entry-only function evidence does not become a debugger mutation.
 
 These public-struct field additions are source-breaking for downstream Rust code that constructs or
 destructures the structs directly. ReSymbol is not yet 1.0; downstream users should pin an alpha
@@ -58,6 +68,10 @@ version and validate serialized schema versions independently.
   compatibility paths. It revalidates persisted metadata, plugin runs and claims, binary binding,
   and rebuilds the deterministic base graph; it does not rewrite a legacy package. `inspect --json`
   preserves the validated original representation instead of mislabeling migrated content.
+- Schema 1 plugin claims pass through a closed legacy assertion decoder. Name, prototype,
+  boundary, type-definition, class-membership, and comment claims remain accepted and fully
+  revalidated; post-schema-1 entry, control-flow, string, data-reference, and unknown assertion
+  kinds are rejected under the legacy version label.
 - Schema 1 packages do not contain the original executable bytes, so migration cannot run the new
   recovery passes. Migrated direct-call, thunk, string, and data-reference sets remain unavailable
   and are not evidence that no relationships or literals exist. Schema 2 retains its persisted
@@ -68,6 +82,8 @@ version and validate serialized schema versions independently.
   migration to accept an older schema.
 - Markdown export is presentation-only and does not change either version domain: new analyses
   continue to use package schema 3 and the neutral projection continues to use schema 4.
+- MAP export consumes the current validated session and neutral projection without adding fields to
+  package schema 3 or projection schema 4. PDB output remains planned.
 
 ### Safety and limits
 
@@ -97,3 +113,7 @@ version and validate serialized schema versions independently.
 - Markdown reports retain at most 1,024 rows in each tabular section, truncate projection text to a
   256-byte per-cell budget before escaping, and cannot exceed 16 MiB. Markdown punctuation and
   raw-HTML/entity delimiters are escaped before projection text enters a table.
+- MAP export accepts at most 262,144 selected named function/global candidates before same-RVA
+  reduction and at most 64 MiB of generated text. A selected function wins over a selected global
+  at the same RVA; an unnamed function suppresses nothing. MAP comments cannot enforce exact-binary
+  identity, so consumers must compare the recorded SHA-256 and file size independently.

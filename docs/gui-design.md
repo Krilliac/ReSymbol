@@ -132,9 +132,9 @@ independent reconciliation path. The export surface should show:
 - existing-file/create-new behavior; and
 - a reviewable summary before writing.
 
-IDA/Ghidra script export, and later MAP/PDB export, should differ only in their target capability
-panels. An interactive debugger bridge may add preview and selective application, but it still
-uses the core identity and projection rules.
+IDA/Ghidra script export and the current MAP text export, followed later by PDB export, should
+differ only in their target capability panels. An interactive debugger bridge may add preview and
+selective application, but it still uses the core identity and projection rules.
 
 ## Theme system
 
