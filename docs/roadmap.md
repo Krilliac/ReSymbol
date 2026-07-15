@@ -42,12 +42,15 @@ separation is not an OS sandbox, and interactive binary reads remain reserved ra
 implemented.
 
 The first export checkpoint is implemented as a validated, debugger-neutral projection with
-deterministic JSON output and standalone IDAPython and Ghidra Java import scripts. The scripts bind
-to the exact loaded binary SHA-256, resolve addresses as loaded image base plus RVA, preserve
-user-authored names and existing function bodies, and continue past per-symbol application errors.
-They are deliberately narrower than the planned interactive debugger bridges: prototypes, types,
-alternate names, provenance comments, and richer relationships are retained or diagnosed by the
-projection but are not yet fully applied inside the tools.
+deterministic JSON output, a bounded human-readable Markdown report, and standalone IDAPython and
+Ghidra Java import scripts. Markdown is presentation-only rather than a stable interchange schema;
+JSON remains the machine-consumable artifact. The presentation writer leaves package schema 2 and
+neutral projection schema 3 unchanged. The scripts bind to the exact loaded binary SHA-256, resolve
+addresses as loaded image base plus RVA, preserve user-authored names and existing function bodies,
+and continue past per-symbol application errors. They are deliberately narrower than the planned
+interactive debugger bridges: prototypes, types, alternate names, provenance comments, and richer
+relationships are retained or diagnosed by the projection but are not yet fully applied inside the
+tools.
 
 The neutral projection intentionally retains larger model-validation caps of 262,144 direct calls
 and 65,536 thunks. Those bounds support combined/plugin-produced graphs and are separate from the
@@ -55,7 +58,7 @@ built-in decoder's lower 8,192-call and 4,096-thunk recovery caps.
 
 The remaining Milestone 2 work is deliberately substantial: broader disassembly-assisted candidate
 discovery, strings and data references, indirect control flow and richer call-graph analysis,
-broader RTTI/ABI coverage, an open fixture corpus, reports, benchmarks, and continued
+broader RTTI/ABI coverage, an open fixture corpus, benchmarks, and continued
 malformed-input/resource-limit validation.
 The WASM, native C/C++, managed/.NET, and debugger-hosted execution paths remain future work; their
 contracts and architecture are present, but should not be mistaken for working hosts.
@@ -117,12 +120,13 @@ adversarial obfuscation.
 - Initial MSVC x64 Rev1 RTTI and vftable analysis (bounded modern-layout slice implemented)
 - Portable `.resym` analysis package
 - Deterministic, loss-aware JSON symbol projection
+- Deterministic, bounded Markdown review report
 - Reproducible open-source fixture corpus compiled with and without symbols
 - Boundary, coverage, malformed-input, and resource-limit benchmarks
 
 The PE metadata, x64 exception ingestion, bounded direct-call/thunk recovery, bounded modern MSVC
 x64 Rev1 RTTI/vftable slice, portable package, canonical package encoding, neutral JSON export
-projection, and related CLI portions are implemented. Human-readable reports and the unfinished
+projection, bounded Markdown report, and related CLI portions are implemented. The unfinished
 parts of the bullets describe the remainder of this milestone.
 
 The MVP should be useful without AI, a network connection, Ghidra, or IDA.

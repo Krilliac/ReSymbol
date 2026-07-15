@@ -14,7 +14,8 @@ IDA, Ghidra, debuggers, PDB consumers, and DWARF consumers.
 > [!IMPORTANT]
 > ReSymbol is an early alpha. The PE analyzer and `.resym` format are usable but intentionally
 > narrow. The first external-process plugin runtime is also usable, but it is not an OS sandbox.
-> The initial JSON, IDAPython, and Ghidra Java exporters are usable but deliberately conservative.
+> The initial JSON, Markdown, IDAPython, and Ghidra Java exporters are usable but deliberately
+> conservative.
 > Plugin and data formats may change; PDB, MAP, DWARF, and interactive debugger bridges are not
 > implemented yet.
 
@@ -39,8 +40,9 @@ The current alpha implements and tests an end-to-end, deliberately narrow analys
 - `resymbol analyze`, which writes a portable package, and `resymbol inspect`, which validates and
   summarizes a package or emits its JSON representation;
 - a deterministic, debugger-neutral export projection plus `resymbol export`, which writes the
-  projection as JSON or generates self-contained IDAPython and Ghidra Java import scripts with
-  exact-binary identity gates and RVA-aware rebasing;
+  projection as JSON, renders a bounded human-readable Markdown report, or generates
+  self-contained IDAPython and Ghidra Java import scripts with exact-binary identity gates and
+  RVA-aware rebasing;
 - versioned plugin manifests and health diagnostics for WASM, native, managed, external-process,
   and tool-adapter runtime families;
 - local plugin-directory discovery, manifest and entrypoint validation, API compatibility checks,
@@ -144,6 +146,7 @@ resymbol analyze application.exe
 resymbol inspect application.resym
 resymbol inspect application.resym --json
 resymbol export application.resym --format json
+resymbol export application.resym --format markdown
 resymbol export application.resym --format ida-python
 resymbol export application.resym --format ghidra-java
 resymbol plugin list
@@ -157,7 +160,7 @@ resymbol analyze application.exe --plugin community.example-analyzer
 path. ReSymbol refuses to replace an existing package, so an earlier analysis cannot be lost by
 accident. `inspect` validates the package schema, payload, and embedded binary identity before
 displaying it. `export` also uses create-new writes; use `--output` to choose a destination instead
-of replacing an existing projection or script.
+of replacing an existing projection, report, or script.
 
 New analyses write package schema 2. `inspect` and `export` also accept a schema 1 package by
 migrating its persisted metadata and plugin ledger to a validated current in-memory session and
@@ -171,6 +174,11 @@ MSVC RTTI vftables, unique types, base-class records, and virtual slots. If a fi
 RTTI discovery budget is reached, the corresponding summary prints a `partial` status; the valid
 deterministic prefix remains available and the package records the truncation explicitly.
 
+The Markdown output is a deterministic, bounded presentation report for people to review. It is
+not a stable interchange format; integrations should consume the neutral JSON projection instead.
+Without `--output`, it is written as `application.symbols.md` beside the package. Package schema 2
+and neutral projection schema 3 remain unchanged by this presentation-only format.
+
 The generated IDA and Ghidra scripts verify the exact loaded binary SHA-256 before changing a
 database and calculate addresses from the tool's current image base plus each RVA. They preserve
 existing user-authored names and apply only the first projection subset: selected function/global
@@ -178,8 +186,9 @@ names (including validated vftable global names) and conservative non-overlappin
 boundaries. The neutral JSON projection retains attributed function entries, direct calls, thunks,
 and class-membership relationships, while the current scripts ignore that relationship metadata
 and do not synthesize virtual-method names. See the
-[export guide](docs/exporting.md) for usage, limitations, and in-tool instructions. PDB, MAP,
-DWARF, richer type application, and interactive preview bridges remain roadmap work. See the
+[export guide](docs/exporting.md) for report contents, usage, limitations, and in-tool
+instructions. PDB, MAP, DWARF, richer type application, and interactive preview bridges remain
+roadmap work. See the
 [installation guide](docs/install.md) for portable prerelease archives and source-build steps.
 
 A normal plugin installation is dropping a prebuilt plugin directory into `plugins/`. ReSymbol

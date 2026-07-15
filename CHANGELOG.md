@@ -23,6 +23,10 @@ prereleases; breaking changes remain explicit.
 - Added deterministic control-flow and class-membership projection, including attributed function
   entries, calls, and thunks in neutral JSON. The IDAPython and Ghidra Java writers remain
   conservative and do not install those relationships.
+- Added `resymbol export PACKAGE --format markdown`, a deterministic, bounded human-readable
+  report with binary-identity, summary, function, global, type, direct-call, thunk, and warning
+  sections. Markdown is a presentation format rather than a stable interchange contract; neutral
+  JSON remains the machine-consumable artifact.
 - Added `ResymPackage::try_map_payload` so applications can migrate a payload after validating and
   preserving its package envelope.
 
@@ -53,6 +57,8 @@ version and validate serialized schema versions independently.
 - Package schema 2 and neutral projection schema 3 are independent version domains. Generic package
   readers still require an explicit compatibility range and application-defined payload migration
   to accept an older schema.
+- Markdown export is presentation-only and does not change either version domain: new analyses
+  continue to use package schema 2 and the neutral projection continues to use schema 3.
 
 ### Safety and limits
 
@@ -71,3 +77,6 @@ version and validate serialized schema versions independently.
 - RTTI discovery scans at most 64 MiB of eligible read-only data, retains at most 16 MiB of RTTI
   name text, and applies bounded candidate, vftable, hierarchy, base-record, and virtual-slot
   counts. A function retains at most 4,096 projected class memberships.
+- Markdown reports retain at most 1,024 rows in each tabular section, truncate projection text to a
+  256-byte per-cell budget before escaping, and cannot exceed 16 MiB. Markdown punctuation and
+  raw-HTML/entity delimiters are escaped before projection text enters a table.
