@@ -36,6 +36,8 @@ The current alpha implements and tests an end-to-end, deliberately narrow analys
   import-address-table slots, plus exact supported RIP-relative references into eligible data;
 - bounded recovery of exact NUL-terminated ASCII and UTF-16LE strings from file-backed,
   initialized, readable, non-executable sections, including writable data;
+- a source-available, byte-reproducible MSVC x64 PE fixture pair with and without CodeView metadata,
+  plus an exact hash and semantic oracle covering the implemented Milestone 2 evidence families;
 - conservative symbol-graph generation from exact export names, metadata-backed function
   boundaries, function-entry candidates, direct calls, thunks, recovered strings, and data
   references, with SHA-256 binary identity, evidence, provenance, confidence, and claim validation;
@@ -81,7 +83,8 @@ is a bounded control-flow-guided block sweep, not a general recursive disassembl
 validated x64 exception-range entries, follows supported direct same-range branches with a
 deterministic ordered worklist, and stops a path at returns, terminal or indirect control flow,
 invalid instructions, and ambiguous interior targets. It recognizes supported `E8` direct calls,
-RIP-relative `FF 15` import calls, and seeded `E9`, `EB`, or RIP-relative `FF 25` thunks. The
+RIP-relative `FF 15` import calls, and seeded `E9`, `EB`, or RIP-relative `FF 25` thunks, including
+the redundant `REX.W` prefix emitted by current MSVC for some import calls and thunks. The
 built-in pass discovers at most
 262,144 block starts and retains at most 8,192 direct calls, 32,768 supported RIP-relative data
 references, and 4,096 thunks. These are heuristic-confidence findings: reachable embedded data can

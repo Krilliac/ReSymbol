@@ -85,6 +85,12 @@ function entries and relationships, validated string literals, RTTI type/vftable
 function-to-class relationships from virtual slots become evidence-bearing graph claims. Broader
 candidate discovery and unsupported evidence sources remain planned.
 
+The analyzer is exercised against a checked-in, source-available MSVC x64 fixture pair built with
+and without CodeView metadata. Exact SHA-256 values bind the byte-reproducible PE inputs, while a
+shared semantic oracle covers imports, exports, unwind functions, calls, internal and import
+thunks, ASCII/UTF-16LE strings, data references, and modern RTTI/vftables. The build script checks
+repeat PE determinism and keeps the byte-variable full PDB as a local `target/` artifact.
+
 The x86-64 decoder is a pure-Rust, bounded control-flow-guided block sweep used only over complete
 file-backed executable exception ranges and the first instruction at metadata-backed thunk seeds.
 Each distinct exception range seeds an ordered worklist. Pending supported direct conditional and
@@ -92,7 +98,8 @@ unconditional targets within that same range are dequeued by smallest RVA, while
 fallthrough continues immediately. Returns, terminal or indirect control flow, invalid
 instructions, out-of-range targets, and targets inside a previously decoded instruction stop only
 the affected path. The recorded forms remain `E8` internal calls, RIP-relative `FF 15` calls to
-exact parsed IAT slots, `E9`/`EB` internal thunks, and RIP-relative `FF 25` import thunks. Internal
+exact parsed IAT slots, `E9`/`EB` internal thunks, and RIP-relative `FF 25` import thunks. The exact
+6-byte IAT forms and their redundant 7-byte `REX.W`-prefixed MSVC encodings are both accepted. Internal
 targets covered by known runtime-function metadata are suppressed
 unless their RVA matches a recorded runtime-function begin. Aggregate limits of 64 MiB, 1,000,000
 instructions, 262,144 discovered block starts, 8,192 retained direct calls, 4,096 retained thunks,

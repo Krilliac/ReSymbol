@@ -678,11 +678,16 @@ fn is_modeled_iat_control_flow(
     target_rva: u32,
     import_iat_rvas: &BTreeSet<u32>,
 ) -> bool {
-    let exact_iat_call =
-        instruction.code() == Code::Call_rm64 && raw.len() == 6 && raw.starts_with(&[0xff, 0x15]);
+    let exact_iat_call = instruction.code() == Code::Call_rm64
+        && has_exact_rip_relative_indirect_encoding(raw, 0x15);
     let exact_iat_jump =
-        instruction.code() == Code::Jmp_rm64 && raw.len() == 6 && raw.starts_with(&[0xff, 0x25]);
+        instruction.code() == Code::Jmp_rm64 && has_exact_rip_relative_indirect_encoding(raw, 0x25);
     (exact_iat_call || exact_iat_jump) && import_iat_rvas.contains(&target_rva)
+}
+
+fn has_exact_rip_relative_indirect_encoding(raw: &[u8], modrm: u8) -> bool {
+    matches!(raw, [0xff, actual, _, _, _, _] if *actual == modrm)
+        || matches!(raw, [0x48, 0xff, actual, _, _, _, _] if *actual == modrm)
 }
 
 fn insert_bounded<T: Ord>(records: &mut BTreeSet<T>, value: T, limit: usize) -> bool {
@@ -714,8 +719,7 @@ fn decode_call_target(
         .then_some(PeControlFlowTarget::Function { rva });
     }
     if instruction.code() == Code::Call_rm64
-        && raw.len() == 6
-        && raw.starts_with(&[0xff, 0x15])
+        && has_exact_rip_relative_indirect_encoding(raw, 0x15)
         && instruction.is_ip_rel_memory_operand()
     {
         let iat_rva = va_to_rva(
@@ -752,8 +756,7 @@ fn decode_thunk_target(
         .then_some(PeControlFlowTarget::Function { rva });
     }
     if instruction.code() == Code::Jmp_rm64
-        && raw.len() == 6
-        && raw.starts_with(&[0xff, 0x25])
+        && has_exact_rip_relative_indirect_encoding(raw, 0x25)
         && instruction.is_ip_rel_memory_operand()
     {
         let iat_rva = va_to_rva(
@@ -870,12 +873,12 @@ pub(crate) fn validate_code_recovery(analysis: &PeAnalysis) -> Result<(), Analys
         )?;
         let supported_size = match call.target {
             PeControlFlowTarget::Function { .. } => call.instruction_size == 5,
-            PeControlFlowTarget::ImportIat { .. } => call.instruction_size == 6,
+            PeControlFlowTarget::ImportIat { .. } => matches!(call.instruction_size, 6 | 7),
         };
         if !supported_size {
             return invalid(
                 "direct-call instruction size",
-                "does not match a supported E8 or FF15 encoding",
+                "does not match a supported E8, FF15, or REX.W-prefixed FF15 encoding",
             );
         }
     }
@@ -913,12 +916,12 @@ pub(crate) fn validate_code_recovery(analysis: &PeAnalysis) -> Result<(), Analys
                 }
                 matches!(thunk.instruction_size, 2 | 5)
             }
-            PeControlFlowTarget::ImportIat { .. } => thunk.instruction_size == 6,
+            PeControlFlowTarget::ImportIat { .. } => matches!(thunk.instruction_size, 6 | 7),
         };
         if !supported_size {
             return invalid(
                 "thunk instruction size",
-                "does not match a supported EB, E9, or FF25 encoding",
+                "does not match a supported EB, E9, FF25, or REX.W-prefixed FF25 encoding",
             );
         }
     }

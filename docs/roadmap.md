@@ -138,10 +138,15 @@ separately accepts at most 262,144 selected named function/global candidates and
 PDB export applies the same candidate ceiling before same-RVA reduction and independently bounds
 its logical streams and MSF container.
 
+An initial source-available MSVC x64 fixture corpus is implemented as byte-reproducible symbolized
+and stripped PE inputs plus an exact hash and semantic oracle. It covers imports/exports, unwind
+functions, direct calls, internal and MSVC `REX.W`-prefixed import thunks, ASCII/UTF-16LE strings,
+data references, and modern RTTI/vftables without executing the fixture binaries.
+
 The remaining Milestone 2 work is deliberately substantial: broader disassembly-assisted candidate
 discovery, indirect control flow and richer call-graph analysis, string-reference correlation,
-persisted basic-block modeling, broader RTTI/ABI coverage, an open fixture corpus, benchmarks, and
-continued malformed-input/resource-limit validation.
+persisted basic-block modeling, broader RTTI/ABI coverage, broader compiler/configuration fixtures,
+benchmarks, and continued malformed-input/resource-limit validation.
 The debugger-hosted execution paths remain future work; their contracts and architecture should not
 be mistaken for working hosts.
 
@@ -213,13 +218,14 @@ adversarial obfuscation.
 - Portable `.resym` analysis package
 - Deterministic, loss-aware JSON symbol projection
 - Deterministic, bounded Markdown review report
-- Reproducible open-source fixture corpus compiled with and without symbols
+- Reproducible open-source fixture corpus compiled with and without symbols (initial deterministic
+  MSVC x64 pair and semantic oracle implemented; broader compilers/configurations remain planned)
 - Boundary, coverage, malformed-input, and resource-limit benchmarks
 
 The PE metadata, x64 exception ingestion, bounded string/data-reference/direct-call/thunk recovery,
 bounded modern MSVC x64 RTTI/vftable slice, portable package, canonical package encoding, neutral
-JSON export projection, bounded Markdown report, and related CLI portions are implemented. The
-unfinished parts of the bullets describe the remainder of this milestone.
+JSON export projection, bounded Markdown report, initial MSVC fixture pair, and related CLI portions
+are implemented. The unfinished parts of the bullets describe the remainder of this milestone.
 
 The MVP should be useful without AI, a network connection, Ghidra, or IDA.
 

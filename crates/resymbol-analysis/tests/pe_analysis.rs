@@ -157,6 +157,15 @@ fn put_rip_relative_instruction(bytes: &mut [u8], rva: u32, modrm: u8, target_rv
     bytes[offset + 2..offset + 6].copy_from_slice(&displacement.to_le_bytes());
 }
 
+fn put_rex_w_rip_relative_instruction(bytes: &mut [u8], rva: u32, modrm: u8, target_rva: u32) {
+    let next_rva = rva.checked_add(7).expect("fixture instruction end");
+    let displacement = i64::from(target_rva) - i64::from(next_rva);
+    let displacement = i32::try_from(displacement).expect("fixture RIP displacement");
+    let offset = file_offset(rva);
+    bytes[offset..offset + 3].copy_from_slice(&[0x48, 0xff, modrm]);
+    bytes[offset + 3..offset + 7].copy_from_slice(&displacement.to_le_bytes());
+}
+
 fn code_recovery_fixture() -> Vec<u8> {
     let mut bytes = fixture();
     bytes[file_offset(0x1000)..file_offset(0x1020)].fill(0x90);
@@ -460,6 +469,27 @@ fn rtti_fixture() -> Vec<u8> {
 
     put_rtti_rva_u64(&mut bytes, 0x22c0, RTTI_IMAGE_BASE + 0x2180);
     put_rtti_rva_u64(&mut bytes, 0x22c8, RTTI_IMAGE_BASE + 0x1000);
+    bytes
+}
+
+fn rtti_fixture_with_rex_w_iat_control_flow() -> Vec<u8> {
+    let mut bytes = rtti_fixture();
+    set_directory(&mut bytes, 1, 0x2300, 40);
+
+    put_rtti_rva_u32(&mut bytes, 0x2300, 0x2330);
+    put_rtti_rva_u32(&mut bytes, 0x230c, 0x2350);
+    put_rtti_rva_u32(&mut bytes, 0x2310, 0x2340);
+    put_rtti_rva_u64(&mut bytes, 0x2330, 0x2360);
+    put_rtti_rva_u64(&mut bytes, 0x2340, 0x2360);
+    put_c_string(&mut bytes, rtti_file_offset(0x2350), "KERNEL32.dll");
+    put_u16(&mut bytes, rtti_file_offset(0x2360), 0);
+    put_c_string(&mut bytes, rtti_file_offset(0x2362), "Imported");
+
+    bytes[rtti_file_offset(0x1000)..rtti_file_offset(0x1010)].fill(0x90);
+    put_rex_w_rip_relative_instruction(&mut bytes, 0x1000, 0x15, 0x2340);
+    bytes[rtti_file_offset(0x1007)] = 0xc3;
+    bytes[rtti_file_offset(0x1020)..rtti_file_offset(0x1030)].fill(0x90);
+    put_rex_w_rip_relative_instruction(&mut bytes, 0x1020, 0x25, 0x2340);
     bytes
 }
 
@@ -915,6 +945,67 @@ fn recovers_bounded_direct_calls_and_exact_jump_thunks() {
     let encoded = serde_json::to_string(&analysis).expect("serialize recovered control flow");
     let decoded = serde_json::from_str(&encoded).expect("deserialize recovered control flow");
     assert_eq!(analysis, decoded);
+}
+
+#[test]
+fn recovers_msvc_rex_w_prefixed_import_calls_and_thunks() {
+    let mut bytes = fixture();
+    bytes[file_offset(0x1000)..file_offset(0x1050)].fill(0x90);
+    put_rex_w_rip_relative_instruction(&mut bytes, 0x1000, 0x15, 0x1260);
+    bytes[file_offset(0x1007)] = 0xc3;
+    put_u32(&mut bytes, file_offset(0x1144), 0x1040);
+    put_rex_w_rip_relative_instruction(&mut bytes, 0x1040, 0x25, 0x1268);
+
+    let analysis = analyze_pe(&bytes).expect("valid PE with MSVC import encodings");
+    assert_eq!(
+        analysis.direct_calls,
+        [PeDirectCall {
+            caller_rva: 0x1000,
+            call_site_rva: 0x1000,
+            instruction_size: 7,
+            target: PeControlFlowTarget::ImportIat { iat_rva: 0x1260 },
+        }]
+    );
+    assert_eq!(
+        analysis.thunks,
+        [PeThunk {
+            rva: 0x1040,
+            instruction_size: 7,
+            target: PeControlFlowTarget::ImportIat { iat_rva: 0x1268 },
+        }]
+    );
+
+    let json = serde_json::to_value(&analysis).expect("serialize REX.W recovery");
+    let decoded = serde_json::from_value(json).expect("validate REX.W recovery");
+    assert_eq!(analysis, decoded);
+}
+
+#[test]
+fn rex_w_iat_control_flow_is_not_duplicated_as_data_flow() {
+    let analysis = analyze_pe(&rtti_fixture_with_rex_w_iat_control_flow())
+        .expect("valid PE with an IAT in non-executable data");
+
+    assert_eq!(
+        analysis.direct_calls,
+        [PeDirectCall {
+            caller_rva: 0x1000,
+            call_site_rva: 0x1000,
+            instruction_size: 7,
+            target: PeControlFlowTarget::ImportIat { iat_rva: 0x2340 },
+        }]
+    );
+    assert_eq!(
+        analysis.thunks,
+        [PeThunk {
+            rva: 0x1020,
+            instruction_size: 7,
+            target: PeControlFlowTarget::ImportIat { iat_rva: 0x2340 },
+        }]
+    );
+    assert!(
+        analysis.data_references.is_empty(),
+        "IAT control flow must not be duplicated as data flow"
+    );
 }
 
 #[test]
