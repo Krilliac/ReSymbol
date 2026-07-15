@@ -1,11 +1,12 @@
 use resymbol_core::{
-    BinaryFormat, BinaryId, BinaryIdentity, ClaimProducer, ClaimProvenance, Confidence, Evidence,
-    EvidenceKind, SymbolAssertion, SymbolClaim, SymbolGraph, SymbolSubject, plugin_api::PluginId,
+    BinaryFormat, BinaryId, BinaryIdentity, ClaimProducer, ClaimProvenance, Confidence,
+    ControlFlowTarget, Evidence, EvidenceKind, SymbolAssertion, SymbolClaim, SymbolGraph,
+    SymbolSubject, plugin_api::PluginId,
 };
 use resymbol_export::{
-    ExportError, ExportProducer, ExportProjection, ExportSubject,
-    MAX_CLASS_MEMBERSHIPS_PER_FUNCTION, MAX_NAME_BYTES, MAX_OUTPUT_NAME_BYTES,
-    ProjectionValidationError, ProjectionWarningCode,
+    ExportControlFlowTarget, ExportError, ExportProducer, ExportProjection, ExportSubject,
+    MAX_CLASS_MEMBERSHIPS_PER_FUNCTION, MAX_DIRECT_CALLS, MAX_NAME_BYTES, MAX_OUTPUT_NAME_BYTES,
+    MAX_THUNKS, ProjectionValidationError, ProjectionWarningCode,
 };
 
 fn binary() -> BinaryIdentity {
@@ -104,6 +105,30 @@ fn boundary(rva: u64, size: u64, confidence: f64, core_claim: bool, method: &str
     )
 }
 
+fn function_prototype(
+    rva: u64,
+    declaration: &str,
+    confidence: f64,
+    core_claim: bool,
+) -> SymbolClaim {
+    claim(
+        SymbolSubject::Function {
+            binary: binary().id,
+            rva,
+            size: None,
+        },
+        SymbolAssertion::FunctionPrototype {
+            declaration: declaration.to_owned(),
+        },
+        confidence,
+        if core_claim {
+            core("function-prototype")
+        } else {
+            plugin("function-prototype")
+        },
+    )
+}
+
 fn class_membership(rva: u64, class_name: &str, confidence: f64, core_claim: bool) -> SymbolClaim {
     claim(
         SymbolSubject::Function {
@@ -119,6 +144,66 @@ fn class_membership(rva: u64, class_name: &str, confidence: f64, core_claim: boo
             core("class-membership")
         } else {
             plugin("class-membership")
+        },
+    )
+}
+
+fn function_entry(rva: u64, confidence: f64, core_claim: bool) -> SymbolClaim {
+    claim(
+        SymbolSubject::Function {
+            binary: binary().id,
+            rva,
+            size: None,
+        },
+        SymbolAssertion::FunctionEntry,
+        confidence,
+        if core_claim {
+            core("function-entry")
+        } else {
+            plugin("function-entry")
+        },
+    )
+}
+
+fn direct_call(
+    caller_rva: u64,
+    call_site_rva: u64,
+    target: ControlFlowTarget,
+    confidence: f64,
+    core_claim: bool,
+) -> SymbolClaim {
+    claim(
+        SymbolSubject::Function {
+            binary: binary().id,
+            rva: caller_rva,
+            size: None,
+        },
+        SymbolAssertion::DirectCall {
+            call_site_rva,
+            target,
+        },
+        confidence,
+        if core_claim {
+            core("direct-call")
+        } else {
+            plugin("direct-call")
+        },
+    )
+}
+
+fn thunk(rva: u64, target: ControlFlowTarget, confidence: f64, core_claim: bool) -> SymbolClaim {
+    claim(
+        SymbolSubject::Function {
+            binary: binary().id,
+            rva,
+            size: None,
+        },
+        SymbolAssertion::ThunkTarget { target },
+        confidence,
+        if core_claim {
+            core("thunk")
+        } else {
+            plugin("thunk")
         },
     )
 }
@@ -203,6 +288,357 @@ fn projection_is_stable_across_claim_order_and_core_names_outrank_plugins() {
 }
 
 #[test]
+fn represented_function_assertions_set_the_strongest_entry_attribution() {
+    let projection = project([
+        function_name(0x100, None, "NamedFunction", 0.6, true),
+        function_prototype(0x200, "void PrototypeOnly(void)", 0.9, false),
+        boundary(0x300, 0x20, 0.7, true, "exception-directory"),
+        class_membership(0x400, "demo::ClassOnly", 0.75, true),
+        function_name(0x500, None, "PluginName", 1.0, false),
+        function_prototype(0x500, "void Ranked(void)", 0.5, true),
+        class_membership(0x500, "demo::Ranked", 0.7, true),
+        boundary(0x500, 0x20, 0.8, true, "ranked-boundary"),
+    ]);
+
+    for (rva, method, confidence) in [
+        (0x100, "function-name", 0.6),
+        (0x200, "function-prototype", 0.9),
+        (0x300, "exception-directory", 0.7),
+        (0x400, "class-membership", 0.75),
+        (0x500, "ranked-boundary", 0.8),
+    ] {
+        let attribution = projection
+            .functions
+            .iter()
+            .find(|function| function.rva == rva)
+            .and_then(|function| function.entry_attribution.as_ref())
+            .expect("represented function assertion contributes entry attribution");
+        assert_eq!(attribution.provenance.method, method);
+        assert_eq!(attribution.confidence, confidence);
+    }
+    assert!(matches!(
+        projection
+            .functions
+            .iter()
+            .find(|function| function.rva == 0x500)
+            .and_then(|function| function.entry_attribution.as_ref())
+            .expect("ranked entry attribution")
+            .provenance
+            .producer,
+        ExportProducer::Core { .. }
+    ));
+}
+
+#[test]
+fn mismatched_and_unsupported_function_assertions_do_not_create_entries() {
+    let projection = project([
+        claim(
+            SymbolSubject::Function {
+                binary: binary().id,
+                rva: 0x100,
+                size: Some(0x20),
+            },
+            SymbolAssertion::FunctionBoundary { size: 0x30 },
+            1.0,
+            core("mismatched-boundary"),
+        ),
+        claim(
+            SymbolSubject::Function {
+                binary: binary().id,
+                rva: 0x200,
+                size: None,
+            },
+            SymbolAssertion::TypeDefinition {
+                declaration: "struct WrongSubject {};".to_owned(),
+            },
+            1.0,
+            core("mismatched-type-definition"),
+        ),
+        claim(
+            SymbolSubject::Function {
+                binary: binary().id,
+                rva: 0x300,
+                size: None,
+            },
+            SymbolAssertion::Comment {
+                text: "unsupported comment".to_owned(),
+            },
+            1.0,
+            plugin("comment"),
+        ),
+    ]);
+
+    assert!(projection.functions.is_empty());
+    assert_eq!(
+        projection
+            .warnings
+            .iter()
+            .filter(|warning| warning.code == ProjectionWarningCode::AssertionSubjectMismatch)
+            .map(|warning| warning.occurrences)
+            .sum::<u64>(),
+        2
+    );
+    assert!(projection.warnings.iter().any(|warning| {
+        warning.code == ProjectionWarningCode::UnsupportedAssertion
+            && warning.subject == Some(ExportSubject::Function { rva: 0x300 })
+    }));
+}
+
+#[test]
+fn control_flow_projection_is_canonical_and_keeps_strongest_attribution() {
+    let claims = vec![
+        function_entry(0x100, 1.0, false),
+        function_entry(0x100, 0.6, true),
+        direct_call(
+            0x100,
+            0x120,
+            ControlFlowTarget::ImportIat { iat_rva: 0x900 },
+            0.7,
+            true,
+        ),
+        direct_call(
+            0x100,
+            0x110,
+            ControlFlowTarget::Function { rva: 0x200 },
+            1.0,
+            false,
+        ),
+        direct_call(
+            0x100,
+            0x110,
+            ControlFlowTarget::Function { rva: 0x200 },
+            0.8,
+            true,
+        ),
+        thunk(
+            0x300,
+            ControlFlowTarget::ImportIat { iat_rva: 0x900 },
+            1.0,
+            false,
+        ),
+        thunk(0x300, ControlFlowTarget::Function { rva: 0x200 }, 0.7, true),
+    ];
+
+    let forward = project(claims.clone());
+    let reverse = project(claims.into_iter().rev());
+
+    assert_eq!(forward, reverse);
+    assert_eq!(forward.schema_version, 3);
+    assert_eq!(
+        forward
+            .functions
+            .iter()
+            .map(|function| function.rva)
+            .collect::<Vec<_>>(),
+        [0x100, 0x200, 0x300]
+    );
+    assert!(forward.functions.iter().all(|function| {
+        function.entry_attribution.is_some()
+            && function.size.is_none()
+            && function.selected_name.is_none()
+    }));
+    assert_eq!(forward.direct_calls.len(), 2);
+    assert_eq!(forward.direct_calls[0].call_site_rva, 0x110);
+    assert_eq!(
+        forward.direct_calls[0].target,
+        ExportControlFlowTarget::Function { rva: 0x200 }
+    );
+    assert!(matches!(
+        forward.direct_calls[0].attribution.provenance.producer,
+        ExportProducer::Core { .. }
+    ));
+    assert_eq!(forward.direct_calls[0].attribution.confidence, 0.8);
+    assert_eq!(forward.direct_calls[1].call_site_rva, 0x120);
+    assert_eq!(forward.thunks.len(), 1);
+    assert_eq!(forward.thunks[0].rva, 0x300);
+    assert_eq!(
+        forward.thunks[0].target,
+        ExportControlFlowTarget::Function { rva: 0x200 }
+    );
+    assert!(
+        forward
+            .warnings
+            .iter()
+            .all(|warning| warning.code != ProjectionWarningCode::UnsupportedAssertion)
+    );
+}
+
+#[test]
+fn control_flow_projection_validation_rejects_noncanonical_or_dangling_relations() {
+    let projection = project([
+        direct_call(
+            0x100,
+            0x110,
+            ControlFlowTarget::Function { rva: 0x200 },
+            0.8,
+            true,
+        ),
+        direct_call(
+            0x100,
+            0x120,
+            ControlFlowTarget::ImportIat { iat_rva: 0x900 },
+            0.8,
+            true,
+        ),
+        thunk(0x300, ControlFlowTarget::Function { rva: 0x200 }, 0.8, true),
+    ]);
+
+    let mut unsorted_calls = projection.clone();
+    unsorted_calls.direct_calls.swap(0, 1);
+    assert!(matches!(
+        unsorted_calls.validate(),
+        Err(ProjectionValidationError::UnsortedCollection {
+            collection: "direct_calls"
+        })
+    ));
+
+    let mut old_schema = projection.clone();
+    old_schema.schema_version = 2;
+    assert!(matches!(
+        old_schema.validate(),
+        Err(ProjectionValidationError::InvalidBinaryField {
+            field: "schema_version"
+        })
+    ));
+
+    let mut duplicate_thunk_source = projection.clone();
+    duplicate_thunk_source
+        .thunks
+        .push(duplicate_thunk_source.thunks[0].clone());
+    assert!(matches!(
+        duplicate_thunk_source.validate(),
+        Err(ProjectionValidationError::UnsortedCollection {
+            collection: "thunks"
+        })
+    ));
+
+    let mut dangling_target = projection.clone();
+    dangling_target
+        .functions
+        .retain(|function| function.rva != 0x200);
+    assert!(matches!(
+        dangling_target.validate(),
+        Err(ProjectionValidationError::InvalidBinaryField {
+            field: "control_flow.function_entry"
+        })
+    ));
+
+    let mut missing_entry_attribution = projection.clone();
+    missing_entry_attribution.functions[0].entry_attribution = None;
+    assert!(matches!(
+        missing_entry_attribution.validate(),
+        Err(ProjectionValidationError::InvalidBinaryField {
+            field: "control_flow.function_entry"
+        })
+    ));
+
+    let mut outside_call_site = projection.clone();
+    outside_call_site.direct_calls[1].call_site_rva = 0x2_000;
+    assert!(matches!(
+        outside_call_site.validate(),
+        Err(ProjectionValidationError::AddressOutsideImage { rva: 0x2_000, .. })
+    ));
+
+    let mut before_caller = projection.clone();
+    before_caller.direct_calls[0].call_site_rva = 0x80;
+    assert!(matches!(
+        before_caller.validate(),
+        Err(ProjectionValidationError::InvalidBinaryField {
+            field: "direct_call.call_site"
+        })
+    ));
+
+    let mut outside_known_caller = projection.clone();
+    outside_known_caller.functions[0].size = Some(0x10);
+    outside_known_caller.functions[0].size_attribution =
+        outside_known_caller.functions[0].entry_attribution.clone();
+    assert!(matches!(
+        outside_known_caller.validate(),
+        Err(ProjectionValidationError::InvalidBinaryField {
+            field: "direct_call.call_site"
+        })
+    ));
+
+    let mut outside_iat = projection.clone();
+    outside_iat.direct_calls[1].target = ExportControlFlowTarget::ImportIat { iat_rva: 0x2_000 };
+    assert!(matches!(
+        outside_iat.validate(),
+        Err(ProjectionValidationError::AddressOutsideImage { rva: 0x2_000, .. })
+    ));
+
+    let mut self_thunk = projection;
+    self_thunk.thunks[0].target = ExportControlFlowTarget::Function { rva: 0x300 };
+    assert!(matches!(
+        self_thunk.validate(),
+        Err(ProjectionValidationError::InvalidBinaryField {
+            field: "thunk.target"
+        })
+    ));
+
+    assert_eq!(MAX_DIRECT_CALLS, 262_144);
+    assert_eq!(MAX_THUNKS, 65_536);
+}
+
+#[test]
+fn control_flow_assertions_on_non_functions_warn_as_subject_mismatches() {
+    let projection = project([
+        claim(
+            SymbolSubject::Global {
+                binary: binary().id,
+                rva: 0x100,
+                size: None,
+            },
+            SymbolAssertion::FunctionEntry,
+            0.8,
+            core("mismatched-function-entry"),
+        ),
+        claim(
+            SymbolSubject::Global {
+                binary: binary().id,
+                rva: 0x200,
+                size: None,
+            },
+            SymbolAssertion::DirectCall {
+                call_site_rva: 0x210,
+                target: ControlFlowTarget::Function { rva: 0x300 },
+            },
+            0.8,
+            core("mismatched-direct-call"),
+        ),
+        claim(
+            SymbolSubject::Type {
+                binary: binary().id,
+                key: "type.mismatch".to_owned(),
+            },
+            SymbolAssertion::ThunkTarget {
+                target: ControlFlowTarget::ImportIat { iat_rva: 0x900 },
+            },
+            0.8,
+            core("mismatched-thunk"),
+        ),
+    ]);
+
+    assert!(projection.functions.is_empty());
+    assert!(projection.direct_calls.is_empty());
+    assert!(projection.thunks.is_empty());
+    assert_eq!(
+        projection
+            .warnings
+            .iter()
+            .filter(|warning| warning.code == ProjectionWarningCode::AssertionSubjectMismatch)
+            .map(|warning| warning.occurrences)
+            .sum::<u64>(),
+        3
+    );
+    assert!(
+        projection
+            .warnings
+            .iter()
+            .all(|warning| warning.code != ProjectionWarningCode::UnsupportedAssertion)
+    );
+}
+
+#[test]
 fn function_class_memberships_survive_projection_with_attribution() {
     let projection = project([
         class_membership(0x100, "demo::Base", 1.0, false),
@@ -210,7 +646,7 @@ fn function_class_memberships_survive_projection_with_attribution() {
         class_membership(0x100, "demo::Base", 0.8, true),
     ]);
 
-    assert_eq!(projection.schema_version, 2);
+    assert_eq!(projection.schema_version, 3);
     assert_eq!(projection.functions.len(), 1);
     assert_eq!(
         projection.functions[0]
@@ -559,15 +995,19 @@ fn core_size_outranks_plugin_size_even_when_plugin_confidence_is_higher() {
 }
 
 #[test]
-fn overlapping_weaker_function_boundary_is_omitted() {
+fn overlapping_weaker_function_boundary_loses_size_but_keeps_its_entry() {
     let projection = project([
         boundary(0x100, 0x100, 0.8, true, "exception-directory"),
         boundary(0x180, 0x20, 1.0, false, "model-boundary"),
     ]);
 
-    assert_eq!(projection.functions.len(), 1);
+    assert_eq!(projection.functions.len(), 2);
     assert_eq!(projection.functions[0].rva, 0x100);
     assert_eq!(projection.functions[0].size, Some(0x100));
+    assert_eq!(projection.functions[1].rva, 0x180);
+    assert!(projection.functions[1].entry_attribution.is_some());
+    assert_eq!(projection.functions[1].size, None);
+    assert!(projection.functions[1].selected_name.is_none());
     assert!(projection.warnings.iter().any(|warning| {
         warning.code == ProjectionWarningCode::OverlappingFunctionRange
             && warning.subject == Some(ExportSubject::Function { rva: 0x180 })

@@ -313,8 +313,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        AttributedText, ExportAttribution, ExportBinary, ExportBinaryFormat, ExportGlobal,
-        ExportName, ExportProducer, ExportProvenance,
+        AttributedText, ExportAttribution, ExportBinary, ExportBinaryFormat,
+        ExportControlFlowTarget, ExportDirectCall, ExportGlobal, ExportName, ExportProducer,
+        ExportProvenance, ExportThunk,
     };
 
     fn attribution() -> ExportAttribution {
@@ -348,7 +349,7 @@ mod tests {
 
     fn projection() -> ExportProjection {
         ExportProjection {
-            schema_version: 2,
+            schema_version: 3,
             binary: ExportBinary {
                 id: BinaryId::from_sha256("11".repeat(32)).expect("test digest"),
                 file_size: 0x3000,
@@ -359,6 +360,7 @@ mod tests {
             },
             functions: vec![ExportFunction {
                 rva: 0x1000,
+                entry_attribution: None,
                 size: Some(0x20),
                 size_attribution: Some(attribution()),
                 selected_name: Some(name("quoted_\"_slash_\\_snowman_☃")),
@@ -377,6 +379,8 @@ mod tests {
                 alternate_names: Vec::new(),
             }],
             types: Vec::new(),
+            direct_calls: Vec::new(),
+            thunks: Vec::new(),
             warnings: Vec::new(),
         }
     }
@@ -417,6 +421,7 @@ mod tests {
         let functions = vec![
             ExportFunction {
                 rva: 0x100,
+                entry_attribution: None,
                 size: Some(0x100),
                 size_attribution: Some(attribution()),
                 selected_name: None,
@@ -426,6 +431,7 @@ mod tests {
             },
             ExportFunction {
                 rva: 0x180,
+                entry_attribution: None,
                 size: Some(0x10),
                 size_attribution: Some(attribution()),
                 selected_name: None,
@@ -435,6 +441,7 @@ mod tests {
             },
             ExportFunction {
                 rva: 0x300,
+                entry_attribution: None,
                 size: Some(0x10),
                 size_attribution: Some(attribution()),
                 selected_name: None,
@@ -456,6 +463,50 @@ mod tests {
             render_ida_python(&projection).expect("first"),
             render_ida_python(&projection).expect("second")
         );
+    }
+
+    #[test]
+    fn entry_only_functions_and_relationships_emit_no_mutation_records() {
+        let mut projection = projection();
+        projection.functions = vec![
+            ExportFunction {
+                rva: 0x3000,
+                entry_attribution: Some(attribution()),
+                size: None,
+                size_attribution: None,
+                selected_name: None,
+                alternate_names: Vec::new(),
+                prototypes: Vec::new(),
+                class_memberships: Vec::new(),
+            },
+            ExportFunction {
+                rva: 0x4000,
+                entry_attribution: Some(attribution()),
+                size: None,
+                size_attribution: None,
+                selected_name: None,
+                alternate_names: Vec::new(),
+                prototypes: Vec::new(),
+                class_memberships: Vec::new(),
+            },
+        ];
+        projection.globals.clear();
+        projection.direct_calls = vec![ExportDirectCall {
+            caller_rva: 0x3000,
+            call_site_rva: 0x3004,
+            target: ExportControlFlowTarget::Function { rva: 0x4000 },
+            attribution: attribution(),
+        }];
+        projection.thunks = vec![ExportThunk {
+            rva: 0x4000,
+            target: ExportControlFlowTarget::ImportIat { iat_rva: 0x2000 },
+            attribution: attribution(),
+        }];
+
+        let script = render_ida_python(&projection).expect("render entry-only projection");
+        assert!(script.contains("FUNCTIONS = (\n)\n\nGLOBALS = (\n)"));
+        assert!(!script.contains("    (0x3000,"));
+        assert!(!script.contains("    (0x4000,"));
     }
 
     #[test]

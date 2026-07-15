@@ -5,14 +5,16 @@ use std::{
 };
 
 use resymbol_core::{
-    BinaryFormat, BinaryId, BinaryIdentity, ClaimProducer, ClaimProvenance, Confidence, Evidence,
-    EvidenceKind, SymbolAssertion, SymbolClaim, SymbolGraph, SymbolSubject,
+    BinaryFormat, BinaryId, BinaryIdentity, ClaimProducer, ClaimProvenance, Confidence,
+    ControlFlowTarget, Evidence, EvidenceKind, SymbolAssertion, SymbolClaim, SymbolGraph,
+    SymbolSubject,
 };
 
 use crate::{
     AnalysisError, CoffHeader, DataDirectory, ImportTarget, MsvcRttiVftable, PeAnalysis,
-    PeDataDirectories, PeExport, PeExportName, PeImport, PeImportLibrary, PeSection,
-    RuntimeFunction,
+    PeControlFlowTarget, PeDataDirectories, PeDirectCall, PeExport, PeExportName, PeImport,
+    PeImportLibrary, PeSection, PeThunk, RuntimeFunction,
+    code_recovery::{CodeRecoveryInput, recover_code, validate_code_recovery},
     msvc_rtti::{parse_msvc_rtti, validate_msvc_rtti},
 };
 
@@ -54,6 +56,19 @@ const EXPORT_DIRECTORY_INDEX: usize = 0;
 const IMPORT_DIRECTORY_INDEX: usize = 1;
 const EXCEPTION_DIRECTORY_INDEX: usize = 3;
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum RecoveredEntrySource {
+    DirectCall {
+        caller_rva: u32,
+        call_site_rva: u32,
+        instruction_size: u8,
+    },
+    Thunk {
+        source_rva: u32,
+        instruction_size: u8,
+    },
+}
+
 struct ParsedHeaders {
     pe_header_offset: u32,
     coff: CoffHeader,
@@ -67,6 +82,17 @@ struct ParsedHeaders {
     dll_characteristics: u16,
     directories: PeDataDirectories,
     sections: Vec<PeSection>,
+}
+
+pub(crate) struct SymbolGraphInput<'a> {
+    pub identity: &'a BinaryIdentity,
+    pub entry_point_rva: u32,
+    pub sections: &'a [PeSection],
+    pub exports: &'a [PeExport],
+    pub runtime_functions: &'a [RuntimeFunction],
+    pub direct_calls: &'a [PeDirectCall],
+    pub thunks: &'a [PeThunk],
+    pub msvc_rtti_vftables: &'a [MsvcRttiVftable],
 }
 
 /// Parse a PE32+ x86-64 image without loading or executing it.
@@ -94,6 +120,17 @@ pub fn analyze_pe(bytes: &[u8]) -> Result<PeAnalysis, AnalysisError> {
         headers.image_base,
         headers.size_of_image,
     )?;
+    let code_recovery = recover_code(CodeRecoveryInput {
+        mapper: &mapper,
+        image_base: headers.image_base,
+        size_of_image: headers.size_of_image,
+        entry_point_rva: headers.entry_point_rva,
+        sections: &headers.sections,
+        imports: &imports,
+        exports: &exports,
+        runtime_functions: &runtime_functions,
+        msvc_rtti_vftables: &msvc_rtti_vftables,
+    });
 
     let identity = BinaryIdentity {
         id: BinaryId::digest(bytes),
@@ -103,13 +140,16 @@ pub fn analyze_pe(bytes: &[u8]) -> Result<PeAnalysis, AnalysisError> {
         architecture: "x86_64".to_owned(),
         image_base: headers.image_base,
     };
-    let symbol_graph = build_symbol_graph(
-        &identity,
-        &headers.sections,
-        &exports,
-        &runtime_functions,
-        &msvc_rtti_vftables,
-    )?;
+    let symbol_graph = build_symbol_graph(SymbolGraphInput {
+        identity: &identity,
+        entry_point_rva: headers.entry_point_rva,
+        sections: &headers.sections,
+        exports: &exports,
+        runtime_functions: &runtime_functions,
+        direct_calls: &code_recovery.direct_calls,
+        thunks: &code_recovery.thunks,
+        msvc_rtti_vftables: &msvc_rtti_vftables,
+    })?;
 
     let analysis = PeAnalysis {
         identity,
@@ -128,6 +168,9 @@ pub fn analyze_pe(bytes: &[u8]) -> Result<PeAnalysis, AnalysisError> {
         export_library_name,
         exports,
         runtime_functions,
+        code_recovery_scan_truncated: code_recovery.scan_truncated,
+        direct_calls: code_recovery.direct_calls,
+        thunks: code_recovery.thunks,
         msvc_rtti_scan_truncated,
         msvc_rtti_vftables,
         symbol_graph,
@@ -614,15 +657,19 @@ pub(crate) fn validate_pe_analysis(analysis: &PeAnalysis) -> Result<(), Analysis
     }
 
     validate_msvc_rtti(analysis)?;
+    validate_code_recovery(analysis)?;
 
     analysis.symbol_graph.validate()?;
-    let rebuilt = build_symbol_graph(
-        &analysis.identity,
-        &analysis.sections,
-        &analysis.exports,
-        &analysis.runtime_functions,
-        &analysis.msvc_rtti_vftables,
-    )?;
+    let rebuilt = build_symbol_graph(SymbolGraphInput {
+        identity: &analysis.identity,
+        entry_point_rva: analysis.entry_point_rva,
+        sections: &analysis.sections,
+        exports: &analysis.exports,
+        runtime_functions: &analysis.runtime_functions,
+        direct_calls: &analysis.direct_calls,
+        thunks: &analysis.thunks,
+        msvc_rtti_vftables: &analysis.msvc_rtti_vftables,
+    })?;
     if !symbol_graph_semantically_matches(&rebuilt, &analysis.symbol_graph) {
         return invalid_field(
             "symbol graph",
@@ -1421,20 +1468,32 @@ fn parse_runtime_functions(
 }
 
 pub(crate) fn build_symbol_graph(
-    identity: &BinaryIdentity,
-    sections: &[PeSection],
-    exports: &[PeExport],
-    runtime_functions: &[RuntimeFunction],
-    msvc_rtti_vftables: &[MsvcRttiVftable],
+    input: SymbolGraphInput<'_>,
 ) -> Result<SymbolGraph, AnalysisError> {
+    let SymbolGraphInput {
+        identity,
+        entry_point_rva,
+        sections,
+        exports,
+        runtime_functions,
+        direct_calls,
+        thunks,
+        msvc_rtti_vftables,
+    } = input;
     let mut graph = SymbolGraph::default();
     let _ = graph.insert_binary(identity.clone())?;
     let exact_metadata_confidence = Confidence::new(1.0)?;
     let export_subject_confidence = Confidence::new(0.99)?;
     let runtime_boundary_confidence = Confidence::new(0.99)?;
+    let entry_point_confidence = Confidence::new(0.99)?;
+    let function_candidate_confidence = Confidence::new(0.95)?;
+    let direct_call_confidence = Confidence::new(0.90)?;
+    let recovered_target_confidence = Confidence::new(0.85)?;
+    let thunk_confidence = Confidence::new(0.95)?;
     let rtti_vftable_confidence = Confidence::new(0.99)?;
     let rtti_slot_confidence = Confidence::new(0.95)?;
     let metadata_kind = EvidenceKind::new(EvidenceKind::METADATA)?;
+    let control_flow_kind = EvidenceKind::new(EvidenceKind::CONTROL_FLOW)?;
     let provenance = |method: &str| ClaimProvenance {
         producer: ClaimProducer::Core {
             component: "resymbol-analysis".to_owned(),
@@ -1469,9 +1528,6 @@ pub(crate) fn build_symbol_graph(
         };
         let is_executable = section.characteristics & IMAGE_SCN_MEM_EXECUTE != 0;
         let is_runtime_function_start = runtime_function_starts.contains(&address_rva);
-        if is_executable && !is_runtime_function_start {
-            continue;
-        }
         let mut evidence = Evidence::new(
             metadata_kind.clone(),
             "exact name from the PE export name-pointer table",
@@ -1495,7 +1551,7 @@ pub(crate) fn build_symbol_graph(
                 .artifacts
                 .insert("section_name".to_owned(), section.name.clone());
         }
-        let is_function = is_executable && is_runtime_function_start;
+        let is_function = is_executable;
         let subject_kind = if is_function { "function" } else { "global" };
         evidence
             .artifacts
@@ -1503,7 +1559,11 @@ pub(crate) fn build_symbol_graph(
         evidence.artifacts.insert(
             "classification_basis".to_owned(),
             if is_function {
-                "x64-runtime-function-start"
+                if is_runtime_function_start {
+                    "x64-runtime-function-start"
+                } else {
+                    "executable-local-export"
+                }
             } else {
                 "non-executable-section"
             }
@@ -1530,6 +1590,81 @@ pub(crate) fn build_symbol_graph(
             export_subject_confidence,
             vec![evidence],
             provenance("pe-export-directory"),
+        )?)?;
+    }
+
+    if entry_point_rva != 0 {
+        if let Some((section_index, section)) =
+            file_backed_executable_section_for_rva(identity, entry_point_rva, sections)
+        {
+            let mut evidence = Evidence::new(
+                metadata_kind.clone(),
+                "nonzero file-backed executable address from the PE AddressOfEntryPoint field",
+            )?;
+            evidence.confidence = Some(entry_point_confidence);
+            evidence.artifacts.insert(
+                "entry_point_rva".to_owned(),
+                format!("{entry_point_rva:#x}"),
+            );
+            evidence
+                .artifacts
+                .insert("section_index".to_owned(), section_index.to_string());
+            if !section.name.is_empty() {
+                evidence
+                    .artifacts
+                    .insert("section_name".to_owned(), section.name.clone());
+            }
+            graph.submit_claim(SymbolClaim::new(
+                SymbolSubject::Function {
+                    binary: identity.id.clone(),
+                    rva: u64::from(entry_point_rva),
+                    size: None,
+                },
+                SymbolAssertion::FunctionEntry,
+                entry_point_confidence,
+                vec![evidence],
+                provenance("pe-entry-point"),
+            )?)?;
+        }
+    }
+
+    for export in exports {
+        if export.forwarded_to.is_some() {
+            continue;
+        }
+        let Some(address_rva) = export.address_rva else {
+            continue;
+        };
+        let Some((section_index, section)) = section_for_rva(address_rva, sections) else {
+            continue;
+        };
+        if section.characteristics & IMAGE_SCN_MEM_EXECUTE == 0 {
+            continue;
+        }
+        let mut evidence = Evidence::new(
+            metadata_kind.clone(),
+            "executable function candidate from a local PE export-address-table entry",
+        )?;
+        evidence.confidence = Some(function_candidate_confidence);
+        evidence
+            .artifacts
+            .insert("export_ordinal".to_owned(), export.ordinal.to_string());
+        evidence
+            .artifacts
+            .insert("source_rva".to_owned(), format!("{address_rva:#x}"));
+        evidence
+            .artifacts
+            .insert("section_index".to_owned(), section_index.to_string());
+        graph.submit_claim(SymbolClaim::new(
+            SymbolSubject::Function {
+                binary: identity.id.clone(),
+                rva: u64::from(address_rva),
+                size: None,
+            },
+            SymbolAssertion::FunctionEntry,
+            function_candidate_confidence,
+            vec![evidence],
+            provenance("pe-export-function-candidate"),
         )?)?;
     }
 
@@ -1575,6 +1710,159 @@ pub(crate) fn build_symbol_graph(
             runtime_boundary_confidence,
             vec![evidence],
             provenance("pe-exception-directory"),
+        )?)?;
+    }
+
+    let mut recovered_entry_sources = BTreeMap::<u32, RecoveredEntrySource>::new();
+    for call in direct_calls {
+        let target = core_control_flow_target(&call.target);
+        let mut evidence = Evidence::new(
+            control_flow_kind.clone(),
+            "exact supported x64 call encoding observed during a bounded linear sweep of a file-backed runtime-function range",
+        )?;
+        evidence.confidence = Some(direct_call_confidence);
+        evidence
+            .artifacts
+            .insert("caller_rva".to_owned(), format!("{:#x}", call.caller_rva));
+        evidence.artifacts.insert(
+            "call_site_rva".to_owned(),
+            format!("{:#x}", call.call_site_rva),
+        );
+        evidence.artifacts.insert(
+            "instruction_size".to_owned(),
+            call.instruction_size.to_string(),
+        );
+        evidence
+            .artifacts
+            .insert("target_rva".to_owned(), format!("{:#x}", target.rva()));
+        graph.submit_claim(SymbolClaim::new(
+            SymbolSubject::Function {
+                binary: identity.id.clone(),
+                rva: u64::from(call.caller_rva),
+                size: None,
+            },
+            SymbolAssertion::DirectCall {
+                call_site_rva: u64::from(call.call_site_rva),
+                target,
+            },
+            direct_call_confidence,
+            vec![evidence],
+            provenance("pe-x64-direct-call"),
+        )?)?;
+
+        if let PeControlFlowTarget::Function { rva } = call.target {
+            let source = RecoveredEntrySource::DirectCall {
+                caller_rva: call.caller_rva,
+                call_site_rva: call.call_site_rva,
+                instruction_size: call.instruction_size,
+            };
+            recovered_entry_sources
+                .entry(rva)
+                .and_modify(|retained| *retained = (*retained).min(source))
+                .or_insert(source);
+        }
+    }
+
+    for thunk in thunks {
+        let target = core_control_flow_target(&thunk.target);
+        let mut evidence = Evidence::new(
+            control_flow_kind.clone(),
+            "exact unconditional x64 jump in the first instruction of a metadata-seeded executable candidate",
+        )?;
+        evidence.confidence = Some(thunk_confidence);
+        evidence
+            .artifacts
+            .insert("source_rva".to_owned(), format!("{:#x}", thunk.rva));
+        evidence.artifacts.insert(
+            "instruction_size".to_owned(),
+            thunk.instruction_size.to_string(),
+        );
+        evidence
+            .artifacts
+            .insert("target_rva".to_owned(), format!("{:#x}", target.rva()));
+        graph.submit_claim(SymbolClaim::new(
+            SymbolSubject::Function {
+                binary: identity.id.clone(),
+                rva: u64::from(thunk.rva),
+                size: None,
+            },
+            SymbolAssertion::ThunkTarget { target },
+            thunk_confidence,
+            vec![evidence],
+            provenance("pe-x64-jump-thunk"),
+        )?)?;
+
+        if let PeControlFlowTarget::Function { rva } = thunk.target {
+            let source = RecoveredEntrySource::Thunk {
+                source_rva: thunk.rva,
+                instruction_size: thunk.instruction_size,
+            };
+            recovered_entry_sources
+                .entry(rva)
+                .and_modify(|retained| *retained = (*retained).min(source))
+                .or_insert(source);
+        }
+    }
+
+    for (target_rva, source) in recovered_entry_sources {
+        let mut evidence = match source {
+            RecoveredEntrySource::DirectCall {
+                caller_rva,
+                call_site_rva,
+                instruction_size,
+            } => {
+                let mut evidence = Evidence::new(
+                    control_flow_kind.clone(),
+                    "conservative internal function candidate inferred from the deterministic first retained direct-call edge",
+                )?;
+                evidence
+                    .artifacts
+                    .insert("edge_kind".to_owned(), "direct-call".to_owned());
+                evidence
+                    .artifacts
+                    .insert("caller_rva".to_owned(), format!("{caller_rva:#x}"));
+                evidence
+                    .artifacts
+                    .insert("call_site_rva".to_owned(), format!("{call_site_rva:#x}"));
+                evidence
+                    .artifacts
+                    .insert("instruction_size".to_owned(), instruction_size.to_string());
+                evidence
+            }
+            RecoveredEntrySource::Thunk {
+                source_rva,
+                instruction_size,
+            } => {
+                let mut evidence = Evidence::new(
+                    control_flow_kind.clone(),
+                    "conservative internal function candidate inferred from the deterministic first retained seeded-thunk edge",
+                )?;
+                evidence
+                    .artifacts
+                    .insert("edge_kind".to_owned(), "seeded-thunk".to_owned());
+                evidence
+                    .artifacts
+                    .insert("source_rva".to_owned(), format!("{source_rva:#x}"));
+                evidence
+                    .artifacts
+                    .insert("instruction_size".to_owned(), instruction_size.to_string());
+                evidence
+            }
+        };
+        evidence.confidence = Some(recovered_target_confidence);
+        evidence
+            .artifacts
+            .insert("target_rva".to_owned(), format!("{target_rva:#x}"));
+        graph.submit_claim(SymbolClaim::new(
+            SymbolSubject::Function {
+                binary: identity.id.clone(),
+                rva: u64::from(target_rva),
+                size: None,
+            },
+            SymbolAssertion::FunctionEntry,
+            recovered_target_confidence,
+            vec![evidence],
+            provenance("pe-x64-recovered-function-target"),
         )?)?;
     }
 
@@ -1693,6 +1981,17 @@ pub(crate) fn build_symbol_graph(
     Ok(graph)
 }
 
+fn core_control_flow_target(target: &PeControlFlowTarget) -> ControlFlowTarget {
+    match *target {
+        PeControlFlowTarget::Function { rva } => ControlFlowTarget::Function {
+            rva: u64::from(rva),
+        },
+        PeControlFlowTarget::ImportIat { iat_rva } => ControlFlowTarget::ImportIat {
+            iat_rva: u64::from(iat_rva),
+        },
+    }
+}
+
 fn rtti_vftable_name(vftable: &MsvcRttiVftable) -> String {
     if vftable.offset == 0 && vftable.constructor_displacement_offset == 0 {
         format!("{}::vftable", vftable.class_name)
@@ -1706,6 +2005,23 @@ fn rtti_vftable_name(vftable: &MsvcRttiVftable) -> String {
         }
         name
     }
+}
+
+fn file_backed_executable_section_for_rva<'a>(
+    identity: &BinaryIdentity,
+    rva: u32,
+    sections: &'a [PeSection],
+) -> Option<(usize, &'a PeSection)> {
+    let (section_index, section) = section_for_rva(rva, sections)?;
+    if section.characteristics & IMAGE_SCN_MEM_EXECUTE == 0 {
+        return None;
+    }
+    let delta = rva.checked_sub(section.virtual_address)?;
+    if delta >= section.raw_data_size {
+        return None;
+    }
+    let file_offset = u64::from(section.raw_data_offset).checked_add(u64::from(delta))?;
+    (file_offset < identity.size).then_some((section_index, section))
 }
 
 pub(crate) fn section_for_rva(rva: u32, sections: &[PeSection]) -> Option<(usize, &PeSection)> {
@@ -1789,7 +2105,21 @@ impl<'a> RvaMap<'a> {
         self.offset(rva, size, "file-backed RVA check").is_ok()
     }
 
-    fn contiguous_bytes(&self, rva: u32, context: &'static str) -> Result<&'a [u8], AnalysisError> {
+    pub(crate) fn bytes(
+        &self,
+        rva: u32,
+        size: usize,
+        context: &'static str,
+    ) -> Result<&'a [u8], AnalysisError> {
+        let offset = self.offset(rva, size, context)?;
+        ensure_slice(self.bytes, offset, size, context)
+    }
+
+    pub(crate) fn contiguous_bytes(
+        &self,
+        rva: u32,
+        context: &'static str,
+    ) -> Result<&'a [u8], AnalysisError> {
         if rva < self.size_of_headers {
             let offset = usize::try_from(rva)
                 .map_err(|_| AnalysisError::IntegerConversion("header string RVA"))?;

@@ -4,8 +4,8 @@ use resymbol_core::BinaryId;
 use serde::Serialize;
 
 use crate::{
-    MAX_CLASS_MEMBERSHIPS_PER_FUNCTION, MAX_DECLARATION_BYTES, MAX_NAME_BYTES,
-    MAX_OUTPUT_NAME_BYTES, MAX_PROVENANCE_TEXT_BYTES, MAX_TYPE_KEY_BYTES,
+    MAX_CLASS_MEMBERSHIPS_PER_FUNCTION, MAX_DECLARATION_BYTES, MAX_DIRECT_CALLS, MAX_NAME_BYTES,
+    MAX_OUTPUT_NAME_BYTES, MAX_PROVENANCE_TEXT_BYTES, MAX_THUNKS, MAX_TYPE_KEY_BYTES,
     ProjectionValidationError,
 };
 
@@ -83,6 +83,9 @@ pub struct ExportName {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ExportFunction {
     pub rva: u64,
+    /// Strongest successfully represented claim establishing that this RVA is
+    /// a function entry, without implying a name or recoverable extent.
+    pub entry_attribution: Option<ExportAttribution>,
     pub size: Option<u64>,
     pub size_attribution: Option<ExportAttribution>,
     pub selected_name: Option<ExportName>,
@@ -93,6 +96,32 @@ pub struct ExportFunction {
     /// Debugger-specific writers may ignore this relationship when their
     /// target format cannot represent it without inventing extra symbols.
     pub class_memberships: Vec<AttributedText>,
+}
+
+/// Address target retained for a direct call or thunk relationship.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum ExportControlFlowTarget {
+    Function { rva: u64 },
+    ImportIat { iat_rva: u64 },
+}
+
+/// One attributed direct-call relationship in the binary image.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ExportDirectCall {
+    pub caller_rva: u64,
+    pub call_site_rva: u64,
+    pub target: ExportControlFlowTarget,
+    pub attribution: ExportAttribution,
+}
+
+/// One attributed function thunk and its selected target.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ExportThunk {
+    pub rva: u64,
+    pub target: ExportControlFlowTarget,
+    pub attribution: ExportAttribution,
 }
 
 /// A global projected at one relative virtual address.
@@ -203,11 +232,13 @@ pub struct ExportProjection {
     pub functions: Vec<ExportFunction>,
     pub globals: Vec<ExportGlobal>,
     pub types: Vec<ExportType>,
+    pub direct_calls: Vec<ExportDirectCall>,
+    pub thunks: Vec<ExportThunk>,
     pub warnings: Vec<ProjectionWarning>,
 }
 
 impl ExportProjection {
-    pub(crate) const SCHEMA_VERSION: u32 = 2;
+    pub(crate) const SCHEMA_VERSION: u32 = 3;
 
     /// Revalidate ordering, range, text, attribution, and uniqueness invariants.
     pub fn validate(&self) -> Result<(), ProjectionValidationError> {
@@ -232,6 +263,16 @@ impl ExportProjection {
                 collection: "warnings",
             });
         }
+        if self.direct_calls.len() > MAX_DIRECT_CALLS {
+            return Err(ProjectionValidationError::CollectionLimit {
+                collection: "direct_calls",
+            });
+        }
+        if self.thunks.len() > MAX_THUNKS {
+            return Err(ProjectionValidationError::CollectionLimit {
+                collection: "thunks",
+            });
+        }
 
         if !strictly_increasing_by(&self.functions, |left, right| left.rva < right.rva) {
             return Err(ProjectionValidationError::UnsortedCollection {
@@ -254,6 +295,9 @@ impl ExportProjection {
         let mut output_names = BTreeSet::new();
         for function in &self.functions {
             validate_range(function.rva, function.size, self.binary.image_size)?;
+            if let Some(attribution) = &function.entry_attribution {
+                validate_attribution(attribution)?;
+            }
             validate_entity_names(
                 function.selected_name.as_ref(),
                 &function.alternate_names,
@@ -310,6 +354,58 @@ impl ExportProjection {
             )?;
         }
 
+        if self
+            .direct_calls
+            .windows(2)
+            .any(|pair| direct_call_key(&pair[0]) >= direct_call_key(&pair[1]))
+        {
+            return Err(ProjectionValidationError::UnsortedCollection {
+                collection: "direct_calls",
+            });
+        }
+        for call in &self.direct_calls {
+            validate_point(call.caller_rva, self.binary.image_size)?;
+            validate_point(call.call_site_rva, self.binary.image_size)?;
+            let caller = require_function_entry(&self.functions, call.caller_rva)?;
+            let site_outside_caller = call.call_site_rva < call.caller_rva
+                || caller.size.is_some_and(|size| {
+                    call.caller_rva
+                        .checked_add(size)
+                        .is_none_or(|end| call.call_site_rva >= end)
+                });
+            if site_outside_caller {
+                return Err(ProjectionValidationError::InvalidBinaryField {
+                    field: "direct_call.call_site",
+                });
+            }
+            validate_control_flow_target(&self.functions, &call.target, &self.binary)?;
+            validate_attribution(&call.attribution)?;
+        }
+
+        if self
+            .thunks
+            .windows(2)
+            .any(|pair| pair[0].rva >= pair[1].rva)
+        {
+            return Err(ProjectionValidationError::UnsortedCollection {
+                collection: "thunks",
+            });
+        }
+        for thunk in &self.thunks {
+            validate_point(thunk.rva, self.binary.image_size)?;
+            require_function_entry(&self.functions, thunk.rva)?;
+            validate_control_flow_target(&self.functions, &thunk.target, &self.binary)?;
+            if matches!(
+                thunk.target,
+                ExportControlFlowTarget::Function { rva } if rva == thunk.rva
+            ) {
+                return Err(ProjectionValidationError::InvalidBinaryField {
+                    field: "thunk.target",
+                });
+            }
+            validate_attribution(&thunk.attribution)?;
+        }
+
         if self.warnings.windows(2).any(|pair| pair[0] >= pair[1]) {
             return Err(ProjectionValidationError::UnsortedWarnings);
         }
@@ -332,6 +428,46 @@ impl ExportProjection {
             }
         }
         Ok(())
+    }
+}
+
+fn direct_call_key(call: &ExportDirectCall) -> (u64, u64, &ExportControlFlowTarget) {
+    (call.caller_rva, call.call_site_rva, &call.target)
+}
+
+fn validate_point(rva: u64, image_size: u64) -> Result<(), ProjectionValidationError> {
+    validate_range(rva, None, image_size)
+}
+
+fn require_function_entry(
+    functions: &[ExportFunction],
+    rva: u64,
+) -> Result<&ExportFunction, ProjectionValidationError> {
+    let function = functions
+        .binary_search_by_key(&rva, |function| function.rva)
+        .ok()
+        .and_then(|index| functions.get(index));
+    let Some(function) = function.filter(|function| function.entry_attribution.is_some()) else {
+        return Err(ProjectionValidationError::InvalidBinaryField {
+            field: "control_flow.function_entry",
+        });
+    };
+    Ok(function)
+}
+
+fn validate_control_flow_target(
+    functions: &[ExportFunction],
+    target: &ExportControlFlowTarget,
+    binary: &ExportBinary,
+) -> Result<(), ProjectionValidationError> {
+    match target {
+        ExportControlFlowTarget::Function { rva } => {
+            validate_point(*rva, binary.image_size)?;
+            require_function_entry(functions, *rva).map(|_| ())
+        }
+        ExportControlFlowTarget::ImportIat { iat_rva } => {
+            validate_point(*iat_rva, binary.image_size)
+        }
     }
 }
 

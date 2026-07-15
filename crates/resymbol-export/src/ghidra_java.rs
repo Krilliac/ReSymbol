@@ -555,8 +555,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        AttributedText, ExportAttribution, ExportBinary, ExportBinaryFormat, ExportGlobal,
-        ExportName, ExportProducer, ExportProvenance,
+        AttributedText, ExportAttribution, ExportBinary, ExportBinaryFormat,
+        ExportControlFlowTarget, ExportDirectCall, ExportGlobal, ExportName, ExportProducer,
+        ExportProvenance, ExportThunk,
     };
 
     fn attribution() -> ExportAttribution {
@@ -590,7 +591,7 @@ mod tests {
 
     fn projection() -> ExportProjection {
         ExportProjection {
-            schema_version: 2,
+            schema_version: 3,
             binary: ExportBinary {
                 id: BinaryId::from_sha256("22".repeat(32)).expect("test digest"),
                 file_size: 0x3000,
@@ -601,6 +602,7 @@ mod tests {
             },
             functions: vec![ExportFunction {
                 rva: 0x1000,
+                entry_attribution: None,
                 size: Some(0x20),
                 size_attribution: Some(attribution()),
                 selected_name: Some(name("quoted_\"_slash_\\_snowman_☃")),
@@ -619,6 +621,8 @@ mod tests {
                 alternate_names: Vec::new(),
             }],
             types: Vec::new(),
+            direct_calls: Vec::new(),
+            thunks: Vec::new(),
             warnings: Vec::new(),
         }
     }
@@ -676,6 +680,51 @@ mod tests {
     }
 
     #[test]
+    fn entry_only_functions_and_relationships_emit_no_mutation_records() {
+        let mut projection = projection();
+        projection.functions = vec![
+            ExportFunction {
+                rva: 0x3000,
+                entry_attribution: Some(attribution()),
+                size: None,
+                size_attribution: None,
+                selected_name: None,
+                alternate_names: Vec::new(),
+                prototypes: Vec::new(),
+                class_memberships: Vec::new(),
+            },
+            ExportFunction {
+                rva: 0x4000,
+                entry_attribution: Some(attribution()),
+                size: None,
+                size_attribution: None,
+                selected_name: None,
+                alternate_names: Vec::new(),
+                prototypes: Vec::new(),
+                class_memberships: Vec::new(),
+            },
+        ];
+        projection.globals.clear();
+        projection.direct_calls = vec![ExportDirectCall {
+            caller_rva: 0x3000,
+            call_site_rva: 0x3004,
+            target: ExportControlFlowTarget::Function { rva: 0x4000 },
+            attribution: attribution(),
+        }];
+        projection.thunks = vec![ExportThunk {
+            rva: 0x4000,
+            target: ExportControlFlowTarget::ImportIat { iat_rva: 0x2000 },
+            attribution: attribution(),
+        }];
+
+        let script = render_ghidra_java(&projection, "ReSymbolImport")
+            .expect("render entry-only projection");
+        assert!(!script.contains("applyBatch0();"));
+        assert!(!script.contains("3000,"));
+        assert!(!script.contains("4000,"));
+    }
+
+    #[test]
     fn function_wins_when_a_global_shares_its_rva() {
         let mut projection = projection();
         projection.globals[0].rva = projection.functions[0].rva;
@@ -691,6 +740,7 @@ mod tests {
         projection.functions = (0..=MAX_SYMBOL_RECORDS)
             .map(|index| ExportFunction {
                 rva: u64::try_from(index).expect("test index fits u64"),
+                entry_attribution: None,
                 size: Some(1),
                 size_attribution: Some(attribution()),
                 selected_name: None,

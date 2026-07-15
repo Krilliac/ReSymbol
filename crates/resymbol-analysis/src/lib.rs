@@ -4,6 +4,7 @@
 //! binaries, and the PE parser uses checked arithmetic and explicit collection
 //! limits throughout.
 
+mod code_recovery;
 mod error;
 mod msvc_rtti;
 mod pe;
@@ -15,8 +16,8 @@ pub use pe::analyze_pe;
 pub use session::{AnalysisSession, PluginRunRecord, PluginRunStatus, SessionValidationError};
 pub use types::{
     BinaryAnalysis, CoffHeader, DataDirectory, ImportTarget, MsvcRttiBaseClass, MsvcRttiVftable,
-    PeAnalysis, PeDataDirectories, PeExport, PeExportName, PeImport, PeImportLibrary, PeSection,
-    RuntimeFunction,
+    PeAnalysis, PeControlFlowTarget, PeDataDirectories, PeDirectCall, PeExport, PeExportName,
+    PeImport, PeImportLibrary, PeSection, PeThunk, RuntimeFunction,
 };
 
 /// Detect and analyze a supported binary container.

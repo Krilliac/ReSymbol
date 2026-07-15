@@ -870,4 +870,53 @@ mod tests {
             Err(PluginRuntimeError::Protocol { .. })
         ));
     }
+
+    #[test]
+    fn control_flow_claims_use_the_published_wire_shapes() {
+        let subject = serde_json::json!({
+            "kind": "function",
+            "binary": "0000000000000000000000000000000000000000000000000000000000000000",
+            "rva": 4096
+        });
+        let evidence = serde_json::json!([{
+            "kind": "control-flow",
+            "description": "validated test edge"
+        }]);
+        let parse = |claim: Value| {
+            serde_json::from_value::<WireClaim>(serde_json::json!({
+                "subject": subject,
+                "claim": claim,
+                "confidence": 0.8,
+                "evidence": evidence
+            }))
+            .expect("published control-flow claim shape")
+        };
+
+        let entry = parse(serde_json::json!({ "kind": "function-entry" }));
+        assert!(matches!(entry.claim, SymbolAssertion::FunctionEntry));
+
+        let call = parse(serde_json::json!({
+            "kind": "direct-call",
+            "call_site_rva": 4100,
+            "target": { "kind": "import-iat", "iat_rva": 8192 }
+        }));
+        assert!(matches!(
+            call.claim,
+            SymbolAssertion::DirectCall {
+                call_site_rva: 4100,
+                target: resymbol_core::ControlFlowTarget::ImportIat { iat_rva: 8192 },
+            }
+        ));
+
+        let thunk = parse(serde_json::json!({
+            "kind": "thunk-target",
+            "target": { "kind": "function", "rva": 12288 }
+        }));
+        assert!(matches!(
+            thunk.claim,
+            SymbolAssertion::ThunkTarget {
+                target: resymbol_core::ControlFlowTarget::Function { rva: 12288 },
+            }
+        ));
+    }
 }

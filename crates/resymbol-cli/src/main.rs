@@ -8,7 +8,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use resymbol_analysis::{
-    AnalysisSession, BinaryAnalysis, PluginRunRecord, PluginRunStatus, analyze_bytes,
+    AnalysisSession, BinaryAnalysis, PeAnalysis, PluginRunRecord, PluginRunStatus, analyze_bytes,
 };
 use resymbol_core::{
     BinaryId, DiscoveredPlugin, PLUGIN_DISABLED_SENTINEL, PluginDiscoveryOptions, PluginSource,
@@ -21,7 +21,12 @@ use resymbol_core::{
 use resymbol_export::{
     ExportProjection, render_ghidra_java, render_ida_python, validate_ghidra_java_class_name,
 };
-use resymbol_package::{ResymPackage, read_file_bound, write_file_new_bound};
+#[cfg(test)]
+use resymbol_package::read_file_bound;
+use resymbol_package::{
+    CURRENT_SCHEMA_VERSION, DEFAULT_MAX_PACKAGE_BYTES, PackageOptions, ResymPackage,
+    SchemaCompatibility, read_file_with_options, write_file_new_bound,
+};
 use resymbol_plugin_runtime::{
     ExternalProcessHost, ExternalProcessRequest, PluginMethod, PluginRuntimeError, StreamKind,
 };
@@ -225,7 +230,7 @@ fn analyze(args: AnalyzeArgs, safe_mode: bool, plugin_dir: PathBuf) -> Result<()
         .with_context(|| format!("cannot write package {}", output.display()))?;
 
     println!("binary: {}", binary.display());
-    print_session_summary(package.payload())?;
+    print_session_summary(package.payload(), CodeRecoveryAvailability::Recorded)?;
     println!("package: {}", output.display());
     println!("plugin directory: {}", plugin_dir.display());
     println!("safe mode: {safe_mode}");
@@ -262,22 +267,189 @@ fn inspect(args: InspectArgs) -> Result<()> {
         .package
         .canonicalize()
         .with_context(|| format!("cannot open package {}", args.package.display()))?;
-    let package: ResymPackage<AnalysisSession> = read_file_bound(&package_path)
+    let loaded = read_analysis_package(&package_path, args.json)
         .with_context(|| format!("cannot read package {}", package_path.display()))?;
 
     if args.json {
-        let json = serde_json::to_string_pretty(&package)
-            .context("cannot serialize validated package as JSON")?;
+        let json = loaded.to_pretty_inspection_json()?;
         println!("{json}");
         return Ok(());
     }
 
     println!("package: {}", package_path.display());
-    println!("schema: {}", package.schema_version());
-    println!("generator: {}", package.generator_version());
-    print_session_summary(package.payload())?;
+    println!("schema: {}", loaded.package.schema_version());
+    println!("generator: {}", loaded.package.generator_version());
+    print_session_summary(loaded.package.payload(), loaded.code_recovery_availability)?;
 
     Ok(())
+}
+
+fn analysis_package_read_options() -> PackageOptions {
+    let compatibility = SchemaCompatibility::inclusive(1, CURRENT_SCHEMA_VERSION)
+        .expect("the application package compatibility range is valid");
+    PackageOptions::new(DEFAULT_MAX_PACKAGE_BYTES, compatibility)
+        .expect("the application package size limit is non-zero")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodeRecoveryAvailability {
+    Recorded,
+    UnavailableSchema1,
+}
+
+impl CodeRecoveryAvailability {
+    const fn export_summary_line(self) -> Option<&'static str> {
+        match self {
+            Self::Recorded => None,
+            Self::UnavailableSchema1 => Some(
+                "code recovery: unavailable (schema 1 package predates decoder data; reanalyze the exact original binary)",
+            ),
+        }
+    }
+}
+
+struct LoadedAnalysisPackage {
+    package: ResymPackage<AnalysisSession>,
+    code_recovery_availability: CodeRecoveryAvailability,
+    schema1_source: Option<ResymPackage<Value>>,
+}
+
+impl LoadedAnalysisPackage {
+    fn to_pretty_inspection_json(&self) -> Result<String> {
+        match &self.schema1_source {
+            Some(source) => serde_json::to_string_pretty(source)
+                .context("cannot serialize validated schema-v1 package as JSON"),
+            None => serde_json::to_string_pretty(&self.package)
+                .context("cannot serialize validated package as JSON"),
+        }
+    }
+}
+
+fn read_analysis_package(
+    path: &Path,
+    preserve_schema1_source: bool,
+) -> Result<LoadedAnalysisPackage> {
+    let package: ResymPackage<Value> =
+        read_file_with_options(path, analysis_package_read_options())?;
+    let schema_version = package.schema_version();
+    let code_recovery_availability = match schema_version {
+        1 => CodeRecoveryAvailability::UnavailableSchema1,
+        CURRENT_SCHEMA_VERSION => CodeRecoveryAvailability::Recorded,
+        _ => bail!("unsupported analysis package schema {schema_version}"),
+    };
+    let schema1_source = (preserve_schema1_source && schema_version == 1).then(|| package.clone());
+    let package = package.try_map_payload(|payload| match schema_version {
+        1 => serde_json::from_value::<SchemaV1AnalysisSession>(payload)
+            .context("cannot decode schema-v1 analysis payload")?
+            .migrate(),
+        CURRENT_SCHEMA_VERSION => {
+            serde_json::from_value(payload).context("cannot decode current analysis payload")
+        }
+        _ => bail!("unsupported analysis package schema {schema_version}"),
+    })?;
+    package
+        .ensure_payload_binding()
+        .context("package envelope and migrated payload identify different binaries")?;
+    Ok(LoadedAnalysisPackage {
+        package,
+        code_recovery_availability,
+        schema1_source,
+    })
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SchemaV1AnalysisSession {
+    base_analysis: SchemaV1BinaryAnalysis,
+    plugin_runs: Vec<PluginRunRecord>,
+    plugin_claims: Vec<SymbolClaim>,
+}
+
+impl SchemaV1AnalysisSession {
+    fn migrate(self) -> Result<AnalysisSession> {
+        AnalysisSession::new(
+            self.base_analysis.migrate()?,
+            self.plugin_runs,
+            self.plugin_claims,
+        )
+        .context("migrated schema-v1 analysis session is invalid")
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "format", content = "analysis", rename_all = "kebab-case")]
+enum SchemaV1BinaryAnalysis {
+    Pe(SchemaV1PeAnalysis),
+}
+
+impl SchemaV1BinaryAnalysis {
+    fn migrate(self) -> Result<BinaryAnalysis> {
+        match self {
+            Self::Pe(analysis) => analysis.migrate().map(BinaryAnalysis::Pe),
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SchemaV1PeAnalysis {
+    identity: resymbol_core::BinaryIdentity,
+    pe_header_offset: u32,
+    coff: resymbol_analysis::CoffHeader,
+    entry_point_rva: u32,
+    size_of_image: u32,
+    size_of_headers: u32,
+    section_alignment: u32,
+    file_alignment: u32,
+    subsystem: u16,
+    dll_characteristics: u16,
+    directories: resymbol_analysis::PeDataDirectories,
+    sections: Vec<resymbol_analysis::PeSection>,
+    imports: Vec<resymbol_analysis::PeImportLibrary>,
+    export_library_name: Option<String>,
+    exports: Vec<resymbol_analysis::PeExport>,
+    runtime_functions: Vec<resymbol_analysis::RuntimeFunction>,
+    #[serde(default)]
+    msvc_rtti_scan_truncated: bool,
+    #[serde(default)]
+    msvc_rtti_vftables: Vec<resymbol_analysis::MsvcRttiVftable>,
+    symbol_graph: resymbol_core::SymbolGraph,
+}
+
+impl SchemaV1PeAnalysis {
+    fn migrate(self) -> Result<PeAnalysis> {
+        let mut analysis = PeAnalysis {
+            identity: self.identity,
+            pe_header_offset: self.pe_header_offset,
+            coff: self.coff,
+            entry_point_rva: self.entry_point_rva,
+            size_of_image: self.size_of_image,
+            size_of_headers: self.size_of_headers,
+            section_alignment: self.section_alignment,
+            file_alignment: self.file_alignment,
+            subsystem: self.subsystem,
+            dll_characteristics: self.dll_characteristics,
+            directories: self.directories,
+            sections: self.sections,
+            imports: self.imports,
+            export_library_name: self.export_library_name,
+            exports: self.exports,
+            runtime_functions: self.runtime_functions,
+            code_recovery_scan_truncated: false,
+            direct_calls: Vec::new(),
+            thunks: Vec::new(),
+            msvc_rtti_scan_truncated: self.msvc_rtti_scan_truncated,
+            msvc_rtti_vftables: self.msvc_rtti_vftables,
+            symbol_graph: self.symbol_graph,
+        };
+        analysis.symbol_graph = analysis
+            .rebuild_symbol_graph()
+            .context("cannot rebuild claims for a schema-v1 PE analysis")?;
+        analysis
+            .validate()
+            .context("migrated schema-v1 PE analysis is invalid")?;
+        Ok(analysis)
+    }
 }
 
 fn export(args: ExportArgs) -> Result<()> {
@@ -289,9 +461,9 @@ fn export(args: ExportArgs) -> Result<()> {
     let package_path = package
         .canonicalize()
         .with_context(|| format!("cannot open package {}", package.display()))?;
-    let package_data: ResymPackage<AnalysisSession> = read_file_bound(&package_path)
+    let package_data = read_analysis_package(&package_path, false)
         .with_context(|| format!("cannot read package {}", package_path.display()))?;
-    let projection = ExportProjection::from_session(package_data.payload())
+    let projection = ExportProjection::from_session(package_data.package.payload())
         .context("cannot build debugger export projection")?;
     let output = output
         .unwrap_or_else(|| default_export_path(&package, format, projection.binary.id.as_str()));
@@ -331,6 +503,12 @@ fn export(args: ExportArgs) -> Result<()> {
         projection.globals.len(),
         projection.types.len()
     );
+    if let Some(line) = package_data
+        .code_recovery_availability
+        .export_summary_line()
+    {
+        println!("{line}");
+    }
     println!(
         "warnings: {} group(s), {warning_occurrences} occurrence(s)",
         projection.warnings.len()
@@ -890,8 +1068,11 @@ fn default_package_path(binary: &Path) -> PathBuf {
     binary.with_extension("resym")
 }
 
-fn print_session_summary(session: &AnalysisSession) -> Result<()> {
-    print_analysis_summary(session.base_analysis());
+fn print_session_summary(
+    session: &AnalysisSession,
+    code_recovery_availability: CodeRecoveryAvailability,
+) -> Result<()> {
+    print_analysis_summary(session.base_analysis(), code_recovery_availability);
     let succeeded = session
         .plugin_runs()
         .iter()
@@ -929,7 +1110,10 @@ fn print_session_summary(session: &AnalysisSession) -> Result<()> {
     Ok(())
 }
 
-fn print_analysis_summary(analysis: &BinaryAnalysis) {
+fn print_analysis_summary(
+    analysis: &BinaryAnalysis,
+    code_recovery_availability: CodeRecoveryAvailability,
+) {
     let identity = analysis.identity();
     println!("size: {} bytes", identity.size);
     println!("sha256: {}", identity.id);
@@ -992,6 +1176,9 @@ fn print_analysis_summary(analysis: &BinaryAnalysis) {
                 forwarder_count
             );
             println!("runtime functions: {}", pe.runtime_functions.len());
+            for line in code_recovery_summary_lines(pe, code_recovery_availability) {
+                println!("{line}");
+            }
             println!(
                 "MSVC RTTI: {} vftable(s), {rtti_type_count} type(s), {rtti_base_record_count} base record(s), {rtti_slot_count} virtual slot(s)",
                 pe.msvc_rtti_vftables.len()
@@ -1004,6 +1191,29 @@ fn print_analysis_summary(analysis: &BinaryAnalysis) {
     }
 
     println!("base claims: {}", analysis.symbol_graph().claims().len());
+}
+
+fn code_recovery_summary_lines(
+    pe: &resymbol_analysis::PeAnalysis,
+    availability: CodeRecoveryAvailability,
+) -> [String; 3] {
+    match availability {
+        CodeRecoveryAvailability::Recorded => [
+            format!("recovered direct calls: {}", pe.direct_calls.len()),
+            format!("recovered thunks: {}", pe.thunks.len()),
+            if pe.code_recovery_scan_truncated {
+                "code recovery scan: partial (a fixed discovery budget was reached)".to_owned()
+            } else {
+                "code recovery scan: complete".to_owned()
+            },
+        ],
+        CodeRecoveryAvailability::UnavailableSchema1 => [
+            "recovered direct calls: unavailable (not recorded by schema 1)".to_owned(),
+            "recovered thunks: unavailable (not recorded by schema 1)".to_owned(),
+            "code recovery scan: not run (schema 1 package predates decoder data; reanalyze the exact original binary)"
+                .to_owned(),
+        ],
+    }
 }
 
 fn plugins(args: PluginArgs, safe_mode: bool, plugin_dir: PathBuf) -> Result<()> {
@@ -1590,6 +1800,26 @@ mod tests {
         bytes
     }
 
+    fn pe_code_recovery_fixture() -> Vec<u8> {
+        let mut bytes = pe_fixture();
+
+        set_directory(&mut bytes, 3, 0x1300, 24);
+        let exception = file_offset(0x1300);
+        put_u32(&mut bytes, exception + 4, 0x1010);
+        put_u32(&mut bytes, exception + 12, 0x1010);
+        put_u32(&mut bytes, exception + 16, 0x1020);
+        put_u32(&mut bytes, exception + 20, 0x1350);
+
+        let call = file_offset(0x1000);
+        bytes[call] = 0xe8;
+        put_u32(&mut bytes, call + 1, 0x0b);
+
+        let thunk = file_offset(0x1010);
+        bytes[thunk..thunk + 2].copy_from_slice(&[0xff, 0x25]);
+        put_u32(&mut bytes, thunk + 2, 0x24a);
+        bytes
+    }
+
     fn create_plugin(root: &Path, id: &str) -> PathBuf {
         let plugin = root.join("example");
         fs::create_dir(&plugin).expect("create plugin directory");
@@ -1738,6 +1968,58 @@ args = ["--stdio", "literal argument"]
             assert_eq!(args.format, expected);
             assert_eq!(args.output, Some(PathBuf::from("symbols.out")));
         }
+    }
+
+    #[test]
+    fn analysis_summary_reports_code_recovery_counts_and_completion_state() {
+        let mut analysis = analyze_bytes(&pe_code_recovery_fixture()).expect("analyze fixture");
+        let BinaryAnalysis::Pe(pe) = &mut analysis else {
+            panic!("PE analysis expected");
+        };
+        assert_eq!(pe.direct_calls.len(), 1);
+        assert_eq!(pe.thunks.len(), 1);
+        assert_eq!(
+            code_recovery_summary_lines(pe, CodeRecoveryAvailability::Recorded),
+            [
+                "recovered direct calls: 1".to_owned(),
+                "recovered thunks: 1".to_owned(),
+                "code recovery scan: complete".to_owned(),
+            ]
+        );
+
+        pe.code_recovery_scan_truncated = true;
+        assert_eq!(
+            code_recovery_summary_lines(pe, CodeRecoveryAvailability::Recorded)[2],
+            "code recovery scan: partial (a fixed discovery budget was reached)"
+        );
+    }
+
+    #[test]
+    fn schema_v1_summary_reports_code_recovery_as_unavailable() {
+        let analysis = analyze_bytes(&pe_code_recovery_fixture()).expect("analyze fixture");
+        let BinaryAnalysis::Pe(pe) = &analysis else {
+            panic!("PE analysis expected");
+        };
+
+        assert_eq!(
+            code_recovery_summary_lines(pe, CodeRecoveryAvailability::UnavailableSchema1),
+            [
+                "recovered direct calls: unavailable (not recorded by schema 1)".to_owned(),
+                "recovered thunks: unavailable (not recorded by schema 1)".to_owned(),
+                "code recovery scan: not run (schema 1 package predates decoder data; reanalyze the exact original binary)"
+                    .to_owned(),
+            ]
+        );
+        assert_eq!(
+            CodeRecoveryAvailability::UnavailableSchema1.export_summary_line(),
+            Some(
+                "code recovery: unavailable (schema 1 package predates decoder data; reanalyze the exact original binary)"
+            )
+        );
+        assert_eq!(
+            CodeRecoveryAvailability::Recorded.export_summary_line(),
+            None
+        );
     }
 
     #[test]
@@ -1932,7 +2214,7 @@ args = ["--stdio", "literal argument"]
                 .symbol_graph()
                 .claims()
                 .len(),
-            3
+            5
         );
         assert!(package.payload().plugin_runs().is_empty());
         assert!(package.payload().plugin_claims().is_empty());
@@ -1943,7 +2225,7 @@ args = ["--stdio", "literal argument"]
                 .expect("combine session graph")
                 .claims()
                 .len(),
-            3
+            5
         );
 
         let original = fs::read(&output).expect("read original package bytes");
@@ -1974,6 +2256,90 @@ args = ["--stdio", "literal argument"]
             json: true,
         })
         .expect("JSON inspection serializes validated package");
+    }
+
+    #[test]
+    fn inspect_reads_a_schema_v1_package_without_code_recovery_fields() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let path = temp.path().join("prior-schema.resym");
+        let base_analysis = analyze_bytes(&pe_fixture()).expect("analyze PE fixture");
+        let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
+            .expect("create base-only session");
+        let package = ResymPackage::from_bound_payload("0.1.0-alpha.1", session)
+            .expect("create current package value");
+        let mut value = serde_json::to_value(package).expect("serialize package value");
+        value["schema_version"] = serde_json::json!(1);
+        let pe = value
+            .pointer_mut("/payload/base_analysis/analysis")
+            .and_then(Value::as_object_mut)
+            .expect("serialized PE analysis object");
+        pe.remove("code_recovery_scan_truncated");
+        pe.remove("direct_calls");
+        pe.remove("thunks");
+        let claims = pe
+            .get_mut("symbol_graph")
+            .and_then(|graph| graph.get_mut("claims"))
+            .and_then(Value::as_array_mut)
+            .expect("serialized base claims");
+        let current_claim_count = claims.len();
+        claims.retain(|claim| {
+            !matches!(
+                claim.pointer("/assertion/kind").and_then(Value::as_str),
+                Some("function-entry" | "direct-call" | "thunk-target")
+            )
+        });
+        assert_eq!(current_claim_count - claims.len(), 2);
+        fs::write(
+            &path,
+            serde_json::to_vec(&value).expect("encode prior-schema package"),
+        )
+        .expect("write prior-schema package");
+
+        let decoded = read_analysis_package(&path, true)
+            .expect("CLI compatibility policy migrates a genuine schema-v1 payload");
+        assert_eq!(decoded.package.schema_version(), 1);
+        assert_eq!(
+            decoded.code_recovery_availability,
+            CodeRecoveryAvailability::UnavailableSchema1
+        );
+        let BinaryAnalysis::Pe(pe) = decoded.package.payload().base_analysis() else {
+            panic!("PE analysis expected");
+        };
+        assert!(!pe.code_recovery_scan_truncated);
+        assert!(pe.direct_calls.is_empty());
+        assert!(pe.thunks.is_empty());
+        assert_eq!(pe.symbol_graph.claims().len(), current_claim_count);
+
+        let inspected: Value = serde_json::from_str(
+            &decoded
+                .to_pretty_inspection_json()
+                .expect("serialize validated original schema-v1 representation"),
+        )
+        .expect("inspection JSON is valid");
+        assert_eq!(inspected["schema_version"], 1);
+        let inspected_pe = inspected
+            .pointer("/payload/base_analysis/analysis")
+            .and_then(Value::as_object)
+            .expect("schema-v1 PE payload remains an object");
+        assert!(!inspected_pe.contains_key("code_recovery_scan_truncated"));
+        assert!(!inspected_pe.contains_key("direct_calls"));
+        assert!(!inspected_pe.contains_key("thunks"));
+        assert!(
+            inspected_pe["symbol_graph"]["claims"]
+                .as_array()
+                .expect("schema-v1 base claims")
+                .iter()
+                .all(|claim| !matches!(
+                    claim.pointer("/assertion/kind").and_then(Value::as_str),
+                    Some("function-entry" | "direct-call" | "thunk-target")
+                ))
+        );
+
+        inspect(InspectArgs {
+            package: path,
+            json: false,
+        })
+        .expect("CLI inspection accepts the prior package schema");
     }
 
     #[test]
@@ -2011,7 +2377,7 @@ args = ["--stdio", "literal argument"]
                 .expect("combine base-only graph")
                 .claims()
                 .len(),
-            3
+            5
         );
     }
 
