@@ -540,6 +540,9 @@ fn control_flow_target(target: &ExportControlFlowTarget) -> String {
     match target {
         ExportControlFlowTarget::Function { rva } => format!("function {}", hex(*rva)),
         ExportControlFlowTarget::ImportIat { iat_rva } => format!("import IAT {}", hex(*iat_rva)),
+        ExportControlFlowTarget::FunctionPointer { slot_rva, rva } => {
+            format!("function {} via pointer slot {}", hex(*rva), hex(*slot_rva))
+        }
     }
 }
 
@@ -640,7 +643,7 @@ mod tests {
 
     fn empty_projection() -> ExportProjection {
         ExportProjection {
-            schema_version: 5,
+            schema_version: 6,
             binary: ExportBinary {
                 id: BinaryId::from_sha256(
                     "0000000000000000000000000000000000000000000000000000000000000000",

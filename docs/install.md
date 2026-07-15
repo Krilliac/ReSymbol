@@ -16,8 +16,10 @@ names and metadata-backed `RUNTIME_FUNCTION` ranges become evidence-bearing symb
 It also performs a bounded pure-Rust x86-64 control-flow-guided block sweep inside fully file-backed
 exception ranges and checks metadata-backed entry candidates for one-instruction internal or import
 thunks. It follows supported direct same-range branches, stops paths at terminal or indirect flow,
-and retains supported direct calls, RIP-relative data references, and thunks without inventing
-source names, function sizes, or target semantics. A separate bounded pass recovers exact
+and retains supported direct calls, including one-hop exact RIP-relative calls through fully backed
+read-only eight-byte function-pointer slots, RIP-relative data references, and thunks without
+inventing source names or function sizes. Resolved pointer calls preserve both the slot and endpoint
+and retain a paired same-site data reference. A separate bounded pass recovers exact
 NUL-terminated ASCII and UTF-16LE strings from eligible file-backed data.
 The built-in bounded RTTI pass also validates modern MSVC x64 Rev1 type descriptors, class and base
 records, vftables, and executable virtual-slot targets. Recovered class/type names, vftable names,
@@ -177,13 +179,14 @@ unique-type, base-record, and virtual-slot counts. A partial line appears when a
 retention, or aggregate discovery budget was reached; the package preserves the independent flags
 for downstream review.
 
-New analyses write package schema 3. `inspect` and `export` can also open schemas 1 and 2. Schema 1
-is migrated into a validated current in-memory session and its base graph is rebuilt; schema 2 uses
-the current model's validated defaults for fields introduced later. Neither path rewrites the
-legacy package. Because `.resym` does not contain the original executable, compatibility loading
-cannot run missing recovery passes: schema 1 has no direct-call or thunk records, and schemas 1 and
-2 have no string or data-reference records. Analyze the exact original binary again to create a
-schema 3 package with those results.
+New analyses write package schema 4. `inspect` and `export` can also open schemas 1 through 3.
+Schema 1 is migrated into a validated current in-memory session and its base graph is rebuilt;
+schemas 2 and 3 use explicit compatibility paths. None rewrites the legacy package. Because
+`.resym` does not contain the original executable, compatibility loading cannot run missing
+recovery passes: schema 1 has no direct-call or thunk records, schemas 1 and 2 have no string or
+data-reference records, and schemas 2 and 3 have no read-only function-pointer call results.
+Analyze the exact original binary again to create schema 4 with all current results. Relabeling a
+schema-4 pointer target beneath a schema 2 or 3 envelope is rejected.
 
 Export a package to a specific destination with `--output`:
 
@@ -203,14 +206,14 @@ Without `--output`, those formats write `application.symbols.json`, `application
 `application.map`, `application.pdb`, `application.ida.py`, and
 `ReSymbolImport_<first-12-binary-sha256>.java` beside the package, respectively. Markdown is a
 deterministic presentation report for human review, not a stable machine-interchange format; use
-JSON for integrations. New analyses write `.resym` package schema 3; export also accepts package
-schemas 1 and 2 through validated compatibility paths without rewriting them. The current neutral
-projection is schema 5, and MAP/PDB add no schema fields. Schema 5 correlates exact or
+JSON for integrations. New analyses write `.resym` package schema 4; export also accepts package
+schemas 1 through 3 through validated compatibility paths without rewriting them. The current
+neutral projection is schema 6, and MAP/PDB add no schema fields. Schema 5 correlates exact or
 content-interior data-reference targets with retained strings, excluding NUL terminators and
-requiring UTF-16LE code-unit alignment; a missing correlation does not prove the target is not a
-string. A custom Ghidra filename must use a
-lowercase `.java` extension and a valid conservative Java-identifier stem; the generated public
-class uses that stem.
+requiring UTF-16LE code-unit alignment; schema 6 adds explicit function-pointer slot and endpoint
+targets. A missing correlation does not prove the target is not a string. A custom Ghidra filename
+must use a lowercase `.java` extension and a valid conservative Java-identifier stem; the generated
+public class uses that stem.
 
 PDB export must reread the exact original PE because `.resym` intentionally does not contain its
 bytes. The source must match the package's SHA-256/session identity and contain exactly one valid

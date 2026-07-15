@@ -253,6 +253,18 @@ impl AnalysisSession {
                 .ok_or(SessionValidationError::AcceptedClaimCountOverflow)?;
         }
 
+        let pointer_call_companions = self
+            .base_analysis
+            .symbol_graph()
+            .claims()
+            .iter()
+            .chain(&self.plugin_claims)
+            .filter_map(pointer_call_companion_key)
+            .collect::<BTreeSet<_>>();
+        for (index, claim) in self.plugin_claims.iter().enumerate() {
+            validate_pointer_call_companion(index, claim, &pointer_call_companions)?;
+        }
+
         for run in &self.plugin_runs {
             let actual = accepted_counts
                 .get(run.run_id.as_str())
@@ -454,6 +466,24 @@ pub enum SessionValidationError {
         assertion: &'static str,
         iat_rva: u64,
     },
+    #[error(
+        "plugin claim {index} read-only function-pointer slot RVA {slot_rva:#x} collides with a parsed import-IAT slot"
+    )]
+    FunctionPointerSlotIsImportIat { index: usize, slot_rva: u64 },
+    #[error(
+        "plugin claim {index} read-only function-pointer slot is not eight fully backed bytes of read-only initialized non-executable PE data"
+    )]
+    FunctionPointerSlotNotReadOnly { index: usize },
+    #[error(
+        "plugin claim {index} read-only function-pointer target is not backed by executable PE data"
+    )]
+    FunctionPointerTargetNotExecutable { index: usize },
+    #[error(
+        "plugin claim {index} read-only function-pointer call lacks a same-caller/site 6-or-7-byte data reference to slot RVA {slot_rva:#x}"
+    )]
+    FunctionPointerMissingDataReference { index: usize, slot_rva: u64 },
+    #[error("plugin claim {index} uses a read-only function-pointer target on a thunk assertion")]
+    FunctionPointerThunkUnsupported { index: usize },
     #[error("plugin claim {index} provenance is not plugin-owned")]
     NonPluginProducer { index: usize },
     #[error("plugin claim {index} provenance has no run id")]
@@ -567,6 +597,21 @@ fn validate_claim_ranges(
             };
             validate_image_range(index, target_field, target.rva(), 1, image_size)?;
             validate_import_iat_target(index, "direct-call assertion", target, import_iat_rvas)?;
+            if let ControlFlowTarget::FunctionPointer { slot_rva, .. } = target {
+                validate_image_range(
+                    index,
+                    "direct-call function-pointer slot",
+                    *slot_rva,
+                    8,
+                    image_size,
+                )?;
+                if import_iat_rvas.contains(slot_rva) {
+                    return Err(SessionValidationError::FunctionPointerSlotIsImportIat {
+                        index,
+                        slot_rva: *slot_rva,
+                    });
+                }
+            }
         }
         SymbolAssertion::ThunkTarget { target } => {
             let SymbolSubject::Function {
@@ -582,6 +627,9 @@ fn validate_claim_ranges(
             };
             validate_image_range(index, target_field, target.rva(), 1, image_size)?;
             validate_import_iat_target(index, "thunk-target assertion", target, import_iat_rvas)?;
+            if matches!(target, ControlFlowTarget::FunctionPointer { .. }) {
+                return Err(SessionValidationError::FunctionPointerThunkUnsupported { index });
+            }
             if target.is_function_at(*function_rva) {
                 return Err(SessionValidationError::ThunkSelfTarget {
                     index,
@@ -706,6 +754,22 @@ fn validate_claim_section_policy(
 ) -> Result<(), SessionValidationError> {
     let BinaryAnalysis::Pe(analysis) = analysis;
     match claim.assertion() {
+        SymbolAssertion::DirectCall {
+            target: ControlFlowTarget::FunctionPointer { slot_rva, rva },
+            ..
+        } => {
+            let (Ok(slot_rva), Ok(rva)) = (u32::try_from(*slot_rva), u32::try_from(*rva)) else {
+                return Err(SessionValidationError::FunctionPointerSlotNotReadOnly { index });
+            };
+            if !crate::code_recovery::model_range_is_backed_read_only_initialized_data(
+                analysis, slot_rva, 8,
+            ) {
+                return Err(SessionValidationError::FunctionPointerSlotNotReadOnly { index });
+            }
+            if !crate::code_recovery::model_range_is_backed_executable(analysis, rva, 1) {
+                return Err(SessionValidationError::FunctionPointerTargetNotExecutable { index });
+            }
+        }
         SymbolAssertion::StringLiteral { .. } => {
             let SymbolSubject::Global {
                 rva,
@@ -750,6 +814,54 @@ fn validate_claim_section_policy(
         _ => {}
     }
     Ok(())
+}
+
+fn validate_pointer_call_companion(
+    index: usize,
+    claim: &SymbolClaim,
+    companion_keys: &BTreeSet<(u64, u64, u64)>,
+) -> Result<(), SessionValidationError> {
+    let SymbolAssertion::DirectCall {
+        call_site_rva,
+        target: ControlFlowTarget::FunctionPointer { slot_rva, .. },
+    } = claim.assertion()
+    else {
+        return Ok(());
+    };
+    let SymbolSubject::Function {
+        rva: caller_rva, ..
+    } = claim.subject()
+    else {
+        return Ok(());
+    };
+
+    if !companion_keys.contains(&(*caller_rva, *call_site_rva, *slot_rva)) {
+        return Err(
+            SessionValidationError::FunctionPointerMissingDataReference {
+                index,
+                slot_rva: *slot_rva,
+            },
+        );
+    }
+    Ok(())
+}
+
+fn pointer_call_companion_key(claim: &SymbolClaim) -> Option<(u64, u64, u64)> {
+    let SymbolSubject::Function {
+        rva: caller_rva, ..
+    } = claim.subject()
+    else {
+        return None;
+    };
+    let SymbolAssertion::DataReference {
+        instruction_rva,
+        instruction_size,
+        target_rva,
+    } = claim.assertion()
+    else {
+        return None;
+    };
+    matches!(*instruction_size, 6 | 7).then_some((*caller_rva, *instruction_rva, *target_rva))
 }
 
 fn validate_import_iat_target(

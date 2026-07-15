@@ -352,7 +352,7 @@ mod tests {
 
     fn projection() -> ExportProjection {
         ExportProjection {
-            schema_version: 5,
+            schema_version: 6,
             binary: ExportBinary {
                 id: BinaryId::from_sha256("11".repeat(32)).expect("test digest"),
                 file_size: 0x3000,

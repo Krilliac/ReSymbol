@@ -61,11 +61,18 @@ prereleases; breaking changes remain explicit.
 - Added supported x64 RIP-relative data-reference recovery to eligible file-backed data, recording
   the caller, instruction RVA and size, and exact target RVA without inventing access semantics or
   target names.
+- Added explicit resolution of exact `FF 15 disp32` and redundant-`REX.W` `48 FF 15 disp32` calls
+  through one complete eight-byte slot in read-only initialized PE data. Parsed IAT slots retain
+  precedence; accepted non-IAT slots resolve one preferred-image VA hop to executable code and
+  preserve both `slot_rva` and the endpoint plus a paired same-site data reference. Focused
+  synthetic PE fixtures cover both encodings, rejection policy, caps, packages, and exports without
+  regenerating or changing the hashes of the four checked-in MSVC corpus binaries.
 - Added `ControlFlowTarget` and the `FunctionEntry`, `DirectCall`, and `ThunkTarget` symbol
   assertions, plus PE recovery records and graph attribution for PE entry points, recovered targets,
   and validated RTTI virtual slots.
 - Extended the external-process plugin wire schema with the corresponding function-entry,
-  direct-call, thunk-target, internal-function, and import-IAT shapes already accepted by the host.
+  direct-call, thunk-target, internal-function, import-IAT, and additive `function-pointer` target
+  shapes decoded by the host.
 - Added deterministic control-flow and class-membership projection, including attributed function
   entries, calls, and thunks in neutral JSON. The IDAPython and Ghidra Java writers remain
   conservative and do not install those relationships.
@@ -111,13 +118,15 @@ prereleases; breaking changes remain explicit.
   and no longer quarantine the plugin artifact.
 - Raised the pinned Rust source-build toolchain and workspace MSRV to 1.86 for the Component Model
   host. Ordinary release users and users of the bundled WASM example still need no compiler.
-- New `.resym` analyses use package schema 3. The `PeAnalysis` public alpha model now carries
-  recovered strings, data references, and independent partial-scan state in addition to code
-  recovery records.
-- The debugger-neutral JSON projection now uses schema 5. Schema 4 added attributed string and
+- New `.resym` analyses use package schema 4. The new `function-pointer` control-flow target
+  persists both the read-only slot RVA and resolved function RVA; schema 4 validation requires its
+  paired same-site slot data reference.
+- The debugger-neutral JSON projection now uses schema 6. Schema 4 added attributed string and
   data-reference arrays to schema 3's entry attribution and control-flow relationships; schema 5
-  adds `referenced_string_rva` to each data reference for validated exact or content-interior
-  correlation. Every schema-5 data-reference object serializes the field as an RVA or JSON `null`.
+  added `referenced_string_rva` correlation; and schema 6 adds explicit `function-pointer` targets.
+  A retained pointer target losslessly preserves its slot and resolved endpoint. If deterministic
+  same-site data-reference reduction selects a conflicting noncompanion reference, the projection
+  omits the pointer call with an `unsupported-assertion` warning instead of flattening it.
 - `resymbol analyze` and `resymbol inspect` report recovered string, data-reference, direct-call,
   and thunk counts plus their applicable partial-recovery status.
 - Address-kind collision diagnostics and both standalone debugger writers now share one
@@ -132,19 +141,19 @@ prereleases; breaking changes remain explicit.
 - Code recovery now uses a deterministic ordered worklist for direct same-range branch targets,
   stops at terminal or indirect control flow, and refuses to decode branch targets inside an
   already decoded instruction. This suppresses unreachable post-return bytes and can recover valid
-  blocks after jump-over data without changing package schema 3 or the projected control-flow
-  record shapes.
+  blocks after jump-over data while retaining deterministic bounded relationship ordering.
 - New direct-call graph evidence describes the control-flow-guided traversal accurately. Validated
   package reads continue accepting the exact legacy bounded-linear-sweep evidence summary without
   relaxing any other evidence field.
 
-These public-struct field additions are source-breaking for downstream Rust code that constructs or
-destructures the structs directly. ReSymbol is not yet 1.0; downstream users should pin an alpha
-version and validate serialized schema versions independently.
+These public-struct field and public-enum variant additions are source-breaking for downstream Rust
+code that constructs or destructures the structs directly or matches the enums exhaustively.
+ReSymbol is not yet 1.0; downstream users should pin an alpha version and validate serialized
+schema versions independently.
 
 ### Compatibility
 
-- The CLI can inspect and export package schemas 1 and 2 through explicit, validated in-memory
+- The CLI can inspect and export package schemas 1 through 3 through explicit, validated in-memory
   compatibility paths. It revalidates persisted metadata, plugin runs and claims, binary binding,
   and rebuilds the deterministic base graph; it does not rewrite a legacy package. `inspect --json`
   preserves the validated original representation instead of mislabeling migrated content.
@@ -155,17 +164,20 @@ version and validate serialized schema versions independently.
 - Schema 1 packages do not contain the original executable bytes, so migration cannot run the new
   recovery passes. Migrated direct-call, thunk, string, and data-reference sets remain unavailable
   and are not evidence that no relationships or literals exist. Schema 2 retains its persisted
-  direct calls and thunks, but predates strings and data references. Reanalyze the exact original
-  binary to create a schema 3 package with current recovery.
-- Package schema 3 and neutral projection schema 5 are independent version domains. Generic
+  direct calls and thunks but predates strings and data references. Schema 3 retains string/data
+  recovery, while schemas 2 and 3 both predate read-only function-pointer call resolution.
+  Reanalyze the exact original binary to create schema 4 with current recovery. The reader rejects
+  schema 2 or 3 envelopes containing schema-4 function-pointer targets in base relationships,
+  symbol graphs, or plugin claims instead of accepting a relabeled payload.
+- Package schema 4 and neutral projection schema 6 are independent version domains. Generic
   package readers still require an explicit compatibility range and application-defined payload
   migration to accept an older schema.
 - Markdown export is presentation-only and does not change either version domain: new analyses
-  continue to use package schema 3 and the neutral projection continues to use schema 5.
+  continue to use package schema 4 and the neutral projection continues to use schema 6.
 - MAP export consumes the current validated session and neutral projection without adding fields to
-  package schema 3 or projection schema 5.
+  package schema 4 or projection schema 6.
 - PDB export consumes the same current session and projection plus a byte-backed inspection of the
-  exact original PE. It does not add fields to package schema 3 or projection schema 5.
+  exact original PE. It does not add fields to package schema 4 or projection schema 6.
 - Managed-plugin execution adds no package-schema field: successful runs and validated claims use
   the existing `AnalysisSession` plugin ledger and claim representation.
 - WASM-plugin execution likewise adds no package-schema field. It uses the existing plugin ledger,
@@ -200,6 +212,11 @@ version and validate serialized schema versions independently.
   matches a recorded runtime-function begin. A call to its own next instruction is not promoted to
   a function target. Overlapping runtime-function ranges may be traversed and charged to decoder
   budgets separately.
+- Read-only function-pointer calls are accepted only from exact supported RIP-relative encodings.
+  Their non-IAT slot must be eight fully backed bytes of initialized, readable, non-writable,
+  non-executable data, and its preferred-image VA must resolve in one hop to file-backed executable
+  code. The call is retained only with its exact paired data reference, so exhausting the
+  data-reference cap also marks pointer-call recovery partial.
 - The decoder is heuristic-confidence evidence, not complete recursive disassembly or a persisted
   control-flow graph. It avoids unreachable post-terminal bytes and follows supported direct
   branches, but reachable embedded data can still produce false positives and invalid or unsupported

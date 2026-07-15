@@ -12,12 +12,13 @@ exception metadata, and derives conservative metadata-backed claims. Canonical `
 now carry an `AnalysisSession`: deterministic base analysis, an auditable plugin-run ledger, and
 separately validated plugin claims with a derived combined graph.
 
-The CLI writes package schema 3 and can inspect or export schemas 1 and 2 through explicit
+The CLI writes package schema 4 and can inspect or export schemas 1 through 3 through explicit
 compatibility paths. Schema 1 is migrated in memory by revalidating persisted metadata and
-rebuilding the base graph; schema 2 already contains direct-call and thunk recovery. Older packages
-do not embed executable bytes, so compatibility loading cannot reconstruct results that were never
-recorded. Reanalyzing the exact original binary is required to populate strings and data references
-in a new schema 3 package, and also direct calls and thunks when starting from schema 1.
+rebuilding the base graph; schema 2 already contains direct-call and thunk recovery, and schema 3
+adds string/data recovery. Older packages do not embed executable bytes, so compatibility loading
+cannot reconstruct results that were never recorded. Reanalyzing the exact original binary is
+required for read-only function-pointer calls in schemas 2 and 3, for strings/data references in
+schemas 1 and 2, and for all code recovery when starting from schema 1.
 
 A bounded modern MSVC x64 Rev1 RTTI/vftable slice is now implemented. It validates compiler
 metadata through complete object locators, type descriptors, modern 28-byte base-class descriptors,
@@ -28,16 +29,17 @@ Fixed scan, record, slot, and name budgets surface partial discovery explicitly.
 A bounded pure-Rust x86-64 code-recovery slice is also implemented. Its control-flow-guided block
 sweep starts at fully file-backed `RUNTIME_FUNCTION` entries, follows supported direct same-range
 branches with a deterministic ordered worklist, and stops paths at terminal, indirect, invalid,
-out-of-range, or ambiguous interior control flow. It records exact supported direct calls and
-RIP-relative data references and checks the first instruction at metadata-backed entry candidates
-for internal or import thunks. It discovers at most 262,144 block starts and retains at most 8,192
-direct calls, 32,768 data references, and 4,096 thunks; internal targets covered by known
-runtime-function metadata are suppressed unless their RVA matches a recorded runtime-function
-begin. A separate
-bounded pass recovers complete NUL-terminated ASCII and UTF-16LE literals from readable initialized
-non-executable file-backed data. These passes emit attributed claims without inventing names or
-extents and preserve independent partial-scan flags. The guided sweep suppresses unreachable
-post-terminal bytes and can reach valid blocks after jump-over data, but remains heuristic evidence:
+out-of-range, or ambiguous interior control flow. It records exact supported direct calls,
+including one-hop plain or redundant-`REX.W` RIP-relative calls through complete read-only
+eight-byte pointer slots, and RIP-relative data references; it checks the first instruction at
+metadata-backed entry candidates for internal or import thunks. It discovers at most 262,144 block
+starts and retains at most 8,192 direct calls, 32,768 data references, and 4,096 thunks; internal
+targets covered by known runtime-function metadata are suppressed unless their RVA matches a
+recorded runtime-function begin. A separate bounded pass recovers complete NUL-terminated ASCII and
+UTF-16LE literals from readable initialized non-executable file-backed data. These passes emit
+attributed claims without inventing names or extents and preserve independent partial-scan flags.
+The guided sweep suppresses unreachable post-terminal bytes and can reach valid blocks after
+jump-over data, but remains heuristic evidence:
 reachable embedded data can produce false positives, and invalid or unsupported flow can omit later
 relationships on that path. It does not persist a basic-block graph.
 
@@ -107,11 +109,12 @@ The first export checkpoint is implemented as a validated, debugger-neutral proj
 deterministic JSON output, a bounded human-readable Markdown report, PE-only
 Microsoft-linker-style MAP text, an exact-RSDS public-symbol PDB, and standalone IDAPython and
 Ghidra Java import scripts. Markdown is presentation-only rather than a stable interchange schema;
-JSON remains the machine-consumable artifact. New analyses write package schema 3, while export also
-accepts package schemas 1 and 2 through validated compatibility paths. The neutral projection is
-schema 5; MAP and PDB add no schema fields, and no exporter rewrites its source package. Schema 5
+JSON remains the machine-consumable artifact. New analyses write package schema 4, while export also
+accepts package schemas 1 through 3 through validated compatibility paths. The neutral projection is
+schema 6; MAP and PDB add no schema fields, and no exporter rewrites its source package. Schema 5
 correlates exact or valid content-interior data-reference targets with retained strings while
-excluding NUL terminators and misaligned UTF-16LE interiors. The scripts
+excluding NUL terminators and misaligned UTF-16LE interiors; schema 6 preserves function-pointer
+slot and resolved-target RVAs. The scripts
 bind to the exact loaded binary SHA-256, resolve addresses as loaded image base plus RVA, preserve
 user-authored names and existing function bodies, and continue past per-symbol application errors.
 They are deliberately narrower than the planned interactive debugger bridges: prototypes, types,
@@ -144,9 +147,11 @@ An initial source-available MSVC x64 fixture corpus is implemented as a byte-rep
 four-artifact matrix: optimized and unoptimized PE inputs, each symbolized and stripped. Exact
 hashes bind every input, while a shared semantic oracle keeps layout-sensitive expectations scoped
 to the optimization profile. The matrix covers imports/exports, unwind functions, direct calls,
-internal and MSVC `REX.W`-prefixed import thunks, ASCII/UTF-16LE strings, data references, and modern
-RTTI/vftables without executing the fixture binaries. These checked-in inputs are repository/source
-test data rather than portable runtime archive contents.
+internal and MSVC `REX.W`-prefixed import thunks, ASCII/UTF-16LE strings,
+data references, and modern RTTI/vftables without executing the fixture binaries. These checked-in
+inputs are repository/source test data rather than portable runtime archive contents. Read-only
+function-pointer calls are covered by focused synthetic PE fixtures, so this slice does not change
+those four binaries or their recorded hashes.
 
 The remaining Milestone 2 work is deliberately substantial: broader disassembly-assisted candidate
 discovery, indirect control flow and richer call-graph analysis, persisted basic-block modeling,

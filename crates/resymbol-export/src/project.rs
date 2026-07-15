@@ -189,6 +189,28 @@ impl ExportProjection {
             )?;
         }
 
+        let unpaired_pointer_calls = direct_calls
+            .keys()
+            .filter(|key| !direct_call_has_companion(key, &data_references))
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in unpaired_pointer_calls {
+            direct_calls.remove(&key);
+            warnings.add(
+                ProjectionWarningCode::UnsupportedAssertion,
+                Some(ExportSubject::Function { rva: key.0 }),
+            )?;
+        }
+        for ((_, _, target), attribution) in &direct_calls {
+            if let Some(target_rva) = control_flow_function_rva(target) {
+                let target_function = address_entry(&mut functions, target_rva, &mut entity_count)?;
+                insert_entry_attribution(
+                    &mut target_function.entry_attribution,
+                    attribution.clone(),
+                );
+            }
+        }
+
         let mut functions = functions
             .into_iter()
             .map(|(rva, value)| finish_function(rva, value, &mut warnings))
@@ -470,10 +492,6 @@ fn project_direct_call(
             insert_size(&mut caller.sizes, size, attribution.clone());
         }
     }
-    if let ExportControlFlowTarget::Function { rva } = &target {
-        let target_function = address_entry(functions, *rva, entity_count)?;
-        insert_entry_attribution(&mut target_function.entry_attribution, attribution.clone());
-    }
     insert_direct_call(
         direct_calls,
         (caller_rva, call_site_rva, target),
@@ -510,8 +528,8 @@ fn project_thunk(
             insert_size(&mut source.sizes, size, attribution.clone());
         }
     }
-    if let ExportControlFlowTarget::Function { rva: target_rva } = &target {
-        let target_function = address_entry(functions, *target_rva, entity_count)?;
+    if let Some(target_rva) = control_flow_function_rva(&target) {
+        let target_function = address_entry(functions, target_rva, entity_count)?;
         insert_entry_attribution(&mut target_function.entry_attribution, attribution.clone());
     }
     insert_thunk(thunks, rva, target, attribution)
@@ -649,6 +667,12 @@ fn export_control_flow_target(target: &ControlFlowTarget) -> Option<ExportContro
         ControlFlowTarget::ImportIat { iat_rva } => {
             Some(ExportControlFlowTarget::ImportIat { iat_rva: *iat_rva })
         }
+        ControlFlowTarget::FunctionPointer { slot_rva, rva } => {
+            Some(ExportControlFlowTarget::FunctionPointer {
+                slot_rva: *slot_rva,
+                rva: *rva,
+            })
+        }
         _ => None,
     }
 }
@@ -657,6 +681,32 @@ fn valid_control_flow_target(target: &ExportControlFlowTarget, image_size: u64) 
     match target {
         ExportControlFlowTarget::Function { rva } => valid_range(*rva, None, image_size),
         ExportControlFlowTarget::ImportIat { iat_rva } => valid_range(*iat_rva, None, image_size),
+        ExportControlFlowTarget::FunctionPointer { slot_rva, rva } => {
+            valid_range(*slot_rva, Some(8), image_size) && valid_range(*rva, None, image_size)
+        }
+    }
+}
+
+fn direct_call_has_companion(
+    key: &DirectCallKey,
+    data_references: &BTreeMap<DataReferenceKey, ExportDataReference>,
+) -> bool {
+    let (caller_rva, call_site_rva, target) = key;
+    let ExportControlFlowTarget::FunctionPointer { slot_rva, .. } = target else {
+        return true;
+    };
+    data_references
+        .get(&(*caller_rva, *call_site_rva))
+        .is_some_and(|reference| {
+            matches!(reference.instruction_size, 6 | 7) && reference.target_rva == *slot_rva
+        })
+}
+
+fn control_flow_function_rva(target: &ExportControlFlowTarget) -> Option<u64> {
+    match target {
+        ExportControlFlowTarget::Function { rva }
+        | ExportControlFlowTarget::FunctionPointer { rva, .. } => Some(*rva),
+        ExportControlFlowTarget::ImportIat { .. } => None,
     }
 }
 

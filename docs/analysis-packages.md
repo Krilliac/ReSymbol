@@ -30,7 +30,7 @@ Every package contains four top-level fields:
   "binary_sha256": "<64 lowercase hexadecimal characters>",
   "generator_version": "0.1.0-alpha.1",
   "payload": {},
-  "schema_version": 3
+  "schema_version": 4
 }
 ```
 
@@ -40,10 +40,10 @@ Every package contains four top-level fields:
 - `payload` contains one validated `AnalysisSession`: deterministic base analysis, a plugin-run
   ledger, and accepted plugin claims.
 
-This package envelope currently writes schema 3. The CLI can also inspect and export schema 1 and
-schema 2 packages through the compatibility paths described below, while other schema versions
-fail explicitly. The debugger-neutral JSON produced by `resymbol export --format json` is a
-different artifact with its own schema version; its current projection is schema 5.
+This package envelope currently writes schema 4. The CLI can also inspect and export schemas 1, 2,
+and 3 through the compatibility paths described below, while other schema versions fail
+explicitly. The debugger-neutral JSON produced by `resymbol export --format json` is a different
+artifact with its own schema version; its current projection is schema 6.
 
 Object keys are sorted recursively and no timestamp is inserted, so encoding the same deterministic
 payload produces the same bytes. Arrays preserve analysis order because source-table order can be
@@ -85,12 +85,14 @@ allowlist is not a validation bypass.
 
 A `.resym` package does not contain the original binary
 bytes, so migration cannot retroactively run code recovery: direct-call and thunk arrays stay empty
-and the migrated session is not evidence that the decoder found no relationships. Analyze the exact
-original executable again to create a schema 3 package containing current recovery results. Schema
-2 packages retain their recorded calls and thunks, but predate recovered strings and data
-references; those newer arrays are empty after compatibility decoding and are likewise reported as
-unavailable rather than as a complete empty scan. The `inspect` and `export` terminal summaries
-distinguish those cases and recommend reanalysis. `inspect --json` emits the validated original
+and the migrated session is not evidence that the decoder found no relationships. Schema 2 retains
+its recorded calls and thunks but predates recovered strings and data references. Schema 3 retains
+strings and data references. Schemas 2 and 3 both predate exact read-only function-pointer call
+resolution, so their recorded code recovery remains available while that newer result family is
+reported as unavailable. Reanalyze the exact original executable to create a schema 4 package with
+all current recovery results. The compatibility reader explicitly rejects a schema 2 or 3 envelope
+whose base analysis, base graph, or plugin claims contain a schema-4 `function-pointer` target;
+changing only the envelope label is not migration. `inspect --json` emits the validated original
 schema 1 representation rather than placing the migrated current payload beneath a legacy schema
 label.
 
@@ -118,8 +120,9 @@ The base analysis includes:
 - COFF and optional-header fields used by analysis;
 - bounded section, import, export, and exception-directory records;
 - x64 `RUNTIME_FUNCTION` entries as evidence-backed candidate function boundaries;
-- bounded direct-call and one-instruction thunk records, with explicit internal-function or exact
-  parsed import-IAT targets and a persisted partial-scan flag;
+- bounded direct-call records with explicit internal-function, exact parsed import-IAT, or read-only
+  function-pointer targets; one-instruction thunks currently use only internal-function or exact
+  parsed import-IAT targets, with a persisted partial-scan flag;
 - bounded NUL-terminated ASCII and UTF-16LE strings plus exact x64 RIP-relative references to
   eligible data, each with independent persisted partial-scan state;
 - validated modern MSVC x64 Rev1 RTTI records, including type descriptors, class hierarchy and
@@ -211,16 +214,27 @@ the instruction permits it. Returns, terminal or indirect control flow, invalid 
 out-of-range targets, and targets inside an already decoded instruction stop the affected path. The
 ephemeral traversal is not a persisted basic-block graph or a general recursive disassembler.
 
-The pass recognizes exact five-byte `E8 rel32` calls to file-backed executable RVAs and exact
-six-byte RIP-relative `FF 15` calls whose computed address is a parsed IAT slot. It does not retain
-other indirect-call forms or targets merely located near an import table. An internal target covered
-by known `RUNTIME_FUNCTION` metadata is suppressed unless its RVA matches a recorded
-runtime-function begin, preventing an interior label from being promoted to a separate function
-entry.
+The pass recognizes exact five-byte `E8 rel32` calls to file-backed executable RVAs. It also
+recognizes exact RIP-relative `FF 15 disp32` and redundant-`REX.W` `48 FF 15 disp32` calls, with
+instruction sizes six and seven bytes respectively. If the computed slot RVA exactly matches a
+parsed import-IAT slot, import semantics take precedence and the slot is not dereferenced.
+Otherwise the complete eight-byte slot must lie in one file-backed, initialized, readable,
+non-writable, non-executable section. Its little-endian preferred-image VA is resolved exactly one
+hop to an in-image, file-backed executable RVA. Pointer chains, writable slots, other indirect-call
+forms, and targets merely located near an import table are not retained as resolved calls.
+
+A resolved pointer call uses the explicit target shape
+`{"kind":"function-pointer","slot_rva":...,"rva":...}` in both the base graph and package. Its
+control-flow evidence records the slot and resolved endpoint, and the same decoded instruction is
+retained as a paired data reference to `slot_rva`. This preserves both call semantics and the exact
+memory dependency. An internal endpoint covered by known `RUNTIME_FUNCTION` metadata is suppressed
+unless its RVA matches a recorded runtime-function begin, preventing an interior label from being
+promoted to a separate function entry.
 
 The same instruction sweep retains exact RIP-relative data references from supported decoded
-instructions. It excludes call and jump operands already represented as control flow and accepts a
-target only when the computed RVA lies in file-backed, initialized, readable,
+instructions. It excludes call and jump operands already represented as control flow except for the
+required same-site slot reference paired with a resolved read-only function-pointer call. A data
+target is accepted only when its computed RVA lies in file-backed, initialized, readable,
 non-executable section data. The persisted relationship records caller, instruction RVA and size,
 and target RVA; it does not guess a target name, object size, or access mode. The independently
 versioned export projection derives string correlation later from the retained canonical strings.
@@ -235,7 +249,10 @@ Decoding is deterministic and bounded to 64 MiB of instruction bytes, 1,000,000 
 262,144 discovered block starts, 8,192 retained direct calls, 32,768 retained data references, and
 4,096 retained thunks. Each relationship family retains its deterministic traversal prefix when
 its record cap is reached; `code_recovery_scan_truncated` and
-`data_reference_scan_truncated` preserve the applicable partial state. Exhausting the shared
+`data_reference_scan_truncated` preserve the applicable partial state. A pointer call is retained
+only when its paired slot data reference is retained, so exhausting the data-reference cap also
+makes the pointer-call result incomplete rather than publishing a call without its provenance.
+Exhausting the shared
 decode or block-discovery budget makes both instruction-derived sets partial. Overlapping
 `RUNTIME_FUNCTION` ranges are preserved and traversed separately, with each decode charged to the
 shared budgets, so adversarial overlap metadata can make the scan partial earlier.
@@ -253,10 +270,11 @@ The package stores recovered values and relationships, but not the analyzed exec
 During analysis, ReSymbol checks each string against its source bytes and derives each data
 reference from the decoded instruction. On a later package read it can still enforce collection and
 text limits, canonical ordering and uniqueness, non-overlap, encoding and exact encoded-size rules,
-image and eligible-section ranges, runtime-function/site containment, and graph agreement. It
-cannot independently compare a persisted string with the original bytes or re-decode a persisted
-instruction because those bytes are absent. The envelope SHA-256 binds the records to one exact
-binary; reanalyze that binary when byte-level reproduction is required.
+image and eligible-section ranges, runtime-function/site containment, pointer-slot read-only policy,
+required same-site call/reference pairing, and graph agreement. It cannot independently compare a
+persisted string with the original bytes, re-decode a persisted instruction, or reread the pointer
+value because those bytes are absent. The envelope SHA-256 binds the records to one exact binary;
+reanalyze that binary when byte-level reproduction is required.
 
 ## Export projection
 
@@ -266,14 +284,20 @@ alternate names, confidence and provenance, supported function/global sizes, pro
 definitions, attributed function-to-class memberships, and structured warnings. Ordering and
 collision handling are stable so the same validated session produces the same projection.
 
-The current neutral JSON projection is schema 5. Schema 4 added bounded, attributed `strings` and
-`data_references` arrays to schema 3's function-entry, direct-call, and thunk model. Schema 5 adds
-`referenced_string_rva` to each data reference. Every schema-5 object emits the field as a string
-RVA or JSON `null`. A numeric value names the retained string when the target is its exact RVA or a
-content-interior address; the NUL terminator is excluded, and UTF-16LE interior targets must be
-code-unit aligned. `null` means only that no retained projected string matched, not that the target
-bytes cannot contain a string. Correlation occurs after deterministic string conflict and overlap
-reduction, so the field cannot name a discarded candidate.
+The current neutral JSON projection is schema 6. Schema 4 added bounded, attributed `strings` and
+`data_references` arrays to schema 3's function-entry, direct-call, and thunk model. Schema 5 added
+`referenced_string_rva` to each data reference. Every data-reference object emits the field as a
+string RVA or JSON `null`. A numeric value names the retained string when the target is its exact
+RVA or a content-interior address; the NUL terminator is excluded, and UTF-16LE interior targets
+must be code-unit aligned. `null` means only that no retained projected string matched, not that the
+target bytes cannot contain a string. Correlation occurs after deterministic string conflict and
+overlap reduction, so the field cannot name a discarded candidate. Schema 6 adds the explicit
+`function-pointer` control-flow target with both `slot_rva` and the resolved function `rva`. A
+retained pointer call preserves that slot provenance rather than flattening the call into an
+ordinary direct function target. Before pairing, projection deterministically reduces competing
+data references by caller and instruction site. If the selected same-site reference targets
+something other than the pointer slot, projection omits the pointer call and emits an
+`unsupported-assertion` warning.
 Internal relation targets must reference projected function entries; import targets retain their
 IAT RVA. Its projection/model bounds are intentionally separate from the lower built-in recovery
 caps: at most 65,536 strings, 32 MiB of retained string UTF-8 with 16 KiB per value, and 262,144
@@ -294,8 +318,8 @@ inspection of the exact original PE. It emits deterministic, bounded, pure-Rust 
 containing selected public function and global names and verbatim section headers. Same-RVA
 function/global collisions prefer the function; unnamed functions do not suppress globals. The
 writer does not synthesize private symbols, compilands, source lines, locals, prototypes, function
-extents, or type records, and it does not add fields to package schema 3 or neutral projection
-schema 5. Generating the file requires no separately installed Visual Studio, DIA, LLVM, or
+extents, or type records, and it does not add fields to package schema 4 or neutral projection
+schema 6. Generating the file requires no separately installed Visual Studio, DIA, LLVM, or
 compiler toolchain; Windows compatibility CI validates it with native and DIA-backed
 `llvm-pdbutil` reads and a direct DIA identity/public-symbol probe.
 

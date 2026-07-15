@@ -202,6 +202,24 @@
               "maximum": 18446744073709551615
             }
           }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "slot_rva", "rva"],
+          "properties": {
+            "kind": { "const": "function-pointer" },
+            "slot_rva": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 18446744073709551615
+            },
+            "rva": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 18446744073709551615
+            }
+          }
         }
       ]
     },

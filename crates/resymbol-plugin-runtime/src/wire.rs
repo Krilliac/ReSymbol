@@ -860,6 +860,26 @@ mod tests {
             }
         ));
 
+        let pointer_call = parse(serde_json::json!({
+            "kind": "direct-call",
+            "call_site_rva": 4104,
+            "target": {
+                "kind": "function-pointer",
+                "slot_rva": 16384,
+                "rva": 12288
+            }
+        }));
+        assert!(matches!(
+            pointer_call.claim,
+            SymbolAssertion::DirectCall {
+                call_site_rva: 4104,
+                target: resymbol_core::ControlFlowTarget::FunctionPointer {
+                    slot_rva: 16384,
+                    rva: 12288,
+                },
+            }
+        ));
+
         let thunk = parse(serde_json::json!({
             "kind": "thunk-target",
             "target": { "kind": "function", "rva": 12288 }
@@ -1019,6 +1039,24 @@ mod tests {
             schema["$defs"]["stringEncoding"]["enum"],
             serde_json::json!(["ascii", "utf-16-le"])
         );
+        let control_flow_targets = schema["$defs"]["controlFlowTarget"]["oneOf"]
+            .as_array()
+            .expect("control-flow target variants");
+        let function_pointer = control_flow_targets
+            .iter()
+            .find(|target| target["properties"]["kind"]["const"] == "function-pointer")
+            .expect("function-pointer target schema");
+        assert_eq!(
+            function_pointer["required"],
+            serde_json::json!(["kind", "slot_rva", "rva"])
+        );
+        for address in ["slot_rva", "rva"] {
+            assert_eq!(function_pointer["properties"][address]["minimum"], 0);
+            assert_eq!(
+                function_pointer["properties"][address]["maximum"],
+                serde_json::json!(u64::MAX)
+            );
+        }
         let assertions = schema["$defs"]["symbolAssertion"]["oneOf"]
             .as_array()
             .expect("assertion variants");

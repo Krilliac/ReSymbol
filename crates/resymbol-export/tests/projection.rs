@@ -485,7 +485,7 @@ fn control_flow_projection_is_canonical_and_keeps_strongest_attribution() {
     let reverse = project(claims.into_iter().rev());
 
     assert_eq!(forward, reverse);
-    assert_eq!(forward.schema_version, 5);
+    assert_eq!(forward.schema_version, 6);
     assert_eq!(
         forward
             .functions
@@ -526,6 +526,246 @@ fn control_flow_projection_is_canonical_and_keeps_strongest_attribution() {
 }
 
 #[test]
+fn function_pointer_targets_project_losslessly_and_sort_deterministically() {
+    let claims = vec![
+        direct_call(
+            0x100,
+            0x110,
+            ControlFlowTarget::FunctionPointer {
+                slot_rva: 0x700,
+                rva: 0x300,
+            },
+            0.9,
+            true,
+        ),
+        data_reference(0x100, Some(0x80), 0x110, 6, 0x700, 0.9, true),
+        direct_call(
+            0x100,
+            0x110,
+            ControlFlowTarget::ImportIat { iat_rva: 0x900 },
+            0.8,
+            true,
+        ),
+        direct_call(
+            0x100,
+            0x110,
+            ControlFlowTarget::Function { rva: 0x200 },
+            0.7,
+            true,
+        ),
+        thunk(
+            0x400,
+            ControlFlowTarget::FunctionPointer {
+                slot_rva: 0x708,
+                rva: 0x300,
+            },
+            0.9,
+            true,
+        ),
+    ];
+
+    let forward = project(claims.clone());
+    let reverse = project(claims.into_iter().rev());
+
+    assert_eq!(forward, reverse);
+    assert_eq!(forward.schema_version, 6);
+    assert_eq!(
+        forward
+            .direct_calls
+            .iter()
+            .map(|call| call.target.clone())
+            .collect::<Vec<_>>(),
+        [
+            ExportControlFlowTarget::Function { rva: 0x200 },
+            ExportControlFlowTarget::ImportIat { iat_rva: 0x900 },
+            ExportControlFlowTarget::FunctionPointer {
+                slot_rva: 0x700,
+                rva: 0x300,
+            },
+        ]
+    );
+    assert_eq!(
+        forward
+            .functions
+            .iter()
+            .map(|function| function.rva)
+            .collect::<Vec<_>>(),
+        [0x100, 0x200, 0x300, 0x400]
+    );
+    assert!(
+        forward
+            .functions
+            .iter()
+            .find(|function| function.rva == 0x300)
+            .expect("resolved pointer target function")
+            .entry_attribution
+            .is_some()
+    );
+    assert_eq!(
+        forward.thunks[0].target,
+        ExportControlFlowTarget::FunctionPointer {
+            slot_rva: 0x708,
+            rva: 0x300,
+        }
+    );
+
+    let wire = serde_json::to_value(&forward).expect("serialize function-pointer projection");
+    assert_eq!(wire["schema_version"], serde_json::json!(6));
+    assert_eq!(
+        wire["direct_calls"][2]["target"],
+        serde_json::json!({
+            "kind": "function-pointer",
+            "slot_rva": 0x700,
+            "rva": 0x300
+        })
+    );
+    assert_eq!(
+        serde_json::to_vec(&forward).expect("serialize forward projection"),
+        serde_json::to_vec(&reverse).expect("serialize reverse projection")
+    );
+}
+
+#[test]
+fn function_pointer_projection_validates_slot_and_resolved_function_addresses() {
+    let projection = project([
+        direct_call(
+            0x100,
+            0x110,
+            ControlFlowTarget::FunctionPointer {
+                slot_rva: 0x700,
+                rva: 0x200,
+            },
+            0.9,
+            true,
+        ),
+        data_reference(0x100, Some(0x80), 0x110, 6, 0x700, 0.9, true),
+    ]);
+
+    let mut outside_slot = projection.clone();
+    outside_slot.direct_calls[0].target = ExportControlFlowTarget::FunctionPointer {
+        slot_rva: 0x2_000,
+        rva: 0x200,
+    };
+    assert!(matches!(
+        outside_slot.validate(),
+        Err(ProjectionValidationError::AddressOutsideImage { rva: 0x2_000, .. })
+    ));
+
+    let mut short_slot = projection.clone();
+    short_slot.direct_calls[0].target = ExportControlFlowTarget::FunctionPointer {
+        slot_rva: 0x1ff9,
+        rva: 0x200,
+    };
+    assert!(matches!(
+        short_slot.validate(),
+        Err(ProjectionValidationError::AddressOutsideImage {
+            rva: 0x1ff9,
+            size: Some(8),
+        })
+    ));
+
+    let mut outside_function = projection.clone();
+    outside_function.direct_calls[0].target = ExportControlFlowTarget::FunctionPointer {
+        slot_rva: 0x700,
+        rva: 0x2_000,
+    };
+    assert!(matches!(
+        outside_function.validate(),
+        Err(ProjectionValidationError::AddressOutsideImage { rva: 0x2_000, .. })
+    ));
+
+    let mut missing_function_entry = projection.clone();
+    missing_function_entry
+        .functions
+        .retain(|function| function.rva != 0x200);
+    assert!(matches!(
+        missing_function_entry.validate(),
+        Err(ProjectionValidationError::InvalidBinaryField {
+            field: "control_flow.function_entry"
+        })
+    ));
+
+    let mut missing_reference = projection.clone();
+    missing_reference.data_references.clear();
+    assert!(matches!(
+        missing_reference.validate(),
+        Err(ProjectionValidationError::InvalidBinaryField {
+            field: "direct_call.function_pointer_reference"
+        })
+    ));
+
+    let rejected = project([
+        direct_call(
+            0x100,
+            0x110,
+            ControlFlowTarget::FunctionPointer {
+                slot_rva: 0x2_000,
+                rva: 0x200,
+            },
+            0.9,
+            true,
+        ),
+        direct_call(
+            0x100,
+            0x120,
+            ControlFlowTarget::FunctionPointer {
+                slot_rva: 0x700,
+                rva: 0x2_000,
+            },
+            0.9,
+            true,
+        ),
+        direct_call(
+            0x100,
+            0x130,
+            ControlFlowTarget::FunctionPointer {
+                slot_rva: 0x1ff9,
+                rva: 0x200,
+            },
+            0.9,
+            true,
+        ),
+        data_reference(0x100, Some(0x80), 0x130, 6, 0x1ff9, 0.9, true),
+    ]);
+    assert!(rejected.direct_calls.is_empty());
+    assert_eq!(
+        rejected
+            .warnings
+            .iter()
+            .filter(|warning| warning.code == ProjectionWarningCode::AddressOutsideImage)
+            .map(|warning| warning.occurrences)
+            .sum::<u64>(),
+        3
+    );
+}
+
+#[test]
+fn pointer_call_is_omitted_when_data_reference_conflict_loses_its_companion() {
+    let projection = project([
+        direct_call(
+            0x100,
+            0x110,
+            ControlFlowTarget::FunctionPointer {
+                slot_rva: 0x700,
+                rva: 0x200,
+            },
+            0.9,
+            true,
+        ),
+        data_reference(0x100, Some(0x80), 0x110, 6, 0x700, 0.8, true),
+        data_reference(0x100, Some(0x80), 0x110, 7, 0x710, 1.0, true),
+    ]);
+
+    assert!(projection.direct_calls.is_empty());
+    assert_eq!(projection.data_references.len(), 1);
+    assert_eq!(projection.data_references[0].target_rva, 0x710);
+    assert!(projection.warnings.iter().any(|warning| {
+        warning.code == ProjectionWarningCode::UnsupportedAssertion
+            && warning.subject == Some(ExportSubject::Function { rva: 0x100 })
+    }));
+}
+
+#[test]
 fn strings_and_data_references_are_canonical_and_claim_order_invariant() {
     let claims = vec![
         string_literal(0x500, StringEncoding::Ascii, "World", 1.0, false),
@@ -554,7 +794,7 @@ fn strings_and_data_references_are_canonical_and_claim_order_invariant() {
     let reverse = project(claims.into_iter().rev());
 
     assert_eq!(forward, reverse);
-    assert_eq!(forward.schema_version, 5);
+    assert_eq!(forward.schema_version, 6);
     assert_eq!(forward.strings.len(), 2);
     assert_eq!(forward.strings[0].rva, 0x500);
     assert_eq!(forward.strings[0].byte_size, 6);
@@ -600,8 +840,8 @@ fn strings_and_data_references_are_canonical_and_claim_order_invariant() {
         ]
     );
     assert!(forward.functions[0].entry_attribution.is_some());
-    let wire = serde_json::to_value(&forward).expect("serialize schema-5 projection");
-    assert_eq!(wire["schema_version"], serde_json::json!(5));
+    let wire = serde_json::to_value(&forward).expect("serialize schema-6 projection");
+    assert_eq!(wire["schema_version"], serde_json::json!(6));
     assert_eq!(
         wire["data_references"][0]["referenced_string_rva"],
         serde_json::json!(0x500)
@@ -611,8 +851,8 @@ fn strings_and_data_references_are_canonical_and_claim_order_invariant() {
         serde_json::Value::Null
     );
     assert_eq!(
-        serde_json::to_vec(&forward).expect("serialize schema-5 projection"),
-        serde_json::to_vec(&reverse).expect("serialize reversed schema-5 projection")
+        serde_json::to_vec(&forward).expect("serialize schema-6 projection"),
+        serde_json::to_vec(&reverse).expect("serialize reversed schema-6 projection")
     );
 }
 
@@ -835,7 +1075,7 @@ fn control_flow_projection_validation_rejects_noncanonical_or_dangling_relations
     ));
 
     let mut old_schema = projection.clone();
-    old_schema.schema_version = 4;
+    old_schema.schema_version = 5;
     assert!(matches!(
         old_schema.validate(),
         Err(ProjectionValidationError::InvalidBinaryField {
@@ -908,10 +1148,22 @@ fn control_flow_projection_validation_rejects_noncanonical_or_dangling_relations
         Err(ProjectionValidationError::AddressOutsideImage { rva: 0x2_000, .. })
     ));
 
-    let mut self_thunk = projection;
+    let mut self_thunk = projection.clone();
     self_thunk.thunks[0].target = ExportControlFlowTarget::Function { rva: 0x300 };
     assert!(matches!(
         self_thunk.validate(),
+        Err(ProjectionValidationError::InvalidBinaryField {
+            field: "thunk.target"
+        })
+    ));
+
+    let mut pointer_self_thunk = projection;
+    pointer_self_thunk.thunks[0].target = ExportControlFlowTarget::FunctionPointer {
+        slot_rva: 0x700,
+        rva: 0x300,
+    };
+    assert!(matches!(
+        pointer_self_thunk.validate(),
         Err(ProjectionValidationError::InvalidBinaryField {
             field: "thunk.target"
         })
@@ -988,7 +1240,7 @@ fn function_class_memberships_survive_projection_with_attribution() {
         class_membership(0x100, "demo::Base", 0.8, true),
     ]);
 
-    assert_eq!(projection.schema_version, 5);
+    assert_eq!(projection.schema_version, 6);
     assert_eq!(projection.functions.len(), 1);
     assert_eq!(
         projection.functions[0]

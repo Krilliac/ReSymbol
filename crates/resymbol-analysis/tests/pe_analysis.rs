@@ -23,6 +23,10 @@ const LEGACY_DIRECT_CALL_EVIDENCE_SUMMARY: &str = concat!(
     "exact supported x64 call encoding observed during a bounded linear sweep ",
     "of a file-backed runtime-function range",
 );
+const READ_ONLY_POINTER_CALL_EVIDENCE_SUMMARY: &str = concat!(
+    "exact RIP-relative x64 indirect call resolved through one fully backed read-only ",
+    "in-image pointer slot during bounded runtime traversal",
+);
 
 fn put_u16(bytes: &mut [u8], offset: usize, value: u16) {
     bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
@@ -490,6 +494,45 @@ fn rtti_fixture_with_rex_w_iat_control_flow() -> Vec<u8> {
     bytes[rtti_file_offset(0x1007)] = 0xc3;
     bytes[rtti_file_offset(0x1020)..rtti_file_offset(0x1030)].fill(0x90);
     put_rex_w_rip_relative_instruction(&mut bytes, 0x1020, 0x25, 0x2340);
+    bytes
+}
+
+fn read_only_pointer_call_fixture() -> Vec<u8> {
+    let mut bytes = rtti_fixture();
+    bytes[rtti_file_offset(0x2100)..rtti_file_offset(0x2300)].fill(0);
+    bytes[rtti_file_offset(0x1000)..rtti_file_offset(0x1010)].fill(0x90);
+    put_rip_relative_instruction(&mut bytes, 0x1000, 0x15, 0x2301);
+    put_rex_w_rip_relative_instruction(&mut bytes, 0x1006, 0x15, 0x2311);
+    bytes[rtti_file_offset(0x100d)] = 0xc3;
+    put_rtti_rva_u64(&mut bytes, 0x2301, RTTI_IMAGE_BASE + 0x1020);
+    put_rtti_rva_u64(&mut bytes, 0x2311, RTTI_IMAGE_BASE + 0x1020);
+    bytes
+}
+
+fn single_pointer_call_fixture(slot_rva: u32, target_va: u64) -> Vec<u8> {
+    let mut bytes = rtti_fixture();
+    bytes[rtti_file_offset(0x2100)..rtti_file_offset(0x2300)].fill(0);
+    bytes[rtti_file_offset(0x1000)..rtti_file_offset(0x1010)].fill(0x90);
+    put_rip_relative_instruction(&mut bytes, 0x1000, 0x15, slot_rva);
+    bytes[rtti_file_offset(0x1006)] = 0xc3;
+    put_rtti_rva_u64(&mut bytes, slot_rva, target_va);
+    bytes
+}
+
+fn prefixed_pointer_call_fixture(prefix: u8, slot_rva: u32, target_va: u64) -> Vec<u8> {
+    let mut bytes = rtti_fixture();
+    bytes[rtti_file_offset(0x2100)..rtti_file_offset(0x2300)].fill(0);
+    bytes[rtti_file_offset(0x1000)..rtti_file_offset(0x1010)].fill(0x90);
+
+    let call_rva = 0x1000_u32;
+    let call_end_rva = call_rva.checked_add(7).expect("fixture call end");
+    let displacement = i64::from(slot_rva) - i64::from(call_end_rva);
+    let displacement = i32::try_from(displacement).expect("fixture RIP displacement");
+    let offset = rtti_file_offset(call_rva);
+    bytes[offset..offset + 3].copy_from_slice(&[prefix, 0xff, 0x15]);
+    bytes[offset + 3..offset + 7].copy_from_slice(&displacement.to_le_bytes());
+    bytes[rtti_file_offset(call_end_rva)] = 0xc3;
+    put_rtti_rva_u64(&mut bytes, slot_rva, target_va);
     bytes
 }
 
@@ -1005,6 +1048,230 @@ fn rex_w_iat_control_flow_is_not_duplicated_as_data_flow() {
     assert!(
         analysis.data_references.is_empty(),
         "IAT control flow must not be duplicated as data flow"
+    );
+}
+
+#[test]
+fn resolves_exact_six_and_seven_byte_calls_through_unaligned_read_only_pointer_slots() {
+    let analysis = analyze_pe(&read_only_pointer_call_fixture())
+        .expect("valid PE with read-only function-pointer calls");
+
+    assert_eq!(
+        analysis.direct_calls,
+        [
+            PeDirectCall {
+                caller_rva: 0x1000,
+                call_site_rva: 0x1000,
+                instruction_size: 6,
+                target: PeControlFlowTarget::FunctionPointer {
+                    slot_rva: 0x2301,
+                    rva: 0x1020,
+                },
+            },
+            PeDirectCall {
+                caller_rva: 0x1000,
+                call_site_rva: 0x1006,
+                instruction_size: 7,
+                target: PeControlFlowTarget::FunctionPointer {
+                    slot_rva: 0x2311,
+                    rva: 0x1020,
+                },
+            },
+        ]
+    );
+    assert_eq!(
+        analysis.data_references,
+        [
+            PeDataReference {
+                caller_rva: 0x1000,
+                instruction_rva: 0x1000,
+                instruction_size: 6,
+                target_rva: 0x2301,
+            },
+            PeDataReference {
+                caller_rva: 0x1000,
+                instruction_rva: 0x1006,
+                instruction_size: 7,
+                target_rva: 0x2311,
+            },
+        ]
+    );
+
+    let pointer_claim = analysis
+        .symbol_graph
+        .claims()
+        .iter()
+        .find(|claim| {
+            matches!(
+                claim.assertion(),
+                SymbolAssertion::DirectCall {
+                    call_site_rva: 0x1000,
+                    target: ControlFlowTarget::FunctionPointer {
+                        slot_rva: 0x2301,
+                        rva: 0x1020,
+                    },
+                }
+            )
+        })
+        .expect("typed read-only pointer-call claim");
+    assert_eq!(
+        pointer_claim.provenance().method,
+        "pe-x64-read-only-pointer-call"
+    );
+    assert_eq!(
+        pointer_claim.evidence()[0].summary,
+        READ_ONLY_POINTER_CALL_EVIDENCE_SUMMARY
+    );
+    assert_eq!(
+        pointer_claim.evidence()[0].artifacts.get("slot_rva"),
+        Some(&"0x2301".to_owned())
+    );
+
+    let recovered_entry = analysis
+        .symbol_graph
+        .claims()
+        .iter()
+        .find(|claim| {
+            claim.provenance().method == "pe-x64-recovered-function-target"
+                && matches!(
+                    (claim.subject(), claim.assertion()),
+                    (
+                        SymbolSubject::Function { rva: 0x1020, .. },
+                        SymbolAssertion::FunctionEntry,
+                    )
+                )
+                && claim.evidence()[0].artifacts.get("slot_rva") == Some(&"0x2301".to_owned())
+        })
+        .expect("pointer-derived recovered entry preserves its slot");
+    assert_eq!(
+        recovered_entry.evidence()[0].artifacts.get("edge_kind"),
+        Some(&"read-only-pointer-call".to_owned())
+    );
+
+    assert_eq!(
+        analysis
+            .rebuild_symbol_graph()
+            .expect("rebuild pointer graph"),
+        analysis.symbol_graph
+    );
+    let encoded = serde_json::to_string(&analysis).expect("serialize pointer-call analysis");
+    let decoded = serde_json::from_str(&encoded).expect("deserialize pointer-call analysis");
+    assert_eq!(analysis, decoded);
+}
+
+#[test]
+fn prefixed_ff15_near_misses_remain_data_flow_instead_of_pointer_calls() {
+    for prefix in [0x40, 0x66, 0xf2, 0xf3] {
+        let analysis = analyze_pe(&prefixed_pointer_call_fixture(
+            prefix,
+            0x2301,
+            RTTI_IMAGE_BASE + 0x1020,
+        ))
+        .unwrap_or_else(|error| panic!("prefix 0x{prefix:02x}: {error}"));
+
+        assert!(
+            analysis
+                .direct_calls
+                .iter()
+                .all(|call| !matches!(call.target, PeControlFlowTarget::FunctionPointer { .. })),
+            "prefix 0x{prefix:02x}"
+        );
+        assert_eq!(
+            analysis.data_references,
+            [PeDataReference {
+                caller_rva: 0x1000,
+                instruction_rva: 0x1000,
+                instruction_size: 7,
+                target_rva: 0x2301,
+            }],
+            "prefix 0x{prefix:02x}"
+        );
+    }
+}
+
+#[test]
+fn exact_iat_membership_precedes_read_only_pointer_resolution() {
+    let mut bytes = rtti_fixture_with_rex_w_iat_control_flow();
+    put_rtti_rva_u64(&mut bytes, 0x2340, RTTI_IMAGE_BASE + 0x1020);
+
+    let analysis = analyze_pe(&bytes).expect("valid PE with executable-looking IAT contents");
+    assert_eq!(
+        analysis.direct_calls,
+        [PeDirectCall {
+            caller_rva: 0x1000,
+            call_site_rva: 0x1000,
+            instruction_size: 7,
+            target: PeControlFlowTarget::ImportIat { iat_rva: 0x2340 },
+        }]
+    );
+    assert!(analysis.data_references.is_empty());
+}
+
+#[test]
+fn read_only_pointer_resolution_rejects_invalid_slots_and_targets_without_hiding_data_flow() {
+    for (label, bytes) in [
+        (
+            "preferred VA below image base",
+            single_pointer_call_fixture(0x2301, RTTI_IMAGE_BASE - 1),
+        ),
+        (
+            "preferred VA at image end",
+            single_pointer_call_fixture(0x2301, RTTI_IMAGE_BASE + 0x3000),
+        ),
+        (
+            "non-executable target",
+            single_pointer_call_fixture(0x2301, RTTI_IMAGE_BASE + 0x2300),
+        ),
+        (
+            "runtime-function interior target",
+            single_pointer_call_fixture(0x2301, RTTI_IMAGE_BASE + 0x1008),
+        ),
+        (
+            "call-end target",
+            single_pointer_call_fixture(0x2301, RTTI_IMAGE_BASE + 0x1006),
+        ),
+    ] {
+        let analysis = analyze_pe(&bytes).unwrap_or_else(|error| panic!("{label}: {error}"));
+        assert!(analysis.direct_calls.is_empty(), "{label}");
+        assert_eq!(analysis.data_references.len(), 1, "{label}");
+        assert_eq!(analysis.data_references[0].target_rva, 0x2301, "{label}");
+    }
+
+    let mut writable = single_pointer_call_fixture(0x2301, RTTI_IMAGE_BASE + 0x1020);
+    put_u32(&mut writable, SECTION_OFFSET + 40 + 36, 0xc000_0040);
+    let analysis = analyze_pe(&writable).expect("writable slot remains ordinary data flow");
+    assert!(analysis.direct_calls.is_empty());
+    assert_eq!(analysis.data_references.len(), 1);
+
+    let mut short = rtti_fixture();
+    short[rtti_file_offset(0x1000)..rtti_file_offset(0x1010)].fill(0x90);
+    put_rip_relative_instruction(&mut short, 0x1000, 0x15, 0x23fc);
+    short[rtti_file_offset(0x1006)] = 0xc3;
+    put_u32(&mut short, rtti_file_offset(0x23fc), 0x1020);
+    let analysis = analyze_pe(&short).expect("short slot remains ordinary data flow");
+    assert!(analysis.direct_calls.is_empty());
+    assert_eq!(analysis.data_references.len(), 1);
+    assert_eq!(analysis.data_references[0].target_rva, 0x23fc);
+}
+
+#[test]
+fn read_only_pointer_resolution_rejects_executable_virtual_tail_targets() {
+    let mut bytes = single_pointer_call_fixture(0x2301, RTTI_IMAGE_BASE + 0x1200);
+    // Extend .text virtually but leave its 0x200-byte raw extent unchanged.
+    // RVA 0x1200 is therefore executable in-image metadata without file bytes.
+    put_u32(&mut bytes, SECTION_OFFSET + 8, 0x400);
+
+    let analysis = analyze_pe(&bytes)
+        .expect("pointer target in executable virtual tail remains ordinary data flow");
+    assert!(analysis.direct_calls.is_empty());
+    assert_eq!(
+        analysis.data_references,
+        [PeDataReference {
+            caller_rva: 0x1000,
+            instruction_rva: 0x1000,
+            instruction_size: 6,
+            target_rva: 0x2301,
+        }]
     );
 }
 
@@ -1925,6 +2192,70 @@ fn validated_deserialization_rejects_tampered_code_recovery() {
 }
 
 #[test]
+fn validated_deserialization_rejects_tampered_read_only_pointer_calls() {
+    let analysis = analyze_pe(&read_only_pointer_call_fixture())
+        .expect("valid read-only pointer-call analysis");
+    let original = serde_json::to_value(analysis).expect("serialize pointer-call analysis");
+
+    let mut missing_reference = original.clone();
+    missing_reference["data_references"]
+        .as_array_mut()
+        .expect("data-reference array")
+        .remove(0);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(missing_reference)
+        .expect_err("a pointer call cannot outlive its exact slot reference");
+    assert!(error.to_string().contains("direct-call data reference"));
+
+    let mut mismatched_reference = original.clone();
+    mismatched_reference["data_references"][0]["target_rva"] = serde_json::json!(0x2302);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(mismatched_reference)
+        .expect_err("a nearby data reference cannot satisfy the pointer-call dependency");
+    assert!(error.to_string().contains("direct-call data reference"));
+
+    let mut wrong_size = original.clone();
+    wrong_size["direct_calls"][0]["instruction_size"] = serde_json::json!(5);
+    wrong_size["data_references"][0]["instruction_size"] = serde_json::json!(5);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(wrong_size)
+        .expect_err("a pointer call must retain its exact supported size");
+    assert!(error.to_string().contains("direct-call instruction size"));
+
+    let mut interior_target = original.clone();
+    interior_target["direct_calls"][0]["target"]["rva"] = serde_json::json!(0x1008);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(interior_target)
+        .expect_err("a pointer call cannot promote a runtime-function interior");
+    assert!(error.to_string().contains("runtime-function metadata"));
+
+    let mut writable_slot = original.clone();
+    writable_slot["sections"][1]["characteristics"] = serde_json::json!(0xc000_0040_u32);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(writable_slot)
+        .expect_err("a persisted pointer slot must remain read-only");
+    assert!(error.to_string().contains("eight fully backed bytes"));
+
+    let iat_analysis =
+        analyze_pe(&rtti_fixture_with_rex_w_iat_control_flow()).expect("valid IAT analysis");
+    let mut iat_collision = serde_json::to_value(iat_analysis).expect("serialize IAT analysis");
+    iat_collision["direct_calls"][0]["target"] = serde_json::json!({
+        "kind": "function-pointer",
+        "slot_rva": 0x2340,
+        "rva": 0x1020,
+    });
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(iat_collision)
+        .expect_err("IAT membership must take precedence in persisted models");
+    assert!(error.to_string().contains("import-address-table slot"));
+
+    let thunk_analysis = analyze_pe(&code_recovery_fixture()).expect("valid thunk analysis");
+    let mut pointer_thunk = serde_json::to_value(thunk_analysis).expect("serialize thunk analysis");
+    pointer_thunk["thunks"][0]["target"] = serde_json::json!({
+        "kind": "function-pointer",
+        "slot_rva": 0x1260,
+        "rva": 0x1060,
+    });
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(pointer_thunk)
+        .expect_err("pointer-slot resolution is not a thunk model");
+    assert!(error.to_string().contains("not supported for thunks"));
+}
+
+#[test]
 fn validated_deserialization_rejects_call_next_outside_runtime_coverage() {
     let analysis = analyze_pe(&control_flow_suppression_fixture())
         .expect("valid analysis with a suppressed call-next encoding");
@@ -2698,6 +3029,156 @@ fn session_enforces_pe_section_policy_for_plugin_strings_and_data_references() {
     assert!(matches!(
         error,
         SessionValidationError::DataReferenceSourceNotExecutable { index: 0 }
+    ));
+}
+
+#[test]
+fn session_validates_read_only_pointer_call_targets_slots_and_companions() {
+    let base_analysis = analyze_bytes(&read_only_pointer_call_fixture())
+        .expect("valid PE with a base pointer-call companion");
+    let binary = base_analysis.identity().id.clone();
+    let producer = || ClaimProducer::Plugin {
+        id: plugin_id(),
+        version: "1.2.3".to_owned(),
+    };
+    let pointer_claim = |call_site_rva, slot_rva, rva| {
+        plugin_claim(
+            SymbolSubject::Function {
+                binary: binary.clone(),
+                rva: 0x1000,
+                size: Some(0x10),
+            },
+            SymbolAssertion::DirectCall {
+                call_site_rva,
+                target: ControlFlowTarget::FunctionPointer { slot_rva, rva },
+            },
+            producer(),
+            Some("run-001"),
+        )
+    };
+
+    AnalysisSession::new(
+        base_analysis.clone(),
+        vec![plugin_run(PluginRunStatus::Succeeded, 1)],
+        vec![pointer_claim(0x1000, 0x2301, 0x1020)],
+    )
+    .expect("a valid base data-reference claim may satisfy the pointer-call dependency");
+
+    let error = AnalysisSession::new(
+        base_analysis.clone(),
+        vec![plugin_run(PluginRunStatus::Succeeded, 1)],
+        vec![pointer_claim(0x1001, 0x2301, 0x1020)],
+    )
+    .expect_err("a different call site cannot borrow the base companion");
+    assert!(matches!(
+        error,
+        SessionValidationError::FunctionPointerMissingDataReference {
+            index: 0,
+            slot_rva: 0x2301,
+        }
+    ));
+
+    let error = AnalysisSession::new(
+        base_analysis,
+        vec![plugin_run(PluginRunStatus::Succeeded, 1)],
+        vec![pointer_claim(0x1000, 0x2301, 0x2300)],
+    )
+    .expect_err("the resolved pointer target must be executable");
+    assert!(matches!(
+        error,
+        SessionValidationError::FunctionPointerTargetNotExecutable { index: 0 }
+    ));
+
+    let mut writable_bytes = read_only_pointer_call_fixture();
+    put_u32(&mut writable_bytes, SECTION_OFFSET + 40 + 36, 0xc000_0040);
+    let writable_analysis = analyze_bytes(&writable_bytes)
+        .expect("writable pointer slots remain valid ordinary data references");
+    let writable_claim = plugin_claim(
+        SymbolSubject::Function {
+            binary: writable_analysis.identity().id.clone(),
+            rva: 0x1000,
+            size: Some(0x10),
+        },
+        SymbolAssertion::DirectCall {
+            call_site_rva: 0x1000,
+            target: ControlFlowTarget::FunctionPointer {
+                slot_rva: 0x2301,
+                rva: 0x1020,
+            },
+        },
+        producer(),
+        Some("run-001"),
+    );
+    let error = AnalysisSession::new(
+        writable_analysis,
+        vec![plugin_run(PluginRunStatus::Succeeded, 1)],
+        vec![writable_claim],
+    )
+    .expect_err("plugin pointer slots must be read-only");
+    assert!(matches!(
+        error,
+        SessionValidationError::FunctionPointerSlotNotReadOnly { index: 0 }
+    ));
+
+    let iat_analysis = analyze_bytes(&rtti_fixture_with_rex_w_iat_control_flow())
+        .expect("valid PE with parsed imports");
+    let iat_binary = iat_analysis.identity().id.clone();
+    let iat_claim = plugin_claim(
+        SymbolSubject::Function {
+            binary: iat_binary,
+            rva: 0x1000,
+            size: Some(0x10),
+        },
+        SymbolAssertion::DirectCall {
+            call_site_rva: 0x1000,
+            target: ControlFlowTarget::FunctionPointer {
+                slot_rva: 0x2340,
+                rva: 0x1020,
+            },
+        },
+        producer(),
+        Some("run-001"),
+    );
+    let error = AnalysisSession::new(
+        iat_analysis,
+        vec![plugin_run(PluginRunStatus::Succeeded, 1)],
+        vec![iat_claim],
+    )
+    .expect_err("a plugin cannot reinterpret an exact IAT slot as a function pointer");
+    assert!(matches!(
+        error,
+        SessionValidationError::FunctionPointerSlotIsImportIat {
+            index: 0,
+            slot_rva: 0x2340,
+        }
+    ));
+
+    let thunk_claim = plugin_claim(
+        SymbolSubject::Function {
+            binary: binary.clone(),
+            rva: 0x1000,
+            size: Some(0x10),
+        },
+        SymbolAssertion::ThunkTarget {
+            target: ControlFlowTarget::FunctionPointer {
+                slot_rva: 0x2301,
+                rva: 0x1020,
+            },
+        },
+        producer(),
+        Some("run-001"),
+    );
+    let base_analysis = analyze_bytes(&read_only_pointer_call_fixture())
+        .expect("valid PE for plugin thunk rejection");
+    let error = AnalysisSession::new(
+        base_analysis,
+        vec![plugin_run(PluginRunStatus::Succeeded, 1)],
+        vec![thunk_claim],
+    )
+    .expect_err("pointer resolution is not supported on thunk assertions");
+    assert!(matches!(
+        error,
+        SessionValidationError::FunctionPointerThunkUnsupported { index: 0 }
     ));
 }
 

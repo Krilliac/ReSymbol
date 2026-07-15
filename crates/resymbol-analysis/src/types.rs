@@ -304,9 +304,11 @@ pub enum PeControlFlowTarget {
     Function { rva: u32 },
     /// An exact slot from the parsed PE import address table.
     ImportIat { iat_rva: u32 },
+    /// A file-backed executable address read from one exact read-only pointer slot.
+    FunctionPointer { slot_rva: u32, rva: u32 },
 }
 
-/// One exact direct call decoded inside an x64 `RUNTIME_FUNCTION` range.
+/// One exact statically resolved call decoded inside an x64 `RUNTIME_FUNCTION` range.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PeDirectCall {

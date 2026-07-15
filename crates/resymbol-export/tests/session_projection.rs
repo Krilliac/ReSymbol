@@ -325,7 +325,7 @@ fn recovered_direct_call_survives_json_but_entry_only_target_skips_writers() {
     let session = AnalysisSession::new(analysis, Vec::new(), Vec::new()).expect("valid session");
     let projection = ExportProjection::from_session(&session).expect("session projection");
 
-    assert_eq!(projection.schema_version, 5);
+    assert_eq!(projection.schema_version, 6);
     assert_eq!(projection.direct_calls.len(), 1);
     assert_eq!(projection.direct_calls[0].caller_rva, 0x1000);
     assert_eq!(projection.direct_calls[0].call_site_rva, 0x1000);
@@ -370,7 +370,7 @@ fn cfg_recovery_keeps_session_and_projection_shapes_stable() {
     let projection = ExportProjection::from_session(&session).expect("session projection");
     projection.validate().expect("projection remains valid");
 
-    assert_eq!(projection.schema_version, 5);
+    assert_eq!(projection.schema_version, 6);
     assert_eq!(
         projection
             .direct_calls
@@ -435,7 +435,7 @@ fn cfg_recovery_keeps_session_and_projection_shapes_stable() {
     assert_eq!(projection, decoded_projection);
 
     let projection_json = serde_json::to_value(&projection).expect("serialize CFG projection");
-    assert_eq!(projection_json["schema_version"], serde_json::json!(5));
+    assert_eq!(projection_json["schema_version"], serde_json::json!(6));
     assert_eq!(
         projection_json["direct_calls"][0],
         serde_json::json!({
@@ -482,7 +482,7 @@ fn recovered_strings_and_data_references_flow_through_the_session_projection() {
     let projection = ExportProjection::from_session(&session).expect("session projection");
     projection.validate().expect("projection remains valid");
 
-    assert_eq!(projection.schema_version, 5);
+    assert_eq!(projection.schema_version, 6);
     assert_eq!(projection.strings.len(), 2);
     assert_eq!(projection.strings[0].rva, 0x2000);
     assert_eq!(projection.strings[0].value, "Recovered ASCII");
@@ -552,7 +552,7 @@ fn msvc_rtti_names_and_relationships_flow_into_all_export_inputs() {
     let projection = ExportProjection::from_session(&session).expect("session projection");
     projection.validate().expect("projection remains valid");
 
-    assert_eq!(projection.schema_version, 5);
+    assert_eq!(projection.schema_version, 6);
     assert_eq!(projection.types.len(), 1);
     assert_eq!(
         projection.types[0].key,

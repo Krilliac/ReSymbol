@@ -32,8 +32,10 @@ The current alpha implements and tests an end-to-end, deliberately narrow analys
   including validated class/type names, base-class records, and contiguous executable slot
   candidates;
 - bounded pure-Rust x86-64 decoding inside fully file-backed `RUNTIME_FUNCTION` ranges, recovering
-  supported direct calls and one-instruction thunks to internal executable targets or exact parsed
-  import-address-table slots, plus exact supported RIP-relative references into eligible data;
+  supported direct calls to internal executable targets, exact parsed import-address-table slots,
+  or targets resolved one hop through exact read-only in-image function-pointer slots;
+  one-instruction thunks to internal targets or exact parsed import slots; and exact supported
+  RIP-relative references into eligible data;
 - bounded recovery of exact NUL-terminated ASCII and UTF-16LE strings from file-backed,
   initialized, readable, non-executable sections, including writable data;
 - a source-available, byte-reproducible four-artifact MSVC x64 PE fixture matrix spanning optimized
@@ -90,13 +92,18 @@ The core PE analyzer never loads or executes its input and requires no network s
 is a bounded control-flow-guided block sweep, not a general recursive disassembler: it starts at
 validated x64 exception-range entries, follows supported direct same-range branches with a
 deterministic ordered worklist, and stops a path at returns, terminal or indirect control flow,
-invalid instructions, and ambiguous interior targets. It recognizes supported `E8` direct calls,
-RIP-relative `FF 15` import calls, and seeded `E9`, `EB`, or RIP-relative `FF 25` thunks, including
-the redundant `REX.W` prefix emitted by current MSVC for some import calls and thunks. The
-built-in pass discovers at most
-262,144 block starts and retains at most 8,192 direct calls, 32,768 supported RIP-relative data
-references, and 4,096 thunks. These are heuristic-confidence findings: reachable embedded data can
-still decode as instructions, while an invalid encoding or unsupported branch can omit later
+invalid instructions, and ambiguous interior targets. It recognizes supported `E8` direct calls;
+exact RIP-relative `FF 15 disp32` and redundant-`REX.W` `48 FF 15 disp32` calls to parsed IAT
+slots; and the same two call encodings through a complete eight-byte pointer slot in readable,
+initialized, non-writable, non-executable data. Parsed IAT membership takes precedence. Otherwise
+the slot's little-endian preferred-image VA is resolved exactly once to a file-backed executable
+target; pointer chains and writable slots remain unsupported. A resolved pointer call records its
+slot and endpoint explicitly and retains the same instruction as a paired data reference to the
+slot. Seeded `E9`, `EB`, or RIP-relative `FF 25` thunks remain supported, including the redundant
+`REX.W` prefix emitted by current MSVC for some import calls and thunks. The built-in pass discovers
+at most 262,144 block starts and retains at most 8,192 direct calls, 32,768 supported RIP-relative
+data references, and 4,096 thunks. These are heuristic-confidence findings: reachable embedded data
+can still decode as instructions, while an invalid encoding or unsupported branch can omit later
 relationships on that path. An internal target covered by known `RUNTIME_FUNCTION` metadata is
 suppressed unless its RVA matches a recorded runtime-function begin. The pass does not persist a
 basic-block graph, infer erased identifiers, invent names or sizes, recover register-indirect
@@ -209,12 +216,14 @@ accident. `inspect` validates the package schema, payload, and embedded binary i
 displaying it. `export` stages and flushes a complete artifact before a no-clobber publish; use
 `--output` to choose a destination instead of replacing an existing export artifact.
 
-New analyses write package schema 3. `inspect` and `export` also accept schema 1 and schema 2
-packages through validated in-memory compatibility paths. Migration does not rewrite the source
-package or rerun analysis because `.resym` does not embed the executable bytes. Schema 1 therefore
-has no available recovered calls, thunks, strings, or data references. Schema 2 retains its calls
-and thunks, but strings and data references remain unavailable. Reanalyze the exact original binary
-to produce package schema 3 with current recovery results.
+New analyses write package schema 4. `inspect` and `export` also accept schemas 1, 2, and 3 through
+validated in-memory compatibility paths. Migration does not rewrite the source package or rerun
+analysis because `.resym` does not embed the executable bytes. Schema 1 therefore has no available
+recovered calls, thunks, strings, or data references. Schema 2 retains calls and thunks but predates
+strings and data references. Schema 3 retains those string/data records, but schemas 2 and 3 both
+predate read-only function-pointer call resolution. Reanalyze the exact original binary to produce
+schema 4 with current recovery results. A schema 2 or 3 envelope containing a schema-4
+`function-pointer` target is rejected rather than treated as a relabeled legacy package.
 
 The `analyze` and `inspect` summaries report recovered strings, data references, direct calls, and
 thunks as well as discovered MSVC RTTI vftables, unique types, base-class records, and virtual
@@ -224,17 +233,17 @@ and the package records the truncation explicitly.
 
 The Markdown output is a deterministic, bounded presentation report for people to review. It is
 not a stable interchange format; integrations should consume the neutral JSON projection instead.
-Without `--output`, it is written as `application.symbols.md` beside the package. Package schema 3
-is used by new analyses, export also accepts package schemas 1 and 2 through validated compatibility
-paths, and neutral projection schema 5 remains unchanged by this presentation-only format. Export
-does not rewrite the source package.
+Without `--output`, it is written as `application.symbols.md` beside the package. Package schema 4
+is used by new analyses, export also accepts package schemas 1 through 3 through validated
+compatibility paths, and neutral projection schema 6 remains unchanged by this presentation-only
+format. Export does not rewrite the source package.
 
 The PE-only `map` format writes deterministic Microsoft-linker-style text to `application.map` by
 default for tools that support that format. It maps selected names to one-based PE
 `section:offset` values and preferred-image-base-plus-RVA addresses. Its semicolon-prefixed exact
 SHA-256 and file-size comments are informational: a MAP file cannot check the binary loaded by a
 consumer, so compare the executable with the recorded identity before using the symbols. MAP adds
-no fields to package schema 3 or neutral projection schema 5, and it does not rewrite legacy source
+no fields to package schema 4 or neutral projection schema 6, and it does not rewrite legacy source
 packages accepted through compatibility paths. The header module name is the package filename stem;
 for a valid UTF-8 stem, unsupported/non-ASCII encoded bytes become `_` and the result is capped at
 255 bytes. A non-UTF-8 or otherwise unusable stem falls back to `resymbol_<sha12>`.
@@ -253,9 +262,9 @@ database and calculate addresses from the tool's current image base plus each RV
 existing user-authored names and apply only the first projection subset: selected function/global
 names (including validated vftable global names) and conservative non-overlapping function
 boundaries. The neutral JSON projection retains attributed function entries, direct calls, thunks,
-recovered strings, data references, their schema-5 string correlations, and class-membership
-relationships, while the current scripts ignore those relationship and literal records and do not
-synthesize virtual-method names. See the
+recovered strings, data references, their string correlations, explicit function-pointer slot
+provenance from projection schema 6, and class-membership relationships, while the current scripts
+ignore those relationship and literal records and do not synthesize virtual-method names. See the
 [export guide](docs/exporting.md) for report contents, usage, limitations, and in-tool
 instructions. Richer PDB records, DWARF, richer type application, and interactive preview bridges
 remain roadmap work. See the

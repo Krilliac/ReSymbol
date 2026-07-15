@@ -349,15 +349,20 @@ fn analysis_package_read_options() -> PackageOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CodeRecoveryAvailability {
     Recorded,
+    RecordedWithoutReadOnlyPointerCalls(u32),
     UnavailableSchema1,
 }
 
 impl CodeRecoveryAvailability {
-    const fn export_summary_line(self) -> Option<&'static str> {
+    fn export_summary_line(self) -> Option<String> {
         match self {
             Self::Recorded => None,
+            Self::RecordedWithoutReadOnlyPointerCalls(schema_version) => Some(format!(
+                "read-only function-pointer call resolution: unavailable (schema {schema_version} package predates this recovery data; reanalyze the exact original binary)"
+            )),
             Self::UnavailableSchema1 => Some(
-                "code recovery: unavailable (schema 1 package predates decoder data; reanalyze the exact original binary)",
+                "code recovery: unavailable (schema 1 package predates decoder data; reanalyze the exact original binary)"
+                    .to_owned(),
             ),
         }
     }
@@ -411,21 +416,29 @@ fn read_analysis_package(
     let schema_version = package.schema_version();
     let code_recovery_availability = match schema_version {
         1 => CodeRecoveryAvailability::UnavailableSchema1,
-        2 | CURRENT_SCHEMA_VERSION => CodeRecoveryAvailability::Recorded,
+        2 => CodeRecoveryAvailability::RecordedWithoutReadOnlyPointerCalls(2),
+        3 => CodeRecoveryAvailability::RecordedWithoutReadOnlyPointerCalls(3),
+        CURRENT_SCHEMA_VERSION => CodeRecoveryAvailability::Recorded,
         _ => bail!("unsupported analysis package schema {schema_version}"),
     };
     let string_data_recovery_availability = match schema_version {
         1 => StringDataRecoveryAvailability::UnavailableSchema1,
         2 => StringDataRecoveryAvailability::UnavailableSchema2,
+        3 => StringDataRecoveryAvailability::Recorded,
         CURRENT_SCHEMA_VERSION => StringDataRecoveryAvailability::Recorded,
         _ => bail!("unsupported analysis package schema {schema_version}"),
     };
     let schema1_source = (preserve_schema1_source && schema_version == 1).then(|| package.clone());
+    if matches!(schema_version, 2 | 3) {
+        reject_pre_v4_function_pointer_targets(package.payload(), schema_version)?;
+    }
     let package = package.try_map_payload(|payload| match schema_version {
         1 => serde_json::from_value::<SchemaV1AnalysisSession>(payload)
             .context("cannot decode schema-v1 analysis payload")?
             .migrate(),
-        2 | CURRENT_SCHEMA_VERSION => {
+        2 => serde_json::from_value(payload).context("cannot decode schema-v2 analysis payload"),
+        3 => serde_json::from_value(payload).context("cannot decode schema-v3 analysis payload"),
+        CURRENT_SCHEMA_VERSION => {
             serde_json::from_value(payload).context("cannot decode current analysis payload")
         }
         _ => bail!("unsupported analysis package schema {schema_version}"),
@@ -439,6 +452,56 @@ fn read_analysis_package(
         string_data_recovery_availability,
         schema1_source,
     })
+}
+
+fn reject_pre_v4_function_pointer_targets(payload: &Value, schema_version: u32) -> Result<()> {
+    debug_assert!(matches!(schema_version, 2 | 3));
+    let base_analysis = payload.pointer("/base_analysis/analysis");
+    let base_relationship_uses_pointer = base_analysis.is_some_and(|analysis| {
+        relationship_array_uses_function_pointer(analysis.get("direct_calls"))
+            || relationship_array_uses_function_pointer(analysis.get("thunks"))
+            || symbol_graph_uses_function_pointer(analysis.get("symbol_graph"))
+    });
+    let plugin_claim_uses_pointer = claim_array_uses_function_pointer(payload.get("plugin_claims"));
+    if base_relationship_uses_pointer || plugin_claim_uses_pointer {
+        bail!(
+            "package schema {schema_version} predates function-pointer targets but its payload contains a schema-4 function-pointer target; legacy envelopes cannot be relabeled, so reanalyze the exact original binary"
+        );
+    }
+    Ok(())
+}
+
+fn relationship_array_uses_function_pointer(value: Option<&Value>) -> bool {
+    value
+        .and_then(Value::as_array)
+        .is_some_and(|relationships| {
+            relationships
+                .iter()
+                .any(|relationship| target_is_function_pointer(relationship.get("target")))
+        })
+}
+
+fn symbol_graph_uses_function_pointer(value: Option<&Value>) -> bool {
+    claim_array_uses_function_pointer(value.and_then(|graph| graph.get("claims")))
+}
+
+fn claim_array_uses_function_pointer(value: Option<&Value>) -> bool {
+    value.and_then(Value::as_array).is_some_and(|claims| {
+        claims.iter().any(|claim| {
+            target_is_function_pointer(
+                claim
+                    .get("assertion")
+                    .and_then(|assertion| assertion.get("target")),
+            )
+        })
+    })
+}
+
+fn target_is_function_pointer(value: Option<&Value>) -> bool {
+    value
+        .and_then(|target| target.get("kind"))
+        .and_then(Value::as_str)
+        == Some("function-pointer")
 }
 
 #[derive(serde::Deserialize)]
@@ -1909,9 +1972,9 @@ fn print_analysis_summary(
 fn code_recovery_summary_lines(
     pe: &resymbol_analysis::PeAnalysis,
     availability: CodeRecoveryAvailability,
-) -> [String; 3] {
+) -> Vec<String> {
     match availability {
-        CodeRecoveryAvailability::Recorded => [
+        CodeRecoveryAvailability::Recorded => vec![
             format!("recovered direct calls: {}", pe.direct_calls.len()),
             format!("recovered thunks: {}", pe.thunks.len()),
             if pe.code_recovery_scan_truncated {
@@ -1920,7 +1983,19 @@ fn code_recovery_summary_lines(
                 "code recovery scan: complete".to_owned()
             },
         ],
-        CodeRecoveryAvailability::UnavailableSchema1 => [
+        CodeRecoveryAvailability::RecordedWithoutReadOnlyPointerCalls(schema_version) => vec![
+            format!("recovered direct calls: {}", pe.direct_calls.len()),
+            format!("recovered thunks: {}", pe.thunks.len()),
+            if pe.code_recovery_scan_truncated {
+                "code recovery scan: partial (a fixed discovery budget was reached)".to_owned()
+            } else {
+                "code recovery scan: complete".to_owned()
+            },
+            format!(
+                "read-only function-pointer calls: unavailable (not recorded by schema {schema_version}; reanalyze the exact original binary)"
+            ),
+        ],
+        CodeRecoveryAvailability::UnavailableSchema1 => vec![
             "recovered direct calls: unavailable (not recorded by schema 1)".to_owned(),
             "recovered thunks: unavailable (not recorded by schema 1)".to_owned(),
             "code recovery scan: not run (schema 1 package predates decoder data; reanalyze the exact original binary)"
@@ -2966,12 +3041,43 @@ entrypoint = "Plugin.dll"
             CodeRecoveryAvailability::UnavailableSchema1.export_summary_line(),
             Some(
                 "code recovery: unavailable (schema 1 package predates decoder data; reanalyze the exact original binary)"
+                    .to_owned()
             )
         );
         assert_eq!(
             CodeRecoveryAvailability::Recorded.export_summary_line(),
             None
         );
+    }
+
+    #[test]
+    fn schema_v2_and_v3_summaries_preserve_code_recovery_but_mark_pointer_calls_unavailable() {
+        let analysis = analyze_bytes(&pe_code_recovery_fixture()).expect("analyze fixture");
+        let BinaryAnalysis::Pe(pe) = &analysis else {
+            panic!("PE analysis expected");
+        };
+
+        for schema_version in [2, 3] {
+            let availability =
+                CodeRecoveryAvailability::RecordedWithoutReadOnlyPointerCalls(schema_version);
+            assert_eq!(
+                code_recovery_summary_lines(pe, availability),
+                [
+                    "recovered direct calls: 1".to_owned(),
+                    "recovered thunks: 1".to_owned(),
+                    "code recovery scan: complete".to_owned(),
+                    format!(
+                        "read-only function-pointer calls: unavailable (not recorded by schema {schema_version}; reanalyze the exact original binary)"
+                    ),
+                ]
+            );
+            assert_eq!(
+                availability.export_summary_line(),
+                Some(format!(
+                    "read-only function-pointer call resolution: unavailable (schema {schema_version} package predates this recovery data; reanalyze the exact original binary)"
+                ))
+            );
+        }
     }
 
     #[test]
@@ -3185,7 +3291,7 @@ entrypoint = "Plugin.dll"
         let json_path = package.with_extension("symbols.json");
         let json_bytes = fs::read(&json_path).expect("read JSON export");
         let json: Value = serde_json::from_slice(&json_bytes).expect("parse JSON export");
-        assert_eq!(json["schema_version"], Value::from(5_u64));
+        assert_eq!(json["schema_version"], Value::from(6_u64));
         assert_eq!(
             json["binary"]["id"],
             Value::String(BinaryId::digest(&bytes).to_string())
@@ -3841,7 +3947,7 @@ entrypoint = "Plugin.dll"
         assert_eq!(decoded.package.schema_version(), 2);
         assert_eq!(
             decoded.code_recovery_availability,
-            CodeRecoveryAvailability::Recorded
+            CodeRecoveryAvailability::RecordedWithoutReadOnlyPointerCalls(2)
         );
         assert_eq!(
             decoded.string_data_recovery_availability,
@@ -3886,6 +3992,142 @@ entrypoint = "Plugin.dll"
             json: false,
         })
         .expect("CLI inspection accepts schema 2");
+    }
+
+    #[test]
+    fn inspect_and_json_export_accept_schema_v3_with_string_and_data_recovery() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let path = temp.path().join("schema-v3.resym");
+        let output = temp.path().join("schema-v3.json");
+        let base_analysis = analyze_bytes(&pe_code_recovery_fixture()).expect("analyze PE fixture");
+        let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
+            .expect("create base-only session");
+        let package = ResymPackage::from_bound_payload("0.1.0-alpha.3", session)
+            .expect("create current package value");
+        let mut value = serde_json::to_value(package).expect("serialize package value");
+        value["schema_version"] = serde_json::json!(3);
+        fs::write(
+            &path,
+            serde_json::to_vec(&value).expect("encode schema-v3 package"),
+        )
+        .expect("write schema-v3 package");
+
+        let decoded = read_analysis_package(&path, true)
+            .expect("CLI compatibility policy accepts schema 3 explicitly");
+        assert_eq!(decoded.package.schema_version(), 3);
+        assert_eq!(
+            decoded.code_recovery_availability,
+            CodeRecoveryAvailability::RecordedWithoutReadOnlyPointerCalls(3)
+        );
+        assert_eq!(
+            decoded.string_data_recovery_availability,
+            StringDataRecoveryAvailability::Recorded
+        );
+        assert!(decoded.schema1_source.is_none());
+        assert_eq!(
+            serde_json::from_str::<Value>(
+                &decoded
+                    .to_pretty_inspection_json()
+                    .expect("serialize decoded schema-v3 representation")
+            )
+            .expect("inspection JSON is valid")["schema_version"],
+            3
+        );
+
+        inspect(InspectArgs {
+            package: path.clone(),
+            json: false,
+        })
+        .expect("CLI inspection accepts schema 3");
+        export(ExportArgs {
+            package: path,
+            format: ExportFormat::Json,
+            output: Some(output.clone()),
+            binary: None,
+        })
+        .expect("JSON export accepts schema 3");
+        let projection: Value =
+            serde_json::from_slice(&fs::read(output).expect("read schema-v3 JSON projection"))
+                .expect("projection JSON is valid");
+        assert_eq!(projection["schema_version"], 6);
+    }
+
+    #[test]
+    fn schema_v2_and_v3_reject_relabeled_schema_v4_function_pointer_targets() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let base_analysis = analyze_bytes(&pe_code_recovery_fixture()).expect("analyze PE fixture");
+        let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
+            .expect("create base-only session");
+        let package = ResymPackage::from_bound_payload("0.1.0", session)
+            .expect("create current package value");
+        let current = serde_json::to_value(package).expect("serialize current package value");
+
+        for schema_version in [2, 3] {
+            let mut value = current.clone();
+            value["schema_version"] = serde_json::json!(schema_version);
+            value["payload"]["base_analysis"]["analysis"]["direct_calls"][0]["target"] = serde_json::json!({
+                "kind": "function-pointer",
+                "slot_rva": 0x1300,
+                "rva": 0x1040
+            });
+            let path = temp
+                .path()
+                .join(format!("relabeled-schema-{schema_version}.resym"));
+            fs::write(
+                &path,
+                serde_json::to_vec(&value).expect("encode relabeled package"),
+            )
+            .expect("write relabeled package");
+
+            let error = match read_analysis_package(&path, false) {
+                Ok(_) => panic!("schema {schema_version} must reject schema-4 target semantics"),
+                Err(error) => error,
+            };
+            let diagnostic = format!("{error:#}");
+            assert!(diagnostic.contains("schema-4 function-pointer target"));
+            assert!(diagnostic.contains("cannot be relabeled"));
+        }
+    }
+
+    #[test]
+    fn pre_v4_function_pointer_gate_covers_base_graph_and_plugin_claim_targets() {
+        let target = serde_json::json!({
+            "kind": "function-pointer",
+            "slot_rva": 0x2000,
+            "rva": 0x1000
+        });
+        for payload in [
+            serde_json::json!({
+                "base_analysis": {
+                    "analysis": {
+                        "direct_calls": [],
+                        "thunks": [],
+                        "symbol_graph": {
+                            "claims": [{"assertion": {"target": target.clone()}}]
+                        }
+                    }
+                },
+                "plugin_claims": []
+            }),
+            serde_json::json!({
+                "base_analysis": {
+                    "analysis": {
+                        "direct_calls": [],
+                        "thunks": [],
+                        "symbol_graph": {"claims": []}
+                    }
+                },
+                "plugin_claims": [{"assertion": {"target": target.clone()}}]
+            }),
+        ] {
+            let error = reject_pre_v4_function_pointer_targets(&payload, 3)
+                .expect_err("pre-v4 claim targets must be rejected");
+            assert!(
+                error
+                    .to_string()
+                    .contains("schema-4 function-pointer target")
+            );
+        }
     }
 
     #[test]

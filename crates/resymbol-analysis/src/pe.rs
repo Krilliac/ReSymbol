@@ -64,6 +64,10 @@ const DIRECT_CALL_EVIDENCE_SUMMARY: &str = concat!(
     "exact supported x64 call encoding observed during a bounded ",
     "control-flow-guided traversal of a file-backed runtime-function range",
 );
+const READ_ONLY_POINTER_CALL_EVIDENCE_SUMMARY: &str = concat!(
+    "exact RIP-relative x64 indirect call resolved through one fully backed read-only ",
+    "in-image pointer slot during bounded runtime traversal",
+);
 const LEGACY_DIRECT_CALL_EVIDENCE_SUMMARY: &str = concat!(
     "exact supported x64 call encoding observed during a bounded linear sweep ",
     "of a file-backed runtime-function range",
@@ -145,6 +149,7 @@ enum RecoveredEntrySource {
         caller_rva: u32,
         call_site_rva: u32,
         instruction_size: u8,
+        slot_rva: Option<u32>,
     },
     Thunk {
         source_rva: u32,
@@ -2141,7 +2146,17 @@ pub(crate) fn build_symbol_graph(
     let mut recovered_entry_sources = BTreeMap::<u32, RecoveredEntrySource>::new();
     for call in direct_calls {
         let target = core_control_flow_target(&call.target);
-        let mut evidence = Evidence::new(control_flow_kind.clone(), DIRECT_CALL_EVIDENCE_SUMMARY)?;
+        let (evidence_summary, provenance_method, slot_rva) = match call.target {
+            PeControlFlowTarget::FunctionPointer { slot_rva, .. } => (
+                READ_ONLY_POINTER_CALL_EVIDENCE_SUMMARY,
+                "pe-x64-read-only-pointer-call",
+                Some(slot_rva),
+            ),
+            PeControlFlowTarget::Function { .. } | PeControlFlowTarget::ImportIat { .. } => {
+                (DIRECT_CALL_EVIDENCE_SUMMARY, "pe-x64-direct-call", None)
+            }
+        };
+        let mut evidence = Evidence::new(control_flow_kind.clone(), evidence_summary)?;
         evidence.confidence = Some(direct_call_confidence);
         evidence
             .artifacts
@@ -2157,6 +2172,11 @@ pub(crate) fn build_symbol_graph(
         evidence
             .artifacts
             .insert("target_rva".to_owned(), format!("{:#x}", target.rva()));
+        if let Some(slot_rva) = slot_rva {
+            evidence
+                .artifacts
+                .insert("slot_rva".to_owned(), format!("{slot_rva:#x}"));
+        }
         graph.submit_claim(SymbolClaim::new(
             SymbolSubject::Function {
                 binary: identity.id.clone(),
@@ -2169,14 +2189,17 @@ pub(crate) fn build_symbol_graph(
             },
             direct_call_confidence,
             vec![evidence],
-            provenance("pe-x64-direct-call"),
+            provenance(provenance_method),
         )?)?;
 
-        if let PeControlFlowTarget::Function { rva } = call.target {
+        if let PeControlFlowTarget::Function { rva }
+        | PeControlFlowTarget::FunctionPointer { rva, .. } = call.target
+        {
             let source = RecoveredEntrySource::DirectCall {
                 caller_rva: call.caller_rva,
                 call_site_rva: call.call_site_rva,
                 instruction_size: call.instruction_size,
+                slot_rva,
             };
             recovered_entry_sources
                 .entry(rva)
@@ -2232,14 +2255,23 @@ pub(crate) fn build_symbol_graph(
                 caller_rva,
                 call_site_rva,
                 instruction_size,
+                slot_rva,
             } => {
-                let mut evidence = Evidence::new(
-                    control_flow_kind.clone(),
-                    "conservative internal function candidate inferred from the deterministic first retained direct-call edge",
-                )?;
+                let (summary, edge_kind) = if slot_rva.is_some() {
+                    (
+                        "conservative internal function candidate inferred from the deterministic first retained read-only pointer-call edge",
+                        "read-only-pointer-call",
+                    )
+                } else {
+                    (
+                        "conservative internal function candidate inferred from the deterministic first retained direct-call edge",
+                        "direct-call",
+                    )
+                };
+                let mut evidence = Evidence::new(control_flow_kind.clone(), summary)?;
                 evidence
                     .artifacts
-                    .insert("edge_kind".to_owned(), "direct-call".to_owned());
+                    .insert("edge_kind".to_owned(), edge_kind.to_owned());
                 evidence
                     .artifacts
                     .insert("caller_rva".to_owned(), format!("{caller_rva:#x}"));
@@ -2249,6 +2281,11 @@ pub(crate) fn build_symbol_graph(
                 evidence
                     .artifacts
                     .insert("instruction_size".to_owned(), instruction_size.to_string());
+                if let Some(slot_rva) = slot_rva {
+                    evidence
+                        .artifacts
+                        .insert("slot_rva".to_owned(), format!("{slot_rva:#x}"));
+                }
                 evidence
             }
             RecoveredEntrySource::Thunk {
@@ -2411,6 +2448,12 @@ fn core_control_flow_target(target: &PeControlFlowTarget) -> ControlFlowTarget {
         PeControlFlowTarget::ImportIat { iat_rva } => ControlFlowTarget::ImportIat {
             iat_rva: u64::from(iat_rva),
         },
+        PeControlFlowTarget::FunctionPointer { slot_rva, rva } => {
+            ControlFlowTarget::FunctionPointer {
+                slot_rva: u64::from(slot_rva),
+                rva: u64::from(rva),
+            }
+        }
     }
 }
 

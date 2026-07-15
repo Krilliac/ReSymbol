@@ -110,6 +110,7 @@ pub struct ExportFunction {
 pub enum ExportControlFlowTarget {
     Function { rva: u64 },
     ImportIat { iat_rva: u64 },
+    FunctionPointer { slot_rva: u64, rva: u64 },
 }
 
 /// One attributed direct-call relationship in the binary image.
@@ -279,7 +280,7 @@ pub struct ExportProjection {
 }
 
 impl ExportProjection {
-    pub(crate) const SCHEMA_VERSION: u32 = 5;
+    pub(crate) const SCHEMA_VERSION: u32 = 6;
 
     /// Revalidate ordering, range, text, attribution, and uniqueness invariants.
     pub fn validate(&self) -> Result<(), ProjectionValidationError> {
@@ -324,6 +325,18 @@ impl ExportProjection {
                 collection: "data_references",
             });
         }
+        let pointer_call_companions = self
+            .data_references
+            .iter()
+            .filter(|reference| matches!(reference.instruction_size, 6 | 7))
+            .map(|reference| {
+                (
+                    reference.caller_rva,
+                    reference.instruction_rva,
+                    reference.target_rva,
+                )
+            })
+            .collect::<BTreeSet<_>>();
 
         if !strictly_increasing_by(&self.functions, |left, right| left.rva < right.rva) {
             return Err(ProjectionValidationError::UnsortedCollection {
@@ -430,6 +443,17 @@ impl ExportProjection {
                 });
             }
             validate_control_flow_target(&self.functions, &call.target, &self.binary)?;
+            if let ExportControlFlowTarget::FunctionPointer { slot_rva, .. } = call.target {
+                if !pointer_call_companions.contains(&(
+                    call.caller_rva,
+                    call.call_site_rva,
+                    slot_rva,
+                )) {
+                    return Err(ProjectionValidationError::InvalidBinaryField {
+                        field: "direct_call.function_pointer_reference",
+                    });
+                }
+            }
             validate_attribution(&call.attribution)?;
         }
 
@@ -446,10 +470,7 @@ impl ExportProjection {
             validate_point(thunk.rva, self.binary.image_size)?;
             require_function_entry(&self.functions, thunk.rva)?;
             validate_control_flow_target(&self.functions, &thunk.target, &self.binary)?;
-            if matches!(
-                thunk.target,
-                ExportControlFlowTarget::Function { rva } if rva == thunk.rva
-            ) {
+            if control_flow_function_rva(&thunk.target) == Some(thunk.rva) {
                 return Err(ProjectionValidationError::InvalidBinaryField {
                     field: "thunk.target",
                 });
@@ -690,6 +711,19 @@ fn validate_control_flow_target(
         ExportControlFlowTarget::ImportIat { iat_rva } => {
             validate_point(*iat_rva, binary.image_size)
         }
+        ExportControlFlowTarget::FunctionPointer { slot_rva, rva } => {
+            validate_range(*slot_rva, Some(8), binary.image_size)?;
+            validate_point(*rva, binary.image_size)?;
+            require_function_entry(functions, *rva).map(|_| ())
+        }
+    }
+}
+
+fn control_flow_function_rva(target: &ExportControlFlowTarget) -> Option<u64> {
+    match target {
+        ExportControlFlowTarget::Function { rva }
+        | ExportControlFlowTarget::FunctionPointer { rva, .. } => Some(*rva),
+        ExportControlFlowTarget::ImportIat { .. } => None,
     }
 }
 

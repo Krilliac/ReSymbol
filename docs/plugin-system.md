@@ -390,8 +390,13 @@ the transaction. Plugin-attributable failures quarantine only the exact artifact
 
 The managed SDK provides `StringEncoding`, validated `StringLiteralAssertion` and
 `DataReferenceAssertion` records, and `ClaimAssertions` helpers that emit canonical `JsonElement`
-payloads. `examples/plugins/managed/` shows those payloads inside complete `SymbolClaim` values;
-the SDK rejects unsupported encoding names, invalid literal text, and zero instruction sizes before
+payloads. It does not yet provide a typed helper for function-pointer direct-call targets. A
+managed plugin that constructs a raw direct-call assertion may use the additive
+`{"kind":"function-pointer","slot_rva":...,"rva":...}` target shape; the managed-host validator
+checks its discriminator and required numeric fields, then the Rust session enforces the PE slot
+and endpoint section policy plus the required same-site companion data reference.
+`examples/plugins/managed/` shows the typed payloads inside complete `SymbolClaim` values; the SDK
+rejects unsupported encoding names, invalid literal text, and zero instruction sizes before
 submission. `AnalysisRequest.BaseAnalysis` contains the detached canonical base analysis only when
 `symbols.read` was granted; without that permission it is `null`.
 
@@ -471,9 +476,10 @@ An interpreter is not assumed to exist. A plugin that needs Python either ships 
 runtime within its package, declares a clearly diagnosed external prerequisite, or is distributed
 as a standalone executable.
 
-These assertion additions do not change the external-process protocol version: the handshake
-remains `resymbol.plugin-wire` 1.0, and strict claim-event decoding accepts the additive tagged JSON
-shapes below.
+These assertion and target additions do not change the external-process protocol version: the
+handshake remains `resymbol.plugin-wire` 1.0. Strict claim-event decoding accepts the additive
+tagged JSON shapes below and the raw
+`{"kind":"function-pointer","slot_rva":...,"rva":...}` control-flow target.
 
 ### Tool-hosted bridges (planned host)
 

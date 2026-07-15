@@ -103,23 +103,25 @@ The `json` format is the loss-aware interchange output. It retains:
 - competing names, confidence, and producer/run provenance;
 - supported function and global boundaries;
 - recovered function prototypes and type definitions that fit the neutral model;
-- attributed function entries, direct calls, one-instruction thunks, and function-to-class
-  membership relationships;
+- attributed function entries, direct calls (including explicit read-only pointer-slot and resolved
+  endpoint provenance), one-instruction thunks, and function-to-class membership relationships;
 - attributed recovered strings and exact supported data-reference relationships; and
 - structured, counted warnings for information that was reduced or omitted.
 
-The current neutral export uses `schema_version: 5`. Schema 4 added top-level attributed `strings`
+The current neutral export uses `schema_version: 6`. Schema 4 added top-level attributed `strings`
 and `data_references` arrays to schema 3's function-entry, direct-call, and thunk model; schema 5
-adds deterministic string correlation to each data reference. This
+added deterministic string correlation to each data reference. Schema 6 adds the
+`function-pointer` control-flow target with both `slot_rva` and resolved function `rva`. This
 projection schema is independent from the `.resym` package-envelope schema; consumers must validate
 the version of the artifact they are actually reading.
 
-The CLI can export schema 1 and schema 2 `.resym` packages through validated in-memory compatibility
-paths. Migration neither rewrites the package nor reruns analysis: the package does not embed
-executable bytes. Schema 1 therefore has no available direct calls, thunks, strings, or data
-references. Schema 2 retains its persisted calls and thunks but predates recovered strings and data
-references. Reanalyze the exact original binary to produce a schema 3 package before expecting all
-current recovery relationships in the export.
+The CLI can export package schemas 1 through 3 through validated in-memory compatibility paths.
+Migration neither rewrites the package nor reruns analysis: the package does not embed executable
+bytes. Schema 1 therefore has no available direct calls, thunks, strings, or data references.
+Schema 2 retains its persisted calls and thunks but predates strings and data references. Schema 3
+retains those records, but schemas 2 and 3 both predate read-only function-pointer call resolution.
+Reanalyze the exact original binary to produce schema 4 before expecting all current recovery
+relationships in the export.
 
 Entries are emitted in stable order. Name and range conflicts are resolved conservatively, and
 colliding selected names receive deterministic output suffixes rather than silently referring to
@@ -143,17 +145,32 @@ to target-specific writers and a useful artifact for plugins, review tools, and 
 A projected function may carry `entry_attribution` even when no safe name or size is known. Each
 direct-call record identifies its caller entry, call-site RVA, target kind, and attribution. Each
 thunk record identifies its entry RVA, selected target kind, and attribution. Internal targets
-reference another projected function entry; import targets retain an IAT-slot RVA. Relations are
-canonical, bounded to 262,144 direct calls and 65,536 thunks, and validated against the binary's
-virtual image. These are neutral projection/model caps, not the built-in decoder's lower recovery
-caps of 8,192 direct calls and 4,096 thunks. The source `.resym` analysis additionally validates
-import targets against exact parsed IAT entries and instruction encodings against file-backed
-executable bytes.
+reference another projected function entry; import targets retain an IAT-slot RVA. A retained
+function-pointer target preserves both the read-only slot RVA and resolved function RVA rather than
+flattening the indirection. Relations are canonical, bounded to 262,144 direct calls and 65,536
+thunks, and validated against the binary's virtual image. These are neutral projection/model caps,
+not the built-in decoder's lower recovery caps of 8,192 direct calls and 4,096 thunks. During
+analysis, the built-in producer additionally checks exact parsed IAT membership, file-backed
+instruction bytes, and the section properties used to resolve any pointer slot.
 
-Built-in call recovery is a bounded linear sweep with heuristic confidence, not a recursive
-reachability analysis. Post-terminator bytes or embedded data can produce false positives, and an
-invalid encoding can omit later calls in the affected runtime range. Internal targets covered by
-known runtime-function metadata are suppressed unless their RVA matches a recorded runtime-function
+Built-in call recovery is a bounded control-flow-guided block sweep with heuristic confidence, not
+a complete recursive disassembler. It recognizes only exact RIP-relative `FF 15 disp32` and
+redundant-`REX.W` `48 FF 15 disp32` indirect-call encodings. Exact parsed IAT membership takes
+precedence. A non-IAT slot must be fully backed for all eight bytes in initialized, readable,
+non-writable, non-executable data; its little-endian preferred-image VA is resolved exactly one hop
+to file-backed executable code. The resolved call carries explicit slot provenance, and the same
+instruction is retained as a paired data reference to that slot. Pointer chains, writable slots,
+and other indirect-call forms are not projected as resolved calls.
+
+Before pairing relations, projection deterministically reduces competing data references by caller
+and instruction site. A pointer call is retained only when the selected same-site reference targets
+its slot. If a conflicting noncompanion reference wins that reduction, projection omits the pointer
+call and emits an `unsupported-assertion` warning instead of flattening or inventing provenance.
+
+The sweep suppresses unreachable post-terminal bytes and can follow supported branches across
+jump-over data, but reachable embedded data can still produce false positives, and invalid or
+unsupported flow can omit later calls on the affected path. Internal targets covered by known
+runtime-function metadata are suppressed unless their RVA matches a recorded runtime-function
 begin. Consumers must therefore treat the projected relation set as evidence, not as a complete
 call graph.
 
@@ -166,10 +183,11 @@ continues to use the existing conservative application policy.
 
 Each projected string records its encoding, RVA, encoded byte size, exact recovered value, and
 attribution. Each projected data reference records the enclosing caller entry, instruction RVA and
-decoded size, exact target RVA, attribution, and `referenced_string_rva`. Every schema-5 data
-reference emits that field as the retained string RVA or JSON `null`. A numeric value means the
-target is the string's exact RVA or lies within its encoded content. The NUL terminator is excluded,
-and a UTF-16LE interior target must be aligned to a two-byte code unit relative to the string start.
+decoded size, exact target RVA, attribution, and `referenced_string_rva`. Every current
+data-reference record emits that field as the retained string RVA or JSON `null`. A numeric value
+means the target is the string's exact RVA or lies within its encoded content. The NUL terminator is
+excluded, and a UTF-16LE interior target must be aligned to a two-byte code unit relative to the
+string start.
 Correlation is computed after deterministic string conflict and overlap reduction. A `null` value
 means no retained projected string matched; it does not prove the target bytes are not a string.
 The relationship still does not assert an access mode, target object size, or target name.
@@ -267,14 +285,16 @@ database, or add claims to the package. Its fixed section order is:
 
 The report is a presentation of the existing projection and does not add a new symbol or
 relationship model. Missing categories and row counts are represented consistently so two reports
-from the same projection compare cleanly.
+from the same projection compare cleanly. A function-pointer target is rendered as
+`function 0x... via pointer slot 0x...`, preserving the same endpoint and slot provenance as the
+schema-6 JSON record.
 
 Markdown is a human-facing presentation format, not a stable interchange contract. Its wording,
 table layout, and section organization may evolve between alpha releases. Tools should consume the
 `json` output and validate its `schema_version` instead of parsing the report. New analyses write
-package schema 3; export also accepts package schemas 1 and 2 through validated compatibility paths
-without rewriting them. The current neutral projection is schema 5, and adding this writer changes
-neither version domain.
+package schema 4; export also accepts package schemas 1 through 3 through validated compatibility
+paths without rewriting them. The current neutral projection is schema 6, and adding this writer
+changes neither version domain.
 
 The report writer applies limits in addition to the projection's own validation bounds:
 
@@ -302,9 +322,9 @@ resymbol export application.resym --format map
 The default destination is `application.map`. This is a deterministic text export, not a claim that
 every debugger or linker will accept it. ReSymbol currently rejects non-PE sessions and
 projections, mismatched session/projection binary fields, selected symbol RVAs outside real PE
-sections, and a nonzero entry point outside those sections. New analyses write package schema 3;
-export also accepts package schemas 1 and 2 through validated compatibility paths without rewriting
-them. The current neutral projection is schema 5, and MAP adds no schema fields.
+sections, and a nonzero entry point outside those sections. New analyses write package schema 4;
+export also accepts package schemas 1 through 3 through validated compatibility paths without
+rewriting them. The current neutral projection is schema 6, and MAP adds no schema fields.
 
 The writer emits the PE timestamp and preferred load address, one group for each final PE section,
 selected public names in RVA order, and the entry-point `section:offset`. Section numbers are

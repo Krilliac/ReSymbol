@@ -37,7 +37,7 @@ fn name(source: &str, output_name: &str, method: &str) -> ExportName {
 
 fn base_projection() -> ExportProjection {
     ExportProjection {
-        schema_version: 5,
+        schema_version: 6,
         binary: ExportBinary {
             id: BinaryId::digest(b"public Markdown integration fixture"),
             file_size: 0x1800,
@@ -117,7 +117,10 @@ fn realistic_projection() -> ExportProjection {
     projection.direct_calls = vec![ExportDirectCall {
         caller_rva: 0x100,
         call_site_rva: 0x108,
-        target: ExportControlFlowTarget::Function { rva: 0x200 },
+        target: ExportControlFlowTarget::FunctionPointer {
+            slot_rva: 0x680,
+            rva: 0x200,
+        },
         attribution: attribution("direct-call"),
     }];
     projection.thunks = vec![ExportThunk {
@@ -142,6 +145,14 @@ fn realistic_projection() -> ExportProjection {
         },
     ];
     projection.data_references = vec![
+        ExportDataReference {
+            caller_rva: 0x100,
+            instruction_rva: 0x108,
+            instruction_size: 6,
+            target_rva: 0x680,
+            referenced_string_rva: None,
+            attribution: attribution("pointer-slot-reference"),
+        },
         ExportDataReference {
             caller_rva: 0x100,
             instruction_rva: 0x10c,
@@ -199,7 +210,7 @@ fn public_writer_renders_every_category_deterministically() {
     for expected in [
         "| Functions | 3 |",
         "| Strings | 2 |",
-        "| Data references | 2 |",
+        "| Data references | 3 |",
         "| Warning groups | 1 |",
         "| Encoding | RVA | Byte size | Value | Confidence | Source |",
         "| Caller RVA | Instruction RVA | Instruction size | Target RVA | Referenced string RVA | Confidence | Source |",
@@ -207,9 +218,10 @@ fn public_writer_renders_every_category_deterministically() {
         "aliases: ResolveSymbols",
         "struct SymbolRecord { unsigned long long rva; };",
         r"| 0x500 | 0x8 | g\_symbol\_count |",
-        "| 0x100 | 0x108 | function 0x200 |",
+        "| 0x100 | 0x108 | function 0x200 via pointer slot 0x680 |",
         "| ASCII | 0x700 | 15 | ReSymbol ready | 0.925 | core:resymbol-analysis@0.1.0; method=ascii-string; run=analysis-001 |",
         "| UTF-16LE | 0x720 | 18 | Resolved | 0.925 | core:resymbol-analysis@0.1.0; method=utf16-string; run=analysis-001 |",
+        "| 0x100 | 0x108 | 6 | 0x680 | - | 0.925 | core:resymbol-analysis@0.1.0; method=pointer-slot-reference; run=analysis-001 |",
         "| 0x100 | 0x10c | 7 | 0x700 | 0x700 | 0.925 | core:resymbol-analysis@0.1.0; method=rip-relative-data; run=analysis-001 |",
         "| 0x100 | 0x114 | 7 | 0x500 | - | 0.925 | core:resymbol-analysis@0.1.0; method=rip-relative-global; run=analysis-001 |",
         "| 0x300 | import IAT 0x600 |",

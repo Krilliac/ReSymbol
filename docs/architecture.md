@@ -97,21 +97,31 @@ profile. The build script checks repeat PE determinism and keeps the byte-variab
 artifacts. The checked-in executables are repository/source analyzer test data, not portable runtime
 archive contents.
 
+Read-only function-pointer call resolution is proven with purpose-built synthetic PE fixtures for
+the plain and redundant-`REX.W` encodings, invalid slot/target policy, relationship caps, and
+projection behavior. That focused addition did not regenerate the four checked-in MSVC binaries or
+change their recorded SHA-256 values.
+
 The x86-64 decoder is a pure-Rust, bounded control-flow-guided block sweep used only over complete
 file-backed executable exception ranges and the first instruction at metadata-backed thunk seeds.
 Each distinct exception range seeds an ordered worklist. Pending supported direct conditional and
 unconditional targets within that same range are dequeued by smallest RVA, while permitted
 fallthrough continues immediately. Returns, terminal or indirect control flow, invalid
 instructions, out-of-range targets, and targets inside a previously decoded instruction stop only
-the affected path. The recorded forms remain `E8` internal calls, RIP-relative `FF 15` calls to
-exact parsed IAT slots, `E9`/`EB` internal thunks, and RIP-relative `FF 25` import thunks. The exact
-6-byte IAT forms and their redundant 7-byte `REX.W`-prefixed MSVC encodings are both accepted. Internal
-targets covered by known runtime-function metadata are suppressed
-unless their RVA matches a recorded runtime-function begin. Aggregate limits of 64 MiB, 1,000,000
-instructions, 262,144 discovered block starts, 8,192 retained direct calls, 4,096 retained thunks,
-and 32,768 retained data references retain deterministic traversal prefixes when exhausted;
+the affected path. The recorded forms include `E8` internal calls; exact RIP-relative
+`FF 15 disp32` and `48 FF 15 disp32` calls to parsed IAT slots or one read-only function-pointer
+slot; `E9`/`EB` internal thunks; and RIP-relative `FF 25` import thunks. Parsed IAT membership wins
+before pointer interpretation. A non-IAT call slot must be eight fully file-backed bytes in
+initialized, readable, non-writable, non-executable data. Its little-endian preferred-image VA is
+resolved one hop to a file-backed executable endpoint, and both the explicit slot-bearing call
+target and a same-site data reference are retained. Internal targets covered by known
+runtime-function metadata are suppressed unless their RVA matches a recorded runtime-function
+begin. Aggregate limits of 64 MiB, 1,000,000 instructions, 262,144 discovered block starts, 8,192
+retained direct calls, 4,096 retained thunks, and 32,768 retained data references retain
+deterministic traversal prefixes when exhausted;
 `code_recovery_scan_truncated` and `data_reference_scan_truncated` persist the applicable partial
-state independently. Exhausting the shared decode budget makes both instruction-derived sets
+state independently. A pointer call is not retained if its paired data reference cannot be
+retained. Exhausting the shared decode budget makes both instruction-derived sets
 partial. Overlapping runtime-function ranges are preserved and traversed separately, with each
 decode charged to the shared budgets, so adversarial overlap metadata can make the bounded pass
 partial earlier.
@@ -210,12 +220,17 @@ memberships, confidence, and provenance where representable, assigns collision-s
 and emits structured warnings when graph information must be reduced or omitted. Writers revalidate
 that projection before serializing it.
 
-Neutral projection schema 5 correlates each retained data reference with a retained string when the
+Neutral projection schema 6 correlates each retained data reference with a retained string when the
 target is exactly the string RVA or a valid content-interior address. The terminating NUL code unit
 is outside the correlation range, and a UTF-16LE interior target must be aligned to a two-byte code
 unit relative to the string start. Correlation is derived only after deterministic string conflict
 and overlap reduction. A missing `referenced_string_rva` means no retained projected string matched;
 it does not prove the target bytes are not string data, particularly after bounded recovery.
+Schema 6 also represents `FunctionPointer { slot_rva, rva }` targets. A retained pointer relation
+preserves both the indirection slot and resolved endpoint instead of flattening the relationship to
+an ordinary function target. Before pairing, projection deterministically reduces competing data
+references by caller and instruction site. If the selected same-site reference does not target the
+pointer slot, projection omits the pointer call with an `unsupported-assertion` warning.
 
 The first writers serialize the projection as JSON, render bounded Markdown or
 Microsoft-linker-style MAP text, emit an exact-RSDS public-symbol PDB, or generate self-contained
@@ -469,13 +484,15 @@ A plugin declares a supported API range. Unsupported plugins are marked incompat
 loaded optimistically. Schema migrations are explicit and must preserve provenance. Before 1.0,
 breaking changes are expected, but they still require version bumps and release notes.
 
-The current CLI writes analysis-package schema 3 and can inspect or export schemas 1 and 2 through
-explicit compatibility paths. It migrates schema 1 into a validated current session, rebuilds the
-base graph from persisted legacy metadata, and never rewrites the source package. Schema 2 already
-records direct calls and thunks but predates recovered strings and data references. Because a
-package omits the analyzed binary bytes, compatibility loading cannot recreate absent recovery
-results; obtaining them requires reanalyzing the exact original binary into a schema 3 package.
-The independently versioned debugger-neutral projection is schema 5; its string-reference
+The current CLI writes analysis-package schema 4 and can inspect or export schemas 1 through 3
+through explicit compatibility paths. It migrates schema 1 into a validated current session,
+rebuilds the base graph from persisted legacy metadata, and never rewrites the source package.
+Schema 2 already records direct calls and thunks but predates recovered strings and data references;
+schema 3 includes string/data recovery but predates read-only function-pointer call resolution.
+Because a package omits the analyzed binary bytes, compatibility loading cannot recreate absent
+recovery results; obtaining them requires reanalyzing the exact original binary into schema 4.
+Schemas 2 and 3 are also semantically gated against relabeled schema-4 `function-pointer` targets.
+The independently versioned debugger-neutral projection is schema 6; its string-reference
 correlation is derived from already validated string and data-reference claims and therefore does
 not require a package-schema change or legacy package rewrite.
 

@@ -151,6 +151,11 @@ internal static class ClaimValidator
                 RequireProperties(target, ["kind", "iat_rva"], []);
                 _ = RequireUInt64(target, "iat_rva", "control-flow target");
                 break;
+            case "function-pointer":
+                RequireProperties(target, ["kind", "slot_rva", "rva"], []);
+                _ = RequireUInt64(target, "slot_rva", "control-flow target");
+                _ = RequireUInt64(target, "rva", "control-flow target");
+                break;
             default:
                 throw new HostException("control-flow target has an unsupported kind");
         }

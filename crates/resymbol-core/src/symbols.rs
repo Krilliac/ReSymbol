@@ -207,6 +207,8 @@ pub enum ControlFlowTarget {
     Function { rva: u64 },
     /// An import address table slot in the analyzed image.
     ImportIat { iat_rva: u64 },
+    /// An internal function resolved through one pointer slot in the analyzed image.
+    FunctionPointer { slot_rva: u64, rva: u64 },
 }
 
 impl ControlFlowTarget {
@@ -214,7 +216,7 @@ impl ControlFlowTarget {
     #[must_use]
     pub const fn rva(&self) -> u64 {
         match self {
-            Self::Function { rva } => *rva,
+            Self::Function { rva } | Self::FunctionPointer { rva, .. } => *rva,
             Self::ImportIat { iat_rva } => *iat_rva,
         }
     }
@@ -222,18 +224,24 @@ impl ControlFlowTarget {
     /// Whether this target identifies an internal function rather than an IAT slot.
     #[must_use]
     pub const fn is_function(&self) -> bool {
-        matches!(self, Self::Function { .. })
+        matches!(self, Self::Function { .. } | Self::FunctionPointer { .. })
     }
 
     /// Whether this target identifies the internal function at `rva`.
     #[must_use]
     pub const fn is_function_at(&self, rva: u64) -> bool {
-        matches!(self, Self::Function { rva: target_rva } if *target_rva == rva)
+        matches!(
+            self,
+            Self::Function { rva: target_rva }
+                | Self::FunctionPointer {
+                    rva: target_rva, ..
+                } if *target_rva == rva
+        )
     }
 
     fn validate(&self) -> Result<(), ClaimValidationError> {
         match self {
-            Self::Function { .. } | Self::ImportIat { .. } => Ok(()),
+            Self::Function { .. } | Self::ImportIat { .. } | Self::FunctionPointer { .. } => Ok(()),
         }
     }
 }
@@ -857,6 +865,31 @@ mod tests {
             serde_json::json!({"kind": "import-iat", "iat_rva": 0x3000})
         );
 
+        let pointer_target = ControlFlowTarget::FunctionPointer {
+            slot_rva: 0x4000,
+            rva: 0x2000,
+        };
+        assert_eq!(pointer_target.rva(), 0x2000);
+        assert!(pointer_target.is_function());
+        assert!(pointer_target.is_function_at(0x2000));
+        assert!(!pointer_target.is_function_at(0x4000));
+        assert_eq!(
+            serde_json::to_value(pointer_target).expect("serialize function-pointer target"),
+            serde_json::json!({
+                "kind": "function-pointer",
+                "slot_rva": 0x4000,
+                "rva": 0x2000
+            })
+        );
+
+        for missing_field in [
+            serde_json::json!({"kind": "function-pointer", "rva": 0x2000}),
+            serde_json::json!({"kind": "function-pointer", "slot_rva": 0x4000}),
+        ] {
+            serde_json::from_value::<ControlFlowTarget>(missing_field)
+                .expect_err("both function-pointer addresses are required");
+        }
+
         let assertions = [
             SymbolAssertion::FunctionEntry,
             SymbolAssertion::DirectCall {
@@ -864,6 +897,10 @@ mod tests {
                 target: function_target,
             },
             SymbolAssertion::ThunkTarget { target: iat_target },
+            SymbolAssertion::DirectCall {
+                call_site_rva: 0x1020,
+                target: pointer_target,
+            },
         ];
         for assertion in assertions {
             let encoded = serde_json::to_string(&assertion).expect("serialize assertion");

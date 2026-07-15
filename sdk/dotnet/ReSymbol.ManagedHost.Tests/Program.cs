@@ -217,6 +217,31 @@ static Task ClaimValidationMatchesCoreAsync()
             [new ClaimEvidence(new string('a', 128), "bounded kind")]),
         binary);
 
+    var functionPointerCall = JsonObject(new Dictionary<string, object?>
+    {
+        ["kind"] = "direct-call",
+        ["call_site_rva"] = 0x1010UL,
+        ["target"] = new Dictionary<string, object?>
+        {
+            ["kind"] = "function-pointer",
+            ["slot_rva"] = 0x3000UL,
+            ["rva"] = 0x2000UL,
+        },
+    });
+    ClaimValidator.Validate(Claim(validSubject, functionPointerCall), binary);
+
+    var incompleteFunctionPointerCall = JsonObject(new Dictionary<string, object?>
+    {
+        ["kind"] = "direct-call",
+        ["call_site_rva"] = 0x1010UL,
+        ["target"] = new Dictionary<string, object?>
+        {
+            ["kind"] = "function-pointer",
+            ["rva"] = 0x2000UL,
+        },
+    });
+    RejectClaim(Claim(validSubject, incompleteFunctionPointerCall), binary);
+
     var overflowingSubject = JsonObject(new Dictionary<string, object?>
     {
         ["kind"] = "global",

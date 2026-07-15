@@ -22,6 +22,7 @@ const MAX_X86_INSTRUCTION_BYTES: usize = 15;
 const IMAGE_SCN_CNT_INITIALIZED_DATA: u32 = 0x0000_0040;
 const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 const IMAGE_SCN_MEM_READ: u32 = 0x4000_0000;
+const IMAGE_SCN_MEM_WRITE: u32 = 0x8000_0000;
 
 pub(crate) struct CodeRecovery {
     pub scan_truncated: bool,
@@ -327,6 +328,12 @@ enum RuntimeScanResult {
     DecodeBudgetExceeded,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct RelationshipRetention {
+    scan_truncated: bool,
+    data_reference_scan_truncated: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn scan_runtime_function(
     begin_rva: u32,
@@ -431,33 +438,36 @@ fn scan_runtime_function(
                 break;
             }
 
-            if let Some(reference) = decode_data_reference(
+            let reference = decode_data_reference(
                 begin_rva,
                 instruction_rva,
                 instruction_size_u8,
                 &instruction,
                 raw_instruction,
                 context,
-            ) {
-                if !insert_bounded(data_references, reference, MAX_DATA_REFERENCES) {
-                    *data_reference_scan_truncated = true;
-                }
-            }
+            );
 
             // Calls and data references share this decode pass, but their
-            // retention caps are independent. Reaching either cap must not
-            // hide whether the other relationship set also truncated.
-            if let Some(target) = decode_call_target(&instruction, raw_instruction, context) {
-                let call = PeDirectCall {
+            // retention caps are independent except that a resolved pointer
+            // call is meaningful only while its exact slot reference survives.
+            let call = decode_call_target(&instruction, raw_instruction, context).map(|target| {
+                PeDirectCall {
                     caller_rva: begin_rva,
                     call_site_rva: instruction_rva,
                     instruction_size: instruction_size_u8,
                     target,
-                };
-                if !insert_bounded(direct_calls, call, MAX_DIRECT_CALLS) {
-                    *scan_truncated = true;
                 }
-            }
+            });
+            let retention = retain_instruction_relationships(
+                direct_calls,
+                data_references,
+                call,
+                reference,
+                MAX_DIRECT_CALLS,
+                MAX_DATA_REFERENCES,
+            );
+            *scan_truncated |= retention.scan_truncated;
+            *data_reference_scan_truncated |= retention.data_reference_scan_truncated;
 
             let queue_target = |target: u64,
                                 traversal: &mut FunctionTraversal,
@@ -700,6 +710,43 @@ fn insert_bounded<T: Ord>(records: &mut BTreeSet<T>, value: T, limit: usize) -> 
     records.insert(value)
 }
 
+fn retain_instruction_relationships(
+    direct_calls: &mut BTreeSet<PeDirectCall>,
+    data_references: &mut BTreeSet<PeDataReference>,
+    call: Option<PeDirectCall>,
+    reference: Option<PeDataReference>,
+    direct_call_limit: usize,
+    data_reference_limit: usize,
+) -> RelationshipRetention {
+    let mut result = RelationshipRetention::default();
+    let reference_retained = reference.as_ref().is_some_and(|reference| {
+        insert_bounded(data_references, reference.clone(), data_reference_limit)
+    });
+    if reference.is_some() && !reference_retained {
+        result.data_reference_scan_truncated = true;
+    }
+
+    let Some(call) = call else {
+        return result;
+    };
+    let required_reference_retained = match call.target {
+        PeControlFlowTarget::FunctionPointer { slot_rva, .. } => {
+            reference_retained
+                && reference.as_ref().is_some_and(|reference| {
+                    reference.caller_rva == call.caller_rva
+                        && reference.instruction_rva == call.call_site_rva
+                        && reference.instruction_size == call.instruction_size
+                        && reference.target_rva == slot_rva
+                })
+        }
+        PeControlFlowTarget::Function { .. } | PeControlFlowTarget::ImportIat { .. } => true,
+    };
+    if !required_reference_retained || !insert_bounded(direct_calls, call, direct_call_limit) {
+        result.scan_truncated = true;
+    }
+    result
+}
+
 fn decode_call_target(
     instruction: &Instruction,
     raw: &[u8],
@@ -722,15 +769,27 @@ fn decode_call_target(
         && has_exact_rip_relative_indirect_encoding(raw, 0x15)
         && instruction.is_ip_rel_memory_operand()
     {
-        let iat_rva = va_to_rva(
+        let slot_rva = va_to_rva(
             instruction.ip_rel_memory_address(),
             context.image_base,
             context.size_of_image,
         )?;
-        return context
-            .import_iat_rvas
-            .contains(&iat_rva)
-            .then_some(PeControlFlowTarget::ImportIat { iat_rva });
+        if context.import_iat_rvas.contains(&slot_rva) {
+            return Some(PeControlFlowTarget::ImportIat { iat_rva: slot_rva });
+        }
+        if !is_backed_read_only_initialized_data(context.mapper, context.sections, slot_rva, 8) {
+            return None;
+        }
+        let target_va = context
+            .mapper
+            .read_u64(slot_rva, "read-only function-pointer slot")?;
+        if target_va == instruction.next_ip() {
+            return None;
+        }
+        let rva = va_to_rva(target_va, context.image_base, context.size_of_image)?;
+        return (context.runtime_targets.allows_function_target(rva)
+            && is_backed_executable(context.mapper, context.sections, rva, 1))
+        .then_some(PeControlFlowTarget::FunctionPointer { slot_rva, rva });
     }
     None
 }
@@ -796,7 +855,8 @@ fn thunk_seeds(
         insert_executable_seed(&mut seeds, mapper, sections, rva);
     }
     for rva in direct_calls.iter().filter_map(|call| match call.target {
-        PeControlFlowTarget::Function { rva } => Some(rva),
+        PeControlFlowTarget::Function { rva }
+        | PeControlFlowTarget::FunctionPointer { rva, .. } => Some(rva),
         PeControlFlowTarget::ImportIat { .. } => None,
     }) {
         insert_executable_seed(&mut seeds, mapper, sections, rva);
@@ -858,7 +918,12 @@ pub(crate) fn validate_code_recovery(analysis: &PeAnalysis) -> Result<(), Analys
                 "caller and call site do not lie in a fully backed matching runtime-function range",
             );
         }
-        if matches!(call.target, PeControlFlowTarget::Function { rva } if rva == call_end) {
+        if matches!(
+            call.target,
+            PeControlFlowTarget::Function { rva }
+                | PeControlFlowTarget::FunctionPointer { rva, .. }
+                if rva == call_end
+        ) {
             return invalid(
                 "direct-call target",
                 "call-next encodings do not establish a distinct function target",
@@ -871,9 +936,30 @@ pub(crate) fn validate_code_recovery(analysis: &PeAnalysis) -> Result<(), Analys
             &call.target,
             "direct-call target",
         )?;
+        if let PeControlFlowTarget::FunctionPointer { slot_rva, .. } = call.target {
+            let expected_reference = PeDataReference {
+                caller_rva: call.caller_rva,
+                instruction_rva: call.call_site_rva,
+                instruction_size: call.instruction_size,
+                target_rva: slot_rva,
+            };
+            if analysis
+                .data_references
+                .binary_search(&expected_reference)
+                .is_err()
+            {
+                return invalid(
+                    "direct-call data reference",
+                    "read-only function-pointer call lacks its exact same-site slot reference",
+                );
+            }
+        }
         let supported_size = match call.target {
             PeControlFlowTarget::Function { .. } => call.instruction_size == 5,
             PeControlFlowTarget::ImportIat { .. } => matches!(call.instruction_size, 6 | 7),
+            PeControlFlowTarget::FunctionPointer { .. } => {
+                matches!(call.instruction_size, 6 | 7)
+            }
         };
         if !supported_size {
             return invalid(
@@ -902,6 +988,12 @@ pub(crate) fn validate_code_recovery(analysis: &PeAnalysis) -> Result<(), Analys
                 "is not a file-backed executable metadata or call target candidate",
             );
         }
+        if matches!(thunk.target, PeControlFlowTarget::FunctionPointer { .. }) {
+            return invalid(
+                "thunk target",
+                "read-only function-pointer resolution is not supported for thunks",
+            );
+        }
         validate_target(
             analysis,
             &import_iat_rvas,
@@ -917,6 +1009,7 @@ pub(crate) fn validate_code_recovery(analysis: &PeAnalysis) -> Result<(), Analys
                 matches!(thunk.instruction_size, 2 | 5)
             }
             PeControlFlowTarget::ImportIat { .. } => matches!(thunk.instruction_size, 6 | 7),
+            PeControlFlowTarget::FunctionPointer { .. } => false,
         };
         if !supported_size {
             return invalid(
@@ -1013,7 +1106,8 @@ fn model_thunk_seeds(analysis: &PeAnalysis) -> BTreeSet<u32> {
             .direct_calls
             .iter()
             .filter_map(|call| match call.target {
-                PeControlFlowTarget::Function { rva } => Some(rva),
+                PeControlFlowTarget::Function { rva }
+                | PeControlFlowTarget::FunctionPointer { rva, .. } => Some(rva),
                 PeControlFlowTarget::ImportIat { .. } => None,
             }),
     );
@@ -1053,6 +1147,32 @@ fn validate_target(
                 return invalid(
                     field,
                     "does not match an exact parsed import-address-table slot",
+                );
+            }
+        }
+        PeControlFlowTarget::FunctionPointer { slot_rva, rva } => {
+            if import_iat_rvas.contains(&slot_rva) {
+                return invalid(
+                    field,
+                    "read-only function-pointer slot collides with an exact parsed import-address-table slot",
+                );
+            }
+            if !model_range_is_backed_read_only_initialized_data(analysis, slot_rva, 8) {
+                return invalid(
+                    field,
+                    "function-pointer slot is not eight fully backed bytes of read-only initialized non-executable data",
+                );
+            }
+            if !runtime_targets.allows_function_target(rva) {
+                return invalid(
+                    field,
+                    "internal endpoint lies inside runtime-function metadata but is not a runtime-function begin",
+                );
+            }
+            if !model_range_is_backed_executable(analysis, rva, 1) {
+                return invalid(
+                    field,
+                    "internal endpoint is not file-backed executable data",
                 );
             }
         }
@@ -1118,6 +1238,24 @@ fn is_backed_readable_initialized_data(
     })
 }
 
+fn is_backed_read_only_initialized_data(
+    mapper: &RvaMap<'_>,
+    sections: &[PeSection],
+    rva: u32,
+    size: usize,
+) -> bool {
+    if size == 0 || !mapper.is_backed(rva, size) {
+        return false;
+    }
+    let Ok(size_u32) = u32::try_from(size) else {
+        return false;
+    };
+    sections.iter().any(|section| {
+        is_read_only_initialized_non_executable(section.characteristics)
+            && section_has_file_backed_range(section, rva, size_u32)
+    })
+}
+
 pub(crate) fn model_range_is_backed_executable(analysis: &PeAnalysis, rva: u32, size: u32) -> bool {
     if size == 0 {
         return false;
@@ -1145,10 +1283,26 @@ pub(crate) fn model_range_is_backed_readable_initialized_data(
     })
 }
 
+pub(crate) fn model_range_is_backed_read_only_initialized_data(
+    analysis: &PeAnalysis,
+    rva: u32,
+    size: u32,
+) -> bool {
+    analysis.sections.iter().any(|section| {
+        is_read_only_initialized_non_executable(section.characteristics)
+            && section_has_file_backed_range(section, rva, size)
+    })
+}
+
 const fn is_readable_initialized_non_executable(characteristics: u32) -> bool {
     characteristics & IMAGE_SCN_CNT_INITIALIZED_DATA != 0
         && characteristics & IMAGE_SCN_MEM_READ != 0
         && characteristics & IMAGE_SCN_MEM_EXECUTE == 0
+}
+
+const fn is_read_only_initialized_non_executable(characteristics: u32) -> bool {
+    is_readable_initialized_non_executable(characteristics)
+        && characteristics & IMAGE_SCN_MEM_WRITE == 0
 }
 
 fn section_has_file_backed_range(section: &PeSection, rva: u32, size: u32) -> bool {
@@ -1426,6 +1580,10 @@ mod tests {
     fn data_sections_must_be_readable_initialized_and_non_executable() {
         let eligible = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ;
         assert!(is_readable_initialized_non_executable(eligible));
+        assert!(is_read_only_initialized_non_executable(eligible));
+        assert!(!is_read_only_initialized_non_executable(
+            eligible | IMAGE_SCN_MEM_WRITE
+        ));
         assert!(!is_readable_initialized_non_executable(
             eligible | IMAGE_SCN_MEM_EXECUTE
         ));
@@ -1480,6 +1638,75 @@ mod tests {
         assert!(call_truncated);
         assert!(!data_truncated);
         assert_eq!(data, BTreeSet::from([1, 2]));
+    }
+
+    #[test]
+    fn pointer_call_retention_requires_its_reference_but_not_the_reverse() {
+        let call = PeDirectCall {
+            caller_rva: 0x1000,
+            call_site_rva: 0x1010,
+            instruction_size: 6,
+            target: PeControlFlowTarget::FunctionPointer {
+                slot_rva: 0x2001,
+                rva: 0x1100,
+            },
+        };
+        let reference = PeDataReference {
+            caller_rva: 0x1000,
+            instruction_rva: 0x1010,
+            instruction_size: 6,
+            target_rva: 0x2001,
+        };
+
+        let mut calls = BTreeSet::new();
+        let mut references = BTreeSet::new();
+        let result = retain_instruction_relationships(
+            &mut calls,
+            &mut references,
+            Some(call.clone()),
+            Some(reference.clone()),
+            1,
+            0,
+        );
+        assert_eq!(
+            result,
+            RelationshipRetention {
+                scan_truncated: true,
+                data_reference_scan_truncated: true,
+            }
+        );
+        assert!(calls.is_empty());
+        assert!(references.is_empty());
+
+        let result = retain_instruction_relationships(
+            &mut calls,
+            &mut references,
+            Some(call.clone()),
+            Some(reference.clone()),
+            0,
+            1,
+        );
+        assert_eq!(
+            result,
+            RelationshipRetention {
+                scan_truncated: true,
+                data_reference_scan_truncated: false,
+            }
+        );
+        assert!(calls.is_empty());
+        assert_eq!(references, BTreeSet::from([reference.clone()]));
+
+        let result = retain_instruction_relationships(
+            &mut calls,
+            &mut references,
+            Some(call.clone()),
+            Some(reference),
+            1,
+            1,
+        );
+        assert_eq!(result, RelationshipRetention::default());
+        assert_eq!(calls, BTreeSet::from([call]));
+        assert_eq!(references.len(), 1);
     }
 
     #[test]
