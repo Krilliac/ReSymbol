@@ -12,15 +12,17 @@ exception metadata, and derives conservative metadata-backed claims. Canonical `
 now carry an `AnalysisSession`: deterministic base analysis, an auditable plugin-run ledger, and
 separately validated plugin claims with a derived combined graph.
 
-The CLI writes package schema 5 and can inspect or export schemas 1 through 4 through explicit
+The CLI writes package schema 6 and can inspect or export schemas 1 through 5 through explicit
 compatibility paths. Schema 1 is migrated in memory by revalidating persisted metadata and
 rebuilding the base graph; schema 2 already contains direct-call and thunk recovery, and schema 3
 adds string/data recovery. Schema 4 adds read-only pointer control flow but predates legacy 24-byte
-RTTI base-class descriptor recovery. Older packages do not embed executable bytes, so compatibility
-loading cannot reconstruct results that were never recorded. Reanalyzing the exact original binary
-is required for 24-byte descriptors in schemas 1 through 4, read-only function-pointer calls and
-thunks in schemas 2 and 3, strings/data references in schemas 1 and 2, and all code recovery when
-starting from schema 1.
+RTTI base-class descriptor recovery. Schema 5 adds that RTTI form but predates transitive executable
+thunk-chain discovery. Older packages do not embed executable bytes, so compatibility loading
+cannot reconstruct results that were never recorded. Reanalyzing the exact original binary is
+required for transitive thunk chains in schemas 1 through 5, 24-byte descriptors in schemas 1
+through 4, read-only function-pointer calls and thunks in schemas 2 and 3, strings/data references
+in schemas 1 and 2, and all code recovery when starting from schema 1. Relabeled schema-6-only
+transitive base-thunk sources are rejected under schema 1-through-5 envelopes.
 
 A bounded modern MSVC x64 Rev1 RTTI/vftable slice is now implemented. It validates compiler
 metadata through complete object locators, type descriptors, legacy 24-byte and `BCD_HASPCHD`
@@ -38,9 +40,16 @@ including one-hop plain or redundant-`REX.W` RIP-relative calls through complete
 eight-byte pointer slots, and RIP-relative data references. At seeded executable candidates it
 checks internal thunks and exact `FF 25 disp32`/`48 FF 25 disp32` IAT or one-hop read-only pointer
 thunks. Parsed IAT membership takes precedence; each pointer relation preserves its slot and
-endpoint, while only a pointer call requires a paired data reference. It discovers at most 262,144
-block starts and retains at most 8,192 direct calls, 32,768 data references, and 4,096 thunks;
-internal targets covered by known runtime-function metadata are suppressed unless their RVA
+endpoint, while only a pointer call requires a paired data reference. Original thunk candidates are
+checked first in RVA order; internal endpoints of retained thunks form successive sorted layers
+until the causal closure is exhausted. Each exact hop is preserved instead of being flattened to a
+terminal function. Connected cycles terminate through global candidate deduplication and retain
+their exact non-self edges, while disconnected persisted cycles are rejected. Executable endpoint
+traversal does not follow pointer-to-pointer slots: every non-IAT slot remains a one-hop
+dereference. It discovers at most 262,144 block starts and retains at most 8,192 direct calls,
+32,768 data references, and 4,096 thunks. Reaching the shared decode or relationship caps preserves
+the deterministic valid prefix and marks the applicable recovery state partial. Internal targets
+covered by known runtime-function metadata are suppressed unless their RVA
 matches a recorded runtime-function begin. A separate bounded pass recovers complete
 NUL-terminated ASCII and UTF-16LE literals from readable initialized non-executable file-backed
 data. These passes emit attributed claims without inventing names or extents and preserve
@@ -115,12 +124,12 @@ The first export checkpoint is implemented as a validated, debugger-neutral proj
 deterministic JSON output, a bounded human-readable Markdown report, PE-only
 Microsoft-linker-style MAP text, an exact-RSDS public-symbol PDB, and standalone IDAPython and
 Ghidra Java import scripts. Markdown is presentation-only rather than a stable interchange schema;
-JSON remains the machine-consumable artifact. New analyses write package schema 5, while export also
-accepts package schemas 1 through 4 through validated compatibility paths. The neutral projection is
-schema 6; MAP and PDB add no schema fields, and no exporter rewrites its source package. Projection
-schema 5 correlates exact or valid content-interior data-reference targets with retained strings
-while excluding NUL terminators and misaligned UTF-16LE interiors; projection schema 6 preserves
-function-pointer slot and resolved-target RVAs. The scripts
+JSON remains the machine-consumable artifact. New analyses write package schema 6, while export also
+accepts package schemas 1 through 5 through validated compatibility paths. The neutral projection is
+independently schema 6; MAP and PDB add no schema fields, and no exporter rewrites its source
+package. Projection schema 5 correlates exact or valid content-interior data-reference targets with
+retained strings while excluding NUL terminators and misaligned UTF-16LE interiors; projection
+schema 6 preserves function-pointer slot and resolved-target RVAs. The scripts
 bind to the exact loaded binary SHA-256, resolve addresses as loaded image base plus RVA, preserve
 user-authored names and existing function bodies, and continue past per-symbol application errors.
 They are deliberately narrower than the planned interactive debugger bridges: prototypes, types,
@@ -157,8 +166,10 @@ internal and MSVC `REX.W`-prefixed import thunks, ASCII/UTF-16LE strings,
 data references, and modern RTTI/vftables without executing the fixture binaries. These checked-in
 inputs are repository/source test data rather than portable runtime archive contents. Read-only
 function-pointer calls and thunks, plus all-legacy and mixed 24/28-byte RTTI descriptor
-hierarchies, are covered by focused synthetic PE fixtures, so these slices do not change those four
-binaries or their recorded hashes.
+hierarchies, are covered by focused synthetic PE fixtures. Exact transitive thunk chains, connected
+cycles, and disconnected-cycle rejection are also synthetic-only coverage.
+These focused slices do not change the four corpus binaries, their semantic oracle, or their
+recorded hashes.
 
 The remaining Milestone 2 work is deliberately substantial: broader disassembly-assisted candidate
 discovery, broader indirect control flow and richer call-graph analysis, persisted basic-block
@@ -232,8 +243,9 @@ adversarial obfuscation.
   entries implemented)
 - Exception and unwind metadata ingestion
 - Strings, constants, references, call relationships, and thunks (bounded exact strings, supported
-  RIP-relative data references, direct calls, one-instruction thunks, and exact/content-interior
-  string-reference correlation implemented; broader constants remain planned)
+  RIP-relative data references, direct calls, exact per-hop transitive one-instruction thunks, and
+  exact/content-interior string-reference correlation implemented; broader constants remain
+  planned)
 - Initial MSVC x64 Rev1 RTTI and vftable analysis (bounded dual-descriptor-layout slice implemented)
 - Portable `.resym` analysis package
 - Deterministic, loss-aware JSON symbol projection
@@ -243,7 +255,8 @@ adversarial obfuscation.
   broader compilers remain planned)
 - Boundary, coverage, malformed-input, and resource-limit benchmarks
 
-The PE metadata, x64 exception ingestion, bounded string/data-reference/direct-call/thunk recovery,
+The PE metadata, x64 exception ingestion, bounded string, data-reference, direct-call, and
+transitive-thunk recovery,
 deterministic string-reference correlation, bounded dual-layout MSVC x64 RTTI/vftable slice,
 portable package, canonical package encoding, neutral JSON export projection, bounded Markdown
 report, initial MSVC fixture matrix, and related CLI

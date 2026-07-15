@@ -482,7 +482,10 @@ handshake remains `resymbol.plugin-wire` 1.0. Strict claim-event decoding accept
 tagged JSON shapes below and the raw
 `{"kind":"function-pointer","slot_rva":...,"rva":...}` control-flow target.
 Package schema 5's recovery of both MSVC x64 Rev1 base-class descriptor layouts likewise adds no
-plugin assertion or target shape; the wire handshake remains 1.0.
+plugin assertion or target shape. Package schema 6's transitive built-in thunk discovery composes
+the existing exact `thunk-target` assertions instead of adding a chain-depth or terminal-target
+shape; the wire handshake remains `resymbol.plugin-wire` 1.0. Plugin-supplied thunk claims remain
+independent of the deterministic base analyzer's transitive seed-closure invariant.
 
 ### Tool-hosted bridges (planned host)
 

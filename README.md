@@ -35,14 +35,17 @@ The current alpha implements and tests an end-to-end, deliberately narrow analys
   supported direct calls to internal executable targets, exact parsed import-address-table slots,
   or targets resolved one hop through exact read-only in-image function-pointer slots;
   one-instruction thunks to internal targets, exact parsed import slots, or one-hop read-only
-  function-pointer targets; and exact supported RIP-relative references into eligible data;
+  function-pointer targets, including bounded transitive chains of exact executable thunk hops;
+  and exact supported RIP-relative references into eligible data;
 - bounded recovery of exact NUL-terminated ASCII and UTF-16LE strings from file-backed,
   initialized, readable, non-executable sections, including writable data;
 - a source-available, byte-reproducible four-artifact MSVC x64 PE fixture matrix spanning optimized
   and unoptimized builds, each with and without CodeView metadata, plus exact hashes and a
-  profile-sensitive semantic oracle covering the implemented Milestone 2 evidence families; these
-  repository/source fixtures are analyzer test data and are not bundled in portable runtime
-  archives;
+  profile-sensitive semantic oracle covering imports, exports, unwind functions, direct calls,
+  internal/import thunks, strings, data references, and modern RTTI/vftables; focused synthetic PE
+  fixtures cover read-only pointer control flow, dual RTTI descriptor layouts, and transitive thunk
+  chains without changing the four corpus binaries or their oracle; these repository/source
+  fixtures are analyzer test data and are not bundled in portable runtime archives;
 - conservative symbol-graph generation from exact export names, metadata-backed function
   boundaries, function-entry candidates, direct calls, thunks, recovered strings, and data
   references, with SHA-256 binary identity, evidence, provenance, confidence, and claim validation;
@@ -97,14 +100,22 @@ exact RIP-relative `FF 15 disp32` and redundant-`REX.W` `48 FF 15 disp32` calls 
 slots; and the same two call encodings through a complete eight-byte pointer slot in readable,
 initialized, non-writable, non-executable data. Parsed IAT membership takes precedence. Otherwise
 the slot's little-endian preferred-image VA is resolved exactly once to a file-backed executable
-target; pointer chains and writable slots remain unsupported. A resolved pointer call records its
-slot and endpoint explicitly and retains the same instruction as a paired data reference to the
-slot. Seeded `E9` and `EB` internal thunks remain supported. Exact RIP-relative `FF 25 disp32` and
-redundant-`REX.W` `48 FF 25 disp32` thunks use the same IAT-first policy: a parsed IAT slot remains
+target; pointer-to-pointer slot chains and writable slots remain unsupported. A resolved pointer
+call records its slot and endpoint explicitly and retains the same instruction as a paired data
+reference to the slot. Seeded `E9` and `EB` internal thunks remain supported. Exact RIP-relative
+`FF 25 disp32` and redundant-`REX.W` `48 FF 25 disp32` thunks use the same IAT-first policy: a parsed
+IAT slot remains
 an import target, while any other accepted slot resolves one read-only pointer hop to executable
 code. A pointer thunk records its slot and endpoint without requiring a paired data reference. The
-built-in pass discovers at most 262,144 block starts and retains at most 8,192 direct calls, 32,768
-supported RIP-relative data references, and 4,096 thunks. These are heuristic-confidence findings:
+built-in pass checks its original deterministic thunk seeds first, then follows internal endpoints
+of retained thunks in sorted hop layers. It preserves each exact relationship (`A -> B`, `B -> C`)
+instead of rewriting the first thunk or a direct call to a terminal endpoint. A global visited set
+terminates connected cycles while retaining their exact edges; a disconnected persisted cycle is
+not a valid causal chain. This executable-thunk closure does not follow pointer-to-pointer data:
+each non-IAT slot is still dereferenced exactly once. The pass discovers at most 262,144 block
+starts and retains at most 8,192 direct calls, 32,768 supported RIP-relative data references, and
+4,096 thunks. Reaching a shared decode or thunk-retention limit preserves deterministic valid hops
+and marks code recovery partial. These are heuristic-confidence findings:
 reachable embedded data can still decode as instructions, while an invalid encoding or unsupported
 branch can omit later relationships on that path. An internal target covered by known
 `RUNTIME_FUNCTION` metadata is suppressed unless its RVA matches a recorded runtime-function
@@ -220,17 +231,20 @@ accident. `inspect` validates the package schema, payload, and embedded binary i
 displaying it. `export` stages and flushes a complete artifact before a no-clobber publish; use
 `--output` to choose a destination instead of replacing an existing export artifact.
 
-New analyses write package schema 5. `inspect` and `export` also accept schemas 1 through 4 through
+New analyses write package schema 6. `inspect` and `export` also accept schemas 1 through 5 through
 validated in-memory compatibility paths. Migration does not rewrite the source package or rerun
 analysis because `.resym` does not embed the executable bytes. Schema 1 therefore has no available
 recovered calls, thunks, strings, or data references. Schema 2 retains calls and thunks but predates
 strings and data references. Schema 3 retains those string/data records, but schemas 2 and 3 both
 predate read-only function-pointer call and thunk resolution; schema 4 records that control flow.
-Schemas 1 through 4 all predate recovery of legacy 24-byte base-class descriptors. Reanalyze the
-exact original binary to produce schema 5 with all current recovery results. A schema 2 or 3
+Schemas 1 through 4 all predate recovery of legacy 24-byte base-class descriptors; schema 5 records
+that RTTI form but predates transitive executable thunk-chain discovery. Schemas 2 through 5 keep
+their already-recorded direct calls and thunks, but loading cannot synthesize a later result family.
+Reanalyze the exact original binary to produce schema 6 with all current recovery results. A schema 2 or 3
 envelope containing a schema-4 `function-pointer` target, or any schema 1-through-4 envelope
 containing an RTTI base record whose `class_hierarchy_descriptor_rva` is missing or null, is
-rejected rather than treated as a relabeled legacy package.
+rejected rather than treated as a relabeled legacy package. A schema 1-through-5 envelope likewise
+cannot contain a base thunk source that is valid only through schema-6 transitive endpoint seeding.
 
 The `analyze` and `inspect` summaries report recovered strings, data references, direct calls, and
 thunks as well as discovered MSVC RTTI vftables, unique types, base-class records, and virtual
@@ -240,8 +254,8 @@ and the package records the truncation explicitly.
 
 The Markdown output is a deterministic, bounded presentation report for people to review. It is
 not a stable interchange format; integrations should consume the neutral JSON projection instead.
-Without `--output`, it is written as `application.symbols.md` beside the package. Package schema 5
-is used by new analyses, export also accepts package schemas 1 through 4 through validated
+Without `--output`, it is written as `application.symbols.md` beside the package. Package schema 6
+is used by new analyses, export also accepts package schemas 1 through 5 through validated
 compatibility paths, and neutral projection schema 6 remains unchanged by this presentation-only
 format. Export does not rewrite the source package.
 
@@ -250,7 +264,7 @@ default for tools that support that format. It maps selected names to one-based 
 `section:offset` values and preferred-image-base-plus-RVA addresses. Its semicolon-prefixed exact
 SHA-256 and file-size comments are informational: a MAP file cannot check the binary loaded by a
 consumer, so compare the executable with the recorded identity before using the symbols. MAP adds
-no fields to package schema 5 or neutral projection schema 6, and it does not rewrite legacy source
+no fields to package schema 6 or neutral projection schema 6, and it does not rewrite legacy source
 packages accepted through compatibility paths. The header module name is the package filename stem;
 for a valid UTF-8 stem, unsupported/non-ASCII encoded bytes become `_` and the result is capped at
 255 bytes. A non-UTF-8 or otherwise unusable stem falls back to `resymbol_<sha12>`.

@@ -1,6 +1,6 @@
 use std::{
     cmp::Reverse,
-    collections::{BTreeSet, BinaryHeap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet},
 };
 
 use iced_x86::{Code, Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
@@ -589,7 +589,7 @@ pub(crate) fn recover_code(input: CodeRecoveryInput<'_, '_>) -> CodeRecovery {
 
     let direct_calls = direct_calls.into_iter().collect::<Vec<_>>();
     let data_references = data_references.into_iter().collect::<Vec<_>>();
-    let seeds = thunk_seeds(
+    let mut pending_thunk_layer = thunk_seeds(
         input.mapper,
         input.sections,
         input.entry_point_rva,
@@ -598,45 +598,66 @@ pub(crate) fn recover_code(input: CodeRecoveryInput<'_, '_>) -> CodeRecovery {
         &direct_calls,
         input.msvc_rtti_vftables,
     );
+    let mut visited_thunk_candidates = BTreeSet::new();
     let mut thunks = BTreeSet::new();
-    for rva in seeds {
-        let Ok(available) = input.mapper.contiguous_bytes(rva, "thunk instruction") else {
-            continue;
-        };
-        let bytes = &available[..available.len().min(MAX_X86_INSTRUCTION_BYTES)];
-        let Some(ip) = input.image_base.checked_add(u64::from(rva)) else {
-            continue;
-        };
-        let mut decoder = Decoder::with_ip(64, bytes, ip, DecoderOptions::NONE);
-        let instruction = decoder.decode();
-        let instruction_size = instruction.len();
-        if instruction_size == 0 || !budget.consume(instruction_size) {
-            scan_truncated = true;
-            break;
+    'thunk_layers: while !pending_thunk_layer.is_empty() {
+        let current_thunk_layer = std::mem::take(&mut pending_thunk_layer);
+        let mut next_thunk_layer = BTreeSet::new();
+        for rva in current_thunk_layer {
+            if !visited_thunk_candidates.insert(rva) {
+                continue;
+            }
+            let Ok(available) = input.mapper.contiguous_bytes(rva, "thunk instruction") else {
+                continue;
+            };
+            let bytes = &available[..available.len().min(MAX_X86_INSTRUCTION_BYTES)];
+            let Some(ip) = input.image_base.checked_add(u64::from(rva)) else {
+                continue;
+            };
+            let mut decoder = Decoder::with_ip(64, bytes, ip, DecoderOptions::NONE);
+            let instruction = decoder.decode();
+            let instruction_size = instruction.len();
+            if instruction_size == 0 || !budget.consume(instruction_size) {
+                scan_truncated = true;
+                break 'thunk_layers;
+            }
+            if instruction.is_invalid() {
+                continue;
+            }
+            let Some(raw_instruction) = bytes.get(..instruction_size) else {
+                continue;
+            };
+            let Some(target) =
+                decode_thunk_target(rva, &instruction, raw_instruction, &target_context)
+            else {
+                continue;
+            };
+            let Ok(instruction_size) = u8::try_from(instruction_size) else {
+                continue;
+            };
+            let thunk = PeThunk {
+                rva,
+                instruction_size,
+                target,
+            };
+            if !thunks.contains(&thunk) && thunks.len() == MAX_THUNKS {
+                scan_truncated = true;
+                break 'thunk_layers;
+            }
+            thunks.insert(thunk);
+
+            if let Some(target_rva) = local_function_target_rva(target) {
+                if !visited_thunk_candidates.contains(&target_rva) {
+                    insert_executable_seed(
+                        &mut next_thunk_layer,
+                        input.mapper,
+                        input.sections,
+                        target_rva,
+                    );
+                }
+            }
         }
-        if instruction.is_invalid() {
-            continue;
-        }
-        let Some(raw_instruction) = bytes.get(..instruction_size) else {
-            continue;
-        };
-        let Some(target) = decode_thunk_target(rva, &instruction, raw_instruction, &target_context)
-        else {
-            continue;
-        };
-        let Ok(instruction_size) = u8::try_from(instruction_size) else {
-            continue;
-        };
-        let thunk = PeThunk {
-            rva,
-            instruction_size,
-            target,
-        };
-        if !thunks.contains(&thunk) && thunks.len() == MAX_THUNKS {
-            scan_truncated = true;
-            break;
-        }
-        thunks.insert(thunk);
+        pending_thunk_layer = next_thunk_layer;
     }
 
     CodeRecovery {
@@ -806,6 +827,14 @@ fn decode_thunk_target(
         );
     }
     None
+}
+
+const fn local_function_target_rva(target: PeControlFlowTarget) -> Option<u32> {
+    match target {
+        PeControlFlowTarget::Function { rva }
+        | PeControlFlowTarget::FunctionPointer { rva, .. } => Some(rva),
+        PeControlFlowTarget::ImportIat { .. } => None,
+    }
 }
 
 fn decode_rip_relative_indirect_target(
@@ -981,23 +1010,17 @@ pub(crate) fn validate_code_recovery(analysis: &PeAnalysis) -> Result<(), Analys
         }
     }
 
-    let seeds = model_thunk_seeds(analysis);
     let mut previous_rva = None;
     for thunk in &analysis.thunks {
         if previous_rva == Some(thunk.rva) {
             return invalid("thunks", "contain more than one record for a source RVA");
         }
         previous_rva = Some(thunk.rva);
-        if !seeds.contains(&thunk.rva)
-            || !model_range_is_backed_executable(
-                analysis,
-                thunk.rva,
-                u32::from(thunk.instruction_size),
-            )
+        if !model_range_is_backed_executable(analysis, thunk.rva, u32::from(thunk.instruction_size))
         {
             return invalid(
                 "thunk source",
-                "is not a file-backed executable metadata or call target candidate",
+                "is not a fully file-backed executable candidate",
             );
         }
         validate_target(
@@ -1028,6 +1051,18 @@ pub(crate) fn validate_code_recovery(analysis: &PeAnalysis) -> Result<(), Analys
                 "does not match a supported EB, E9, FF25, or REX.W-prefixed FF25 encoding",
             );
         }
+    }
+
+    let reachable_thunk_sources = model_reachable_thunk_sources(analysis);
+    if analysis
+        .thunks
+        .iter()
+        .any(|thunk| !reachable_thunk_sources.contains(&thunk.rva))
+    {
+        return invalid(
+            "thunk source",
+            "is not reachable from a metadata, direct-call, or RTTI seed through retained thunk edges",
+        );
     }
     Ok(())
 }
@@ -1129,6 +1164,29 @@ fn model_thunk_seeds(analysis: &PeAnalysis) -> BTreeSet<u32> {
             .flat_map(|vftable| vftable.virtual_function_rvas.iter().copied()),
     );
     seeds
+}
+
+fn model_reachable_thunk_sources(analysis: &PeAnalysis) -> BTreeSet<u32> {
+    let thunks_by_source = analysis
+        .thunks
+        .iter()
+        .map(|thunk| (thunk.rva, thunk))
+        .collect::<BTreeMap<_, _>>();
+    let mut reachable = model_thunk_seeds(analysis);
+    let mut pending = reachable.clone();
+
+    while let Some(source_rva) = pending.pop_first() {
+        let Some(thunk) = thunks_by_source.get(&source_rva) else {
+            continue;
+        };
+        let Some(target_rva) = local_function_target_rva(thunk.target) else {
+            continue;
+        };
+        if reachable.insert(target_rva) {
+            pending.insert(target_rva);
+        }
+    }
+    reachable
 }
 
 fn validate_target(

@@ -30,7 +30,7 @@ Every package contains four top-level fields:
   "binary_sha256": "<64 lowercase hexadecimal characters>",
   "generator_version": "0.1.0-alpha.1",
   "payload": {},
-  "schema_version": 5
+  "schema_version": 6
 }
 ```
 
@@ -40,8 +40,8 @@ Every package contains four top-level fields:
 - `payload` contains one validated `AnalysisSession`: deterministic base analysis, a plugin-run
   ledger, and accepted plugin claims.
 
-This package envelope currently writes schema 5. The CLI can also inspect and export schemas 1
-through 4 through the compatibility paths described below, while other schema versions fail
+This package envelope currently writes schema 6. The CLI can also inspect and export schemas 1
+through 5 through the compatibility paths described below, while other schema versions fail
 explicitly. The debugger-neutral JSON produced by `resymbol export --format json` is a different
 artifact with its own schema version; its current projection is schema 6.
 
@@ -92,11 +92,17 @@ thunk resolution, so their recorded code recovery remains available while that n
 is reported as unavailable. Schema 4 records pointer control flow but predates recovery of legacy
 24-byte MSVC RTTI base-class descriptors without `pCHD`. Existing RTTI recorded by schemas 1
 through 4 remains available, but loading cannot discover omitted descriptors without the executable
-bytes. Reanalyze the exact original executable to create a schema 5 package with all current
-recovery results. The compatibility reader explicitly rejects a schema 2 or 3 envelope whose base
+bytes. Schema 5 records both RTTI descriptor layouts but predates transitive executable thunk-chain
+discovery; its existing calls and thunks remain available, but loading cannot add omitted hops.
+Reanalyze the exact original executable to create a schema 6 package with all current recovery
+results. The compatibility reader explicitly rejects a schema 2 or 3 envelope whose base
 analysis, base graph, or plugin claims contain a schema-4 `function-pointer` target. It also rejects
 any schema 1-through-4 payload whose RTTI base records have a missing or null
-`class_hierarchy_descriptor_rva`; changing only the envelope label is not migration.
+`class_hierarchy_descriptor_rva`. Schema 1's closed migration path rejects every persisted
+post-schema-1 control-flow record; schemas 2 through 5 explicitly reject a deterministic base thunk
+source valid only through schema-6 transitive endpoint seeding. Changing only the envelope label is
+not migration. Plugin-supplied exact thunk claims remain independent of the built-in base-analysis
+seed invariant.
 `inspect --json` emits the validated original schema 1 representation rather than placing the
 migrated current payload beneath a legacy schema label.
 
@@ -236,8 +242,8 @@ same sizes. If the computed slot RVA exactly matches a parsed import-IAT slot, i
 precedence and the slot is not dereferenced. Otherwise the complete eight-byte slot must lie in one
 file-backed, initialized, readable, non-writable, non-executable section. Its little-endian
 preferred-image VA is resolved exactly one hop to an in-image, file-backed executable RVA. Pointer
-chains, writable slots, other indirect forms, and targets merely located near an import table are
-not retained as resolved control flow.
+to-pointer slot chains, writable slots, other indirect forms, and targets merely located near an
+import table are not retained as resolved control flow.
 
 A resolved pointer call or thunk uses the explicit target shape
 `{"kind":"function-pointer","slot_rva":...,"rva":...}` in both the base graph and package. Its
@@ -264,12 +270,22 @@ Thunk candidates come from deterministic seeds: runtime-function starts, the PE 
 executable exports, internal direct-call targets, and validated RTTI virtual slots. Only a
 candidate's first instruction is considered. Exact `E9 rel32` and `EB rel8` jumps may target
 file-backed executable RVAs. Exact `FF 25 disp32` and `48 FF 25 disp32` jumps use the IAT-first,
-one-hop pointer policy above. A self-targeting internal jump is not a thunk.
+one-hop pointer policy above. The original seed set is processed first in RVA order. Internal
+function endpoints of retained thunks then form the next sorted layer, and that bounded causal
+closure continues until no new endpoint remains. Every relationship retains its exact hop: a call
+to `A` followed by thunks `A -> B -> C` stays one call plus `A -> B` and `B -> C`, never a flattened
+call or thunk to `C`. A candidate is decoded once, so a connected cycle terminates while preserving
+its exact non-self edges. Persisted thunk records must be reachable from the original seed set
+through other retained internal thunk endpoints; a disconnected cycle is rejected. An import-IAT
+target ends the executable chain. A self-targeting internal jump is not a thunk. Following an
+executable endpoint does not relax the data policy: pointer-to-pointer slot chains remain
+unsupported and each non-IAT slot is dereferenced at most once.
 
 Decoding is deterministic and bounded to 64 MiB of instruction bytes, 1,000,000 instructions,
 262,144 discovered block starts, 8,192 retained direct calls, 32,768 retained data references, and
-4,096 retained thunks. Each relationship family retains its deterministic traversal prefix when
-its record cap is reached; `code_recovery_scan_truncated` and
+4,096 retained thunks. Original thunk seeds have priority over later sorted endpoint layers. Each
+relationship family retains its deterministic traversal prefix when its record cap is reached;
+`code_recovery_scan_truncated` and
 `data_reference_scan_truncated` preserve the applicable partial state. A pointer call is retained
 only when its paired slot data reference is retained, so exhausting the data-reference cap also
 makes the pointer-call result incomplete rather than publishing a call without its provenance.
@@ -339,7 +355,7 @@ inspection of the exact original PE. It emits deterministic, bounded, pure-Rust 
 containing selected public function and global names and verbatim section headers. Same-RVA
 function/global collisions prefer the function; unnamed functions do not suppress globals. The
 writer does not synthesize private symbols, compilands, source lines, locals, prototypes, function
-extents, or type records, and it does not add fields to package schema 5 or neutral projection
+extents, or type records, and it does not add fields to package schema 6 or neutral projection
 schema 6. Generating the file requires no separately installed Visual Studio, DIA, LLVM, or
 compiler toolchain; Windows compatibility CI validates it with native and DIA-backed
 `llvm-pdbutil` reads and a direct DIA identity/public-symbol probe.

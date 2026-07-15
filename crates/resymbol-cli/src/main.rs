@@ -9,7 +9,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use resymbol_analysis::{
-    AnalysisSession, BinaryAnalysis, PeAnalysis, PluginRunRecord, PluginRunStatus, analyze_bytes,
+    AnalysisSession, BinaryAnalysis, PeAnalysis, PeControlFlowTarget, PluginRunRecord,
+    PluginRunStatus, analyze_bytes,
 };
 use resymbol_core::{
     BinaryId, ClaimProvenance, Confidence, DiscoveredPlugin, Evidence, PLUGIN_DISABLED_SENTINEL,
@@ -44,6 +45,8 @@ use resymbol_plugin_state::{
 use serde_json::{Map, Value};
 
 const NO_PCHD_BASE_DESCRIPTOR_SCHEMA_VERSION: u32 = 5;
+const TRANSITIVE_THUNK_CHAIN_SCHEMA_VERSION: u32 = 6;
+const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -282,6 +285,7 @@ fn analyze(args: AnalyzeArgs, safe_mode: bool, plugin_dir: PathBuf) -> Result<()
     print_session_summary(
         package.payload(),
         CodeRecoveryAvailability::Recorded,
+        TransitiveThunkRecoveryAvailability::Recorded,
         StringDataRecoveryAvailability::Recorded,
         RttiRecoveryAvailability::Recorded,
     )?;
@@ -336,6 +340,7 @@ fn inspect(args: InspectArgs) -> Result<()> {
     print_session_summary(
         loaded.package.payload(),
         loaded.code_recovery_availability,
+        loaded.transitive_thunk_recovery_availability,
         loaded.string_data_recovery_availability,
         loaded.rtti_recovery_availability,
     )?;
@@ -368,6 +373,24 @@ impl CodeRecoveryAvailability {
                 "code recovery: unavailable (schema 1 package predates decoder data; reanalyze the exact original binary)"
                     .to_owned(),
             ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransitiveThunkRecoveryAvailability {
+    Recorded,
+    RecordedWithoutTransitiveThunkChains(u32),
+    UnavailableSchema1,
+}
+
+impl TransitiveThunkRecoveryAvailability {
+    fn summary_line(self) -> Option<String> {
+        match self {
+            Self::Recorded | Self::UnavailableSchema1 => None,
+            Self::RecordedWithoutTransitiveThunkChains(schema_version) => Some(format!(
+                "transitive exact thunk-chain recovery: unavailable (schema {schema_version} package predates this recovery; existing one-hop thunks remain available; reanalyze the exact original binary)"
+            )),
         }
     }
 }
@@ -413,6 +436,7 @@ impl RttiRecoveryAvailability {
 struct LoadedAnalysisPackage {
     package: ResymPackage<AnalysisSession>,
     code_recovery_availability: CodeRecoveryAvailability,
+    transitive_thunk_recovery_availability: TransitiveThunkRecoveryAvailability,
     string_data_recovery_availability: StringDataRecoveryAvailability,
     rtti_recovery_availability: RttiRecoveryAvailability,
     schema1_source: Option<ResymPackage<Value>>,
@@ -440,21 +464,26 @@ fn read_analysis_package(
         1 => CodeRecoveryAvailability::UnavailableSchema1,
         2 => CodeRecoveryAvailability::RecordedWithoutReadOnlyPointerControlFlow(2),
         3 => CodeRecoveryAvailability::RecordedWithoutReadOnlyPointerControlFlow(3),
-        4 => CodeRecoveryAvailability::Recorded,
-        CURRENT_SCHEMA_VERSION => CodeRecoveryAvailability::Recorded,
+        4..=6 => CodeRecoveryAvailability::Recorded,
+        _ => bail!("unsupported analysis package schema {schema_version}"),
+    };
+    let transitive_thunk_recovery_availability = match schema_version {
+        1 => TransitiveThunkRecoveryAvailability::UnavailableSchema1,
+        2..=5 => TransitiveThunkRecoveryAvailability::RecordedWithoutTransitiveThunkChains(
+            schema_version,
+        ),
+        6 => TransitiveThunkRecoveryAvailability::Recorded,
         _ => bail!("unsupported analysis package schema {schema_version}"),
     };
     let string_data_recovery_availability = match schema_version {
         1 => StringDataRecoveryAvailability::UnavailableSchema1,
         2 => StringDataRecoveryAvailability::UnavailableSchema2,
-        3 => StringDataRecoveryAvailability::Recorded,
-        4 => StringDataRecoveryAvailability::Recorded,
-        CURRENT_SCHEMA_VERSION => StringDataRecoveryAvailability::Recorded,
+        3..=6 => StringDataRecoveryAvailability::Recorded,
         _ => bail!("unsupported analysis package schema {schema_version}"),
     };
     let rtti_recovery_availability = match schema_version {
         1..=4 => RttiRecoveryAvailability::RecordedWithoutNoPchdBaseDescriptors(schema_version),
-        CURRENT_SCHEMA_VERSION => RttiRecoveryAvailability::Recorded,
+        5..=6 => RttiRecoveryAvailability::Recorded,
         _ => bail!("unsupported analysis package schema {schema_version}"),
     };
     let schema1_source = (preserve_schema1_source && schema_version == 1).then(|| package.clone());
@@ -471,17 +500,20 @@ fn read_analysis_package(
         2 => serde_json::from_value(payload).context("cannot decode schema-v2 analysis payload"),
         3 => serde_json::from_value(payload).context("cannot decode schema-v3 analysis payload"),
         4 => serde_json::from_value(payload).context("cannot decode schema-v4 analysis payload"),
-        CURRENT_SCHEMA_VERSION => {
-            serde_json::from_value(payload).context("cannot decode current analysis payload")
-        }
+        5 => serde_json::from_value(payload).context("cannot decode schema-v5 analysis payload"),
+        6 => serde_json::from_value(payload).context("cannot decode current analysis payload"),
         _ => bail!("unsupported analysis package schema {schema_version}"),
     })?;
+    if (2..TRANSITIVE_THUNK_CHAIN_SCHEMA_VERSION).contains(&schema_version) {
+        reject_pre_v6_transitive_thunk_chains(package.payload(), schema_version)?;
+    }
     package
         .ensure_payload_binding()
         .context("package envelope and migrated payload identify different binaries")?;
     Ok(LoadedAnalysisPackage {
         package,
         code_recovery_availability,
+        transitive_thunk_recovery_availability,
         string_data_recovery_availability,
         rtti_recovery_availability,
         schema1_source,
@@ -616,6 +648,80 @@ fn target_is_function_pointer(value: Option<&Value>) -> bool {
         .and_then(|target| target.get("kind"))
         .and_then(Value::as_str)
         == Some("function-pointer")
+}
+
+fn reject_pre_v6_transitive_thunk_chains(
+    session: &AnalysisSession,
+    schema_version: u32,
+) -> Result<()> {
+    debug_assert!((2..TRANSITIVE_THUNK_CHAIN_SCHEMA_VERSION).contains(&schema_version));
+    let BinaryAnalysis::Pe(analysis) = session.base_analysis() else {
+        return Ok(());
+    };
+    let legacy_seeds = legacy_initial_thunk_seeds(analysis);
+    if let Some(thunk) = analysis
+        .thunks
+        .iter()
+        .find(|thunk| !legacy_seeds.contains(&thunk.rva))
+    {
+        bail!(
+            "package schema {schema_version} predates transitive exact thunk-chain recovery but its base analysis contains schema-6 transitive thunk source RVA {:#x}; legacy envelopes cannot be relabeled, so reanalyze the exact original binary",
+            thunk.rva
+        );
+    }
+    Ok(())
+}
+
+fn legacy_initial_thunk_seeds(analysis: &PeAnalysis) -> BTreeSet<u32> {
+    let mut seeds = BTreeSet::new();
+    if analysis.entry_point_rva != 0 {
+        seeds.insert(analysis.entry_point_rva);
+    }
+    seeds.extend(
+        analysis
+            .runtime_functions
+            .iter()
+            .map(|function| function.begin_rva),
+    );
+    seeds.extend(analysis.exports.iter().filter_map(|export| {
+        (export.forwarded_to.is_none())
+            .then_some(export.address_rva)
+            .flatten()
+            .filter(|rva| legacy_range_is_backed_executable(analysis, *rva, 1))
+    }));
+    seeds.extend(
+        analysis
+            .direct_calls
+            .iter()
+            .filter_map(|call| match call.target {
+                PeControlFlowTarget::Function { rva }
+                | PeControlFlowTarget::FunctionPointer { rva, .. } => Some(rva),
+                PeControlFlowTarget::ImportIat { .. } => None,
+            }),
+    );
+    seeds.extend(
+        analysis
+            .msvc_rtti_vftables
+            .iter()
+            .flat_map(|vftable| vftable.virtual_function_rvas.iter().copied()),
+    );
+    seeds
+}
+
+fn legacy_range_is_backed_executable(analysis: &PeAnalysis, rva: u32, size: u32) -> bool {
+    if size == 0 {
+        return false;
+    }
+    let Some(end) = u64::from(rva).checked_add(u64::from(size)) else {
+        return false;
+    };
+    analysis.sections.iter().any(|section| {
+        let start = u64::from(section.virtual_address);
+        let backed_end = start.saturating_add(u64::from(section.raw_data_size));
+        section.characteristics & IMAGE_SCN_MEM_EXECUTE != 0
+            && u64::from(rva) >= start
+            && end <= backed_end
+    })
 }
 
 #[derive(serde::Deserialize)]
@@ -882,6 +988,12 @@ fn export(args: ExportArgs) -> Result<()> {
     if let Some(line) = package_data
         .code_recovery_availability
         .export_summary_line()
+    {
+        println!("{line}");
+    }
+    if let Some(line) = package_data
+        .transitive_thunk_recovery_availability
+        .summary_line()
     {
         println!("{line}");
     }
@@ -1955,12 +2067,14 @@ fn default_package_path(binary: &Path) -> PathBuf {
 fn print_session_summary(
     session: &AnalysisSession,
     code_recovery_availability: CodeRecoveryAvailability,
+    transitive_thunk_recovery_availability: TransitiveThunkRecoveryAvailability,
     string_data_recovery_availability: StringDataRecoveryAvailability,
     rtti_recovery_availability: RttiRecoveryAvailability,
 ) -> Result<()> {
     print_analysis_summary(
         session.base_analysis(),
         code_recovery_availability,
+        transitive_thunk_recovery_availability,
         string_data_recovery_availability,
         rtti_recovery_availability,
     );
@@ -2004,6 +2118,7 @@ fn print_session_summary(
 fn print_analysis_summary(
     analysis: &BinaryAnalysis,
     code_recovery_availability: CodeRecoveryAvailability,
+    transitive_thunk_recovery_availability: TransitiveThunkRecoveryAvailability,
     string_data_recovery_availability: StringDataRecoveryAvailability,
     rtti_recovery_availability: RttiRecoveryAvailability,
 ) {
@@ -2070,6 +2185,9 @@ fn print_analysis_summary(
             );
             println!("runtime functions: {}", pe.runtime_functions.len());
             for line in code_recovery_summary_lines(pe, code_recovery_availability) {
+                println!("{line}");
+            }
+            if let Some(line) = transitive_thunk_recovery_availability.summary_line() {
                 println!("{line}");
             }
             for line in string_data_recovery_summary_lines(pe, string_data_recovery_availability) {
@@ -2857,6 +2975,19 @@ mod tests {
         bytes
     }
 
+    fn pe_transitive_thunk_chain_fixture() -> Vec<u8> {
+        let mut bytes = pe_code_recovery_fixture();
+
+        let first_thunk = file_offset(0x1010);
+        bytes[first_thunk] = 0xe9;
+        put_u32(&mut bytes, first_thunk + 1, 0x0b);
+
+        let second_thunk = file_offset(0x1020);
+        bytes[second_thunk] = 0xe9;
+        put_u32(&mut bytes, second_thunk + 1, 0x0b);
+        bytes
+    }
+
     fn create_plugin(root: &Path, id: &str) -> PathBuf {
         let plugin = root.join("example");
         fs::create_dir(&plugin).expect("create plugin directory");
@@ -3171,6 +3302,14 @@ entrypoint = "Plugin.dll"
             CodeRecoveryAvailability::Recorded.export_summary_line(),
             None
         );
+        assert_eq!(
+            TransitiveThunkRecoveryAvailability::UnavailableSchema1.summary_line(),
+            None
+        );
+        assert_eq!(
+            TransitiveThunkRecoveryAvailability::Recorded.summary_line(),
+            None
+        );
     }
 
     #[test]
@@ -3199,6 +3338,22 @@ entrypoint = "Plugin.dll"
                 availability.export_summary_line(),
                 Some(format!(
                     "read-only function-pointer call/thunk resolution: unavailable (schema {schema_version} package predates this recovery data; reanalyze the exact original binary)"
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn schemas_v2_through_v5_mark_transitive_thunk_chain_recovery_unavailable() {
+        for schema_version in 2..=5 {
+            let availability =
+                TransitiveThunkRecoveryAvailability::RecordedWithoutTransitiveThunkChains(
+                    schema_version,
+                );
+            assert_eq!(
+                availability.summary_line(),
+                Some(format!(
+                    "transitive exact thunk-chain recovery: unavailable (schema {schema_version} package predates this recovery; existing one-hop thunks remain available; reanalyze the exact original binary)"
                 ))
             );
         }
@@ -3618,7 +3773,7 @@ entrypoint = "Plugin.dll"
 
         let package: ResymPackage<AnalysisSession> =
             read_file_bound(&output).expect("read bound package");
-        assert_eq!(CURRENT_SCHEMA_VERSION, 5);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 6);
         assert_eq!(package.schema_version(), CURRENT_SCHEMA_VERSION);
         assert_eq!(
             package.binary_sha256(),
@@ -3990,6 +4145,10 @@ entrypoint = "Plugin.dll"
             CodeRecoveryAvailability::UnavailableSchema1
         );
         assert_eq!(
+            decoded.transitive_thunk_recovery_availability,
+            TransitiveThunkRecoveryAvailability::UnavailableSchema1
+        );
+        assert_eq!(
             decoded.string_data_recovery_availability,
             StringDataRecoveryAvailability::UnavailableSchema1
         );
@@ -4095,6 +4254,10 @@ entrypoint = "Plugin.dll"
             CodeRecoveryAvailability::RecordedWithoutReadOnlyPointerControlFlow(2)
         );
         assert_eq!(
+            decoded.transitive_thunk_recovery_availability,
+            TransitiveThunkRecoveryAvailability::RecordedWithoutTransitiveThunkChains(2)
+        );
+        assert_eq!(
             decoded.string_data_recovery_availability,
             StringDataRecoveryAvailability::UnavailableSchema2
         );
@@ -4169,6 +4332,10 @@ entrypoint = "Plugin.dll"
             CodeRecoveryAvailability::RecordedWithoutReadOnlyPointerControlFlow(3)
         );
         assert_eq!(
+            decoded.transitive_thunk_recovery_availability,
+            TransitiveThunkRecoveryAvailability::RecordedWithoutTransitiveThunkChains(3)
+        );
+        assert_eq!(
             decoded.string_data_recovery_availability,
             StringDataRecoveryAvailability::Recorded
         );
@@ -4210,11 +4377,11 @@ entrypoint = "Plugin.dll"
         let temp = tempfile::tempdir().expect("create temporary directory");
         let path = temp.path().join("schema-v4.resym");
         let output = temp.path().join("schema-v4.json");
-        let base_analysis = analyze_bytes(include_bytes!(
+        let mut base_analysis = analyze_bytes(include_bytes!(
             "../../../fixtures/pe-x64-msvc/artifacts/milestone2-stripped.exe"
         ))
         .expect("analyze modern-RTTI PE fixture");
-        let BinaryAnalysis::Pe(pe) = &base_analysis else {
+        let BinaryAnalysis::Pe(pe) = &mut base_analysis else {
             panic!("PE analysis expected");
         };
         assert!(!pe.msvc_rtti_vftables.is_empty());
@@ -4224,6 +4391,18 @@ entrypoint = "Plugin.dll"
                 .iter()
                 .all(|base| base.class_hierarchy_descriptor_rva.is_some())
         }));
+        let legacy_thunk_seeds = legacy_initial_thunk_seeds(pe);
+        assert!(
+            pe.thunks
+                .iter()
+                .any(|thunk| !legacy_thunk_seeds.contains(&thunk.rva)),
+            "fixture must exercise schema-4 one-hop normalization"
+        );
+        pe.thunks
+            .retain(|thunk| legacy_thunk_seeds.contains(&thunk.rva));
+        pe.symbol_graph = pe
+            .rebuild_symbol_graph()
+            .expect("rebuild schema-4 one-hop symbol graph");
         let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
             .expect("create base-only session");
         let package = ResymPackage::from_bound_payload("0.1.0-alpha.4", session)
@@ -4242,6 +4421,10 @@ entrypoint = "Plugin.dll"
         assert_eq!(
             decoded.code_recovery_availability,
             CodeRecoveryAvailability::Recorded
+        );
+        assert_eq!(
+            decoded.transitive_thunk_recovery_availability,
+            TransitiveThunkRecoveryAvailability::RecordedWithoutTransitiveThunkChains(4)
         );
         assert_eq!(
             decoded.string_data_recovery_availability,
@@ -4279,6 +4462,187 @@ entrypoint = "Plugin.dll"
             serde_json::from_slice(&fs::read(output).expect("read schema-v4 JSON projection"))
                 .expect("projection JSON is valid");
         assert_eq!(projection["schema_version"], 6);
+    }
+
+    #[test]
+    fn inspect_and_json_export_accept_schema_v5_with_one_hop_thunks() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let path = temp.path().join("schema-v5.resym");
+        let output = temp.path().join("schema-v5.json");
+        let base_analysis = analyze_bytes(&pe_code_recovery_fixture()).expect("analyze PE fixture");
+        let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
+            .expect("create base-only session");
+        let package = ResymPackage::from_bound_payload("0.1.0-alpha.5", session)
+            .expect("create current package value");
+        let mut value = serde_json::to_value(package).expect("serialize package value");
+        value["schema_version"] = serde_json::json!(5);
+        fs::write(
+            &path,
+            serde_json::to_vec(&value).expect("encode schema-v5 package"),
+        )
+        .expect("write schema-v5 package");
+
+        let decoded = read_analysis_package(&path, true)
+            .expect("CLI compatibility policy accepts schema 5 explicitly");
+        assert_eq!(decoded.package.schema_version(), 5);
+        assert_eq!(
+            decoded.code_recovery_availability,
+            CodeRecoveryAvailability::Recorded
+        );
+        assert_eq!(
+            decoded.transitive_thunk_recovery_availability,
+            TransitiveThunkRecoveryAvailability::RecordedWithoutTransitiveThunkChains(5)
+        );
+        assert_eq!(
+            decoded.string_data_recovery_availability,
+            StringDataRecoveryAvailability::Recorded
+        );
+        assert_eq!(
+            decoded.rtti_recovery_availability,
+            RttiRecoveryAvailability::Recorded
+        );
+        let BinaryAnalysis::Pe(pe) = decoded.package.payload().base_analysis() else {
+            panic!("PE analysis expected");
+        };
+        assert_eq!(pe.direct_calls.len(), 1);
+        assert_eq!(pe.thunks.len(), 1);
+
+        inspect(InspectArgs {
+            package: path.clone(),
+            json: false,
+        })
+        .expect("CLI inspection accepts schema 5");
+        export(ExportArgs {
+            package: path,
+            format: ExportFormat::Json,
+            output: Some(output.clone()),
+            binary: None,
+        })
+        .expect("JSON export accepts schema 5");
+        let projection: Value =
+            serde_json::from_slice(&fs::read(output).expect("read schema-v5 JSON projection"))
+                .expect("projection JSON is valid");
+        assert_eq!(projection["schema_version"], 6);
+    }
+
+    #[test]
+    fn schemas_v2_through_v5_reject_relabeled_schema_v6_transitive_thunk_chains() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let base_analysis = analyze_bytes(&pe_transitive_thunk_chain_fixture())
+            .expect("analyze transitive thunk-chain fixture");
+        let BinaryAnalysis::Pe(pe) = &base_analysis else {
+            panic!("PE analysis expected");
+        };
+        assert_eq!(
+            pe.thunks.iter().map(|thunk| thunk.rva).collect::<Vec<_>>(),
+            [0x1010, 0x1020]
+        );
+        let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
+            .expect("create transitive thunk-chain session");
+        let package = ResymPackage::from_bound_payload("0.1.0", session)
+            .expect("create current package value");
+        let current = serde_json::to_value(package).expect("serialize current package value");
+        let current_path = temp.path().join("schema-v6-thunk-chain.resym");
+        fs::write(
+            &current_path,
+            serde_json::to_vec(&current).expect("encode current package"),
+        )
+        .expect("write current package");
+        let decoded = read_analysis_package(&current_path, false)
+            .expect("schema 6 accepts transitive thunk-chain recovery");
+        assert_eq!(decoded.package.schema_version(), 6);
+        assert_eq!(
+            decoded.transitive_thunk_recovery_availability,
+            TransitiveThunkRecoveryAvailability::Recorded
+        );
+
+        for schema_version in 2..TRANSITIVE_THUNK_CHAIN_SCHEMA_VERSION {
+            let mut value = current.clone();
+            value["schema_version"] = serde_json::json!(schema_version);
+            let path = temp.path().join(format!(
+                "relabeled-thunk-chain-schema-{schema_version}.resym"
+            ));
+            fs::write(
+                &path,
+                serde_json::to_vec(&value).expect("encode relabeled package"),
+            )
+            .expect("write relabeled package");
+
+            let error = match read_analysis_package(&path, false) {
+                Ok(_) => panic!(
+                    "schema {schema_version} must reject schema-6 transitive thunk semantics"
+                ),
+                Err(error) => error,
+            };
+            let diagnostic = format!("{error:#}");
+            assert!(diagnostic.contains("schema-6 transitive thunk source RVA 0x1020"));
+            assert!(diagnostic.contains("cannot be relabeled"));
+        }
+    }
+
+    #[test]
+    fn schema_v5_transitive_thunk_gate_ignores_plugin_only_claim_chains() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let path = temp.path().join("schema-v5-plugin-thunk-chain.resym");
+        let base_analysis = analyze_bytes(&pe_fixture()).expect("analyze PE fixture");
+        let binary = base_analysis.identity().id.clone();
+        let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
+            .expect("create base-only session");
+        let package = ResymPackage::from_bound_payload("0.1.0-alpha.5", session)
+            .expect("create current package value");
+        let mut value = serde_json::to_value(package).expect("serialize current package value");
+        value["schema_version"] = serde_json::json!(5);
+        install_schema_v1_plugin_claims(
+            &mut value,
+            vec![
+                schema_v1_plugin_claim(
+                    serde_json::json!({
+                        "kind": "function",
+                        "binary": binary.as_str(),
+                        "rva": 0x1040
+                    }),
+                    serde_json::json!({
+                        "kind": "thunk-target",
+                        "target": {"kind": "function", "rva": 0x1060}
+                    }),
+                ),
+                schema_v1_plugin_claim(
+                    serde_json::json!({
+                        "kind": "function",
+                        "binary": binary.as_str(),
+                        "rva": 0x1060
+                    }),
+                    serde_json::json!({
+                        "kind": "thunk-target",
+                        "target": {"kind": "function", "rva": 0x1080}
+                    }),
+                ),
+            ],
+        );
+        fs::write(
+            &path,
+            serde_json::to_vec(&value).expect("encode schema-v5 plugin package"),
+        )
+        .expect("write schema-v5 plugin package");
+
+        let decoded = read_analysis_package(&path, false)
+            .expect("base-only gate must not reject plugin claim relationships");
+        assert_eq!(decoded.package.schema_version(), 5);
+        assert_eq!(decoded.package.payload().plugin_claims().len(), 2);
+    }
+
+    #[test]
+    fn legacy_thunk_seeds_exclude_exports_into_non_executable_data() {
+        let mut base_analysis =
+            analyze_bytes(&pe_code_recovery_fixture()).expect("analyze PE fixture");
+        let BinaryAnalysis::Pe(analysis) = &mut base_analysis else {
+            panic!("PE analysis expected");
+        };
+        analysis.exports[1].address_rva = Some(0x1040);
+        analysis.exports[1].forwarded_to = None;
+        analysis.sections[0].characteristics &= !IMAGE_SCN_MEM_EXECUTE;
+
+        assert!(!legacy_initial_thunk_seeds(analysis).contains(&0x1040));
     }
 
     #[test]

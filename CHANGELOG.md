@@ -74,6 +74,15 @@ prereleases; breaking changes remain explicit.
   provenance without inventing a data-reference record outside the instruction sweep. Focused
   synthetic PE fixtures cover the encodings, rejection policy, caps, packages, and exports without
   regenerating or changing the hashes of the four checked-in MSVC corpus binaries.
+- Added bounded transitive recovery of exact executable thunk chains. Existing metadata, export,
+  direct-call, and RTTI candidates are checked first in deterministic RVA order; internal endpoints
+  of retained thunks form the next sorted layer until the causal closure is exhausted. Every
+  instruction keeps its exact hop (`A -> B`, `B -> C`) rather than being flattened to a terminal
+  endpoint. A global visited set terminates connected cycles while retaining their exact edges, and
+  persisted disconnected thunk cycles remain invalid. This follows executable thunk endpoints, not
+  pointer-to-pointer slot chains: every supported non-IAT pointer operand is still dereferenced
+  exactly once. Focused synthetic PE fixtures cover direct, pointer-backed, cyclic, and
+  disconnected chains without changing the four checked-in MSVC corpus binaries or their hashes.
 - Added `ControlFlowTarget` and the `FunctionEntry`, `DirectCall`, and `ThunkTarget` symbol
   assertions, plus PE recovery records and graph attribution for PE entry points, recovered targets,
   and validated RTTI virtual slots.
@@ -125,12 +134,13 @@ prereleases; breaking changes remain explicit.
   and no longer quarantine the plugin artifact.
 - Raised the pinned Rust source-build toolchain and workspace MSRV to 1.86 for the Component Model
   host. Ordinary release users and users of the bundled WASM example still need no compiler.
-- New `.resym` analyses use package schema 5. Schema 4 introduced the `function-pointer`
+- New `.resym` analyses use package schema 6. Schema 4 introduced the `function-pointer`
   control-flow target, which persists both the read-only slot RVA and resolved function RVA and
   requires a paired same-site slot data reference for a direct call but not for a pointer thunk.
   Schema 5 preserves a legacy 24-byte RTTI base-class descriptor with a null
   `class_hierarchy_descriptor_rva`; the 28-byte `BCD_HASPCHD` form retains its validated nonzero
-  hierarchy link.
+  hierarchy link. Schema 6 permits persisted thunk sources reached through the deterministic
+  transitive thunk closure while retaining the same exact per-hop relationship shape.
 - The debugger-neutral JSON projection now uses schema 6. Schema 4 added attributed string and
   data-reference arrays to schema 3's entry attribution and control-flow relationships; schema 5
   added `referenced_string_rva` correlation; and schema 6 adds explicit `function-pointer` targets.
@@ -163,7 +173,7 @@ schema versions independently.
 
 ### Compatibility
 
-- The CLI can inspect and export package schemas 1 through 4 through explicit, validated in-memory
+- The CLI can inspect and export package schemas 1 through 5 through explicit, validated in-memory
   compatibility paths. It revalidates persisted metadata, plugin runs and claims, binary binding,
   and rebuilds the deterministic base graph; it does not rewrite a legacy package. `inspect --json`
   preserves the validated original representation instead of mislabeling migrated content.
@@ -177,23 +187,28 @@ schema versions independently.
   direct calls and thunks but predates strings and data references. Schema 3 retains string/data
   recovery, while schemas 2 and 3 both predate read-only function-pointer call and thunk
   resolution. Schema 4 retains those pointer relationships but predates legacy 24-byte base-class
-  descriptor recovery. Schemas 1 through 4 cannot gain that missing result family during loading.
-  Reanalyze the exact original binary to create schema 5 with current recovery. The reader rejects
+  descriptor recovery. Schema 5 includes that RTTI recovery but predates transitive executable
+  thunk-chain discovery. Schemas 1 through 5 cannot gain omitted results during loading. Reanalyze
+  the exact original binary to create schema 6 with current recovery. The reader rejects
   schema 2 or 3 envelopes containing schema-4 function-pointer targets in base relationships,
   symbol graphs, or plugin claims. It also rejects a schema 1-through-4 payload containing an RTTI
   base record whose `class_hierarchy_descriptor_rva` is missing or null instead of accepting
-  relabeled schema-5 semantics.
-- Package schema 5 and neutral projection schema 6 are independent version domains. Generic
+  relabeled schema-5 semantics, and rejects a schema 1-through-5 envelope containing a base thunk
+  source that depends on schema-6 transitive endpoint seeding. Changing only the envelope label is
+  never migration.
+- Package schema 6 and neutral projection schema 6 are independent version domains. Generic
   package readers still require an explicit compatibility range and application-defined payload
   migration to accept an older schema.
 - Markdown export is presentation-only and does not change either version domain: new analyses
-  continue to use package schema 5 and the neutral projection continues to use schema 6.
+  continue to use package schema 6 and the neutral projection continues to use schema 6.
 - MAP export consumes the current validated session and neutral projection without adding fields to
-  package schema 5 or projection schema 6.
+  package schema 6 or projection schema 6.
 - PDB export consumes the same current session and projection plus a byte-backed inspection of the
-  exact original PE. It does not add fields to package schema 5 or projection schema 6.
+  exact original PE. It does not add fields to package schema 6 or projection schema 6.
 - The external plugin wire remains protocol 1.0. Dual-layout RTTI recovery changes deterministic
   base-analysis/package content but adds no plugin assertion or control-flow target shape.
+  Transitive built-in thunk discovery likewise composes existing exact `thunk-target` claims and
+  does not add a terminal-target field or change the wire handshake.
 - Managed-plugin execution adds no package-schema field: successful runs and validated claims use
   the existing `AnalysisSession` plugin ledger and claim representation.
 - WASM-plugin execution likewise adds no package-schema field. It uses the existing plugin ledger,
@@ -218,9 +233,10 @@ schema versions independently.
   the guest limits are not process isolation.
 - Built-in code recovery is capped at 64 MiB of decoded instruction bytes, 1,000,000 instructions,
   262,144 discovered block starts, 8,192 retained direct calls, 32,768 retained data references,
-  and 4,096 retained thunks. Exhaustion retains deterministic valid results and marks the
-  applicable relationship sets partial. Neutral projection validation applies separate, larger
-  collection caps.
+  and 4,096 retained thunks. Initial thunk seeds are processed before sorted endpoint layers, and
+  a candidate is decoded at most once across connected cycles. Exhaustion retains deterministic
+  valid exact hops and marks the applicable relationship sets partial. Neutral projection
+  validation applies separate, larger collection caps.
 - Built-in string recovery scans at most 64 MiB, retains at most 16,384 literals and 4 MiB of UTF-8
   text in aggregate, and caps each exact value at 4 KiB UTF-8 and 4 KiB encoded data including its
   terminator. Reaching a limit never publishes a truncated prefix and records the scan as partial.
@@ -233,7 +249,9 @@ schema versions independently.
   non-writable, non-executable data, and its preferred-image VA must resolve in one hop to
   file-backed executable code. A call is retained only with its exact paired data reference, so
   exhausting the data-reference cap also marks pointer-call recovery partial. A pointer thunk
-  preserves the slot and endpoint without requiring a data-reference record.
+  preserves the slot and endpoint without requiring a data-reference record. If that endpoint is
+  itself an exact supported thunk, it may seed the next executable thunk layer, but the data slot
+  is never followed as a pointer chain.
 - The decoder is heuristic-confidence evidence, not complete recursive disassembly or a persisted
   control-flow graph. It avoids unreachable post-terminal bytes and follows supported direct
   branches, but reachable embedded data can still produce false positives and invalid or unsupported

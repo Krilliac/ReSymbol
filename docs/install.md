@@ -22,8 +22,12 @@ data references, and thunks without inventing source names or function sizes. Ex
 `FF 25 disp32`/`48 FF 25 disp32` pointer thunks use the same IAT-first, one-hop slot policy as
 `FF 15 disp32`/`48 FF 15 disp32` calls. Resolved pointer control flow preserves both the slot and
 endpoint; calls retain a paired same-site data reference, while thunks do not require one. A
-separate bounded pass recovers exact NUL-terminated ASCII and UTF-16LE strings from eligible
-file-backed data.
+retained internal thunk endpoint seeds the next sorted executable-candidate layer. The analyzer
+therefore preserves exact chains such as `A -> B` and `B -> C` without rewriting a call or earlier
+thunk to `C`; connected cycles terminate through global candidate deduplication, while a persisted
+disconnected cycle is invalid. This is not pointer-slot chaining: every non-IAT pointer operand is
+still dereferenced exactly once. A separate bounded pass recovers exact NUL-terminated ASCII and
+UTF-16LE strings from eligible file-backed data.
 The built-in bounded RTTI pass also validates modern MSVC x64 Rev1 type descriptors, class and base
 records, vftables, and executable virtual-slot targets. Recovered class/type names, vftable names,
 and function-to-class relationships become evidence-bearing claims, and the result is written to a
@@ -47,7 +51,9 @@ The core PE/RTTI analysis is offline and never executes the input. Its narrow de
 in the executable and requires no native library or compiler. Code recovery decodes at most 64 MiB
 and 1,000,000 instructions, discovers at most 262,144 block starts, and retains at most 8,192 direct
 calls, 32,768 data references, and 4,096 thunks. String recovery has its own bounded scan and
-retention budgets. An internal target covered by known `RUNTIME_FUNCTION` metadata is suppressed
+retention budgets. Original thunk seeds are processed before later sorted endpoint layers; reaching
+a shared decode or thunk-retention limit preserves deterministic valid hops and marks code recovery
+partial. An internal target covered by known `RUNTIME_FUNCTION` metadata is suppressed
 unless its RVA matches a recorded runtime-function begin. The guided sweep suppresses unreachable
 post-terminal bytes and can cross jump-over data, but it remains heuristic-confidence evidence:
 reachable embedded data can produce false positives, while invalid or unsupported flow can omit
@@ -184,17 +190,21 @@ unique-type, base-record, and virtual-slot counts. A partial line appears when a
 retention, or aggregate discovery budget was reached; the package preserves the independent flags
 for downstream review.
 
-New analyses write package schema 5. `inspect` and `export` can also open schemas 1 through 4.
+New analyses write package schema 6. `inspect` and `export` can also open schemas 1 through 5.
 Schema 1 is migrated into a validated current in-memory session and its base graph is rebuilt;
-schemas 2 through 4 use explicit compatibility paths. None rewrites the legacy package. Because
+schemas 2 through 5 use explicit compatibility paths. None rewrites the legacy package. Because
 `.resym` does not contain the original executable, compatibility loading cannot run missing
 recovery passes: schema 1 has no direct-call or thunk records, schemas 1 and 2 have no string or
 data-reference records, and schemas 2 and 3 have no read-only function-pointer call or thunk
 results. Schema 4 contains pointer control flow but lacks recovery of 24-byte RTTI base-class
-descriptors without `pCHD`; schemas 1 through 4 report that result family as unavailable. Analyze
-the exact original binary again to create schema 5 with all current results. Relabeling a schema-4
+descriptors without `pCHD`; schemas 1 through 4 report that result family as unavailable. Schema 5
+contains both RTTI layouts but lacks transitive executable thunk-chain discovery. Schemas 2 through
+5 retain their stored direct calls and thunks, but omitted result families remain unavailable.
+Analyze the exact original binary again to create schema 6 with all current results. Relabeling a schema-4
 pointer target beneath a schema 2 or 3 envelope is rejected, as is placing an RTTI base record with
-a missing or null `class_hierarchy_descriptor_rva` beneath any schema 1-through-4 envelope.
+a missing or null `class_hierarchy_descriptor_rva` beneath any schema 1-through-4 envelope. A
+schema 1-through-5 envelope also cannot contain a deterministic base thunk source that depends on
+schema-6 transitive endpoint seeding.
 
 Export a package to a specific destination with `--output`:
 
@@ -214,12 +224,13 @@ Without `--output`, those formats write `application.symbols.json`, `application
 `application.map`, `application.pdb`, `application.ida.py`, and
 `ReSymbolImport_<first-12-binary-sha256>.java` beside the package, respectively. Markdown is a
 deterministic presentation report for human review, not a stable machine-interchange format; use
-JSON for integrations. New analyses write `.resym` package schema 5; export also accepts package
-schemas 1 through 4 through validated compatibility paths without rewriting them. The current
-neutral projection is schema 6, and MAP/PDB add no schema fields. Projection schema 5 correlates
-exact or content-interior data-reference targets with retained strings, excluding NUL terminators
-and requiring UTF-16LE code-unit alignment; projection schema 6 adds explicit function-pointer slot
-and endpoint targets. A missing correlation does not prove the target is not a string. A custom
+JSON for integrations. New analyses write `.resym` package schema 6; export also accepts package
+schemas 1 through 5 through validated compatibility paths without rewriting them. The current
+neutral projection is independently schema 6, and MAP/PDB add no schema fields. Projection schema
+5 correlates exact or content-interior data-reference targets with retained strings, excluding NUL
+terminators and requiring UTF-16LE code-unit alignment; projection schema 6 adds explicit
+function-pointer slot and endpoint targets. A missing correlation does not prove the target is not
+a string. A custom
 Ghidra filename
 must use a lowercase `.java` extension and a valid conservative Java-identifier stem; the generated
 public class uses that stem.

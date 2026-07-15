@@ -199,6 +199,46 @@ fn code_recovery_fixture() -> Vec<u8> {
     bytes
 }
 
+fn transitive_thunk_chain_fixture() -> Vec<u8> {
+    let mut bytes = fixture();
+    bytes[file_offset(0x1000)..file_offset(0x1020)].fill(0x90);
+
+    put_rel32_instruction(&mut bytes, 0x1000, 0xe8, 0x1040);
+    bytes[file_offset(0x1005)] = 0xc3;
+    put_rel32_instruction(&mut bytes, 0x1040, 0xe9, 0x1060);
+    put_rel8_instruction(&mut bytes, 0x1060, 0xeb, 0x1080);
+    bytes[file_offset(0x1080)] = 0xc3;
+
+    // This valid-looking thunk is not metadata-seeded or reachable from a
+    // retained call/thunk edge, so recovery must leave it undiscovered.
+    put_rel32_instruction(&mut bytes, 0x10c0, 0xe9, 0x10e0);
+    bytes[file_offset(0x10e0)] = 0xc3;
+    bytes
+}
+
+fn descending_transitive_thunk_chain_fixture() -> Vec<u8> {
+    let mut bytes = fixture();
+    bytes[file_offset(0x1000)..file_offset(0x1020)].fill(0x90);
+
+    put_rel32_instruction(&mut bytes, 0x1000, 0xe8, 0x10a0);
+    bytes[file_offset(0x1005)] = 0xc3;
+    put_rel32_instruction(&mut bytes, 0x10a0, 0xe9, 0x1080);
+    put_rel32_instruction(&mut bytes, 0x1080, 0xe9, 0x1060);
+    bytes[file_offset(0x1060)] = 0xc3;
+    bytes
+}
+
+fn cyclic_transitive_thunk_chain_fixture() -> Vec<u8> {
+    let mut bytes = fixture();
+    bytes[file_offset(0x1000)..file_offset(0x1020)].fill(0x90);
+
+    put_rel32_instruction(&mut bytes, 0x1000, 0xe8, 0x1040);
+    bytes[file_offset(0x1005)] = 0xc3;
+    put_rel32_instruction(&mut bytes, 0x1040, 0xe9, 0x1060);
+    put_rel32_instruction(&mut bytes, 0x1060, 0xe9, 0x1040);
+    bytes
+}
+
 fn control_flow_suppression_fixture() -> Vec<u8> {
     let mut bytes = fixture();
     put_u32(&mut bytes, OPTIONAL_OFFSET + 16, 0x1040);
@@ -597,6 +637,19 @@ fn read_only_pointer_thunk_fixture() -> Vec<u8> {
     bytes
 }
 
+fn mixed_transitive_pointer_thunk_chain_fixture() -> Vec<u8> {
+    let mut bytes = rtti_fixture();
+    bytes[rtti_file_offset(0x1000)..rtti_file_offset(0x1010)].fill(0x90);
+
+    put_rel32_instruction_at_rtti_rva(&mut bytes, 0x1000, 0xe8, 0x1040);
+    bytes[rtti_file_offset(0x1005)] = 0xc3;
+    put_rel32_instruction_at_rtti_rva(&mut bytes, 0x1040, 0xe9, 0x1060);
+    put_rip_relative_instruction(&mut bytes, 0x1060, 0x25, 0x2301);
+    bytes[rtti_file_offset(0x1080)] = 0xc3;
+    put_rtti_rva_u64(&mut bytes, 0x2301, RTTI_IMAGE_BASE + 0x1080);
+    bytes
+}
+
 fn single_pointer_thunk_fixture(slot_rva: u32, target_va: u64) -> Vec<u8> {
     let mut bytes = rtti_fixture();
     bytes[rtti_file_offset(0x2100)..rtti_file_offset(0x2300)].fill(0);
@@ -910,6 +963,183 @@ fn emits_one_metadata_claim_for_a_file_backed_executable_pe_entry_point() {
     assert_eq!(entry.confidence().get(), 0.99);
     assert_eq!(entry.evidence()[0].kind.as_str(), EvidenceKind::METADATA);
     assert_eq!(entry.evidence()[0].artifacts["entry_point_rva"], "0x1000");
+}
+
+#[test]
+fn follows_transitive_thunk_targets_without_discovering_unrelated_executable_jumps() {
+    let analysis = analyze_pe(&transitive_thunk_chain_fixture())
+        .expect("valid PE with a direct-call-seeded thunk chain");
+
+    assert!(!analysis.code_recovery_scan_truncated);
+    assert_eq!(
+        analysis.direct_calls,
+        [PeDirectCall {
+            caller_rva: 0x1000,
+            call_site_rva: 0x1000,
+            instruction_size: 5,
+            target: PeControlFlowTarget::Function { rva: 0x1040 },
+        }]
+    );
+    assert_eq!(
+        analysis.thunks,
+        [
+            PeThunk {
+                rva: 0x1040,
+                instruction_size: 5,
+                target: PeControlFlowTarget::Function { rva: 0x1060 },
+            },
+            PeThunk {
+                rva: 0x1060,
+                instruction_size: 2,
+                target: PeControlFlowTarget::Function { rva: 0x1080 },
+            },
+        ]
+    );
+    assert!(analysis.thunks.iter().all(|thunk| thunk.rva != 0x10c0));
+
+    let claims = analysis.symbol_graph.claims();
+    assert!(claims.iter().any(|claim| matches!(
+        (claim.subject(), claim.assertion()),
+        (
+            SymbolSubject::Function { rva: 0x1060, .. },
+            SymbolAssertion::ThunkTarget {
+                target: ControlFlowTarget::Function { rva: 0x1080 },
+            },
+        )
+    )));
+    assert!(claims.iter().any(|claim| {
+        claim.provenance().method == "pe-x64-recovered-function-target"
+            && matches!(
+                (claim.subject(), claim.assertion()),
+                (
+                    SymbolSubject::Function { rva: 0x1080, .. },
+                    SymbolAssertion::FunctionEntry,
+                )
+            )
+    }));
+    assert!(claims.iter().all(|claim| !matches!(
+        (claim.subject(), claim.assertion()),
+        (
+            SymbolSubject::Function {
+                rva: 0x10c0 | 0x10e0,
+                ..
+            },
+            SymbolAssertion::ThunkTarget { .. } | SymbolAssertion::FunctionEntry,
+        )
+    )));
+    assert_eq!(
+        analysis
+            .rebuild_symbol_graph()
+            .expect("rebuild thunk graph"),
+        analysis.symbol_graph
+    );
+
+    let session =
+        AnalysisSession::new(BinaryAnalysis::Pe(analysis.clone()), Vec::new(), Vec::new())
+            .expect("valid transitive-thunk session");
+    let encoded = serde_json::to_string(&session).expect("serialize transitive-thunk session");
+    let decoded = serde_json::from_str::<AnalysisSession>(&encoded)
+        .expect("deserialize transitive-thunk session");
+    assert_eq!(decoded, session);
+}
+
+#[test]
+fn follows_mixed_internal_and_read_only_pointer_thunk_targets() {
+    let analysis = analyze_pe(&mixed_transitive_pointer_thunk_chain_fixture())
+        .expect("valid PE with a mixed transitive thunk chain");
+
+    assert!(!analysis.code_recovery_scan_truncated);
+    assert_eq!(
+        analysis.thunks,
+        [
+            PeThunk {
+                rva: 0x1040,
+                instruction_size: 5,
+                target: PeControlFlowTarget::Function { rva: 0x1060 },
+            },
+            PeThunk {
+                rva: 0x1060,
+                instruction_size: 6,
+                target: PeControlFlowTarget::FunctionPointer {
+                    slot_rva: 0x2301,
+                    rva: 0x1080,
+                },
+            },
+        ]
+    );
+    assert!(analysis.data_references.iter().all(|reference| {
+        reference.instruction_rva != 0x1060 || reference.target_rva != 0x2301
+    }));
+    assert!(analysis.symbol_graph.claims().iter().any(|claim| {
+        claim.provenance().method == "pe-x64-read-only-pointer-thunk"
+            && matches!(
+                (claim.subject(), claim.assertion()),
+                (
+                    SymbolSubject::Function { rva: 0x1060, .. },
+                    SymbolAssertion::ThunkTarget {
+                        target: ControlFlowTarget::FunctionPointer {
+                            slot_rva: 0x2301,
+                            rva: 0x1080,
+                        },
+                    },
+                )
+            )
+    }));
+}
+
+#[test]
+fn transitive_thunk_validation_is_independent_of_canonical_source_order() {
+    let analysis = analyze_pe(&descending_transitive_thunk_chain_fixture())
+        .expect("valid descending-RVA thunk chain");
+
+    assert_eq!(
+        analysis.thunks,
+        [
+            PeThunk {
+                rva: 0x1080,
+                instruction_size: 5,
+                target: PeControlFlowTarget::Function { rva: 0x1060 },
+            },
+            PeThunk {
+                rva: 0x10a0,
+                instruction_size: 5,
+                target: PeControlFlowTarget::Function { rva: 0x1080 },
+            },
+        ]
+    );
+    let encoded = serde_json::to_string(&analysis).expect("serialize descending thunk chain");
+    let decoded = serde_json::from_str::<resymbol_analysis::PeAnalysis>(&encoded)
+        .expect("deserialize descending thunk chain");
+    assert_eq!(decoded, analysis);
+}
+
+#[test]
+fn connected_transitive_thunk_cycles_terminate_and_retain_each_exact_edge() {
+    let analysis = analyze_pe(&cyclic_transitive_thunk_chain_fixture())
+        .expect("valid PE with a reachable thunk cycle");
+
+    assert!(!analysis.code_recovery_scan_truncated);
+    assert_eq!(
+        analysis.thunks,
+        [
+            PeThunk {
+                rva: 0x1040,
+                instruction_size: 5,
+                target: PeControlFlowTarget::Function { rva: 0x1060 },
+            },
+            PeThunk {
+                rva: 0x1060,
+                instruction_size: 5,
+                target: PeControlFlowTarget::Function { rva: 0x1040 },
+            },
+        ]
+    );
+    assert_eq!(
+        analysis
+            .rebuild_symbol_graph()
+            .expect("rebuild cyclic graph"),
+        analysis.symbol_graph
+    );
 }
 
 #[test]
@@ -2622,6 +2852,41 @@ fn validated_deserialization_rejects_tampered_code_recovery() {
     let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(stale_graph)
         .expect_err("the symbol graph must rebuild from retained control flow");
     assert!(error.to_string().contains("symbol graph"));
+}
+
+#[test]
+fn validated_deserialization_rejects_missing_thunk_predecessors_and_disconnected_cycles() {
+    let analysis = analyze_pe(&transitive_thunk_chain_fixture())
+        .expect("valid analysis with transitive thunk recovery");
+    let original = serde_json::to_value(analysis).expect("serialize transitive thunk analysis");
+
+    let mut missing_predecessor = original.clone();
+    missing_predecessor["thunks"]
+        .as_array_mut()
+        .expect("thunk array")
+        .remove(0);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(missing_predecessor)
+        .expect_err("a transitive thunk source cannot outlive its retained predecessor");
+    assert!(error.to_string().contains("thunk source"));
+    assert!(error.to_string().contains("not reachable"));
+
+    let mut disconnected_cycle = original;
+    disconnected_cycle["thunks"] = serde_json::json!([
+        {
+            "rva": 0x10a0,
+            "instruction_size": 5,
+            "target": { "kind": "function", "rva": 0x10c0 }
+        },
+        {
+            "rva": 0x10c0,
+            "instruction_size": 5,
+            "target": { "kind": "function", "rva": 0x10a0 }
+        }
+    ]);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(disconnected_cycle)
+        .expect_err("a disconnected thunk cycle has no trusted root seed");
+    assert!(error.to_string().contains("thunk source"));
+    assert!(error.to_string().contains("not reachable"));
 }
 
 #[test]

@@ -115,15 +115,17 @@ added deterministic string correlation to each data reference. Schema 6 adds the
 projection schema is independent from the `.resym` package-envelope schema; consumers must validate
 the version of the artifact they are actually reading.
 
-The CLI can export package schemas 1 through 4 through validated in-memory compatibility paths.
+The CLI can export package schemas 1 through 5 through validated in-memory compatibility paths.
 Migration neither rewrites the package nor reruns analysis: the package does not embed executable
 bytes. Schema 1 therefore has no available direct calls, thunks, strings, or data references.
 Schema 2 retains its persisted calls and thunks but predates strings and data references. Schema 3
 retains those records, but schemas 2 and 3 both predate read-only function-pointer call and thunk
 resolution. Schema 4 retains pointer control flow but predates legacy 24-byte MSVC RTTI base-class
-descriptor recovery. Reanalyze the exact original binary to produce schema 5 before expecting all
-current recovery relationships in the export. Schemas 1 through 4 reject relabeled RTTI base
-records whose `class_hierarchy_descriptor_rva` is missing or null.
+descriptor recovery. Schema 5 records both RTTI descriptor layouts but predates transitive
+executable thunk-chain discovery. Reanalyze the exact original binary to produce schema 6 before
+expecting all current recovery relationships in the export. Schemas 1 through 4 reject relabeled
+RTTI base records whose `class_hierarchy_descriptor_rva` is missing or null, and schemas 1 through
+5 reject a deterministic base thunk source valid only through schema-6 endpoint seeding.
 
 Entries are emitted in stable order. Name and range conflicts are resolved conservatively, and
 colliding selected names receive deterministic output suffixes rather than silently referring to
@@ -155,6 +157,13 @@ not the built-in decoder's lower recovery caps of 8,192 direct calls and 4,096 t
 analysis, the built-in producer additionally checks exact parsed IAT membership, file-backed
 instruction bytes, and the section properties used to resolve any pointer slot.
 
+An executable thunk chain remains a sequence of exact relationships. A call to `A` followed by
+`A -> B -> C` projects as that call and two thunk records; projection never substitutes `C` as a
+canonical terminal target. Each internal hop references a projected function entry. Connected
+cycles are representable as exact non-self edges, while the validated built-in base analysis rejects
+cycles disconnected from its deterministic initial thunk seeds. This uses the existing projection
+schema 6 relationship model and does not add a chain-depth or terminal-target field.
+
 Built-in control-flow recovery is a bounded control-flow-guided block sweep with heuristic
 confidence, not a complete recursive disassembler. It recognizes only exact RIP-relative
 `FF 15 disp32` and redundant-`REX.W` `48 FF 15 disp32` indirect-call encodings. At a deterministic
@@ -163,8 +172,10 @@ parsed IAT membership takes precedence. A non-IAT slot must be fully backed for 
 eight bytes in initialized, readable, non-writable, non-executable data; its little-endian
 preferred-image VA is resolved exactly one hop to file-backed executable code. The resolved call or
 thunk carries explicit slot provenance. A pointer call's instruction is also retained as a paired
-data reference to that slot; a pointer thunk does not require one. Pointer chains, writable slots,
-and other indirect forms are not projected as resolved control flow.
+data reference to that slot; a pointer thunk does not require one. Pointer-to-pointer slot chains,
+writable slots, and other indirect forms are not projected as resolved control flow. A resolved
+executable endpoint may itself seed another exact thunk hop, but the pointer slot is never
+dereferenced a second time.
 
 Before pairing relations, projection deterministically reduces competing data references by caller
 and instruction site. A pointer call is retained only when the selected same-site reference targets
@@ -299,9 +310,9 @@ schema-6 JSON record.
 Markdown is a human-facing presentation format, not a stable interchange contract. Its wording,
 table layout, and section organization may evolve between alpha releases. Tools should consume the
 `json` output and validate its `schema_version` instead of parsing the report. New analyses write
-package schema 5; export also accepts package schemas 1 through 4 through validated compatibility
+package schema 6; export also accepts package schemas 1 through 5 through validated compatibility
 paths without rewriting them. The current neutral projection is schema 6, and adding this writer
-changes neither version domain.
+changes neither independently versioned domain.
 
 The report writer applies limits in addition to the projection's own validation bounds:
 
@@ -329,8 +340,8 @@ resymbol export application.resym --format map
 The default destination is `application.map`. This is a deterministic text export, not a claim that
 every debugger or linker will accept it. ReSymbol currently rejects non-PE sessions and
 projections, mismatched session/projection binary fields, selected symbol RVAs outside real PE
-sections, and a nonzero entry point outside those sections. New analyses write package schema 5;
-export also accepts package schemas 1 through 4 through validated compatibility paths without
+sections, and a nonzero entry point outside those sections. New analyses write package schema 6;
+export also accepts package schemas 1 through 5 through validated compatibility paths without
 rewriting them. The current neutral projection is schema 6, and MAP adds no schema fields.
 
 The writer emits the PE timestamp and preferred load address, one group for each final PE section,

@@ -526,6 +526,85 @@ fn control_flow_projection_is_canonical_and_keeps_strongest_attribution() {
 }
 
 #[test]
+fn exact_thunk_chains_and_connected_cycles_preserve_each_hop() {
+    let chain = project([
+        thunk(
+            0x100,
+            ControlFlowTarget::Function { rva: 0x200 },
+            0.95,
+            true,
+        ),
+        thunk(
+            0x200,
+            ControlFlowTarget::FunctionPointer {
+                slot_rva: 0x900,
+                rva: 0x300,
+            },
+            0.95,
+            true,
+        ),
+    ]);
+
+    assert_eq!(chain.schema_version, 6);
+    assert_eq!(
+        chain
+            .functions
+            .iter()
+            .map(|function| function.rva)
+            .collect::<Vec<_>>(),
+        [0x100, 0x200, 0x300]
+    );
+    assert_eq!(chain.thunks.len(), 2);
+    assert_eq!(chain.thunks[0].rva, 0x100);
+    assert_eq!(
+        chain.thunks[0].target,
+        ExportControlFlowTarget::Function { rva: 0x200 }
+    );
+    assert_eq!(chain.thunks[1].rva, 0x200);
+    assert_eq!(
+        chain.thunks[1].target,
+        ExportControlFlowTarget::FunctionPointer {
+            slot_rva: 0x900,
+            rva: 0x300,
+        }
+    );
+    assert!(chain.thunks.iter().all(|thunk| {
+        !(thunk.rva == 0x100 && thunk.target == ExportControlFlowTarget::Function { rva: 0x300 })
+    }));
+    chain.validate().expect("an exact thunk chain is valid");
+
+    let cycle = project([
+        thunk(
+            0x100,
+            ControlFlowTarget::Function { rva: 0x200 },
+            0.95,
+            true,
+        ),
+        thunk(
+            0x200,
+            ControlFlowTarget::Function { rva: 0x100 },
+            0.95,
+            true,
+        ),
+    ]);
+    assert_eq!(cycle.thunks.len(), 2);
+    assert_eq!(
+        cycle
+            .thunks
+            .iter()
+            .map(|thunk| (thunk.rva, thunk.target.clone()))
+            .collect::<Vec<_>>(),
+        [
+            (0x100, ExportControlFlowTarget::Function { rva: 0x200 }),
+            (0x200, ExportControlFlowTarget::Function { rva: 0x100 }),
+        ]
+    );
+    cycle
+        .validate()
+        .expect("a connected exact thunk cycle is valid");
+}
+
+#[test]
 fn function_pointer_targets_project_losslessly_and_sort_deterministically() {
     let claims = vec![
         direct_call(
