@@ -1268,8 +1268,7 @@ mod tests {
     use resymbol_core::{
         BinaryId,
         plugin_api::{
-            MANIFEST_VERSION, PluginCapability, PluginHealth, PluginHealthState, PluginId,
-            PluginPermission,
+            MANIFEST_VERSION, PluginCapability, PluginId, PluginPermission,
         },
     };
     use semver::{Version, VersionReq};
@@ -1592,6 +1591,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn fake_helper_receives_private_environment_and_strict_input() {
+        use resymbol_core::plugin_api::{PluginHealth, PluginHealthState};
         use std::os::unix::fs::PermissionsExt as _;
 
         let temporary = TempDir::new().unwrap();
