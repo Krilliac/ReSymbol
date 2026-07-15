@@ -102,6 +102,38 @@ typedef struct resymbol_mut_byte_span {
     uint64_t length;
 } resymbol_mut_byte_span;
 
+/*
+ * Additive protocol-1 claim helpers. The native host callback still accepts a
+ * UTF-8 JSON claim envelope, so these structures do not cross the ABI boundary;
+ * they give C and C++ serializers fixed-width vocabulary for the canonical
+ * public assertion shapes.
+ */
+#define RESYMBOL_ASSERTION_KIND_STRING_LITERAL "string-literal"
+#define RESYMBOL_ASSERTION_KIND_DATA_REFERENCE "data-reference"
+#define RESYMBOL_STRING_ENCODING_ASCII_WIRE "ascii"
+#define RESYMBOL_STRING_ENCODING_UTF16_LE_WIRE "utf-16-le"
+
+typedef uint32_t resymbol_string_encoding;
+
+#define RESYMBOL_STRING_ENCODING_ASCII ((resymbol_string_encoding)1u)
+#define RESYMBOL_STRING_ENCODING_UTF16_LE ((resymbol_string_encoding)2u)
+
+typedef struct resymbol_string_literal_assertion_v1 {
+    /* Decoded UTF-8 text; the host validates it against encoding. */
+    resymbol_string_view value_utf8;
+    resymbol_string_encoding encoding;
+    uint32_t reserved;
+} resymbol_string_literal_assertion_v1;
+
+typedef struct resymbol_data_reference_assertion_v1 {
+    uint64_t instruction_rva;
+    uint64_t target_rva;
+    /* Must be nonzero. PE x64 sessions currently enforce a maximum of 15. */
+    uint8_t instruction_size;
+    /* Must be zero. Reserved for append-only helper evolution. */
+    uint8_t reserved[7];
+} resymbol_data_reference_assertion_v1;
+
 /* All views passed to callbacks are borrowed and valid only for that call. */
 typedef void(RESYMBOL_PLUGIN_CALL *resymbol_host_log_fn)(
     void *host_context,

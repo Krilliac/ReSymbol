@@ -12,10 +12,13 @@ use resymbol_core::{
 
 use crate::{
     AnalysisError, CoffHeader, DataDirectory, ImportTarget, MsvcRttiVftable, PeAnalysis,
-    PeControlFlowTarget, PeDataDirectories, PeDirectCall, PeExport, PeExportName, PeImport,
-    PeImportLibrary, PeSection, PeThunk, RuntimeFunction,
-    code_recovery::{CodeRecoveryInput, recover_code, validate_code_recovery},
+    PeControlFlowTarget, PeDataDirectories, PeDataReference, PeDirectCall, PeExport, PeExportName,
+    PeImport, PeImportLibrary, PeRecoveredString, PeSection, PeThunk, RuntimeFunction,
+    code_recovery::{
+        CodeRecoveryInput, recover_code, validate_code_recovery, validate_data_references,
+    },
     msvc_rtti::{parse_msvc_rtti, validate_msvc_rtti},
+    string_recovery::{recover_strings, validate_recovered_strings},
 };
 
 const DOS_HEADER_SIZE: usize = 64;
@@ -92,6 +95,8 @@ pub(crate) struct SymbolGraphInput<'a> {
     pub runtime_functions: &'a [RuntimeFunction],
     pub direct_calls: &'a [PeDirectCall],
     pub thunks: &'a [PeThunk],
+    pub strings: &'a [PeRecoveredString],
+    pub data_references: &'a [PeDataReference],
     pub msvc_rtti_vftables: &'a [MsvcRttiVftable],
 }
 
@@ -100,6 +105,7 @@ pub fn analyze_pe(bytes: &[u8]) -> Result<PeAnalysis, AnalysisError> {
     let reader = Reader::new(bytes);
     let headers = parse_headers(&reader)?;
     let mapper = RvaMap::new(bytes, headers.size_of_headers, &headers.sections);
+    let string_recovery = recover_strings(bytes, &headers.sections);
 
     let imports = parse_imports(&reader, &mapper, headers.directories.imports)?;
     let (export_library_name, exports) = parse_exports(
@@ -148,6 +154,8 @@ pub fn analyze_pe(bytes: &[u8]) -> Result<PeAnalysis, AnalysisError> {
         runtime_functions: &runtime_functions,
         direct_calls: &code_recovery.direct_calls,
         thunks: &code_recovery.thunks,
+        strings: &string_recovery.strings,
+        data_references: &code_recovery.data_references,
         msvc_rtti_vftables: &msvc_rtti_vftables,
     })?;
 
@@ -171,6 +179,10 @@ pub fn analyze_pe(bytes: &[u8]) -> Result<PeAnalysis, AnalysisError> {
         code_recovery_scan_truncated: code_recovery.scan_truncated,
         direct_calls: code_recovery.direct_calls,
         thunks: code_recovery.thunks,
+        string_recovery_scan_truncated: string_recovery.scan_truncated,
+        strings: string_recovery.strings,
+        data_reference_scan_truncated: code_recovery.data_reference_scan_truncated,
+        data_references: code_recovery.data_references,
         msvc_rtti_scan_truncated,
         msvc_rtti_vftables,
         symbol_graph,
@@ -658,6 +670,12 @@ pub(crate) fn validate_pe_analysis(analysis: &PeAnalysis) -> Result<(), Analysis
 
     validate_msvc_rtti(analysis)?;
     validate_code_recovery(analysis)?;
+    validate_recovered_strings(
+        &analysis.sections,
+        analysis.size_of_image,
+        &analysis.strings,
+    )?;
+    validate_data_references(analysis, &analysis.data_references)?;
 
     analysis.symbol_graph.validate()?;
     let rebuilt = build_symbol_graph(SymbolGraphInput {
@@ -668,6 +686,8 @@ pub(crate) fn validate_pe_analysis(analysis: &PeAnalysis) -> Result<(), Analysis
         runtime_functions: &analysis.runtime_functions,
         direct_calls: &analysis.direct_calls,
         thunks: &analysis.thunks,
+        strings: &analysis.strings,
+        data_references: &analysis.data_references,
         msvc_rtti_vftables: &analysis.msvc_rtti_vftables,
     })?;
     if !symbol_graph_semantically_matches(&rebuilt, &analysis.symbol_graph) {
@@ -1478,6 +1498,8 @@ pub(crate) fn build_symbol_graph(
         runtime_functions,
         direct_calls,
         thunks,
+        strings,
+        data_references,
         msvc_rtti_vftables,
     } = input;
     let mut graph = SymbolGraph::default();
@@ -1488,12 +1510,16 @@ pub(crate) fn build_symbol_graph(
     let entry_point_confidence = Confidence::new(0.99)?;
     let function_candidate_confidence = Confidence::new(0.95)?;
     let direct_call_confidence = Confidence::new(0.90)?;
+    let recovered_string_confidence = Confidence::new(0.90)?;
+    let data_reference_confidence = Confidence::new(0.90)?;
     let recovered_target_confidence = Confidence::new(0.85)?;
     let thunk_confidence = Confidence::new(0.95)?;
     let rtti_vftable_confidence = Confidence::new(0.99)?;
     let rtti_slot_confidence = Confidence::new(0.95)?;
     let metadata_kind = EvidenceKind::new(EvidenceKind::METADATA)?;
     let control_flow_kind = EvidenceKind::new(EvidenceKind::CONTROL_FLOW)?;
+    let string_literal_kind = EvidenceKind::new(EvidenceKind::STRING_LITERAL)?;
+    let data_flow_kind = EvidenceKind::new(EvidenceKind::DATA_FLOW)?;
     let provenance = |method: &str| ClaimProvenance {
         producer: ClaimProducer::Core {
             component: "resymbol-analysis".to_owned(),
@@ -1710,6 +1736,87 @@ pub(crate) fn build_symbol_graph(
             runtime_boundary_confidence,
             vec![evidence],
             provenance("pe-exception-directory"),
+        )?)?;
+    }
+
+    for recovered in strings {
+        let mut evidence = Evidence::new(
+            string_literal_kind.clone(),
+            "complete NUL-terminated literal recovered by a bounded scan of fully file-backed readable initialized non-executable PE data",
+        )?;
+        evidence.confidence = Some(recovered_string_confidence);
+        evidence
+            .artifacts
+            .insert("source_rva".to_owned(), format!("{:#x}", recovered.rva));
+        evidence
+            .artifacts
+            .insert("byte_size".to_owned(), recovered.byte_size.to_string());
+        evidence.artifacts.insert(
+            "encoding".to_owned(),
+            recovered.encoding.as_str().to_owned(),
+        );
+        if let Some((section_index, section)) = section_for_rva(recovered.rva, sections) {
+            evidence
+                .artifacts
+                .insert("section_index".to_owned(), section_index.to_string());
+            if !section.name.is_empty() {
+                evidence
+                    .artifacts
+                    .insert("section_name".to_owned(), section.name.clone());
+            }
+        }
+        graph.submit_claim(SymbolClaim::new(
+            SymbolSubject::Global {
+                binary: identity.id.clone(),
+                rva: u64::from(recovered.rva),
+                size: Some(u64::from(recovered.byte_size)),
+            },
+            SymbolAssertion::StringLiteral {
+                encoding: recovered.encoding,
+                value: recovered.value.clone(),
+            },
+            recovered_string_confidence,
+            vec![evidence],
+            provenance("pe-string-recovery"),
+        )?)?;
+    }
+
+    for reference in data_references {
+        let mut evidence = Evidence::new(
+            data_flow_kind.clone(),
+            "exact x64 RIP-relative memory reference decoded during a bounded sweep of a fully file-backed runtime-function range",
+        )?;
+        evidence.confidence = Some(data_reference_confidence);
+        evidence.artifacts.insert(
+            "caller_rva".to_owned(),
+            format!("{:#x}", reference.caller_rva),
+        );
+        evidence.artifacts.insert(
+            "instruction_rva".to_owned(),
+            format!("{:#x}", reference.instruction_rva),
+        );
+        evidence.artifacts.insert(
+            "instruction_size".to_owned(),
+            reference.instruction_size.to_string(),
+        );
+        evidence.artifacts.insert(
+            "target_rva".to_owned(),
+            format!("{:#x}", reference.target_rva),
+        );
+        graph.submit_claim(SymbolClaim::new(
+            SymbolSubject::Function {
+                binary: identity.id.clone(),
+                rva: u64::from(reference.caller_rva),
+                size: None,
+            },
+            SymbolAssertion::DataReference {
+                instruction_rva: u64::from(reference.instruction_rva),
+                instruction_size: reference.instruction_size,
+                target_rva: u64::from(reference.target_rva),
+            },
+            data_reference_confidence,
+            vec![evidence],
+            provenance("pe-x64-data-reference"),
         )?)?;
     }
 

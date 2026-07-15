@@ -16,6 +16,11 @@ pub(crate) const MAX_DECLARATIONS_PER_ENTITY: usize = 256;
 pub(crate) const MAX_WARNINGS: usize = 100_000;
 pub(crate) const MAX_ARCHITECTURE_BYTES: usize = 128;
 const MAX_WARNING_MESSAGE_BYTES: usize = 256;
+pub(crate) const MAX_RECOVERED_STRINGS: usize = 65_536;
+pub(crate) const MAX_RECOVERED_STRING_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_TOTAL_RECOVERED_STRING_BYTES: usize = 32 * 1024 * 1024;
+pub(crate) const MAX_DATA_REFERENCES: usize = 262_144;
+const MAX_X86_INSTRUCTION_BYTES: u8 = 15;
 
 /// Container format copied into an export without format-specific details.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -121,6 +126,37 @@ pub struct ExportDirectCall {
 pub struct ExportThunk {
     pub rva: u64,
     pub target: ExportControlFlowTarget,
+    pub attribution: ExportAttribution,
+}
+
+/// Source encoding retained for one recovered string literal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[non_exhaustive]
+pub enum ExportStringEncoding {
+    #[serde(rename = "ascii")]
+    Ascii,
+    #[serde(rename = "utf-16-le")]
+    Utf16Le,
+}
+
+/// One bounded, attributed string literal in the binary image.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ExportRecoveredString {
+    pub rva: u64,
+    /// Encoded byte size including the terminating NUL code unit.
+    pub byte_size: u64,
+    pub encoding: ExportStringEncoding,
+    pub value: String,
+    pub attribution: ExportAttribution,
+}
+
+/// One exact attributed x64 RIP-relative relationship to image data.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ExportDataReference {
+    pub caller_rva: u64,
+    pub instruction_rva: u64,
+    pub instruction_size: u8,
+    pub target_rva: u64,
     pub attribution: ExportAttribution,
 }
 
@@ -234,11 +270,13 @@ pub struct ExportProjection {
     pub types: Vec<ExportType>,
     pub direct_calls: Vec<ExportDirectCall>,
     pub thunks: Vec<ExportThunk>,
+    pub strings: Vec<ExportRecoveredString>,
+    pub data_references: Vec<ExportDataReference>,
     pub warnings: Vec<ProjectionWarning>,
 }
 
 impl ExportProjection {
-    pub(crate) const SCHEMA_VERSION: u32 = 3;
+    pub(crate) const SCHEMA_VERSION: u32 = 4;
 
     /// Revalidate ordering, range, text, attribution, and uniqueness invariants.
     pub fn validate(&self) -> Result<(), ProjectionValidationError> {
@@ -271,6 +309,16 @@ impl ExportProjection {
         if self.thunks.len() > MAX_THUNKS {
             return Err(ProjectionValidationError::CollectionLimit {
                 collection: "thunks",
+            });
+        }
+        if self.strings.len() > MAX_RECOVERED_STRINGS {
+            return Err(ProjectionValidationError::CollectionLimit {
+                collection: "strings",
+            });
+        }
+        if self.data_references.len() > MAX_DATA_REFERENCES {
+            return Err(ProjectionValidationError::CollectionLimit {
+                collection: "data_references",
             });
         }
 
@@ -406,6 +454,46 @@ impl ExportProjection {
             validate_attribution(&thunk.attribution)?;
         }
 
+        if !strictly_increasing_by(&self.strings, |left, right| left.rva < right.rva) {
+            return Err(ProjectionValidationError::UnsortedCollection {
+                collection: "strings",
+            });
+        }
+        let mut total_string_bytes = 0_usize;
+        let mut previous_string_end = None;
+        for string in &self.strings {
+            validate_recovered_string(string, &self.binary)?;
+            if previous_string_end.is_some_and(|end| end > string.rva) {
+                return Err(ProjectionValidationError::InvalidBinaryField {
+                    field: "strings.overlap",
+                });
+            }
+            previous_string_end = string.rva.checked_add(string.byte_size);
+            total_string_bytes = total_string_bytes.checked_add(string.value.len()).ok_or(
+                ProjectionValidationError::CollectionLimit {
+                    collection: "string_bytes",
+                },
+            )?;
+            if total_string_bytes > MAX_TOTAL_RECOVERED_STRING_BYTES {
+                return Err(ProjectionValidationError::CollectionLimit {
+                    collection: "string_bytes",
+                });
+            }
+        }
+
+        if self
+            .data_references
+            .windows(2)
+            .any(|pair| data_reference_key(&pair[0]) >= data_reference_key(&pair[1]))
+        {
+            return Err(ProjectionValidationError::UnsortedCollection {
+                collection: "data_references",
+            });
+        }
+        for reference in &self.data_references {
+            validate_data_reference(reference, &self.functions, &self.binary)?;
+        }
+
         if self.warnings.windows(2).any(|pair| pair[0] >= pair[1]) {
             return Err(ProjectionValidationError::UnsortedWarnings);
         }
@@ -433,6 +521,110 @@ impl ExportProjection {
 
 fn direct_call_key(call: &ExportDirectCall) -> (u64, u64, &ExportControlFlowTarget) {
     (call.caller_rva, call.call_site_rva, &call.target)
+}
+
+fn data_reference_key(reference: &ExportDataReference) -> (u64, u64) {
+    (reference.caller_rva, reference.instruction_rva)
+}
+
+fn validate_recovered_string(
+    string: &ExportRecoveredString,
+    binary: &ExportBinary,
+) -> Result<(), ProjectionValidationError> {
+    if string.value.is_empty()
+        || string.value.trim().is_empty()
+        || string.value.len() > MAX_RECOVERED_STRING_BYTES
+    {
+        return Err(ProjectionValidationError::InvalidText {
+            field: "string.value",
+        });
+    }
+    let encoded_content_bytes = match string.encoding {
+        ExportStringEncoding::Ascii => {
+            if !string
+                .value
+                .bytes()
+                .all(|byte| (0x20..=0x7e).contains(&byte))
+            {
+                return Err(ProjectionValidationError::InvalidText {
+                    field: "string.value",
+                });
+            }
+            u64::try_from(string.value.len()).map_err(|_| {
+                ProjectionValidationError::InvalidBinaryField {
+                    field: "string.byte_size",
+                }
+            })?
+        }
+        ExportStringEncoding::Utf16Le => {
+            if string.value.chars().any(char::is_control) {
+                return Err(ProjectionValidationError::InvalidText {
+                    field: "string.value",
+                });
+            }
+            u64::try_from(string.value.encode_utf16().count())
+                .ok()
+                .and_then(|units| units.checked_mul(2))
+                .ok_or(ProjectionValidationError::InvalidBinaryField {
+                    field: "string.byte_size",
+                })?
+        }
+    };
+    let terminator_bytes = match string.encoding {
+        ExportStringEncoding::Ascii => 1,
+        ExportStringEncoding::Utf16Le => 2,
+    };
+    let expected_size = encoded_content_bytes.checked_add(terminator_bytes).ok_or(
+        ProjectionValidationError::InvalidBinaryField {
+            field: "string.byte_size",
+        },
+    )?;
+    if string.byte_size != expected_size
+        || string.byte_size
+            > u64::try_from(MAX_RECOVERED_STRING_BYTES).expect("string limit fits in u64")
+    {
+        return Err(ProjectionValidationError::InvalidBinaryField {
+            field: "string.byte_size",
+        });
+    }
+    validate_range(string.rva, Some(string.byte_size), binary.image_size)?;
+    validate_attribution(&string.attribution)
+}
+
+fn validate_data_reference(
+    reference: &ExportDataReference,
+    functions: &[ExportFunction],
+    binary: &ExportBinary,
+) -> Result<(), ProjectionValidationError> {
+    if !(1..=MAX_X86_INSTRUCTION_BYTES).contains(&reference.instruction_size) {
+        return Err(ProjectionValidationError::InvalidBinaryField {
+            field: "data_reference.instruction_size",
+        });
+    }
+    validate_point(reference.caller_rva, binary.image_size)?;
+    validate_range(
+        reference.instruction_rva,
+        Some(u64::from(reference.instruction_size)),
+        binary.image_size,
+    )?;
+    validate_point(reference.target_rva, binary.image_size)?;
+    let caller = require_function_entry(functions, reference.caller_rva)?;
+    let instruction_end = reference
+        .instruction_rva
+        .checked_add(u64::from(reference.instruction_size));
+    if reference.instruction_rva < reference.caller_rva
+        || caller.size.is_some_and(|size| {
+            reference
+                .caller_rva
+                .checked_add(size)
+                .is_none_or(|caller_end| instruction_end.is_none_or(|end| end > caller_end))
+        })
+    {
+        return Err(ProjectionValidationError::InvalidBinaryField {
+            field: "data_reference.instruction_rva",
+        });
+    }
+    validate_attribution(&reference.attribution)
 }
 
 fn validate_point(rva: u64, image_size: u64) -> Result<(), ProjectionValidationError> {

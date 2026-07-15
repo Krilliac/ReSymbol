@@ -73,6 +73,51 @@ fn control_flow_pe() -> Vec<u8> {
     bytes
 }
 
+fn string_and_data_reference_pe() -> Vec<u8> {
+    const RDATA_RVA: u32 = 0x2000;
+    const RDATA_OFFSET: usize = 0x400;
+
+    let mut bytes = minimal_pe();
+    bytes.resize(0x800, 0);
+    put_u16(&mut bytes, COFF_OFFSET + 2, 2);
+    put_u32(&mut bytes, OPTIONAL_OFFSET + 56, 0x3000);
+
+    let rdata_section = SECTION_OFFSET + 40;
+    bytes[rdata_section..rdata_section + 7].copy_from_slice(b".rdata\0");
+    put_u32(&mut bytes, rdata_section + 8, 0x400);
+    put_u32(&mut bytes, rdata_section + 12, RDATA_RVA);
+    put_u32(&mut bytes, rdata_section + 16, 0x400);
+    put_u32(&mut bytes, rdata_section + 20, RDATA_OFFSET as u32);
+    put_u32(&mut bytes, rdata_section + 36, 0x4000_0040);
+
+    let exception_directory = OPTIONAL_OFFSET + 112 + 3 * 8;
+    put_u32(&mut bytes, exception_directory, 0x2080);
+    put_u32(&mut bytes, exception_directory + 4, 12);
+    put_u32(&mut bytes, RDATA_OFFSET + 0x80, 0x1000);
+    put_u32(&mut bytes, RDATA_OFFSET + 0x84, 0x1010);
+    put_u32(&mut bytes, RDATA_OFFSET + 0x88, 0x2060);
+
+    let put_lea = |bytes: &mut [u8], raw_offset: usize, instruction_rva: u32, target_rva: u32| {
+        let next_rva = instruction_rva + 7;
+        let displacement = i64::from(target_rva) - i64::from(next_rva);
+        let displacement = i32::try_from(displacement).expect("fixture RIP displacement");
+        bytes[raw_offset..raw_offset + 3].copy_from_slice(&[0x48, 0x8d, 0x05]);
+        bytes[raw_offset + 3..raw_offset + 7].copy_from_slice(&displacement.to_le_bytes());
+    };
+    put_lea(&mut bytes, 0x200, 0x1000, 0x2000);
+    put_lea(&mut bytes, 0x207, 0x1007, 0x2020);
+    bytes[0x20e] = 0xc3;
+
+    put_c_string(&mut bytes, RDATA_OFFSET, "Recovered ASCII");
+    let mut offset = RDATA_OFFSET + 0x20;
+    for unit in "Recovered 世界".encode_utf16() {
+        bytes[offset..offset + 2].copy_from_slice(&unit.to_le_bytes());
+        offset += 2;
+    }
+    bytes[offset..offset + 2].fill(0);
+    bytes
+}
+
 fn msvc_rtti_pe() -> Vec<u8> {
     const IMAGE_BASE: u64 = 0x0000_0001_4000_0000;
     const RDATA_RVA: u32 = 0x2000;
@@ -197,7 +242,7 @@ fn recovered_direct_call_survives_json_but_entry_only_target_skips_writers() {
     let session = AnalysisSession::new(analysis, Vec::new(), Vec::new()).expect("valid session");
     let projection = ExportProjection::from_session(&session).expect("session projection");
 
-    assert_eq!(projection.schema_version, 3);
+    assert_eq!(projection.schema_version, 4);
     assert_eq!(projection.direct_calls.len(), 1);
     assert_eq!(projection.direct_calls[0].caller_rva, 0x1000);
     assert_eq!(projection.direct_calls[0].call_site_rva, 0x1000);
@@ -235,6 +280,60 @@ fn recovered_direct_call_survives_json_but_entry_only_target_skips_writers() {
 }
 
 #[test]
+fn recovered_strings_and_data_references_flow_through_the_session_projection() {
+    let bytes = string_and_data_reference_pe();
+    let analysis = analyze_bytes(&bytes).expect("valid PE with strings and data references");
+    let BinaryAnalysis::Pe(pe) = &analysis else {
+        panic!("fixture must parse as PE");
+    };
+    assert_eq!(
+        pe.strings
+            .iter()
+            .filter(|value| matches!(value.rva, 0x2000 | 0x2020))
+            .map(|value| (value.rva, value.byte_size, value.value.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (0x2000, 16, "Recovered ASCII"),
+            (0x2020, 26, "Recovered 世界"),
+        ]
+    );
+    assert_eq!(pe.data_references.len(), 2);
+
+    let session = AnalysisSession::new(analysis, Vec::new(), Vec::new()).expect("valid session");
+    let projection = ExportProjection::from_session(&session).expect("session projection");
+    projection.validate().expect("projection remains valid");
+
+    assert_eq!(projection.schema_version, 4);
+    assert_eq!(projection.strings.len(), 2);
+    assert_eq!(projection.strings[0].rva, 0x2000);
+    assert_eq!(projection.strings[0].value, "Recovered ASCII");
+    assert_eq!(projection.strings[1].rva, 0x2020);
+    assert_eq!(projection.strings[1].value, "Recovered 世界");
+    assert_eq!(projection.data_references.len(), 2);
+    assert_eq!(projection.data_references[0].caller_rva, 0x1000);
+    assert_eq!(projection.data_references[0].instruction_rva, 0x1000);
+    assert_eq!(projection.data_references[0].instruction_size, 7);
+    assert_eq!(projection.data_references[0].target_rva, 0x2000);
+    assert_eq!(projection.data_references[1].instruction_rva, 0x1007);
+    assert_eq!(projection.data_references[1].target_rva, 0x2020);
+    assert!(projection.strings.iter().all(|value| {
+        value.attribution.provenance.method == "pe-string-recovery"
+            && value.attribution.confidence == 0.90
+    }));
+    assert!(projection.data_references.iter().all(|value| {
+        value.attribution.provenance.method == "pe-x64-data-reference"
+            && value.attribution.confidence == 0.90
+    }));
+
+    let json = serde_json::to_string(&projection).expect("JSON projection");
+    assert!(json.contains("\"utf-16-le\""));
+    assert!(json.contains("\"data_references\""));
+    render_ida_python(&projection).expect("IDA ignores new relationships safely");
+    render_ghidra_java(&projection, "ReSymbolStringReferenceFixture")
+        .expect("Ghidra ignores new relationships safely");
+}
+
+#[test]
 fn msvc_rtti_names_and_relationships_flow_into_all_export_inputs() {
     let bytes = msvc_rtti_pe();
     let analysis = analyze_bytes(&bytes).expect("valid PE with MSVC RTTI");
@@ -248,7 +347,7 @@ fn msvc_rtti_names_and_relationships_flow_into_all_export_inputs() {
     let projection = ExportProjection::from_session(&session).expect("session projection");
     projection.validate().expect("projection remains valid");
 
-    assert_eq!(projection.schema_version, 3);
+    assert_eq!(projection.schema_version, 4);
     assert_eq!(projection.types.len(), 1);
     assert_eq!(
         projection.types[0].key,

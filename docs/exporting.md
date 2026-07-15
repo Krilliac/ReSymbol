@@ -85,19 +85,21 @@ The `json` format is the loss-aware interchange output. It retains:
 - supported function and global boundaries;
 - recovered function prototypes and type definitions that fit the neutral model;
 - attributed function entries, direct calls, one-instruction thunks, and function-to-class
-  membership relationships; and
+  membership relationships;
+- attributed recovered strings and exact supported data-reference relationships; and
 - structured, counted warnings for information that was reduced or omitted.
 
-The current neutral export uses `schema_version: 3`. Schema 3 adds function-entry attribution and
-top-level attributed `direct_calls` and `thunks` arrays to schema 2's `class_memberships` model.
-This projection schema is independent from the `.resym` package-envelope schema; consumers must
-validate the version of the artifact they are actually reading.
+The current neutral export uses `schema_version: 4`. Schema 4 adds top-level attributed `strings`
+and `data_references` arrays to schema 3's function-entry, direct-call, and thunk model. This
+projection schema is independent from the `.resym` package-envelope schema; consumers must validate
+the version of the artifact they are actually reading.
 
-The CLI can export a schema 1 `.resym` package after migrating its persisted legacy payload into a
-validated current in-memory session and rebuilding its deterministic base graph. Migration neither
-rewrites the package nor re-runs analysis: the package does not embed executable bytes, so its
-direct-call and thunk sets remain empty. Reanalyze the exact original binary to produce a schema 2
-package before expecting code-recovery relationships in the export.
+The CLI can export schema 1 and schema 2 `.resym` packages through validated in-memory compatibility
+paths. Migration neither rewrites the package nor reruns analysis: the package does not embed
+executable bytes. Schema 1 therefore has no available direct calls, thunks, strings, or data
+references. Schema 2 retains its persisted calls and thunks but predates recovered strings and data
+references. Reanalyze the exact original binary to produce a schema 3 package before expecting all
+current recovery relationships in the export.
 
 Entries are emitted in stable order. Name and range conflicts are resolved conservatively, and
 colliding selected names receive deterministic output suffixes rather than silently referring to
@@ -129,6 +131,46 @@ Entry evidence is deliberately not a name or an extent. The standalone IDA and G
 entry-only functions and currently do not install call or thunk relationships; those records remain
 available in neutral JSON for review and future richer bridges. A normal named or bounded function
 continues to use the existing conservative application policy.
+
+### String and data-reference projection
+
+Each projected string records its encoding, RVA, encoded byte size, exact recovered value, and
+attribution. Each projected data reference records the enclosing caller entry, instruction RVA and
+decoded size, exact target RVA, and attribution. A reference is a supported decoded address
+relationship; it does not assert an access mode, target object size, target name, or that the target
+contains a recovered string.
+
+The Markdown `Strings` table uses `Encoding`, `RVA`, `Byte size`, `Value`, `Confidence`, and
+`Source` columns. `Data references` uses `Caller RVA`, `Instruction RVA`, `Instruction size`,
+`Target RVA`, `Confidence`, and `Source`. The `Source` cells retain producer/method provenance; the
+presentation report does not discard attribution.
+
+The neutral projection accepts at most 65,536 strings, 32 MiB of retained string UTF-8 in
+aggregate, 16 KiB of UTF-8 per string, and 262,144 data references. These model-validation bounds
+are intentionally separate from the lower built-in recovery caps below so future or plugin-backed
+sources can still use the common interchange model without weakening its resource limits.
+
+Built-in string recovery scans complete raw ranges in file-backed, initialized, readable,
+non-executable sections, including writable data. ASCII must be printable and UTF-16LE must begin at
+an even RVA and decode without control characters or unpaired surrogates. Both forms require a NUL
+terminator, at least four code points, and non-whitespace content. The scan is capped at 64 MiB,
+16,384 retained strings, 4 KiB UTF-8 and 4 KiB encoded data per value (including the terminator),
+and 4 MiB of retained UTF-8 text in aggregate. Overlaps are resolved deterministically, and reaching
+a limit sets `string_recovery_scan_truncated` instead of publishing a truncated prefix.
+
+Built-in data-reference recovery shares the bounded x86-64 instruction sweep described above and
+retains at most 32,768 supported RIP-relative references. Call and jump operands are excluded; the
+computed target must fall in file-backed, initialized, readable, non-executable data.
+Exhausting the shared 64 MiB or 1,000,000-instruction budget makes both instruction-derived result
+families partial, while reaching only the data-reference cap sets
+`data_reference_scan_truncated` independently.
+
+A package read can validate canonical ordering, uniqueness, collection and text limits, string
+encoding and encoded size, address containment, and agreement with the persisted graph. It cannot
+independently compare a string with its original bytes or re-decode a reference instruction because
+the `.resym` file does not embed the executable. The package SHA-256 binds the records to the exact
+input; reanalyze that binary when byte-level reproduction is required. The current standalone IDA
+and Ghidra writers do not install string literals or data-reference relationships.
 
 ### RTTI-derived projection
 
@@ -182,9 +224,11 @@ database, or add claims to the package. Its fixed section order is:
 4. `## Functions`
 5. `## Globals`
 6. `## Types`
-7. `## Direct calls`
-8. `## Thunks`
-9. `## Warnings`
+7. `## Strings`
+8. `## Direct calls`
+9. `## Data references`
+10. `## Thunks`
+11. `## Warnings`
 
 The report is a presentation of the existing projection and does not add a new symbol or
 relationship model. Missing categories and row counts are represented consistently so two reports
@@ -194,7 +238,7 @@ Markdown is a human-facing presentation format, not a stable interchange contrac
 table layout, and section organization may evolve between alpha releases. Tools should consume the
 `json` output and validate its `schema_version` instead of parsing the report. Adding this writer
 does not change the source `.resym` package schema or the neutral projection schema: current
-artifacts remain package schema 2 and projection schema 3, respectively.
+artifacts remain package schema 3 and projection schema 4, respectively.
 
 The report writer applies limits in addition to the projection's own validation bounds:
 
@@ -286,9 +330,10 @@ The initial scripts intentionally apply less information than the JSON projectio
   script.
 - **Types:** type names, alternatives, and definitions remain in JSON and are not yet created in
   IDA or Ghidra.
-- **Comments and relationships:** class membership is retained in the neutral JSON projection but
-  is not currently installed in either debugger. Base-class/PMD records remain in `.resym`, and
-  evidence links and other unsupported relationships may be reduced with projection warnings.
+- **Literals, comments, and relationships:** recovered strings, data references, calls, thunks, and
+  class membership are retained in the neutral JSON projection but are not currently installed in
+  either debugger. Base-class/PMD records remain in `.resym`, and evidence links and other
+  unsupported relationships may be reduced with projection warnings.
 - **Existing tool state:** IDA user-authored names, Ghidra names from any source other than
   `DEFAULT`/`ANALYSIS`, and existing function bodies win. The scripts do not offer an override
   switch; an interactive review bridge is planned for choices that require user judgment.

@@ -302,11 +302,12 @@ A plugin declares a supported API range. Unsupported plugins are marked incompat
 loaded optimistically. Schema migrations are explicit and must preserve provenance. Before 1.0,
 breaking changes are expected, but they still require version bumps and release notes.
 
-The current CLI writes analysis-package schema 2 and can migrate schema 1 into a validated current
-session for inspection or export. It rebuilds the base graph from persisted legacy metadata but
-does not rewrite the package. Because the package omits the analyzed binary bytes, migration cannot
-run code recovery; obtaining direct-call and thunk findings requires reanalyzing the exact original
-binary into a new schema 2 package.
+The current CLI writes analysis-package schema 3 and can inspect or export schemas 1 and 2 through
+explicit compatibility paths. It migrates schema 1 into a validated current session, rebuilds the
+base graph from persisted legacy metadata, and never rewrites the source package. Schema 2 already
+records direct calls and thunks but predates recovered strings and data references. Because a
+package omits the analyzed binary bytes, compatibility loading cannot recreate absent recovery
+results; obtaining them requires reanalyzing the exact original binary into a schema 3 package.
 
 ## Core invariants
 

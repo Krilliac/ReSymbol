@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>Example.ManagedMatcher</AssemblyName>
+    <RootNamespace>Example.ManagedMatcher</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../../sdk/dotnet/ReSymbol.PluginSdk/ReSymbol.PluginSdk.csproj" />
+  </ItemGroup>
+</Project>

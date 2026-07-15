@@ -69,6 +69,34 @@ interface types {
         data-json: option<string>,
     }
 
+    /// Canonical decoded encoding names used by string-literal claims.
+    enum string-encoding {
+        ascii,
+        utf-16-le,
+    }
+
+    /// Typed helper corresponding to claim-json kind `string-literal`.
+    record string-literal-assertion {
+        encoding: string-encoding,
+        value: string,
+    }
+
+    /// Typed helper corresponding to claim-json kind `data-reference`.
+    record data-reference-assertion {
+        instruction-rva: u64,
+        instruction-size: u8,
+        target-rva: u64,
+    }
+
+    /// Recovery assertions with public typed Component Model shapes.
+    ///
+    /// Protocol 1.0 continues to submit the canonical tagged JSON form through
+    /// `symbol-claim.claim-json`; this variant is additive SDK vocabulary.
+    variant recovery-assertion {
+        string-literal(string-literal-assertion),
+        data-reference(data-reference-assertion),
+    }
+
     /// Plugins submit hypotheses. The core validates and commits symbol state.
     record symbol-claim {
         subject-json: string,

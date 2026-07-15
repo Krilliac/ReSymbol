@@ -11,6 +11,7 @@ resymbol analyze application.exe
 resymbol inspect application.resym
 resymbol inspect application.resym --json
 resymbol export application.resym --format json
+resymbol export application.resym --format markdown
 resymbol export application.resym --format ida-python
 resymbol export application.resym --format ghidra-java
 ```
@@ -27,7 +28,7 @@ Every package contains four top-level fields:
   "binary_sha256": "<64 lowercase hexadecimal characters>",
   "generator_version": "0.1.0-alpha.1",
   "payload": {},
-  "schema_version": 2
+  "schema_version": 3
 }
 ```
 
@@ -37,11 +38,10 @@ Every package contains four top-level fields:
 - `payload` contains one validated `AnalysisSession`: deterministic base analysis, a plugin-run
   ledger, and accepted plugin claims.
 
-This package envelope currently writes schema 2. The CLI can also inspect and export schema 1
-packages from the preceding alpha payload through the migration described below, while other
-schema versions fail explicitly. The debugger-neutral JSON produced by
-`resymbol export --format json` is a different artifact with its own schema version; its current
-control-flow relationship projection is schema 3.
+This package envelope currently writes schema 3. The CLI can also inspect and export schema 1 and
+schema 2 packages through the compatibility paths described below, while other schema versions
+fail explicitly. The debugger-neutral JSON produced by `resymbol export --format json` is a
+different artifact with its own schema version; its current projection is schema 4.
 
 Object keys are sorted recursively and no timestamp is inserted, so encoding the same deterministic
 payload produces the same bytes. Arrays preserve analysis order because source-table order can be
@@ -68,11 +68,13 @@ binding, and rebuilds the deterministic base graph from the persisted schema 1 a
 not rewrite or upgrade the package on disk. A `.resym` package does not contain the original binary
 bytes, so migration cannot retroactively run code recovery: direct-call and thunk arrays stay empty
 and the migrated session is not evidence that the decoder found no relationships. Analyze the exact
-original executable again to create a schema 2 package containing code-recovery results. The
-`inspect` and `export` terminal summaries therefore report code recovery as unavailable/not run for
-schema 1 and recommend reanalysis; they do not describe the migrated empty arrays as a complete
-scan. `inspect --json` emits the validated original schema 1 representation rather than placing the
-migrated current payload beneath a legacy schema label.
+original executable again to create a schema 3 package containing current recovery results. Schema
+2 packages retain their recorded calls and thunks, but predate recovered strings and data
+references; those newer arrays are empty after compatibility decoding and are likewise reported as
+unavailable rather than as a complete empty scan. The `inspect` and `export` terminal summaries
+distinguish those cases and recommend reanalysis. `inspect --json` emits the validated original
+schema 1 representation rather than placing the migrated current payload beneath a legacy schema
+label.
 
 ## Current `AnalysisSession` payload
 
@@ -100,11 +102,13 @@ The base analysis includes:
 - x64 `RUNTIME_FUNCTION` entries as evidence-backed candidate function boundaries;
 - bounded direct-call and one-instruction thunk records, with explicit internal-function or exact
   parsed import-IAT targets and a persisted partial-scan flag;
+- bounded NUL-terminated ASCII and UTF-16LE strings plus exact x64 RIP-relative references to
+  eligible data, each with independent persisted partial-scan state;
 - validated modern MSVC x64 Rev1 RTTI records, including type descriptors, class hierarchy and
   base-class records, vftable locations, and executable virtual-slot targets; and
 - a symbol graph containing exact export names, metadata-derived boundaries, function entries,
-  direct calls, thunks, recovered RTTI type names, vftable names, and class-membership claims for
-  virtual-slot targets.
+  direct calls, thunks, string literals, data references, recovered RTTI type names, vftable names,
+  and class-membership claims for virtual-slot targets.
 
 ReSymbol derives the combined symbol graph from the base graph plus `plugin_claims`; it does not
 serialize a second independently mutable graph. Session validation rejects duplicate run IDs,
@@ -163,6 +167,22 @@ sets `msvc_rtti_scan_truncated` instead of pretending discovery was complete. `a
 `inspect` surface this state as `MSVC RTTI scan: partial` along with vftable, unique-type,
 base-record, and virtual-slot counts.
 
+### Bounded string-recovery boundary
+
+The built-in string pass scans complete raw ranges from file-backed, initialized, readable,
+non-executable PE sections in RVA order. Writable initialized data is eligible. ASCII candidates
+use printable bytes, while UTF-16LE candidates start at an even RVA and must decode to valid Unicode
+without control characters or unpaired surrogates. Both encodings require a NUL terminator, at least
+four code points, and at least one non-whitespace code point. Competing byte-overlapping
+interpretations are reduced deterministically, and a literal is published only when its complete
+value and terminator fit the model; ReSymbol never records a truncated prefix as an exact string.
+
+The pass scans at most 64 MiB of eligible section data and retains at most 16,384 strings. Each
+value is limited to 4 KiB of UTF-8 and 4 KiB of encoded data, with the encoded limit including the
+NUL terminator. Aggregate retained UTF-8 content is capped at 4 MiB. Hitting a scan, per-value,
+record-count, or aggregate-text limit preserves the deterministic valid results and sets
+`string_recovery_scan_truncated`; CLI summaries report that set as partial.
+
 ### Bounded x86-64 control-flow boundary
 
 The built-in code-recovery pass is a bounded linear sweep over complete, file-backed executable
@@ -174,6 +194,12 @@ covered by known `RUNTIME_FUNCTION` metadata is suppressed unless its RVA matche
 runtime-function begin, preventing an interior label from being promoted to a separate function
 entry.
 
+The same instruction sweep retains exact RIP-relative data references from supported decoded
+instructions. It excludes call and jump operands already represented as control flow and accepts a
+target only when the computed RVA lies in file-backed, initialized, readable,
+non-executable section data. The relationship records caller, instruction RVA and size, and target
+RVA; it does not guess a target name, object size, access mode, or whether the target is a string.
+
 Thunk candidates come from metadata-backed entry points: runtime-function starts, the PE entry
 point, local executable exports, internal direct-call targets, and validated RTTI virtual slots.
 Only a candidate's first instruction is considered. Exact `E9 rel32` and `EB rel8` jumps may target
@@ -181,16 +207,29 @@ file-backed executable RVAs; exact RIP-relative `FF 25` jumps must target a pars
 self-targeting internal jump is not a thunk.
 
 Decoding is deterministic and bounded to 64 MiB of instruction bytes, 1,000,000 instructions,
-8,192 retained direct calls, and 4,096 retained thunks. Exhausting an aggregate budget retains the
-canonical RVA-ordered prefix and sets `code_recovery_scan_truncated`; the CLI reports the result as
-partial. Overlapping `RUNTIME_FUNCTION` ranges are preserved and may be swept and charged to these
-budgets separately, so adversarial overlap metadata can make the scan partial earlier.
+8,192 retained direct calls, 32,768 retained data references, and 4,096 retained thunks. Each
+relationship family retains its deterministic canonical prefix when its record cap is reached;
+`code_recovery_scan_truncated` and `data_reference_scan_truncated` preserve the applicable partial
+state. Exhausting the shared decode budget makes both instruction-derived sets partial.
+Overlapping `RUNTIME_FUNCTION` ranges are preserved and may be swept and charged to these budgets
+separately, so adversarial overlap metadata can make the scan partial earlier.
 
 Linear sweep is intentionally a heuristic-confidence source: it can decode bytes after a terminator
 or embedded data as instructions and therefore retain a false positive, while an invalid encoding
 stops the affected range and can omit valid control flow located later in that range. These records
 establish supported control-flow relationships and function-entry evidence only. They do not
 recover source names, basic blocks, function sizes, or a complete call graph.
+
+### Persisted-record validation boundary
+
+The package stores recovered values and relationships, but not the analyzed executable bytes.
+During analysis, ReSymbol checks each string against its source bytes and derives each data
+reference from the decoded instruction. On a later package read it can still enforce collection and
+text limits, canonical ordering and uniqueness, non-overlap, encoding and exact encoded-size rules,
+image and eligible-section ranges, runtime-function/site containment, and graph agreement. It
+cannot independently compare a persisted string with the original bytes or re-decode a persisted
+instruction because those bytes are absent. The envelope SHA-256 binds the records to one exact
+binary; reanalyze that binary when byte-level reproduction is required.
 
 ## Export projection
 
@@ -200,13 +239,13 @@ alternate names, confidence and provenance, supported function/global sizes, pro
 definitions, attributed function-to-class memberships, and structured warnings. Ordering and
 collision handling are stable so the same validated session produces the same projection.
 
-The current neutral JSON projection is schema 3. It adds optional function-entry attribution and
-bounded, attributed `direct_calls` and `thunks` arrays to the schema 2 class-membership model.
+The current neutral JSON projection is schema 4. It adds bounded, attributed `strings` and
+`data_references` arrays to schema 3's function-entry, direct-call, and thunk model.
 Internal relation targets must reference projected function entries; import targets retain their
-IAT RVA. Its projection/model caps remain 262,144 direct calls and 65,536 thunks; those larger
-validation bounds are separate from the built-in decoder's 8,192-call and 4,096-thunk recovery
-caps. A function retains at most 4,096 distinct memberships. Overflow is loss-aware rather than
-order-dependent: ReSymbol keeps the deterministically strongest 4,096 and emits one
+IAT RVA. Its projection/model bounds are intentionally separate from the lower built-in recovery
+caps: at most 65,536 strings, 32 MiB of retained string UTF-8 with 16 KiB per value, and 262,144
+data references. A function retains at most 4,096 distinct memberships. Overflow is loss-aware
+rather than order-dependent: ReSymbol keeps the deterministically strongest 4,096 and emits one
 `class-membership-limit-exceeded` warning group for the function, with `occurrences` counting the
 omitted distinct relationships.
 

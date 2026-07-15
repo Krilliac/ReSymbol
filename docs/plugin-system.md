@@ -195,6 +195,11 @@ will expose versioned interfaces and capability-scoped resources. Plugins have n
 filesystem, network, clock, environment, or process access unless a specific interface grants it.
 Memory, fuel or execution time, output size, and concurrency will be bounded.
 
+The checked-in WIT package includes additive typed helpers for `string-literal` and
+`data-reference` recovery assertions. Protocol 1.0 still carries the canonical tagged assertion
+inside `symbol-claim.claim-json`; retaining that field avoids breaking existing component bindings.
+The helper vocabulary uses `ascii`/`utf-16-le` and requires the nonzero `instruction-size` field.
+
 ### Native C and C++ (planned host)
 
 Native support is part of the initial architecture because important reversing libraries and SDKs
@@ -205,6 +210,12 @@ already exist in C and C++.
 - Native plugins will run in a version-matched helper process by default.
 - The host will validate every message, handle, range, and returned allocation.
 - An explicitly trusted in-process mode may be offered for workloads that justify the risk.
+
+`sdk/native/include/resymbol_plugin.h` exposes protocol-1 assertion-kind/encoding constants and
+fixed-width `resymbol_string_literal_assertion_v1` and
+`resymbol_data_reference_assertion_v1` serializer helpers. They do not cross the C ABI: native
+plugins still submit the strict UTF-8 JSON claim envelope through `submit_claim`. The example under
+`examples/plugins/native/` is syntax-compatible with both C11 and C++11.
 
 The release archive will supply the native host. End users will not install a compiler, CMake, or
 Visual C++ build tools to use a prebuilt plugin. Platform runtime dependencies must be statically
@@ -219,6 +230,12 @@ requirement, not an end-user requirement.
 Out-of-process hosting remains the intended default. Assembly loading will be constrained to the
 plugin package and declared shared contracts. A managed exception, unload failure, runaway task, or
 protocol violation will be able to terminate that host without terminating ReSymbol.
+
+The managed SDK provides `StringEncoding`, validated `StringLiteralAssertion` and
+`DataReferenceAssertion` records, and `ClaimAssertions` helpers that emit canonical `JsonElement`
+payloads. `examples/plugins/managed/` shows those payloads inside complete `SymbolClaim` values;
+the SDK rejects unsupported encoding names, invalid literal text, and zero instruction sizes before
+submission.
 
 ### External process (current first host)
 
@@ -241,6 +258,10 @@ launch.
 An interpreter is not assumed to exist. A plugin that needs Python either ships an appropriate
 runtime within its package, declares a clearly diagnosed external prerequisite, or is distributed
 as a standalone executable.
+
+These assertion additions do not change the external-process protocol version: the handshake
+remains `resymbol.plugin-wire` 1.0, and strict claim-event decoding accepts the additive tagged JSON
+shapes below.
 
 ### Tool-hosted bridges (planned host)
 
@@ -288,6 +309,67 @@ Plugins submit structured claims. A conceptual payload looks like:
 The host attaches plugin identity, version, and run identity to accepted wire claims. The session's
 run ledger binds that run to the exact artifact fingerprint. The example is the claim-event payload
 rather than a complete NDJSON message.
+
+A recovered UTF-16LE literal uses a sized global subject. `size` is the encoded content plus the
+terminator, so the 12 UTF-16 code units below occupy 26 bytes:
+
+```json
+{
+  "subject": {
+    "binary": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "kind": "global",
+    "rva": 12288,
+    "size": 26
+  },
+  "claim": {
+    "kind": "string-literal",
+    "encoding": "utf-16-le",
+    "value": "Recovered 世界"
+  },
+  "confidence": 0.95,
+  "evidence": [
+    {
+      "kind": "string-literal",
+      "description": "decoded terminated UTF-16LE bytes"
+    }
+  ]
+}
+```
+
+ASCII values contain only bytes `0x20..=0x7e`; both encodings reject empty, whitespace-only,
+control-containing, or embedded-NUL text. The value is canonical UTF-8 JSON text even when the
+source bytes were UTF-16LE.
+
+A data reference identifies the exact instruction and target RVA without inventing a target name,
+data type, width, or read/write meaning:
+
+```json
+{
+  "subject": {
+    "binary": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "kind": "function",
+    "rva": 4096,
+    "size": 32
+  },
+  "claim": {
+    "kind": "data-reference",
+    "instruction_rva": 4104,
+    "instruction_size": 7,
+    "target_rva": 12288
+  },
+  "confidence": 0.9,
+  "evidence": [
+    {
+      "kind": "data-flow",
+      "description": "validated image-relative instruction operand"
+    }
+  ]
+}
+```
+
+Core validation requires `instruction_size` to be nonzero. The current PE x64 session additionally
+requires at most 15 bytes, keeps the instruction within its function subject, and verifies that the
+target is backed readable initialized data.
 
 The core checks ranges, type validity, confidence semantics, evidence, provenance, and transaction
 consistency. Plugin claims remain separate from deterministic base claims in `AnalysisSession`, so
@@ -344,6 +426,11 @@ Each supported family should receive:
 - manifest validation tooling;
 - deterministic fake binary and graph fixtures; and
 - packaging commands that produce a drop-in artifact.
+
+The repository currently checks in the shared WIT contract, the C11/C++11 native header, the .NET
+contract assembly, strict external-process JSON Schema, and minimal native/managed examples. These
+are additive protocol-1 authoring surfaces; the corresponding WASM, native, and managed hosts remain
+planned as described above.
 
 The SDK is successful when plugin authors need their language's normal toolchain, while plugin users
 need only the compiled package and ReSymbol.

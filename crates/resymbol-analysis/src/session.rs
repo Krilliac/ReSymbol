@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use resymbol_core::{
     BinaryId, ClaimProducer, ClaimValidationError, ControlFlowTarget, GraphValidationError,
-    SymbolAssertion, SymbolClaim, SymbolGraph, SymbolSubject, plugin_api::PluginId,
+    StringEncoding, SymbolAssertion, SymbolClaim, SymbolGraph, SymbolSubject, plugin_api::PluginId,
 };
 use semver::Version;
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
@@ -214,6 +214,7 @@ impl AnalysisSession {
                 });
             }
             validate_claim_ranges(index, claim, image_size, &import_iat_rvas)?;
+            validate_claim_section_policy(index, claim, &self.base_analysis)?;
 
             let ClaimProducer::Plugin {
                 id: producer_id,
@@ -369,6 +370,55 @@ pub enum SessionValidationError {
     DirectCallRequiresFunction { index: usize },
     #[error("plugin claim {index} has a thunk-target assertion on a non-function subject")]
     ThunkTargetRequiresFunction { index: usize },
+    #[error("plugin claim {index} has a string-literal assertion on a non-global subject")]
+    StringLiteralRequiresGlobal { index: usize },
+    #[error("plugin claim {index} string-literal subject must record its exact encoded size")]
+    StringLiteralRequiresSize { index: usize },
+    #[error(
+        "plugin claim {index} global size {subject_size:#x} does not match encoded string size {encoded_size:#x}"
+    )]
+    StringLiteralSizeMismatch {
+        index: usize,
+        subject_size: u64,
+        encoded_size: u64,
+    },
+    #[error("plugin claim {index} uses an unsupported recovered-string encoding")]
+    UnsupportedStringEncoding { index: usize },
+    #[error("plugin claim {index} encoded string size overflows the supported address model")]
+    EncodedStringSizeOverflow { index: usize },
+    #[error(
+        "plugin claim {index} string literal is not fully backed readable initialized non-executable PE data"
+    )]
+    StringLiteralUnsupportedSection { index: usize },
+    #[error("plugin claim {index} has a data-reference assertion on a non-function subject")]
+    DataReferenceRequiresFunction { index: usize },
+    #[error(
+        "plugin claim {index} data-reference instruction size {instruction_size} is not a valid x64 instruction size"
+    )]
+    DataReferenceInstructionSizeUnsupported { index: usize, instruction_size: u8 },
+    #[error(
+        "plugin claim {index} data-reference instruction {instruction_rva:#x} precedes caller function {function_rva:#x}"
+    )]
+    DataReferenceSiteBeforeFunction {
+        index: usize,
+        instruction_rva: u64,
+        function_rva: u64,
+    },
+    #[error(
+        "plugin claim {index} data-reference instruction {instruction_rva:#x} lies outside caller range {function_rva:#x}..{function_end_rva:#x}"
+    )]
+    DataReferenceSiteOutsideFunction {
+        index: usize,
+        instruction_rva: u64,
+        function_rva: u64,
+        function_end_rva: u64,
+    },
+    #[error("plugin claim {index} data-reference instruction is not backed by executable PE data")]
+    DataReferenceSourceNotExecutable { index: usize },
+    #[error(
+        "plugin claim {index} data-reference target is not backed by readable initialized non-executable PE data"
+    )]
+    DataReferenceTargetNotData { index: usize },
     #[error(
         "plugin claim {index} function size {subject_size:#x} does not match asserted boundary {boundary_size:#x}"
     )]
@@ -537,6 +587,164 @@ fn validate_claim_ranges(
                     index,
                     rva: *function_rva,
                 });
+            }
+        }
+        SymbolAssertion::StringLiteral { encoding, value } => {
+            let SymbolSubject::Global {
+                rva,
+                size: subject_size,
+                ..
+            } = claim.subject()
+            else {
+                return Err(SessionValidationError::StringLiteralRequiresGlobal { index });
+            };
+            let Some(subject_size) = subject_size else {
+                return Err(SessionValidationError::StringLiteralRequiresSize { index });
+            };
+            let encoded_size = encoded_string_size(index, *encoding, value)?;
+            validate_image_range(index, "string literal", *rva, encoded_size, image_size)?;
+            if *subject_size != encoded_size {
+                return Err(SessionValidationError::StringLiteralSizeMismatch {
+                    index,
+                    subject_size: *subject_size,
+                    encoded_size,
+                });
+            }
+        }
+        SymbolAssertion::DataReference {
+            instruction_rva,
+            instruction_size,
+            target_rva,
+        } => {
+            let SymbolSubject::Function {
+                rva: function_rva,
+                size: function_size,
+                ..
+            } = claim.subject()
+            else {
+                return Err(SessionValidationError::DataReferenceRequiresFunction { index });
+            };
+            if !(1..=15).contains(instruction_size) {
+                return Err(
+                    SessionValidationError::DataReferenceInstructionSizeUnsupported {
+                        index,
+                        instruction_size: *instruction_size,
+                    },
+                );
+            }
+            validate_image_range(
+                index,
+                "data-reference instruction",
+                *instruction_rva,
+                u64::from(*instruction_size),
+                image_size,
+            )?;
+            validate_image_range(index, "data-reference target", *target_rva, 1, image_size)?;
+            if *instruction_rva < *function_rva {
+                return Err(SessionValidationError::DataReferenceSiteBeforeFunction {
+                    index,
+                    instruction_rva: *instruction_rva,
+                    function_rva: *function_rva,
+                });
+            }
+            if let Some(function_size) = function_size {
+                let function_end_rva = function_rva.checked_add(*function_size).ok_or(
+                    SessionValidationError::AddressOutsideImage {
+                        index,
+                        field: "data-reference caller function",
+                        rva: *function_rva,
+                        size: *function_size,
+                        image_size,
+                    },
+                )?;
+                let instruction_end_rva = instruction_rva
+                    .checked_add(u64::from(*instruction_size))
+                    .ok_or(SessionValidationError::AddressOutsideImage {
+                        index,
+                        field: "data-reference instruction",
+                        rva: *instruction_rva,
+                        size: u64::from(*instruction_size),
+                        image_size,
+                    })?;
+                if instruction_end_rva > function_end_rva {
+                    return Err(SessionValidationError::DataReferenceSiteOutsideFunction {
+                        index,
+                        instruction_rva: *instruction_rva,
+                        function_rva: *function_rva,
+                        function_end_rva,
+                    });
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn encoded_string_size(
+    index: usize,
+    encoding: StringEncoding,
+    value: &str,
+) -> Result<u64, SessionValidationError> {
+    match encoding {
+        StringEncoding::Ascii => u64::try_from(value.len())
+            .ok()
+            .and_then(|size| size.checked_add(1)),
+        StringEncoding::Utf16Le => u64::try_from(value.encode_utf16().count())
+            .ok()
+            .and_then(|units| units.checked_mul(2))
+            .and_then(|size| size.checked_add(2)),
+        _ => return Err(SessionValidationError::UnsupportedStringEncoding { index }),
+    }
+    .ok_or(SessionValidationError::EncodedStringSizeOverflow { index })
+}
+
+fn validate_claim_section_policy(
+    index: usize,
+    claim: &SymbolClaim,
+    analysis: &BinaryAnalysis,
+) -> Result<(), SessionValidationError> {
+    let BinaryAnalysis::Pe(analysis) = analysis;
+    match claim.assertion() {
+        SymbolAssertion::StringLiteral { .. } => {
+            let SymbolSubject::Global {
+                rva,
+                size: Some(size),
+                ..
+            } = claim.subject()
+            else {
+                return Ok(());
+            };
+            let (Ok(rva), Ok(size)) = (u32::try_from(*rva), u32::try_from(*size)) else {
+                return Err(SessionValidationError::StringLiteralUnsupportedSection { index });
+            };
+            if !crate::code_recovery::model_range_is_backed_readable_initialized_data(
+                analysis, rva, size,
+            ) {
+                return Err(SessionValidationError::StringLiteralUnsupportedSection { index });
+            }
+        }
+        SymbolAssertion::DataReference {
+            instruction_rva,
+            instruction_size,
+            target_rva,
+        } => {
+            let (Ok(instruction_rva), Ok(target_rva)) =
+                (u32::try_from(*instruction_rva), u32::try_from(*target_rva))
+            else {
+                return Err(SessionValidationError::DataReferenceSourceNotExecutable { index });
+            };
+            if !crate::code_recovery::model_range_is_backed_executable(
+                analysis,
+                instruction_rva,
+                u32::from(*instruction_size),
+            ) {
+                return Err(SessionValidationError::DataReferenceSourceNotExecutable { index });
+            }
+            if !crate::code_recovery::model_range_is_backed_readable_initialized_data(
+                analysis, target_rva, 1,
+            ) {
+                return Err(SessionValidationError::DataReferenceTargetNotData { index });
             }
         }
         _ => {}
@@ -910,5 +1118,181 @@ mod tests {
         );
         validate_claim_ranges(2, &exact_iat, 0x400)
             .expect("an exact parsed import-IAT slot is accepted");
+    }
+
+    #[test]
+    fn string_literals_require_an_exactly_sized_global_subject() {
+        let binary = BinaryId::digest(b"session-test-binary");
+        let valid_ascii = claim(
+            SymbolSubject::Global {
+                binary: binary.clone(),
+                rva: 0x100,
+                size: Some(6),
+            },
+            assertion(serde_json::json!({
+                "kind": "string-literal",
+                "encoding": "ascii",
+                "value": "Hello"
+            })),
+        );
+        validate_claim_ranges(0, &valid_ascii, 0x400).expect("ASCII size includes one NUL byte");
+
+        let valid_utf16 = claim(
+            SymbolSubject::Global {
+                binary: binary.clone(),
+                rva: 0x120,
+                size: Some(10),
+            },
+            assertion(serde_json::json!({
+                "kind": "string-literal",
+                "encoding": "utf-16-le",
+                "value": "Ab世界"
+            })),
+        );
+        validate_claim_ranges(1, &valid_utf16, 0x400)
+            .expect("UTF-16 size includes its two-byte NUL terminator");
+
+        let missing_size = claim(
+            SymbolSubject::Global {
+                binary: binary.clone(),
+                rva: 0x140,
+                size: None,
+            },
+            assertion(serde_json::json!({
+                "kind": "string-literal",
+                "encoding": "ascii",
+                "value": "Hello"
+            })),
+        );
+        assert!(matches!(
+            validate_claim_ranges(2, &missing_size, 0x400),
+            Err(SessionValidationError::StringLiteralRequiresSize { index: 2 })
+        ));
+
+        let wrong_size = claim(
+            SymbolSubject::Global {
+                binary: binary.clone(),
+                rva: 0x160,
+                size: Some(5),
+            },
+            assertion(serde_json::json!({
+                "kind": "string-literal",
+                "encoding": "ascii",
+                "value": "Hello"
+            })),
+        );
+        assert!(matches!(
+            validate_claim_ranges(3, &wrong_size, 0x400),
+            Err(SessionValidationError::StringLiteralSizeMismatch {
+                subject_size: 5,
+                encoded_size: 6,
+                ..
+            })
+        ));
+
+        let wrong_subject = claim(
+            function_subject(0x180, Some(6)),
+            assertion(serde_json::json!({
+                "kind": "string-literal",
+                "encoding": "ascii",
+                "value": "Hello"
+            })),
+        );
+        assert!(matches!(
+            validate_claim_ranges(4, &wrong_subject, 0x400),
+            Err(SessionValidationError::StringLiteralRequiresGlobal { index: 4 })
+        ));
+    }
+
+    #[test]
+    fn data_reference_sites_belong_to_function_subjects_and_targets_stay_in_image() {
+        let valid = claim(
+            function_subject(0x100, Some(0x20)),
+            assertion(serde_json::json!({
+                "kind": "data-reference",
+                "instruction_rva": 0x110,
+                "instruction_size": 7,
+                "target_rva": 0x300
+            })),
+        );
+        validate_claim_ranges(0, &valid, 0x400).expect("bounded data reference is valid");
+
+        let wrong_subject = claim(
+            global_subject(),
+            assertion(serde_json::json!({
+                "kind": "data-reference",
+                "instruction_rva": 0x110,
+                "instruction_size": 7,
+                "target_rva": 0x300
+            })),
+        );
+        assert!(matches!(
+            validate_claim_ranges(1, &wrong_subject, 0x400),
+            Err(SessionValidationError::DataReferenceRequiresFunction { index: 1 })
+        ));
+
+        let before = claim(
+            function_subject(0x100, Some(0x20)),
+            assertion(serde_json::json!({
+                "kind": "data-reference",
+                "instruction_rva": 0xff,
+                "instruction_size": 7,
+                "target_rva": 0x300
+            })),
+        );
+        assert!(matches!(
+            validate_claim_ranges(2, &before, 0x400),
+            Err(SessionValidationError::DataReferenceSiteBeforeFunction { .. })
+        ));
+
+        let at_end = claim(
+            function_subject(0x100, Some(0x20)),
+            assertion(serde_json::json!({
+                "kind": "data-reference",
+                "instruction_rva": 0x120,
+                "instruction_size": 7,
+                "target_rva": 0x300
+            })),
+        );
+        assert!(matches!(
+            validate_claim_ranges(3, &at_end, 0x400),
+            Err(SessionValidationError::DataReferenceSiteOutsideFunction { .. })
+        ));
+
+        let unsupported_instruction_size = claim(
+            function_subject(0x100, Some(0x20)),
+            assertion(serde_json::json!({
+                "kind": "data-reference",
+                "instruction_rva": 0x110,
+                "instruction_size": 16,
+                "target_rva": 0x300
+            })),
+        );
+        assert!(matches!(
+            validate_claim_ranges(4, &unsupported_instruction_size, 0x400),
+            Err(
+                SessionValidationError::DataReferenceInstructionSizeUnsupported {
+                    index: 4,
+                    instruction_size: 16,
+                }
+            )
+        ));
+
+        let outside_target = claim(
+            function_subject(0x100, None),
+            assertion(serde_json::json!({
+                "kind": "data-reference",
+                "instruction_rva": 0x110,
+                "instruction_size": 7,
+                "target_rva": 0x400
+            })),
+        );
+        assert!(matches!(
+            validate_claim_ranges(5, &outside_target, 0x400),
+            Err(SessionValidationError::AddressOutsideImage {
+                field: "data-reference target",
+                ..
+            })
+        ));
     }
 }

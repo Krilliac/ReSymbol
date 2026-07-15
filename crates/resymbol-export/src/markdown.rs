@@ -2,8 +2,8 @@ use thiserror::Error;
 
 use crate::{
     AttributedText, ExportAttribution, ExportBinaryFormat, ExportControlFlowTarget, ExportFunction,
-    ExportName, ExportProducer, ExportProjection, ExportSubject, ProjectionValidationError,
-    ProjectionWarningCode,
+    ExportName, ExportProducer, ExportProjection, ExportStringEncoding, ExportSubject,
+    ProjectionValidationError, ProjectionWarningCode,
 };
 
 const MAX_REPORT_BYTES: usize = 16 * 1024 * 1024;
@@ -40,7 +40,9 @@ pub fn render_markdown(projection: &ExportProjection) -> Result<String, Markdown
     render_functions(&mut report, projection)?;
     render_globals(&mut report, projection)?;
     render_types(&mut report, projection)?;
+    render_strings(&mut report, projection)?;
     render_calls(&mut report, projection)?;
+    render_data_references(&mut report, projection)?;
     render_thunks(&mut report, projection)?;
     render_warnings(&mut report, projection)?;
 
@@ -129,7 +131,12 @@ fn render_summary(report: &mut Report, projection: &ExportProjection) -> Result<
         ("Functions", projection.functions.len().to_string()),
         ("Globals", projection.globals.len().to_string()),
         ("Types", projection.types.len().to_string()),
+        ("Strings", projection.strings.len().to_string()),
         ("Direct calls", projection.direct_calls.len().to_string()),
+        (
+            "Data references",
+            projection.data_references.len().to_string(),
+        ),
         ("Thunks", projection.thunks.len().to_string()),
         ("Warning groups", projection.warnings.len().to_string()),
     ];
@@ -275,6 +282,39 @@ fn render_types(report: &mut Report, projection: &ExportProjection) -> Result<()
     )
 }
 
+fn render_strings(report: &mut Report, projection: &ExportProjection) -> Result<(), MarkdownError> {
+    section(report, "Strings")?;
+    table_header(
+        report,
+        &[
+            "Encoding",
+            "RVA",
+            "Byte size",
+            "Value",
+            "Confidence",
+            "Source",
+        ],
+    )?;
+    for string in projection.strings.iter().take(MAX_ROWS_PER_SECTION) {
+        table_row(
+            report,
+            &[
+                string_encoding(string.encoding).to_owned(),
+                hex(string.rva),
+                string.byte_size.to_string(),
+                string.value.clone(),
+                confidence(&string.attribution),
+                provenance(&string.attribution),
+            ],
+        )?;
+    }
+    row_notice(
+        report,
+        projection.strings.len().min(MAX_ROWS_PER_SECTION),
+        projection.strings.len(),
+    )
+}
+
 fn render_calls(report: &mut Report, projection: &ExportProjection) -> Result<(), MarkdownError> {
     section(report, "Direct calls")?;
     table_header(
@@ -303,6 +343,42 @@ fn render_calls(report: &mut Report, projection: &ExportProjection) -> Result<()
         report,
         projection.direct_calls.len().min(MAX_ROWS_PER_SECTION),
         projection.direct_calls.len(),
+    )
+}
+
+fn render_data_references(
+    report: &mut Report,
+    projection: &ExportProjection,
+) -> Result<(), MarkdownError> {
+    section(report, "Data references")?;
+    table_header(
+        report,
+        &[
+            "Caller RVA",
+            "Instruction RVA",
+            "Instruction size",
+            "Target RVA",
+            "Confidence",
+            "Source",
+        ],
+    )?;
+    for reference in projection.data_references.iter().take(MAX_ROWS_PER_SECTION) {
+        table_row(
+            report,
+            &[
+                hex(reference.caller_rva),
+                hex(reference.instruction_rva),
+                reference.instruction_size.to_string(),
+                hex(reference.target_rva),
+                confidence(&reference.attribution),
+                provenance(&reference.attribution),
+            ],
+        )?;
+    }
+    row_notice(
+        report,
+        projection.data_references.len().min(MAX_ROWS_PER_SECTION),
+        projection.data_references.len(),
     )
 }
 
@@ -481,6 +557,13 @@ fn binary_format(value: &ExportBinaryFormat) -> String {
     }
 }
 
+const fn string_encoding(value: ExportStringEncoding) -> &'static str {
+    match value {
+        ExportStringEncoding::Ascii => "ASCII",
+        ExportStringEncoding::Utf16Le => "UTF-16LE",
+    }
+}
+
 const fn warning_code(value: ProjectionWarningCode) -> &'static str {
     match value {
         ProjectionWarningCode::UnsupportedAssertion => "unsupported-assertion",
@@ -553,7 +636,7 @@ mod tests {
 
     fn empty_projection() -> ExportProjection {
         ExportProjection {
-            schema_version: 3,
+            schema_version: 4,
             binary: ExportBinary {
                 id: BinaryId::from_sha256(
                     "0000000000000000000000000000000000000000000000000000000000000000",
@@ -570,6 +653,8 @@ mod tests {
             types: Vec::new(),
             direct_calls: Vec::new(),
             thunks: Vec::new(),
+            strings: Vec::new(),
+            data_references: Vec::new(),
             warnings: Vec::new(),
         }
     }
@@ -588,7 +673,9 @@ mod tests {
             "## Functions",
             "## Globals",
             "## Types",
+            "## Strings",
             "## Direct calls",
+            "## Data references",
             "## Thunks",
             "## Warnings",
         ] {

@@ -591,7 +591,7 @@ mod tests {
 
     fn projection() -> ExportProjection {
         ExportProjection {
-            schema_version: 3,
+            schema_version: 4,
             binary: ExportBinary {
                 id: BinaryId::from_sha256("22".repeat(32)).expect("test digest"),
                 file_size: 0x3000,
@@ -623,6 +623,8 @@ mod tests {
             types: Vec::new(),
             direct_calls: Vec::new(),
             thunks: Vec::new(),
+            strings: Vec::new(),
+            data_references: Vec::new(),
             warnings: Vec::new(),
         }
     }

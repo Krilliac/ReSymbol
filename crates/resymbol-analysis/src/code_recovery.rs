@@ -1,22 +1,29 @@
 use std::collections::BTreeSet;
 
-use iced_x86::{Code, Decoder, DecoderOptions, Instruction};
+use iced_x86::{Code, Decoder, DecoderOptions, Instruction, Register};
 
 use crate::{
-    AnalysisError, MsvcRttiVftable, PeAnalysis, PeControlFlowTarget, PeDirectCall, PeExport,
-    PeImportLibrary, PeSection, PeThunk, RuntimeFunction,
+    AnalysisError, MsvcRttiVftable, PeAnalysis, PeControlFlowTarget, PeDataReference, PeDirectCall,
+    PeExport, PeImportLibrary, PeSection, PeThunk, RuntimeFunction,
     pe::{RvaMap, section_for_rva},
 };
 
 const MAX_DECODED_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_DECODED_INSTRUCTIONS: u64 = 1_000_000;
 const MAX_DIRECT_CALLS: usize = 8_192;
+const MAX_DATA_REFERENCES: usize = 32_768;
 const MAX_THUNKS: usize = 4_096;
 const MAX_X86_INSTRUCTION_BYTES: usize = 15;
 
+const IMAGE_SCN_CNT_INITIALIZED_DATA: u32 = 0x0000_0040;
+const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
+const IMAGE_SCN_MEM_READ: u32 = 0x4000_0000;
+
 pub(crate) struct CodeRecovery {
     pub scan_truncated: bool,
+    pub data_reference_scan_truncated: bool,
     pub direct_calls: Vec<PeDirectCall>,
+    pub data_references: Vec<PeDataReference>,
     pub thunks: Vec<PeThunk>,
 }
 
@@ -132,7 +139,9 @@ pub(crate) fn recover_code(input: CodeRecoveryInput<'_, '_>) -> CodeRecovery {
     };
     let mut budget = DecodeBudget::default();
     let mut scan_truncated = false;
+    let mut data_reference_scan_truncated = false;
     let mut direct_calls = BTreeSet::new();
+    let mut data_references = BTreeSet::new();
 
     let mut ranges = input
         .runtime_functions
@@ -168,6 +177,7 @@ pub(crate) fn recover_code(input: CodeRecoveryInput<'_, '_>) -> CodeRecovery {
             let instruction_size = instruction.len();
             if instruction_size == 0 || !budget.consume(instruction_size) {
                 scan_truncated = true;
+                data_reference_scan_truncated = true;
                 break 'runtime_functions;
             }
             if instruction.is_invalid() {
@@ -179,31 +189,46 @@ pub(crate) fn recover_code(input: CodeRecoveryInput<'_, '_>) -> CodeRecovery {
             let Ok(position_rva) = u32::try_from(position) else {
                 break;
             };
-            let Some(call_site_rva) = begin_rva.checked_add(position_rva) else {
+            let Some(instruction_rva) = begin_rva.checked_add(position_rva) else {
                 break;
-            };
-            let Some(target) = decode_call_target(&instruction, raw_instruction, &target_context)
-            else {
-                continue;
             };
             let Ok(instruction_size) = u8::try_from(instruction_size) else {
                 break;
             };
-            let call = PeDirectCall {
-                caller_rva: begin_rva,
-                call_site_rva,
+
+            if let Some(reference) = decode_data_reference(
+                begin_rva,
+                instruction_rva,
                 instruction_size,
-                target,
-            };
-            if !direct_calls.contains(&call) && direct_calls.len() == MAX_DIRECT_CALLS {
-                scan_truncated = true;
-                break 'runtime_functions;
+                &instruction,
+                raw_instruction,
+                &target_context,
+            ) {
+                if !insert_bounded(&mut data_references, reference, MAX_DATA_REFERENCES) {
+                    data_reference_scan_truncated = true;
+                }
             }
-            direct_calls.insert(call);
+
+            // Calls and data references share this decode pass, but their
+            // retention caps are independent. Reaching either cap must not
+            // hide whether the other relationship set also truncated.
+            if let Some(target) = decode_call_target(&instruction, raw_instruction, &target_context)
+            {
+                let call = PeDirectCall {
+                    caller_rva: begin_rva,
+                    call_site_rva: instruction_rva,
+                    instruction_size,
+                    target,
+                };
+                if !insert_bounded(&mut direct_calls, call, MAX_DIRECT_CALLS) {
+                    scan_truncated = true;
+                }
+            }
         }
     }
 
     let direct_calls = direct_calls.into_iter().collect::<Vec<_>>();
+    let data_references = data_references.into_iter().collect::<Vec<_>>();
     let seeds = thunk_seeds(
         input.mapper,
         input.sections,
@@ -256,9 +281,68 @@ pub(crate) fn recover_code(input: CodeRecoveryInput<'_, '_>) -> CodeRecovery {
 
     CodeRecovery {
         scan_truncated,
+        data_reference_scan_truncated,
         direct_calls,
+        data_references,
         thunks: thunks.into_iter().collect(),
     }
+}
+
+fn decode_data_reference(
+    caller_rva: u32,
+    instruction_rva: u32,
+    instruction_size: u8,
+    instruction: &Instruction,
+    raw: &[u8],
+    context: &TargetContext<'_, '_>,
+) -> Option<PeDataReference> {
+    let target_rva =
+        rip_relative_target_rva(instruction, context.image_base, context.size_of_image)?;
+    if is_modeled_iat_control_flow(instruction, raw, target_rva, context.import_iat_rvas) {
+        return None;
+    }
+    if !is_backed_readable_initialized_data(context.mapper, context.sections, target_rva, 1) {
+        return None;
+    }
+    Some(PeDataReference {
+        caller_rva,
+        instruction_rva,
+        instruction_size,
+        target_rva,
+    })
+}
+
+fn rip_relative_target_rva(
+    instruction: &Instruction,
+    image_base: u64,
+    size_of_image: u32,
+) -> Option<u32> {
+    (instruction.memory_base() == Register::RIP)
+        .then(|| instruction.ip_rel_memory_address())
+        .and_then(|target| va_to_rva(target, image_base, size_of_image))
+}
+
+fn is_modeled_iat_control_flow(
+    instruction: &Instruction,
+    raw: &[u8],
+    target_rva: u32,
+    import_iat_rvas: &BTreeSet<u32>,
+) -> bool {
+    let exact_iat_call =
+        instruction.code() == Code::Call_rm64 && raw.len() == 6 && raw.starts_with(&[0xff, 0x15]);
+    let exact_iat_jump =
+        instruction.code() == Code::Jmp_rm64 && raw.len() == 6 && raw.starts_with(&[0xff, 0x25]);
+    (exact_iat_call || exact_iat_jump) && import_iat_rvas.contains(&target_rva)
+}
+
+fn insert_bounded<T: Ord>(records: &mut BTreeSet<T>, value: T, limit: usize) -> bool {
+    if records.contains(&value) {
+        return true;
+    }
+    if records.len() >= limit {
+        return false;
+    }
+    records.insert(value)
 }
 
 fn decode_call_target(
@@ -491,6 +575,69 @@ pub(crate) fn validate_code_recovery(analysis: &PeAnalysis) -> Result<(), Analys
     Ok(())
 }
 
+pub(crate) fn validate_data_references(
+    analysis: &PeAnalysis,
+    data_references: &[PeDataReference],
+) -> Result<(), AnalysisError> {
+    if data_references.len() > MAX_DATA_REFERENCES {
+        return invalid("data references", "exceed the retained record cap");
+    }
+    if !strictly_sorted(data_references) {
+        return invalid("data references", "must be strictly sorted and unique");
+    }
+
+    let mut previous_instruction = None;
+    for reference in data_references {
+        let instruction_key = (reference.caller_rva, reference.instruction_rva);
+        if previous_instruction == Some(instruction_key) {
+            return invalid(
+                "data references",
+                "contain more than one target for one caller and instruction",
+            );
+        }
+        previous_instruction = Some(instruction_key);
+
+        if !(1..=MAX_X86_INSTRUCTION_BYTES).contains(&usize::from(reference.instruction_size)) {
+            return invalid(
+                "data-reference instruction size",
+                "must be between one and fifteen bytes",
+            );
+        }
+        let instruction_end = reference
+            .instruction_rva
+            .checked_add(u32::from(reference.instruction_size))
+            .ok_or(AnalysisError::ArithmeticOverflow(
+                "data-reference instruction range",
+            ))?;
+        let matching_runtime_function = analysis.runtime_functions.iter().any(|function| {
+            function.begin_rva == reference.caller_rva
+                && reference.instruction_rva >= function.begin_rva
+                && instruction_end <= function.end_rva
+        });
+        if !matching_runtime_function
+            || !model_range_is_backed_executable(
+                analysis,
+                reference.instruction_rva,
+                u32::from(reference.instruction_size),
+            )
+        {
+            return invalid(
+                "data-reference source",
+                "is not a fully backed executable instruction in its matching runtime function",
+            );
+        }
+        if reference.target_rva >= analysis.size_of_image
+            || !model_range_is_backed_readable_initialized_data(analysis, reference.target_rva, 1)
+        {
+            return invalid(
+                "data-reference target",
+                "is not fully backed readable initialized non-executable data in the image",
+            );
+        }
+    }
+    Ok(())
+}
+
 fn model_thunk_seeds(analysis: &PeAnalysis) -> BTreeSet<u32> {
     let mut seeds = BTreeSet::new();
     if analysis.entry_point_rva != 0 {
@@ -596,10 +743,29 @@ fn is_backed_executable(
     let start_section = section_for_rva(rva, sections);
     let end_section = section_for_rva(last_rva, sections);
     start_section.map(|(index, _)| index) == end_section.map(|(index, _)| index)
-        && start_section.is_some_and(|(_, section)| section.characteristics & 0x2000_0000 != 0)
+        && start_section
+            .is_some_and(|(_, section)| section.characteristics & IMAGE_SCN_MEM_EXECUTE != 0)
 }
 
-fn model_range_is_backed_executable(analysis: &PeAnalysis, rva: u32, size: u32) -> bool {
+fn is_backed_readable_initialized_data(
+    mapper: &RvaMap<'_>,
+    sections: &[PeSection],
+    rva: u32,
+    size: usize,
+) -> bool {
+    if size == 0 || !mapper.is_backed(rva, size) {
+        return false;
+    }
+    let Ok(size_u32) = u32::try_from(size) else {
+        return false;
+    };
+    sections.iter().any(|section| {
+        is_readable_initialized_non_executable(section.characteristics)
+            && section_has_file_backed_range(section, rva, size_u32)
+    })
+}
+
+pub(crate) fn model_range_is_backed_executable(analysis: &PeAnalysis, rva: u32, size: u32) -> bool {
     if size == 0 {
         return false;
     }
@@ -609,8 +775,40 @@ fn model_range_is_backed_executable(analysis: &PeAnalysis, rva: u32, size: u32) 
     analysis.sections.iter().any(|section| {
         let start = u64::from(section.virtual_address);
         let backed_end = start.saturating_add(u64::from(section.raw_data_size));
-        section.characteristics & 0x2000_0000 != 0 && u64::from(rva) >= start && end <= backed_end
+        section.characteristics & IMAGE_SCN_MEM_EXECUTE != 0
+            && u64::from(rva) >= start
+            && end <= backed_end
     })
+}
+
+pub(crate) fn model_range_is_backed_readable_initialized_data(
+    analysis: &PeAnalysis,
+    rva: u32,
+    size: u32,
+) -> bool {
+    analysis.sections.iter().any(|section| {
+        is_readable_initialized_non_executable(section.characteristics)
+            && section_has_file_backed_range(section, rva, size)
+    })
+}
+
+const fn is_readable_initialized_non_executable(characteristics: u32) -> bool {
+    characteristics & IMAGE_SCN_CNT_INITIALIZED_DATA != 0
+        && characteristics & IMAGE_SCN_MEM_READ != 0
+        && characteristics & IMAGE_SCN_MEM_EXECUTE == 0
+}
+
+fn section_has_file_backed_range(section: &PeSection, rva: u32, size: u32) -> bool {
+    if size == 0 {
+        return false;
+    }
+    let start = u64::from(section.virtual_address);
+    let backed_end = start.saturating_add(u64::from(section.raw_data_size));
+    let rva = u64::from(rva);
+    rva >= start
+        && rva
+            .checked_add(u64::from(size))
+            .is_some_and(|end| end <= backed_end)
 }
 
 fn va_to_rva(va: u64, image_base: u64, size_of_image: u32) -> Option<u32> {
@@ -633,6 +831,17 @@ fn invalid<T>(field: &'static str, reason: impl Into<String>) -> Result<T, Analy
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_IMAGE_BASE: u64 = 0x0000_0001_4000_0000;
+
+    fn decode_one(bytes: &[u8], instruction_rva: u32) -> Instruction {
+        let ip = TEST_IMAGE_BASE + u64::from(instruction_rva);
+        let mut decoder = Decoder::with_ip(64, bytes, ip, DecoderOptions::NONE);
+        let instruction = decoder.decode();
+        assert!(!instruction.is_invalid(), "test instruction must decode");
+        assert_eq!(instruction.len(), bytes.len());
+        instruction
+    }
 
     #[test]
     fn decode_budget_accepts_the_exact_limits_and_rejects_the_next_item() {
@@ -658,7 +867,156 @@ mod tests {
     #[test]
     fn retained_record_caps_bound_graph_growth() {
         assert_eq!(MAX_DIRECT_CALLS, 8_192);
+        assert_eq!(MAX_DATA_REFERENCES, 32_768);
         assert_eq!(MAX_THUNKS, 4_096);
+    }
+
+    #[test]
+    fn rip_relative_lea_load_and_store_resolve_positive_displacements() {
+        for opcode in [0x8d, 0x8b, 0x89] {
+            let instruction = decode_one(&[0x48, opcode, 0x05, 0xf9, 0x0f, 0, 0], 0x1000);
+            assert_eq!(
+                rip_relative_target_rva(&instruction, TEST_IMAGE_BASE, 0x4000),
+                Some(0x2000)
+            );
+        }
+    }
+
+    #[test]
+    fn rip_relative_data_target_resolves_a_negative_displacement() {
+        let instruction = decode_one(&[0x48, 0x8b, 0x05, 0xf9, 0xef, 0xff, 0xff], 0x3000);
+        assert_eq!(
+            rip_relative_target_rva(&instruction, TEST_IMAGE_BASE, 0x4000),
+            Some(0x2000)
+        );
+    }
+
+    #[test]
+    fn data_targets_reject_non_rip_and_out_of_image_operands() {
+        let register_relative = decode_one(&[0x48, 0x8b, 0x03], 0x1000);
+        assert_eq!(
+            rip_relative_target_rva(&register_relative, TEST_IMAGE_BASE, 0x4000),
+            None
+        );
+
+        let eip_relative = decode_one(&[0x67, 0x48, 0x8b, 0x05, 0xf8, 0x0f, 0, 0], 0x1000);
+        assert_eq!(eip_relative.memory_base(), Register::EIP);
+        assert_eq!(
+            rip_relative_target_rva(&eip_relative, TEST_IMAGE_BASE, 0x4000),
+            None
+        );
+
+        let image_end = decode_one(&[0x48, 0x8b, 0x05, 0xf9, 0x0f, 0, 0], 0x1000);
+        assert_eq!(
+            rip_relative_target_rva(&image_end, TEST_IMAGE_BASE, 0x2000),
+            None
+        );
+        let before_image = decode_one(&[0x48, 0x8b, 0x05, 0xf8, 0xff, 0xff, 0xff], 0);
+        assert_eq!(
+            rip_relative_target_rva(&before_image, TEST_IMAGE_BASE, 0x4000),
+            None
+        );
+    }
+
+    #[test]
+    fn exact_call_and_jump_iat_operands_are_not_data_references() {
+        let import_iat_rvas = BTreeSet::from([0x2000]);
+        let call = decode_one(&[0xff, 0x15, 0xfa, 0x0f, 0, 0], 0x1000);
+        let jump = decode_one(&[0xff, 0x25, 0xfa, 0x0f, 0, 0], 0x1000);
+        let load = decode_one(&[0x48, 0x8b, 0x05, 0xf9, 0x0f, 0, 0], 0x1000);
+
+        assert_eq!(
+            rip_relative_target_rva(&call, TEST_IMAGE_BASE, 0x4000),
+            Some(0x2000)
+        );
+        assert_eq!(
+            rip_relative_target_rva(&jump, TEST_IMAGE_BASE, 0x4000),
+            Some(0x2000)
+        );
+        assert!(is_modeled_iat_control_flow(
+            &call,
+            &[0xff, 0x15, 0xfa, 0x0f, 0, 0],
+            0x2000,
+            &import_iat_rvas
+        ));
+        assert!(is_modeled_iat_control_flow(
+            &jump,
+            &[0xff, 0x25, 0xfa, 0x0f, 0, 0],
+            0x2000,
+            &import_iat_rvas
+        ));
+        assert!(!is_modeled_iat_control_flow(
+            &load,
+            &[0x48, 0x8b, 0x05, 0xf9, 0x0f, 0, 0],
+            0x2000,
+            &import_iat_rvas
+        ));
+        assert!(!is_modeled_iat_control_flow(
+            &call,
+            &[0xff, 0x15, 0xfa, 0x0f, 0, 0],
+            0x2001,
+            &import_iat_rvas
+        ));
+    }
+
+    #[test]
+    fn data_sections_must_be_readable_initialized_and_non_executable() {
+        let eligible = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ;
+        assert!(is_readable_initialized_non_executable(eligible));
+        assert!(!is_readable_initialized_non_executable(
+            eligible | IMAGE_SCN_MEM_EXECUTE
+        ));
+        assert!(!is_readable_initialized_non_executable(IMAGE_SCN_MEM_READ));
+        assert!(!is_readable_initialized_non_executable(
+            IMAGE_SCN_CNT_INITIALIZED_DATA
+        ));
+
+        let section = PeSection {
+            name: ".rdata".to_owned(),
+            raw_name: [0; 8],
+            virtual_address: 0x2000,
+            virtual_size: 0x200,
+            raw_data_offset: 0x400,
+            raw_data_size: 0x100,
+            characteristics: eligible,
+        };
+        assert!(section_has_file_backed_range(&section, 0x2000, 1));
+        assert!(section_has_file_backed_range(&section, 0x20ff, 1));
+        assert!(!section_has_file_backed_range(&section, 0x2100, 1));
+        assert!(!section_has_file_backed_range(&section, 0x20ff, 2));
+        assert!(!section_has_file_backed_range(&section, 0x2000, 0));
+    }
+
+    #[test]
+    fn bounded_relationships_retain_a_deterministic_prefix_independently() {
+        let retain = || {
+            let mut records = BTreeSet::new();
+            let mut truncated = false;
+            for value in [10, 10, 20, 30, 40] {
+                if !insert_bounded(&mut records, value, 2) {
+                    truncated = true;
+                }
+            }
+            (records, truncated)
+        };
+        assert_eq!(retain(), retain());
+        assert_eq!(retain(), (BTreeSet::from([10, 20]), true));
+
+        let mut calls = BTreeSet::new();
+        let mut data = BTreeSet::new();
+        let mut call_truncated = false;
+        let mut data_truncated = false;
+        for index in 0..3 {
+            if !insert_bounded(&mut calls, index, 1) {
+                call_truncated = true;
+            }
+            if index != 0 && !insert_bounded(&mut data, index, 2) {
+                data_truncated = true;
+            }
+        }
+        assert!(call_truncated);
+        assert!(!data_truncated);
+        assert_eq!(data, BTreeSet::from([1, 2]));
     }
 
     #[test]

@@ -12,10 +12,12 @@ exception metadata, and derives conservative metadata-backed claims. Canonical `
 now carry an `AnalysisSession`: deterministic base analysis, an auditable plugin-run ledger, and
 separately validated plugin claims with a derived combined graph.
 
-The CLI writes package schema 2 and can inspect or export schema 1 through an explicit in-memory
-migration that revalidates persisted metadata and rebuilds the base graph. Legacy packages do not
-embed executable bytes, so migration cannot run the newer code-recovery pass; reanalyzing the exact
-original binary is required to populate direct calls and thunks in a new schema 2 package.
+The CLI writes package schema 3 and can inspect or export schemas 1 and 2 through explicit
+compatibility paths. Schema 1 is migrated in memory by revalidating persisted metadata and
+rebuilding the base graph; schema 2 already contains direct-call and thunk recovery. Older packages
+do not embed executable bytes, so compatibility loading cannot reconstruct results that were never
+recorded. Reanalyzing the exact original binary is required to populate strings and data references
+in a new schema 3 package, and also direct calls and thunks when starting from schema 1.
 
 A bounded modern MSVC x64 Rev1 RTTI/vftable slice is now implemented. It validates compiler
 metadata through complete object locators, type descriptors, modern 28-byte base-class descriptors,
@@ -24,14 +26,16 @@ vftable names and records function-to-class memberships without inventing virtua
 Fixed scan, record, slot, and name budgets surface partial discovery explicitly.
 
 A bounded pure-Rust x86-64 code-recovery slice is also implemented. Its linear sweep decodes fully
-file-backed `RUNTIME_FUNCTION` ranges for exact direct calls and checks the first instruction at
-metadata-backed entry candidates for internal or import thunks. It retains at most 8,192 direct
-calls and 4,096 thunks; internal targets covered by known runtime-function metadata are suppressed
-unless their RVA matches a recorded runtime-function begin. The sweep is heuristic-confidence
-evidence rather than recursive disassembly: post-terminator bytes or embedded data can produce false
-positives, and invalid bytes can omit later calls in the affected range. It records attributed
-function-entry, direct-call, and thunk claims without inventing names or extents, and surfaces
-aggregate budget exhaustion as a partial scan.
+file-backed `RUNTIME_FUNCTION` ranges for exact direct calls and RIP-relative data references, and
+checks the first instruction at metadata-backed entry candidates for internal or import thunks. It
+retains at most 8,192 direct calls, 32,768 data references, and 4,096 thunks; internal targets
+covered by known runtime-function metadata are suppressed unless their RVA matches a recorded
+runtime-function begin. A separate bounded pass recovers complete NUL-terminated ASCII and UTF-16LE
+literals from readable initialized non-executable file-backed data. These passes emit attributed
+claims without inventing names or extents and preserve independent partial-scan flags. The linear
+sweep remains heuristic-confidence evidence rather than recursive disassembly: post-terminator
+bytes or embedded data can produce false positives, and invalid bytes can omit later relationships
+in the affected range.
 
 The first external-process analysis host is also implemented. Dropped-in process plugins require an
 explicit full-directory-fingerprint trust decision, then unchanged trusted artifacts can autoload.
@@ -44,20 +48,20 @@ implemented.
 The first export checkpoint is implemented as a validated, debugger-neutral projection with
 deterministic JSON output, a bounded human-readable Markdown report, and standalone IDAPython and
 Ghidra Java import scripts. Markdown is presentation-only rather than a stable interchange schema;
-JSON remains the machine-consumable artifact. The presentation writer leaves package schema 2 and
-neutral projection schema 3 unchanged. The scripts bind to the exact loaded binary SHA-256, resolve
+JSON remains the machine-consumable artifact. The current formats use package schema 3 and neutral
+projection schema 4. The scripts bind to the exact loaded binary SHA-256, resolve
 addresses as loaded image base plus RVA, preserve user-authored names and existing function bodies,
 and continue past per-symbol application errors. They are deliberately narrower than the planned
 interactive debugger bridges: prototypes, types, alternate names, provenance comments, and richer
 relationships are retained or diagnosed by the projection but are not yet fully applied inside the
 tools.
 
-The neutral projection intentionally retains larger model-validation caps of 262,144 direct calls
-and 65,536 thunks. Those bounds support combined/plugin-produced graphs and are separate from the
-built-in decoder's lower 8,192-call and 4,096-thunk recovery caps.
+The neutral projection intentionally retains larger model-validation caps of 262,144 direct calls,
+262,144 data references, 65,536 strings, and 65,536 thunks. Those bounds support combined or
+plugin-produced graphs and are separate from the built-in recovery passes' lower caps.
 
 The remaining Milestone 2 work is deliberately substantial: broader disassembly-assisted candidate
-discovery, strings and data references, indirect control flow and richer call-graph analysis,
+discovery, indirect control flow and richer call-graph analysis, string-reference correlation,
 broader RTTI/ABI coverage, an open fixture corpus, benchmarks, and continued
 malformed-input/resource-limit validation.
 The WASM, native C/C++, managed/.NET, and debugger-hosted execution paths remain future work; their

@@ -1,8 +1,9 @@
 use resymbol_core::BinaryId;
 use resymbol_export::{
     AttributedText, ExportAttribution, ExportBinary, ExportBinaryFormat, ExportControlFlowTarget,
-    ExportDirectCall, ExportFunction, ExportGlobal, ExportName, ExportProducer, ExportProjection,
-    ExportProvenance, ExportSubject, ExportThunk, ExportType, MarkdownError, ProjectionWarning,
+    ExportDataReference, ExportDirectCall, ExportFunction, ExportGlobal, ExportName,
+    ExportProducer, ExportProjection, ExportProvenance, ExportRecoveredString,
+    ExportStringEncoding, ExportSubject, ExportThunk, ExportType, MarkdownError, ProjectionWarning,
     ProjectionWarningCode, render_markdown,
 };
 
@@ -36,7 +37,7 @@ fn name(source: &str, output_name: &str, method: &str) -> ExportName {
 
 fn base_projection() -> ExportProjection {
     ExportProjection {
-        schema_version: 3,
+        schema_version: 4,
         binary: ExportBinary {
             id: BinaryId::digest(b"public Markdown integration fixture"),
             file_size: 0x1800,
@@ -50,6 +51,8 @@ fn base_projection() -> ExportProjection {
         types: Vec::new(),
         direct_calls: Vec::new(),
         thunks: Vec::new(),
+        strings: Vec::new(),
+        data_references: Vec::new(),
         warnings: Vec::new(),
     }
 }
@@ -122,6 +125,29 @@ fn realistic_projection() -> ExportProjection {
         target: ExportControlFlowTarget::ImportIat { iat_rva: 0x600 },
         attribution: attribution("import-thunk"),
     }];
+    projection.strings = vec![
+        ExportRecoveredString {
+            rva: 0x700,
+            byte_size: 15,
+            encoding: ExportStringEncoding::Ascii,
+            value: "ReSymbol ready".to_owned(),
+            attribution: attribution("ascii-string"),
+        },
+        ExportRecoveredString {
+            rva: 0x720,
+            byte_size: 18,
+            encoding: ExportStringEncoding::Utf16Le,
+            value: "Resolved".to_owned(),
+            attribution: attribution("utf16-string"),
+        },
+    ];
+    projection.data_references = vec![ExportDataReference {
+        caller_rva: 0x100,
+        instruction_rva: 0x10c,
+        instruction_size: 7,
+        target_rva: 0x700,
+        attribution: attribution("rip-relative-data"),
+    }];
     projection.warnings = vec![ProjectionWarning {
         code: ProjectionWarningCode::NameRewritten,
         subject: Some(ExportSubject::Function { rva: 0x100 }),
@@ -141,14 +167,39 @@ fn public_writer_renders_every_category_deterministically() {
 
     assert_eq!(first, second);
     assert!(first.starts_with("# ReSymbol Analysis Report\n"));
+    let section_positions = [
+        "## Binary identity",
+        "## Summary",
+        "## Functions",
+        "## Globals",
+        "## Types",
+        "## Strings",
+        "## Direct calls",
+        "## Data references",
+        "## Thunks",
+        "## Warnings",
+    ]
+    .map(|heading| first.find(heading).expect("fixed report section"));
+    assert!(
+        section_positions
+            .windows(2)
+            .all(|positions| positions[0] < positions[1])
+    );
     for expected in [
         "| Functions | 3 |",
+        "| Strings | 2 |",
+        "| Data references | 1 |",
         "| Warning groups | 1 |",
+        "| Encoding | RVA | Byte size | Value | Confidence | Source |",
+        "| Caller RVA | Instruction RVA | Instruction size | Target RVA | Confidence | Source |",
         r"ReSymbol::recover\_symbols → ReSymbol\_\_recover\_symbols",
         "aliases: ResolveSymbols",
         "struct SymbolRecord { unsigned long long rva; };",
         r"| 0x500 | 0x8 | g\_symbol\_count |",
         "| 0x100 | 0x108 | function 0x200 |",
+        "| ASCII | 0x700 | 15 | ReSymbol ready | 0.925 | core:resymbol-analysis@0.1.0; method=ascii-string; run=analysis-001 |",
+        "| UTF-16LE | 0x720 | 18 | Resolved | 0.925 | core:resymbol-analysis@0.1.0; method=utf16-string; run=analysis-001 |",
+        "| 0x100 | 0x10c | 7 | 0x700 | 0.925 | core:resymbol-analysis@0.1.0; method=rip-relative-data; run=analysis-001 |",
         "| 0x300 | import IAT 0x600 |",
         "name-rewritten",
         "function 0x100",
@@ -207,13 +258,26 @@ fn public_writer_escapes_hostile_markdown_and_raw_html() {
         .source
         .text = "<iframe>|_global_".to_owned();
     projection.types[0].key = "<details>|type".to_owned();
+    projection.strings[0].value = "<span>|*string*&entity;".to_owned();
+    projection.strings[0].byte_size =
+        u64::try_from(projection.strings[0].value.len() + 1).expect("short ASCII string size");
+    projection.strings[0].attribution.provenance.method = "<string-source>|*method*".to_owned();
+    projection.data_references[0].attribution.provenance.method =
+        "<reference-source>|*method*".to_owned();
     projection
         .validate()
         .expect("hostile text remains valid text");
 
     let report = render_markdown(&projection).expect("render escaped report");
 
-    for raw in ["<script>", "<img", "<svg", "<iframe>", "<details>"] {
+    for raw in [
+        "<script>",
+        "<img",
+        "<svg",
+        "<iframe>",
+        "<details>",
+        "<span>",
+    ] {
         assert!(!report.contains(raw), "raw markup leaked: {raw}");
     }
     for escaped in [
@@ -223,9 +287,34 @@ fn public_writer_escapes_hostile_markdown_and_raw_html() {
         "&lt;iframe&gt;\\|\\_global\\_",
         "&lt;details&gt;\\|type",
         "method=&lt;method&gt;\\|\\*entry\\*",
+        "&lt;span&gt;\\|\\*string\\*&amp;entity;",
+        "method=&lt;string-source&gt;\\|\\*method\\*",
+        "method=&lt;reference-source&gt;\\|\\*method\\*",
     ] {
         assert!(report.contains(escaped), "missing escaping: {escaped}");
     }
+}
+
+#[test]
+fn public_writer_truncates_recovered_string_values_with_an_explicit_marker() {
+    let mut projection = base_projection();
+    let value = "x".repeat(400);
+    projection.strings = vec![ExportRecoveredString {
+        rva: 0x700,
+        byte_size: 401,
+        encoding: ExportStringEncoding::Ascii,
+        value,
+        attribution: attribution("ascii-string"),
+    }];
+    projection
+        .validate()
+        .expect("long ASCII string remains projection-valid");
+
+    let report = render_markdown(&projection).expect("render truncated string cell");
+    let expected = format!("{}… \\[truncated\\]", "x".repeat(241));
+
+    assert!(report.contains(&expected));
+    assert!(!report.contains(&"x".repeat(257)));
 }
 
 #[test]

@@ -1,7 +1,7 @@
 use resymbol_analysis::{
     AnalysisError, AnalysisSession, BinaryAnalysis, ImportTarget, PeControlFlowTarget,
-    PeDirectCall, PeThunk, PluginRunRecord, PluginRunStatus, SessionValidationError, analyze_bytes,
-    analyze_pe,
+    PeDataReference, PeDirectCall, PeRecoveredString, PeStringEncoding, PeThunk, PluginRunRecord,
+    PluginRunStatus, SessionValidationError, analyze_bytes, analyze_pe,
 };
 use resymbol_core::{
     BinaryId, ClaimProducer, ClaimProvenance, Confidence, ControlFlowTarget, Evidence,
@@ -288,6 +288,15 @@ fn put_rel32_instruction_at_rtti_rva(bytes: &mut [u8], rva: u32, opcode: u8, tar
     bytes[offset + 1..offset + 5].copy_from_slice(&displacement.to_le_bytes());
 }
 
+fn put_lea_rip_relative_at_rtti_rva(bytes: &mut [u8], rva: u32, target_rva: u32) {
+    let next_rva = rva.checked_add(7).expect("fixture instruction end");
+    let displacement = i64::from(target_rva) - i64::from(next_rva);
+    let displacement = i32::try_from(displacement).expect("fixture RIP displacement");
+    let offset = rtti_file_offset(rva);
+    bytes[offset..offset + 3].copy_from_slice(&[0x48, 0x8d, 0x05]);
+    bytes[offset + 3..offset + 7].copy_from_slice(&displacement.to_le_bytes());
+}
+
 fn rtti_data_file_offset(rva: u32) -> usize {
     RTTI_DATA_RAW_OFFSET
         + usize::try_from(rva - RTTI_DATA_RVA).expect("fixture data RVA fits usize")
@@ -459,6 +468,23 @@ fn rtti_fixture_with_writable_type_descriptors() -> Vec<u8> {
     put_rtti_rva_u32(&mut bytes, 0x21ac, 0x3040);
     put_rtti_rva_u32(&mut bytes, 0x2220, 0x3000);
     put_rtti_rva_u32(&mut bytes, 0x2240, 0x3040);
+    bytes
+}
+
+fn string_and_data_reference_fixture() -> Vec<u8> {
+    let mut bytes = rtti_fixture();
+    put_lea_rip_relative_at_rtti_rva(&mut bytes, 0x1000, 0x2300);
+    put_lea_rip_relative_at_rtti_rva(&mut bytes, 0x1007, 0x2320);
+    bytes[rtti_file_offset(0x100e)] = 0xc3;
+    put_c_string(&mut bytes, rtti_file_offset(0x2300), "Recovered ASCII");
+
+    let utf16 = "Recovered 世界".encode_utf16().collect::<Vec<_>>();
+    let mut offset = rtti_file_offset(0x2320);
+    for unit in utf16 {
+        bytes[offset..offset + 2].copy_from_slice(&unit.to_le_bytes());
+        offset += 2;
+    }
+    bytes[offset..offset + 2].fill(0);
     bytes
 }
 
@@ -768,6 +794,163 @@ fn recovers_bounded_direct_calls_and_exact_jump_thunks() {
     let encoded = serde_json::to_string(&analysis).expect("serialize recovered control flow");
     let decoded = serde_json::from_str(&encoded).expect("deserialize recovered control flow");
     assert_eq!(analysis, decoded);
+}
+
+#[test]
+fn recovers_bounded_strings_and_exact_rip_relative_data_references() {
+    let analysis = analyze_pe(&string_and_data_reference_fixture())
+        .expect("valid PE with recoverable strings and data references");
+
+    assert!(!analysis.string_recovery_scan_truncated);
+    assert!(!analysis.data_reference_scan_truncated);
+    let selected_strings = analysis
+        .strings
+        .iter()
+        .filter(|value| matches!(value.rva, 0x2300 | 0x2320))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        selected_strings,
+        [
+            PeRecoveredString {
+                rva: 0x2300,
+                byte_size: 16,
+                encoding: PeStringEncoding::Ascii,
+                value: "Recovered ASCII".to_owned(),
+            },
+            PeRecoveredString {
+                rva: 0x2320,
+                byte_size: 26,
+                encoding: PeStringEncoding::Utf16Le,
+                value: "Recovered 世界".to_owned(),
+            },
+        ]
+    );
+    assert_eq!(
+        analysis.data_references,
+        [
+            PeDataReference {
+                caller_rva: 0x1000,
+                instruction_rva: 0x1000,
+                instruction_size: 7,
+                target_rva: 0x2300,
+            },
+            PeDataReference {
+                caller_rva: 0x1000,
+                instruction_rva: 0x1007,
+                instruction_size: 7,
+                target_rva: 0x2320,
+            },
+        ]
+    );
+
+    let ascii_claim = analysis
+        .symbol_graph
+        .claims()
+        .iter()
+        .find(|claim| {
+            matches!(
+                (claim.subject(), claim.assertion()),
+                (
+                    SymbolSubject::Global {
+                        rva: 0x2300,
+                        size: Some(16),
+                        ..
+                    },
+                    SymbolAssertion::StringLiteral {
+                        encoding: resymbol_core::StringEncoding::Ascii,
+                        value,
+                    },
+                ) if value == "Recovered ASCII"
+            )
+        })
+        .expect("ASCII string claim");
+    assert_eq!(ascii_claim.confidence().get(), 0.90);
+    assert_eq!(
+        ascii_claim.evidence()[0].kind.as_str(),
+        EvidenceKind::STRING_LITERAL
+    );
+    assert_eq!(ascii_claim.provenance().method, "pe-string-recovery");
+
+    let data_claim = analysis
+        .symbol_graph
+        .claims()
+        .iter()
+        .find(|claim| {
+            matches!(
+                (claim.subject(), claim.assertion()),
+                (
+                    SymbolSubject::Function { rva: 0x1000, .. },
+                    SymbolAssertion::DataReference {
+                        instruction_rva: 0x1007,
+                        instruction_size: 7,
+                        target_rva: 0x2320,
+                    },
+                )
+            )
+        })
+        .expect("RIP-relative data-reference claim");
+    assert_eq!(data_claim.confidence().get(), 0.90);
+    assert_eq!(
+        data_claim.evidence()[0].kind.as_str(),
+        EvidenceKind::DATA_FLOW
+    );
+    assert_eq!(data_claim.provenance().method, "pe-x64-data-reference");
+
+    assert_eq!(
+        analysis
+            .rebuild_symbol_graph()
+            .expect("rebuild string and data-reference graph"),
+        analysis.symbol_graph
+    );
+    let encoded = serde_json::to_string(&analysis).expect("serialize recovered analysis");
+    let decoded = serde_json::from_str(&encoded).expect("deserialize recovered analysis");
+    assert_eq!(analysis, decoded);
+}
+
+#[test]
+fn validated_deserialization_rejects_tampered_string_and_data_recovery() {
+    let analysis = analyze_pe(&string_and_data_reference_fixture())
+        .expect("valid PE with strings and data references");
+    let original = serde_json::to_value(analysis).expect("serialize recovered analysis");
+
+    let explicit_string_index = original["strings"]
+        .as_array()
+        .expect("string array")
+        .iter()
+        .position(|value| value["rva"] == serde_json::json!(0x2300))
+        .expect("explicit string record");
+    let mut wrong_string_size = original.clone();
+    wrong_string_size["strings"][explicit_string_index]["byte_size"] = serde_json::json!(15);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(wrong_string_size)
+        .expect_err("persisted encoded string size must be exact");
+    assert!(error.to_string().contains("encoded content plus NUL"));
+
+    let mut executable_string = original.clone();
+    let mut executable_record = executable_string["strings"][explicit_string_index].clone();
+    executable_record["rva"] = serde_json::json!(0x1000);
+    executable_string["strings"] = serde_json::Value::Array(vec![executable_record]);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(executable_string)
+        .expect_err("persisted strings must remain in eligible data");
+    assert!(error.to_string().contains("recovered string range"));
+
+    let mut bad_instruction_size = original.clone();
+    bad_instruction_size["data_references"][0]["instruction_size"] = serde_json::json!(0);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(bad_instruction_size)
+        .expect_err("persisted data-reference instruction size must be valid");
+    assert!(error.to_string().contains("instruction size"));
+
+    let mut executable_target = original.clone();
+    executable_target["data_references"][0]["target_rva"] = serde_json::json!(0x1000);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(executable_target)
+        .expect_err("persisted data-reference targets must remain in eligible data");
+    assert!(error.to_string().contains("data-reference target"));
+
+    let mut stale_graph = original;
+    stale_graph["data_references"][0]["target_rva"] = serde_json::json!(0x2310);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(stale_graph)
+        .expect_err("persisted data references and graph claims must agree");
+    assert!(error.to_string().contains("symbol graph"));
 }
 
 #[test]
@@ -1611,14 +1794,20 @@ fn classifies_non_executable_exports_as_globals() {
     put_u32(&mut bytes, SECTION_OFFSET + 36, 0x4000_0040);
 
     let analysis = analyze_pe(&bytes).expect("valid data export");
-    assert_eq!(analysis.symbol_graph.claims().len(), 2);
-    assert!(
-        analysis
-            .symbol_graph
-            .claims()
-            .iter()
-            .all(|claim| matches!(claim.subject(), SymbolSubject::Global { rva: 0x1000, .. }))
-    );
+    let export_name_claims = analysis
+        .symbol_graph
+        .claims()
+        .iter()
+        .filter(|claim| claim.provenance().method == "pe-export-directory")
+        .collect::<Vec<_>>();
+    assert_eq!(export_name_claims.len(), 2);
+    assert!(export_name_claims.iter().all(|claim| matches!(
+        (claim.subject(), claim.assertion()),
+        (
+            SymbolSubject::Global { rva: 0x1000, .. },
+            SymbolAssertion::Name { .. },
+        )
+    )));
 }
 
 #[test]
@@ -1747,6 +1936,124 @@ fn analysis_session_round_trips_and_combines_without_mutating_the_base_graph() {
     let json = serde_json::to_string(&session).expect("serialize session");
     let decoded: AnalysisSession = serde_json::from_str(&json).expect("deserialize session");
     assert_eq!(decoded, session);
+}
+
+#[test]
+fn session_enforces_pe_section_policy_for_plugin_strings_and_data_references() {
+    let base_analysis = analyze_bytes(&string_and_data_reference_fixture())
+        .expect("valid PE with eligible code and data");
+    let binary = base_analysis.identity().id.clone();
+    let producer = || ClaimProducer::Plugin {
+        id: plugin_id(),
+        version: "1.2.3".to_owned(),
+    };
+    let string_claim = plugin_claim(
+        SymbolSubject::Global {
+            binary: binary.clone(),
+            rva: 0x2300,
+            size: Some(16),
+        },
+        SymbolAssertion::StringLiteral {
+            encoding: resymbol_core::StringEncoding::Ascii,
+            value: "Recovered ASCII".to_owned(),
+        },
+        producer(),
+        Some("run-001"),
+    );
+    let reference_claim = plugin_claim(
+        SymbolSubject::Function {
+            binary: binary.clone(),
+            rva: 0x1000,
+            size: Some(0x10),
+        },
+        SymbolAssertion::DataReference {
+            instruction_rva: 0x1000,
+            instruction_size: 7,
+            target_rva: 0x2300,
+        },
+        producer(),
+        Some("run-001"),
+    );
+    AnalysisSession::new(
+        base_analysis.clone(),
+        vec![plugin_run(PluginRunStatus::Succeeded, 2)],
+        vec![string_claim, reference_claim],
+    )
+    .expect("eligible plugin string and data reference are accepted");
+
+    let executable_string = plugin_claim(
+        SymbolSubject::Global {
+            binary: binary.clone(),
+            rva: 0x1000,
+            size: Some(16),
+        },
+        SymbolAssertion::StringLiteral {
+            encoding: resymbol_core::StringEncoding::Ascii,
+            value: "Recovered ASCII".to_owned(),
+        },
+        producer(),
+        Some("run-001"),
+    );
+    let error = AnalysisSession::new(
+        base_analysis.clone(),
+        vec![plugin_run(PluginRunStatus::Succeeded, 1)],
+        vec![executable_string],
+    )
+    .expect_err("plugin strings must remain in eligible PE data");
+    assert!(matches!(
+        error,
+        SessionValidationError::StringLiteralUnsupportedSection { index: 0 }
+    ));
+
+    let executable_target = plugin_claim(
+        SymbolSubject::Function {
+            binary: binary.clone(),
+            rva: 0x1000,
+            size: Some(0x10),
+        },
+        SymbolAssertion::DataReference {
+            instruction_rva: 0x1000,
+            instruction_size: 7,
+            target_rva: 0x1000,
+        },
+        producer(),
+        Some("run-001"),
+    );
+    let error = AnalysisSession::new(
+        base_analysis.clone(),
+        vec![plugin_run(PluginRunStatus::Succeeded, 1)],
+        vec![executable_target],
+    )
+    .expect_err("plugin data-reference targets must remain in eligible PE data");
+    assert!(matches!(
+        error,
+        SessionValidationError::DataReferenceTargetNotData { index: 0 }
+    ));
+
+    let data_source = plugin_claim(
+        SymbolSubject::Function {
+            binary,
+            rva: 0x2300,
+            size: Some(0x20),
+        },
+        SymbolAssertion::DataReference {
+            instruction_rva: 0x2300,
+            instruction_size: 7,
+            target_rva: 0x2320,
+        },
+        producer(),
+        Some("run-001"),
+    );
+    let error = AnalysisSession::new(
+        base_analysis,
+        vec![plugin_run(PluginRunStatus::Succeeded, 1)],
+        vec![data_source],
+    )
+    .expect_err("plugin data-reference instructions must remain in executable PE data");
+    assert!(matches!(
+        error,
+        SessionValidationError::DataReferenceSourceNotExecutable { index: 0 }
+    ));
 }
 
 #[test]

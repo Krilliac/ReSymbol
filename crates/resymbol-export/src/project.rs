@@ -7,7 +7,7 @@ use std::{
 use resymbol_analysis::{AnalysisSession, BinaryAnalysis};
 use resymbol_core::{
     BinaryFormat, BinaryIdentity, ClaimProducer, ClaimProvenance, ControlFlowTarget,
-    SymbolAssertion, SymbolClaim, SymbolGraph, SymbolSubject,
+    StringEncoding, SymbolAssertion, SymbolClaim, SymbolGraph, SymbolSubject,
 };
 
 use crate::{
@@ -18,8 +18,10 @@ use crate::{
     MAX_OUTPUT_NAME_BYTES, MAX_THUNKS, MAX_TYPE_KEY_BYTES, ProjectionWarning,
     ProjectionWarningCode,
     model::{
-        MAX_ARCHITECTURE_BYTES, MAX_CLAIMS, MAX_DECLARATIONS_PER_ENTITY, MAX_ENTITIES,
-        MAX_NAMES_PER_ENTITY, MAX_WARNINGS, candidate_order, producer_authority, require_text,
+        ExportDataReference, ExportRecoveredString, ExportStringEncoding, MAX_ARCHITECTURE_BYTES,
+        MAX_CLAIMS, MAX_DATA_REFERENCES, MAX_DECLARATIONS_PER_ENTITY, MAX_ENTITIES,
+        MAX_NAMES_PER_ENTITY, MAX_RECOVERED_STRING_BYTES, MAX_RECOVERED_STRINGS, MAX_WARNINGS,
+        candidate_order, producer_authority, require_text,
     },
 };
 
@@ -35,6 +37,7 @@ struct AddressAccumulator<'claims> {
 
 type DirectCallKey = (u64, u64, ExportControlFlowTarget);
 type ThunkValue = (ExportControlFlowTarget, ExportAttribution);
+type DataReferenceKey = (u64, u64);
 
 #[derive(Debug, Default)]
 struct TypeAccumulator {
@@ -165,6 +168,8 @@ impl ExportProjection {
         let mut types = BTreeMap::<String, TypeAccumulator>::new();
         let mut direct_calls = BTreeMap::<DirectCallKey, ExportAttribution>::new();
         let mut thunks = BTreeMap::<u64, ThunkValue>::new();
+        let mut strings = BTreeMap::<u64, ExportRecoveredString>::new();
+        let mut data_references = BTreeMap::<DataReferenceKey, ExportDataReference>::new();
         let mut entity_count = 0_usize;
         let mut warnings = WarningAccumulator::new();
 
@@ -177,6 +182,8 @@ impl ExportProjection {
                 &mut types,
                 &mut direct_calls,
                 &mut thunks,
+                &mut strings,
+                &mut data_references,
                 &mut entity_count,
                 &mut warnings,
             )?;
@@ -219,6 +226,8 @@ impl ExportProjection {
                 attribution,
             })
             .collect::<Vec<_>>();
+        let strings = select_non_overlapping_strings(strings.into_values().collect());
+        let data_references = data_references.into_values().collect::<Vec<_>>();
 
         remove_overlapping_function_sizes(&mut functions, &mut warnings)?;
         functions.retain(|value| {
@@ -241,6 +250,8 @@ impl ExportProjection {
             types,
             direct_calls,
             thunks,
+            strings,
+            data_references,
             warnings: warnings.finish(),
         };
         projection.validate()?;
@@ -257,6 +268,8 @@ fn project_claim<'claims>(
     types: &mut BTreeMap<String, TypeAccumulator>,
     direct_calls: &mut BTreeMap<DirectCallKey, ExportAttribution>,
     thunks: &mut BTreeMap<u64, ThunkValue>,
+    strings: &mut BTreeMap<u64, ExportRecoveredString>,
+    data_references: &mut BTreeMap<DataReferenceKey, ExportDataReference>,
     entity_count: &mut usize,
     warnings: &mut WarningAccumulator,
 ) -> Result<(), ExportError> {
@@ -312,6 +325,24 @@ fn project_claim<'claims>(
                     function_subject,
                     warnings,
                 ),
+                SymbolAssertion::DataReference {
+                    instruction_rva,
+                    instruction_size,
+                    target_rva,
+                } => project_data_reference(
+                    functions,
+                    data_references,
+                    *rva,
+                    *size,
+                    *instruction_rva,
+                    *instruction_size,
+                    *target_rva,
+                    attribution,
+                    image_size,
+                    entity_count,
+                    function_subject,
+                    warnings,
+                ),
                 _ => {
                     let value = address_entry(functions, *rva, entity_count)?;
                     let represented = project_address_assertion(
@@ -334,6 +365,19 @@ fn project_claim<'claims>(
             if !valid_range(*rva, *size, image_size) {
                 warnings.add(ProjectionWarningCode::AddressOutsideImage, subject)?;
                 return Ok(());
+            }
+            if let SymbolAssertion::StringLiteral { encoding, value } = claim.assertion() {
+                return project_recovered_string(
+                    strings,
+                    *rva,
+                    *size,
+                    *encoding,
+                    value,
+                    attribution,
+                    image_size,
+                    ExportSubject::Global { rva: *rva },
+                    warnings,
+                );
             }
             let value = address_entry(globals, *rva, entity_count)?;
             let _ = project_address_assertion(
@@ -470,6 +514,129 @@ fn project_thunk(
     insert_thunk(thunks, rva, target, attribution)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn project_data_reference(
+    functions: &mut BTreeMap<u64, AddressAccumulator<'_>>,
+    data_references: &mut BTreeMap<DataReferenceKey, ExportDataReference>,
+    caller_rva: u64,
+    subject_size: Option<u64>,
+    instruction_rva: u64,
+    instruction_size: u8,
+    target_rva: u64,
+    attribution: ExportAttribution,
+    image_size: u64,
+    entity_count: &mut usize,
+    subject: ExportSubject,
+    warnings: &mut WarningAccumulator,
+) -> Result<(), ExportError> {
+    if !(1..=15).contains(&instruction_size)
+        || !valid_range(
+            instruction_rva,
+            Some(u64::from(instruction_size)),
+            image_size,
+        )
+        || !valid_range(target_rva, None, image_size)
+    {
+        warnings.add(ProjectionWarningCode::AddressOutsideImage, Some(subject))?;
+        return Ok(());
+    }
+    let instruction_end = instruction_rva
+        .checked_add(u64::from(instruction_size))
+        .expect("validated instruction range cannot overflow");
+    let site_outside_caller = instruction_rva < caller_rva
+        || subject_size.is_some_and(|size| {
+            caller_rva
+                .checked_add(size)
+                .is_none_or(|caller_end| instruction_end > caller_end)
+        });
+    if site_outside_caller {
+        warnings.add(
+            ProjectionWarningCode::AssertionSubjectMismatch,
+            Some(subject),
+        )?;
+        return Ok(());
+    }
+
+    let caller = address_entry(functions, caller_rva, entity_count)?;
+    insert_entry_attribution(&mut caller.entry_attribution, attribution.clone());
+    if let Some(size) = subject_size {
+        insert_size(&mut caller.sizes, size, attribution.clone());
+    }
+    insert_data_reference(
+        data_references,
+        ExportDataReference {
+            caller_rva,
+            instruction_rva,
+            instruction_size,
+            target_rva,
+            attribution,
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn project_recovered_string(
+    strings: &mut BTreeMap<u64, ExportRecoveredString>,
+    rva: u64,
+    subject_size: Option<u64>,
+    encoding: StringEncoding,
+    value: &str,
+    attribution: ExportAttribution,
+    image_size: u64,
+    subject: ExportSubject,
+    warnings: &mut WarningAccumulator,
+) -> Result<(), ExportError> {
+    let Some((encoding, byte_size)) = export_string_shape(encoding, value) else {
+        warnings.add(ProjectionWarningCode::UnsupportedAssertion, Some(subject))?;
+        return Ok(());
+    };
+    if value.len() > MAX_RECOVERED_STRING_BYTES
+        || usize::try_from(byte_size).map_or(true, |size| size > MAX_RECOVERED_STRING_BYTES)
+    {
+        warnings.add(ProjectionWarningCode::TextLimitExceeded, Some(subject))?;
+        return Ok(());
+    }
+    if subject_size != Some(byte_size) {
+        warnings.add(
+            ProjectionWarningCode::AssertionSubjectMismatch,
+            Some(subject),
+        )?;
+        return Ok(());
+    }
+    if !valid_range(rva, Some(byte_size), image_size) {
+        warnings.add(ProjectionWarningCode::AddressOutsideImage, Some(subject))?;
+        return Ok(());
+    }
+    insert_recovered_string(
+        strings,
+        ExportRecoveredString {
+            rva,
+            byte_size,
+            encoding,
+            value: value.to_owned(),
+            attribution,
+        },
+    )
+}
+
+fn export_string_shape(
+    encoding: StringEncoding,
+    value: &str,
+) -> Option<(ExportStringEncoding, u64)> {
+    match encoding {
+        StringEncoding::Ascii => u64::try_from(value.len())
+            .ok()?
+            .checked_add(1)
+            .map(|size| (ExportStringEncoding::Ascii, size)),
+        StringEncoding::Utf16Le => u64::try_from(value.encode_utf16().count())
+            .ok()?
+            .checked_mul(2)?
+            .checked_add(2)
+            .map(|size| (ExportStringEncoding::Utf16Le, size)),
+        _ => None,
+    }
+}
+
 fn export_control_flow_target(target: &ControlFlowTarget) -> Option<ExportControlFlowTarget> {
     match target {
         ControlFlowTarget::Function { rva } => {
@@ -566,6 +733,8 @@ fn project_address_assertion<'claims>(
         | SymbolAssertion::FunctionEntry
         | SymbolAssertion::DirectCall { .. }
         | SymbolAssertion::ThunkTarget { .. }
+        | SymbolAssertion::StringLiteral { .. }
+        | SymbolAssertion::DataReference { .. }
         | SymbolAssertion::TypeDefinition { .. } => {
             warnings.add(
                 ProjectionWarningCode::AssertionSubjectMismatch,
@@ -618,7 +787,9 @@ fn project_type_assertion(
         | SymbolAssertion::ClassMembership { .. }
         | SymbolAssertion::FunctionEntry
         | SymbolAssertion::DirectCall { .. }
-        | SymbolAssertion::ThunkTarget { .. } => warnings.add(
+        | SymbolAssertion::ThunkTarget { .. }
+        | SymbolAssertion::StringLiteral { .. }
+        | SymbolAssertion::DataReference { .. } => warnings.add(
             ProjectionWarningCode::AssertionSubjectMismatch,
             Some(subject),
         ),
@@ -780,6 +951,87 @@ fn insert_thunk(
     }
     values.insert(rva, (target, attribution));
     Ok(())
+}
+
+fn insert_recovered_string(
+    values: &mut BTreeMap<u64, ExportRecoveredString>,
+    candidate: ExportRecoveredString,
+) -> Result<(), ExportError> {
+    if let Some(current) = values.get_mut(&candidate.rva) {
+        let candidate_order = attribution_order(&candidate.attribution, &current.attribution)
+            .then_with(|| candidate.encoding.cmp(&current.encoding))
+            .then_with(|| candidate.value.cmp(&current.value))
+            .then_with(|| candidate.byte_size.cmp(&current.byte_size));
+        if candidate_order.is_lt() {
+            *current = candidate;
+        }
+        return Ok(());
+    }
+    if values.len() == MAX_RECOVERED_STRINGS {
+        return Err(ExportError::LimitExceeded {
+            resource: "recovered string",
+            limit: MAX_RECOVERED_STRINGS,
+        });
+    }
+    values.insert(candidate.rva, candidate);
+    Ok(())
+}
+
+fn insert_data_reference(
+    values: &mut BTreeMap<DataReferenceKey, ExportDataReference>,
+    candidate: ExportDataReference,
+) -> Result<(), ExportError> {
+    let key = (candidate.caller_rva, candidate.instruction_rva);
+    if let Some(current) = values.get_mut(&key) {
+        let candidate_order = attribution_order(&candidate.attribution, &current.attribution)
+            .then_with(|| candidate.instruction_size.cmp(&current.instruction_size))
+            .then_with(|| candidate.target_rva.cmp(&current.target_rva));
+        if candidate_order.is_lt() {
+            *current = candidate;
+        }
+        return Ok(());
+    }
+    if values.len() == MAX_DATA_REFERENCES {
+        return Err(ExportError::LimitExceeded {
+            resource: "data reference",
+            limit: MAX_DATA_REFERENCES,
+        });
+    }
+    values.insert(key, candidate);
+    Ok(())
+}
+
+fn select_non_overlapping_strings(
+    mut candidates: Vec<ExportRecoveredString>,
+) -> Vec<ExportRecoveredString> {
+    candidates.sort_by(|left, right| {
+        attribution_order(&left.attribution, &right.attribution)
+            .then_with(|| left.rva.cmp(&right.rva))
+            .then_with(|| left.byte_size.cmp(&right.byte_size))
+            .then_with(|| left.encoding.cmp(&right.encoding))
+            .then_with(|| left.value.cmp(&right.value))
+    });
+    let mut retained = BTreeMap::<u64, (u64, ExportRecoveredString)>::new();
+    for candidate in candidates {
+        let Some(end) = candidate.rva.checked_add(candidate.byte_size) else {
+            continue;
+        };
+        let overlaps_previous = retained
+            .range(..=candidate.rva)
+            .next_back()
+            .is_some_and(|(_, (retained_end, _))| *retained_end > candidate.rva);
+        let overlaps_next = retained
+            .range(candidate.rva..)
+            .next()
+            .is_some_and(|(retained_rva, _)| *retained_rva < end);
+        if !overlaps_previous && !overlaps_next {
+            retained.insert(candidate.rva, (end, candidate));
+        }
+    }
+    retained
+        .into_values()
+        .map(|(_, candidate)| candidate)
+        .collect()
 }
 
 fn finish_function(

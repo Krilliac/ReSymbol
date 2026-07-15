@@ -3,6 +3,8 @@ use std::{
     io::{self, Write},
 };
 
+#[cfg(test)]
+use resymbol_core::StringEncoding;
 use resymbol_core::{
     ClaimProducer, ClaimProvenance, Confidence, Evidence, EvidenceKind, SymbolAssertion,
     SymbolClaim, SymbolSubject,
@@ -918,5 +920,181 @@ mod tests {
                 target: resymbol_core::ControlFlowTarget::Function { rva: 12288 },
             }
         ));
+    }
+
+    #[test]
+    fn string_and_data_reference_claims_use_the_published_wire_shapes() {
+        let version = protocol_version();
+        assert_eq!((version.major, version.minor), (1, 0));
+
+        let string_payload = serde_json::json!({
+            "subject": {
+                "kind": "global",
+                "binary": "0000000000000000000000000000000000000000000000000000000000000000",
+                "rva": 12288,
+                "size": 26
+            },
+            "claim": {
+                "kind": "string-literal",
+                "encoding": "utf-16-le",
+                "value": "Recovered 世界"
+            },
+            "confidence": 0.95,
+            "evidence": [{
+                "kind": "string-literal",
+                "description": "decoded terminated UTF-16LE bytes"
+            }]
+        });
+        let string_claim = parse_claim(
+            string_payload,
+            &manifest(),
+            &request(),
+            1,
+            &ProcessDiagnostics::default(),
+        )
+        .expect("published string-literal wire shape");
+        assert!(matches!(
+            string_claim.assertion(),
+            SymbolAssertion::StringLiteral {
+                encoding: StringEncoding::Utf16Le,
+                value,
+            } if value == "Recovered 世界"
+        ));
+        assert_eq!(
+            string_claim.evidence()[0].kind.as_str(),
+            EvidenceKind::STRING_LITERAL
+        );
+
+        let reference_payload = serde_json::json!({
+            "subject": {
+                "kind": "function",
+                "binary": "0000000000000000000000000000000000000000000000000000000000000000",
+                "rva": 4096
+            },
+            "claim": {
+                "kind": "data-reference",
+                "instruction_rva": 4104,
+                "instruction_size": 7,
+                "target_rva": 12288
+            },
+            "confidence": 0.9,
+            "evidence": [{
+                "kind": "data-flow",
+                "description": "decoded image-relative operand"
+            }]
+        });
+        let reference_claim = parse_claim(
+            reference_payload,
+            &manifest(),
+            &request(),
+            2,
+            &ProcessDiagnostics::default(),
+        )
+        .expect("published data-reference wire shape");
+        assert!(matches!(
+            reference_claim.assertion(),
+            SymbolAssertion::DataReference {
+                instruction_rva: 4104,
+                instruction_size: 7,
+                target_rva: 12288,
+            }
+        ));
+    }
+
+    #[test]
+    fn string_and_data_reference_wire_shapes_reject_unknown_fields() {
+        let subject = serde_json::json!({
+                "kind": "global",
+                "binary": "0000000000000000000000000000000000000000000000000000000000000000",
+                "rva": 12288,
+                "size": 26
+        });
+        let evidence = serde_json::json!([{
+            "kind": "string-literal",
+            "description": "decoded bytes"
+        }]);
+        for claim in [
+            serde_json::json!({
+                "kind": "string-literal",
+                "encoding": "ascii",
+                "value": "text",
+                "unexpected": true
+            }),
+            serde_json::json!({
+                "kind": "data-reference",
+                "instruction_rva": 4104,
+                "instruction_size": 7,
+                "target_rva": 12288,
+                "unexpected": true
+            }),
+        ] {
+            let error = serde_json::from_value::<WireClaim>(serde_json::json!({
+                "subject": subject,
+                "claim": claim,
+                "confidence": 0.8,
+                "evidence": evidence
+            }))
+            .expect_err("unknown assertion property must fail");
+            assert!(error.to_string().contains("unknown field `unexpected`"));
+        }
+
+        let error = serde_json::from_value::<WireClaim>(serde_json::json!({
+            "subject": subject,
+            "claim": {
+                "kind": "string-literal",
+                "encoding": "utf16-le",
+                "value": "text"
+            },
+            "confidence": 0.8,
+            "evidence": evidence
+        }))
+        .expect_err("non-canonical encoding must fail");
+        assert!(error.to_string().contains("unknown variant `utf16-le`"));
+    }
+
+    #[test]
+    fn checked_in_schema_lists_the_additive_claim_shapes() {
+        let schema: Value =
+            serde_json::from_str(include_str!("../../../protocol/plugin-wire.schema.json"))
+                .expect("plugin wire schema is valid JSON");
+        assert_eq!(
+            schema["$defs"]["protocolVersion"]["properties"]["major"]["const"],
+            serde_json::json!(PROTOCOL_MAJOR)
+        );
+        assert_eq!(
+            schema["$defs"]["protocolVersion"]["properties"]["minor"]["const"],
+            serde_json::json!(PROTOCOL_MINOR)
+        );
+        assert_eq!(
+            schema["$defs"]["stringEncoding"]["enum"],
+            serde_json::json!(["ascii", "utf-16-le"])
+        );
+        let assertions = schema["$defs"]["symbolAssertion"]["oneOf"]
+            .as_array()
+            .expect("assertion variants");
+        for kind in ["string-literal", "data-reference"] {
+            assert!(assertions.iter().any(|assertion| {
+                assertion["properties"]["kind"]["const"] == serde_json::json!(kind)
+            }));
+        }
+        let data_reference = assertions
+            .iter()
+            .find(|assertion| assertion["properties"]["kind"]["const"] == "data-reference")
+            .expect("data-reference assertion schema");
+        assert!(
+            data_reference["required"]
+                .as_array()
+                .expect("required data-reference fields")
+                .iter()
+                .any(|field| field == "instruction_size")
+        );
+        assert_eq!(
+            data_reference["properties"]["instruction_size"]["minimum"],
+            1
+        );
+        assert_eq!(
+            data_reference["properties"]["instruction_size"]["maximum"],
+            255
+        );
     }
 }
