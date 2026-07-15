@@ -14,7 +14,9 @@ IDA, Ghidra, debuggers, PDB consumers, and DWARF consumers.
 > [!IMPORTANT]
 > ReSymbol is an early alpha. The PE analyzer and `.resym` format are usable but intentionally
 > narrow. The first external-process plugin runtime is also usable, but it is not an OS sandbox.
-> Plugin and data formats may change, and debugger/PDB export is not implemented yet.
+> The initial JSON, IDAPython, and Ghidra Java exporters are usable but deliberately conservative.
+> Plugin and data formats may change; PDB, MAP, DWARF, and interactive debugger bridges are not
+> implemented yet.
 
 ## What exists today
 
@@ -29,6 +31,9 @@ The current alpha implements and tests an end-to-end, deliberately narrow analys
   graph;
 - `resymbol analyze`, which writes a portable package, and `resymbol inspect`, which validates and
   summarizes a package or emits its JSON representation;
+- a deterministic, debugger-neutral export projection plus `resymbol export`, which writes the
+  projection as JSON or generates self-contained IDAPython and Ghidra Java import scripts with
+  exact-binary identity gates and RVA-aware rebasing;
 - versioned plugin manifests and health diagnostics for WASM, native, managed, external-process,
   and tool-adapter runtime families;
 - local plugin-directory discovery, manifest and entrypoint validation, API compatibility checks,
@@ -46,7 +51,8 @@ The analyzer does not disassemble or execute its input, and it does not yet infe
 names, recover types, analyze RTTI/vtables, or build call graphs. The current process host supports
 one-shot analysis requests; interactive binary reads are reserved for a later protocol revision.
 Plugin package verification/extraction, WASM/native/managed execution hosts, cross-build matching,
-semantic inference, debugger bridges, and PDB/DWARF export are also **not implemented yet**.
+semantic inference, interactive debugger bridges, and PDB/MAP/DWARF export are also **not
+implemented yet**.
 
 ## Why ReSymbol?
 
@@ -76,16 +82,20 @@ ReSymbol is growing from the working PE/package foundation toward:
 - cross-build, signature, source, and library matching;
 - optional semantic inference that remains separate from deterministic facts;
 - richer portable symbol packages that can be shared without redistributing the analyzed binary;
-- exporters and bridges for IDA, Ghidra, PDB, DWARF, and other debugging formats;
+- conservative standalone import-script exporters for IDA and Ghidra, followed by richer bridges
+  and PDB, MAP, DWARF, and other debugging formats;
+- a desktop workbench GUI for reviewing evidence and conflicts before applying results, with its
+  approved layout and themes currently documented as design rather than implemented behavior;
 - drop-in plugin discovery from a local `plugins/` directory;
 - WASM, native C/C++, managed/.NET, external-process, and debugger-hosted plugin families from the
   initial architecture, with external-process execution implemented first; and
 - automatic plugin validation, disablement, bounded execution, and quarantine so a faulty
   extension does not prevent the core application from starting.
 
-See the [analysis-package format](docs/analysis-packages.md),
-[architecture](docs/architecture.md), [plugin-system design](docs/plugin-system.md), and
-[roadmap](docs/roadmap.md) for the implemented boundaries and the remaining goals.
+See the [analysis-package format](docs/analysis-packages.md), [export guide](docs/exporting.md),
+[architecture](docs/architecture.md), [plugin-system design](docs/plugin-system.md),
+[GUI design](docs/gui-design.md), and [roadmap](docs/roadmap.md) for the implemented boundaries and
+the remaining goals.
 
 ## Product principles
 
@@ -111,6 +121,9 @@ Analyze a supported PE file and inspect the validated package:
 resymbol analyze application.exe
 resymbol inspect application.resym
 resymbol inspect application.resym --json
+resymbol export application.resym --format json
+resymbol export application.resym --format ida-python
+resymbol export application.resym --format ghidra-java
 resymbol plugin list
 resymbol plugin doctor
 # After reviewing a dropped-in process plugin:
@@ -121,9 +134,15 @@ resymbol analyze application.exe --plugin community.example-analyzer
 `analyze` writes `application.resym` by default. Use `--output another.resym` to choose a different
 path. ReSymbol refuses to replace an existing package, so an earlier analysis cannot be lost by
 accident. `inspect` validates the package schema, payload, and embedded binary identity before
-displaying it.
+displaying it. `export` also uses create-new writes; use `--output` to choose a destination instead
+of replacing an existing projection or script.
 
-PDB, DWARF, IDA, and Ghidra exports remain roadmap work; there is no `export` command yet. See the
+The generated IDA and Ghidra scripts verify the exact loaded binary SHA-256 before changing a
+database and calculate addresses from the tool's current image base plus each RVA. They preserve
+existing user-authored names and apply only the first projection subset: selected function/global
+names and conservative non-overlapping function boundaries. See the
+[export guide](docs/exporting.md) for usage, limitations, and in-tool instructions. PDB, MAP,
+DWARF, richer type application, and interactive preview bridges remain roadmap work. See the
 [installation guide](docs/install.md) for portable prerelease archives and source-build steps.
 
 A normal plugin installation is dropping a prebuilt plugin directory into `plugins/`. ReSymbol

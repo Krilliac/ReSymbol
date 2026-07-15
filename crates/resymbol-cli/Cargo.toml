@@ -17,6 +17,7 @@ anyhow = "1.0.98"
 clap = { version = "4.5.40", features = ["derive"] }
 resymbol-analysis = { path = "../resymbol-analysis" }
 resymbol-core = { path = "../resymbol-core" }
+resymbol-export = { path = "../resymbol-export" }
 resymbol-package = { path = "../resymbol-package" }
 resymbol-plugin-runtime = { path = "../resymbol-plugin-runtime" }
 resymbol-plugin-state = { path = "../resymbol-plugin-state" }

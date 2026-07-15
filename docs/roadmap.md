@@ -20,6 +20,14 @@ quarantine the exact fingerprint without blocking base analysis or package creat
 separation is not an OS sandbox, and interactive binary reads remain reserved rather than
 implemented.
 
+The first export checkpoint is implemented as a validated, debugger-neutral projection with
+deterministic JSON output and standalone IDAPython and Ghidra Java import scripts. The scripts bind
+to the exact loaded binary SHA-256, resolve addresses as loaded image base plus RVA, preserve
+user-authored names and existing function bodies, and continue past per-symbol application errors.
+They are deliberately narrower than the planned interactive debugger bridges: prototypes, types,
+alternate names, provenance comments, and richer relationships are retained or diagnosed by the
+projection but are not yet fully applied inside the tools.
+
 The remaining Milestone 2 work is deliberately substantial: disassembly-assisted candidate
 discovery, strings and references, call relationships and thunks, MSVC RTTI/vtables, an open fixture
 corpus, reports, benchmarks, and continued malformed-input/resource-limit validation. The WASM,
@@ -80,13 +88,13 @@ adversarial obfuscation.
 - Strings, constants, references, call relationships, and thunks
 - Initial MSVC RTTI and vtable analysis
 - Portable `.resym` analysis package
-- Deterministic JSON/report export
+- Deterministic, loss-aware JSON symbol projection
 - Reproducible open-source fixture corpus compiled with and without symbols
 - Boundary, coverage, malformed-input, and resource-limit benchmarks
 
-The PE metadata, x64 exception ingestion, portable package, canonical JSON encoding, and CLI
-portions are implemented. Human-readable reports and the other bullets describe the remainder of
-this milestone.
+The PE metadata, x64 exception ingestion, portable package, canonical package encoding, neutral
+JSON export projection, and related CLI portions are implemented. Human-readable reports and the
+other bullets describe the remainder of this milestone.
 
 The MVP should be useful without AI, a network connection, Ghidra, or IDA.
 
@@ -95,11 +103,17 @@ The MVP should be useful without AI, a network connection, Ghidra, or IDA.
 - Cross-build function and type mapping
 - Known-library and reproducible-source signature packs
 - Symbolized-build propagation with evidence and confidence
-- IDA bridge for previewing and applying supported graph information
-- Ghidra bridge with equivalent identity checks and provenance comments
+- Standalone IDAPython importer for applying the initial safe graph subset (implemented)
+- Standalone Ghidra Java importer with equivalent identity checks (implemented)
+- Interactive IDA and Ghidra bridges for preview, selective application, and provenance comments
 - MAP or simple public-symbol export
 - Synthetic PDB export for validated public functions
 - Explicit lossy-export diagnostics
+
+The neutral projection already emits structured diagnostics for reductions such as unsupported
+assertions, name collisions, conflicting sizes, and overlapping ranges. Target-specific loss
+summaries and richer in-tool review remain part of this milestone. MAP and PDB are explicitly later
+outputs; the first import scripts do not generate either format.
 
 ## Milestone 4: richer reconstruction
 
@@ -115,6 +129,9 @@ Semantic inference remains optional and never converts a hypothesis into an extr
 
 ## Milestone 5: ecosystem and collaboration
 
+- Desktop workbench GUI for project navigation, evidence review, claim comparison, plugin health,
+  and export preview; the [approved layout and theme system](gui-design.md) are currently
+  design-only
 - Signed or verifiable plugin packages and registry metadata
 - Hash-addressed community symbol packs without bundled application binaries
 - Mergeable annotations and review decisions

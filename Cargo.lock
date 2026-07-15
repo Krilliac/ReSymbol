@@ -305,6 +305,7 @@ dependencies = [
  "clap",
  "resymbol-analysis",
  "resymbol-core",
+ "resymbol-export",
  "resymbol-package",
  "resymbol-plugin-runtime",
  "resymbol-plugin-state",
@@ -324,6 +325,17 @@ dependencies = [
  "tempfile",
  "thiserror",
  "toml",
+]
+
+[[package]]
+name = "resymbol-export"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "resymbol-analysis",
+ "resymbol-core",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

@@ -16,9 +16,10 @@ names and metadata-backed `RUNTIME_FUNCTION` ranges become evidence-bearing symb
 and the result is written to a portable `.resym` package bound to the input's SHA-256 identity.
 
 This is not yet a disassembler or a full symbol-recovery pipeline. It does not infer names erased
-by compilation, reconstruct types, analyze RTTI/vtables, or produce PDB/debugger files. Packed
-binaries, .NET assemblies, other CPU architectures, ELF, Mach-O, and debugger export are future
-analysis milestones.
+by compilation, reconstruct types, or analyze RTTI/vtables. It can export a neutral JSON projection
+or self-contained import scripts for IDA and Ghidra, but it does not yet produce PDB, MAP, DWARF, or
+native debugger-database files. Packed binaries, .NET assemblies, other CPU architectures, ELF,
+Mach-O, and richer debugger integration are future analysis milestones.
 
 The current release also includes the first external-process analysis-plugin runtime. Dropped-in
 plugins are discovered automatically, but process code requires explicit approval bound to its
@@ -79,6 +80,9 @@ Open a terminal in the extracted directory, then check the executable:
 resymbol --version
 resymbol analyze path/to/application.exe
 resymbol inspect path/to/application.resym
+resymbol export path/to/application.resym --format json
+resymbol export path/to/application.resym --format ida-python
+resymbol export path/to/application.resym --format ghidra-java
 resymbol plugin list
 resymbol plugin doctor
 ```
@@ -101,6 +105,25 @@ printed in a readable form:
 ```console
 resymbol inspect results/application.resym --json
 ```
+
+Export a package to a specific destination with `--output`:
+
+```console
+resymbol export results/application.resym --format json --output results/application.symbols.json
+resymbol export results/application.resym --format ida-python --output results/application_ida.py
+resymbol export results/application.resym --format ghidra-java --output results/ReSymbolImport.java
+```
+
+Without `--output`, those formats write `application.symbols.json`, `application.ida.py`, and
+`ReSymbolImport_<first-12-binary-sha256>.java` beside the package, respectively. A custom Ghidra
+filename must use a lowercase `.java` extension and a valid conservative Java-identifier stem; the
+generated public class uses that stem.
+
+Exports use the same create-new policy as analysis packages and refuse to replace an existing
+file. The generated debugger scripts verify the loaded program's exact SHA-256 before making any
+changes, then resolve every address from the tool's current image base plus the stored RVA. See the
+[export guide](https://github.com/Krilliac/ReSymbol/blob/main/docs/exporting.md) before running a
+script in IDA or Ghidra; the Ghidra Java source filename and generated public class name must match.
 
 See the
 [analysis-package documentation](https://github.com/Krilliac/ReSymbol/blob/main/docs/analysis-packages.md)
