@@ -12,8 +12,8 @@ kind = "native"
 entrypoint = "example-native-rtti.dll"
 isolation = "out-of-process"
 
-# Native plugins default to a dedicated plugin-host process. In-process loading
-# requires both isolation = "in-process" and the unsafe.in-process permission,
-# followed by an explicit user trust decision.
+# Native plugins use the dedicated plugin-host process. The current host does
+# not implement in-process loading, even for manifests that declare it.
 # claim_contract_example.c demonstrates the additive protocol-1 helper types;
+# cpp_exception_safe_plugin.cpp demonstrates the complete C++11 lifecycle;
 # native claim submission remains strict UTF-8 JSON through the C host callback.

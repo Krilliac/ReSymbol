@@ -30,7 +30,8 @@ use resymbol_package::{
     SchemaCompatibility, read_file_with_options, write_file_new_bound,
 };
 use resymbol_plugin_runtime::{
-    ExternalProcessHost, ExternalProcessRequest, PluginMethod, PluginRuntimeError, StreamKind,
+    ExternalProcessHost, ExternalProcessRequest, NativePeImage, NativePeImageSection,
+    NativeProcessHost, PluginMethod, PluginRuntimeError, RuntimeLimits, StreamKind,
 };
 use resymbol_plugin_state::{
     ArtifactFingerprint, ArtifactStateKey, FingerprintLimits, PluginArtifactStatus,
@@ -224,6 +225,12 @@ struct SinglePluginResult {
     attempt: PluginAttempt,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnalysisPluginRuntime {
+    ExternalProcess,
+    NativeProcess,
+}
+
 fn analyze(args: AnalyzeArgs, safe_mode: bool, plugin_dir: PathBuf) -> Result<()> {
     let binary = args
         .binary
@@ -238,8 +245,14 @@ fn analyze(args: AnalyzeArgs, safe_mode: bool, plugin_dir: PathBuf) -> Result<()
 
     let selectors = parse_plugin_selectors(&args.plugins)?;
     let report = scan_plugins(&plugin_dir, safe_mode)?;
-    let execution =
-        execute_analysis_plugins(&base_analysis, &report, &selectors, safe_mode, &plugin_dir)?;
+    let execution = execute_analysis_plugins(
+        &base_analysis,
+        &binary,
+        &report,
+        &selectors,
+        safe_mode,
+        &plugin_dir,
+    )?;
     let strict_failures = strict_plugin_failure_count(&execution.attempts);
     let session = AnalysisSession::new(base_analysis, execution.runs, execution.claims)
         .context("cannot assemble validated analysis session")?;
@@ -868,6 +881,7 @@ fn parse_plugin_selectors(values: &[String]) -> Result<BTreeSet<PluginId>> {
 
 fn execute_analysis_plugins(
     base_analysis: &BinaryAnalysis,
+    binary_path: &Path,
     report: &resymbol_core::PluginDiscoveryReport,
     selectors: &BTreeSet<PluginId>,
     safe_mode: bool,
@@ -886,7 +900,22 @@ fn execute_analysis_plugins(
     let mut claims = Vec::new();
     let mut attempts = Vec::new();
     let store = PluginStateStore::new(plugin_dir);
-    let host = ExternalProcessHost::default();
+    let external_host = ExternalProcessHost::default();
+    let native_host = report
+        .plugins
+        .iter()
+        .filter_map(|plugin| plugin.manifest.as_ref())
+        .any(|manifest| {
+            has_analysis_capability(manifest)
+                && matches!(
+                    &manifest.runtime,
+                    PluginRuntime::Native {
+                        isolation: resymbol_core::plugin_api::NativeIsolation::OutOfProcess,
+                        ..
+                    }
+                )
+        })
+        .then(resolve_native_host);
 
     for plugin in &report.plugins {
         let Some(manifest) = plugin.manifest.as_ref() else {
@@ -896,8 +925,7 @@ fn execute_analysis_plugins(
         let candidate = if explicitly_selected {
             selected
         } else {
-            has_analysis_capability(manifest)
-                && matches!(&manifest.runtime, PluginRuntime::ExternalProcess { .. })
+            has_analysis_capability(manifest) && runtime_supports_analysis(&manifest.runtime)
         };
         if !candidate {
             continue;
@@ -906,7 +934,15 @@ fn execute_analysis_plugins(
             found.insert(manifest.id.clone());
         }
 
-        let result = execute_one_plugin(base_analysis, plugin, safe_mode, &store, &host)?;
+        let result = execute_one_plugin(
+            base_analysis,
+            binary_path,
+            plugin,
+            safe_mode,
+            &store,
+            &external_host,
+            native_host.as_ref(),
+        )?;
         if let Some(run) = result.run {
             runs.push(run);
         }
@@ -931,10 +967,12 @@ fn execute_analysis_plugins(
 
 fn execute_one_plugin(
     base_analysis: &BinaryAnalysis,
+    binary_path: &Path,
     plugin: &DiscoveredPlugin,
     safe_mode: bool,
     store: &PluginStateStore,
-    host: &ExternalProcessHost,
+    external_host: &ExternalProcessHost,
+    native_host: Option<&Result<NativeProcessHost, String>>,
 ) -> Result<SinglePluginResult> {
     let manifest = plugin
         .manifest
@@ -968,22 +1006,56 @@ fn execute_one_plugin(
             "plugin dependencies are not executed by the initial sequential host".to_owned(),
         ));
     }
-    if !matches!(&manifest.runtime, PluginRuntime::ExternalProcess { .. }) {
-        return Ok(skip(format!(
-            "runtime {} is not supported by this host",
-            runtime_name(manifest.runtime.kind())
-        )));
-    }
+    let runtime = match &manifest.runtime {
+        PluginRuntime::ExternalProcess { .. } => AnalysisPluginRuntime::ExternalProcess,
+        PluginRuntime::Native {
+            isolation: resymbol_core::plugin_api::NativeIsolation::OutOfProcess,
+            ..
+        } => AnalysisPluginRuntime::NativeProcess,
+        PluginRuntime::Native {
+            isolation: resymbol_core::plugin_api::NativeIsolation::InProcess,
+            ..
+        } => {
+            return Ok(skip(
+                "in-process native plugins are not supported; use out-of-process isolation"
+                    .to_owned(),
+            ));
+        }
+        _ => {
+            return Ok(skip(format!(
+                "runtime {} is not supported by this host",
+                runtime_name(manifest.runtime.kind())
+            )));
+        }
+    };
     if !plugin.is_loadable() {
         return Ok(skip(format!(
             "discovery state {} is not loadable",
             state_name(plugin.health.state)
         )));
     }
-    if requests_permission(manifest, PluginPermission::BINARY_READ) {
+    if runtime == AnalysisPluginRuntime::ExternalProcess
+        && requests_permission(manifest, PluginPermission::BINARY_READ)
+    {
         return Ok(skip(
             "binary.read is unavailable in the current one-shot host".to_owned(),
         ));
+    }
+    if runtime == AnalysisPluginRuntime::NativeProcess {
+        match native_host {
+            Some(Ok(_)) => {}
+            Some(Err(error)) => return Ok(skip(error.clone())),
+            None => {
+                return Ok(skip(
+                    "native helper was not resolved for this analysis".to_owned(),
+                ));
+            }
+        }
+        if native_pe_image(base_analysis).is_none() {
+            return Ok(skip(
+                "native binary.read currently supports PE analysis only".to_owned(),
+            ));
+        }
     }
     if manifest.version.to_string().len() > 128 {
         return Ok(skip(
@@ -1027,7 +1099,10 @@ fn execute_one_plugin(
         .iter()
         .filter(|permission| {
             let value = permission.as_str();
-            value == PluginPermission::SYMBOLS_READ || value == PluginPermission::CLAIMS_SUBMIT
+            value == PluginPermission::SYMBOLS_READ
+                || value == PluginPermission::CLAIMS_SUBMIT
+                || (runtime == AnalysisPluginRuntime::NativeProcess
+                    && value == PluginPermission::BINARY_READ)
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -1066,9 +1141,64 @@ fn execute_one_plugin(
             second.fingerprint
         )));
     }
+    if let Some(reason) = plugin_execution_policy_blocker(store, &key, &plugin.path) {
+        return Ok(skip(format!(
+            "plugin policy changed immediately before launch: {reason}"
+        )));
+    }
 
-    match host.execute_trusted(plugin, &request) {
+    let execution = match runtime {
+        AnalysisPluginRuntime::ExternalProcess => external_host.execute_trusted(plugin, &request),
+        AnalysisPluginRuntime::NativeProcess => {
+            let native_host = native_host
+                .and_then(|host| host.as_ref().ok())
+                .expect("native host availability was checked before trust");
+            let image = native_pe_image(base_analysis)
+                .expect("native PE compatibility was checked before trust");
+            native_host.execute_trusted(plugin, &request, second.fingerprint, binary_path, &image)
+        }
+    };
+
+    if let Some(reason) = plugin_execution_policy_blocker(store, &key, &plugin.path) {
+        let failed = failed_run_record(manifest, &run_id, second.fingerprint)?;
+        return Ok(SinglePluginResult {
+            run: Some(failed),
+            claims: Vec::new(),
+            attempt: PluginAttempt {
+                plugin_id: manifest.id.to_string(),
+                status: PluginAttemptStatus::Failed,
+                detail: format!(
+                    "plugin result was discarded because policy changed during execution: {reason}; the artifact was not newly quarantined"
+                ),
+            },
+        });
+    }
+
+    match execution {
         Ok(execution) => {
+            let after = fingerprint_plugin_directory(&plugin.path, FingerprintLimits::default());
+            if !matches!(&after, Ok(report) if report.fingerprint == second.fingerprint) {
+                let reason = match after {
+                    Ok(report) => format!(
+                        "plugin artifact changed during execution from {} to {}",
+                        second.fingerprint, report.fingerprint
+                    ),
+                    Err(error) => {
+                        format!("plugin artifact could not be verified after execution: {error}")
+                    }
+                };
+                let detail = quarantine_failed_artifact(store, &key, &plugin.path, &reason);
+                let failed = failed_run_record(manifest, &run_id, second.fingerprint)?;
+                return Ok(SinglePluginResult {
+                    run: Some(failed),
+                    claims: Vec::new(),
+                    attempt: PluginAttempt {
+                        plugin_id: manifest.id.to_string(),
+                        status: PluginAttemptStatus::Failed,
+                        detail,
+                    },
+                });
+            }
             let accepted_claim_count = u64::try_from(execution.claims.len())
                 .context("plugin claim count does not fit the session ledger")?;
             let succeeded = PluginRunRecord::new(
@@ -1118,6 +1248,21 @@ fn execute_one_plugin(
             }
         }
         Err(error) => {
+            if matches!(
+                &error,
+                PluginRuntimeError::InvalidNativeContext(_)
+                    | PluginRuntimeError::NativeHostUnavailable { .. }
+                    | PluginRuntimeError::NativeHostFailed { .. }
+                    | PluginRuntimeError::NativeHostArtifactChanged { .. }
+                    | PluginRuntimeError::NativeSourceBinary { .. }
+                    | PluginRuntimeError::NativeHostInputChanged { .. }
+                    | PluginRuntimeError::EncodeNativeBootstrap(_)
+            ) {
+                return Ok(skip(format!(
+                    "native host-side failure was not attributed to the plugin: {}",
+                    plugin_runtime_error_detail(&error)
+                )));
+            }
             let transient = matches!(
                 &error,
                 PluginRuntimeError::PluginRejected { code, .. } if code == "unavailable"
@@ -1126,7 +1271,14 @@ fn execute_one_plugin(
                 &error,
                 PluginRuntimeError::InvalidLimits(_)
                     | PluginRuntimeError::InvalidRequest(_)
+                    | PluginRuntimeError::InvalidNativeContext(_)
                     | PluginRuntimeError::EncodeInput(_)
+                    | PluginRuntimeError::EncodeNativeBootstrap(_)
+                    | PluginRuntimeError::NativeHostUnavailable { .. }
+                    | PluginRuntimeError::NativeHostFailed { .. }
+                    | PluginRuntimeError::NativeHostArtifactChanged { .. }
+                    | PluginRuntimeError::NativeSourceBinary { .. }
+                    | PluginRuntimeError::NativeHostInputChanged { .. }
                     | PluginRuntimeError::PermissionNotRequested(_)
                     | PluginRuntimeError::StreamLimit {
                         stream: StreamKind::Stdin,
@@ -1134,16 +1286,17 @@ fn execute_one_plugin(
                     }
                     | PluginRuntimeError::WorkerPanicked(_)
             );
+            let error_detail = plugin_runtime_error_detail(&error);
             let detail = if transient {
-                format!("transient plugin failure (not quarantined): {error}")
+                format!("transient plugin failure (not quarantined): {error_detail}")
             } else if host_side {
-                format!("host-side invocation failure (not quarantined): {error}")
+                format!("host-side invocation failure (not quarantined): {error_detail}")
             } else {
                 quarantine_failed_artifact(
                     store,
                     &key,
                     &plugin.path,
-                    &format!("plugin runtime failure: {error}"),
+                    &format!("plugin runtime failure: {error_detail}"),
                 )
             };
             let failed = failed_run_record(manifest, &run_id, second.fingerprint)?;
@@ -1157,6 +1310,21 @@ fn execute_one_plugin(
                 },
             })
         }
+    }
+}
+
+fn plugin_runtime_error_detail(error: &PluginRuntimeError) -> String {
+    let summary = error.to_string();
+    let Some(diagnostics) = error.diagnostics() else {
+        return summary;
+    };
+    let stderr = bounded_single_line(&diagnostics.stderr, 2_048);
+    if stderr.is_empty() {
+        summary
+    } else if diagnostics.stderr_was_lossy {
+        format!("{summary}; stderr (lossy UTF-8): {stderr}")
+    } else {
+        format!("{summary}; stderr: {stderr}")
     }
 }
 
@@ -1194,6 +1362,35 @@ fn quarantine_failed_artifact(
                 sentinel_result(&disable, plugin_path)
             )
         }
+    }
+}
+
+/// Return the current policy reason that prevents an in-flight result from
+/// committing. This check is the parent-side linearization point for manual
+/// disablement, trust revocation, quarantine, and corrupt state.
+fn plugin_execution_policy_blocker(
+    store: &PluginStateStore,
+    key: &ArtifactStateKey,
+    plugin_path: &Path,
+) -> Option<String> {
+    match fs::symlink_metadata(plugin_path.join(PLUGIN_DISABLED_SENTINEL)) {
+        Ok(_) => return Some("plugin.disabled is present".to_owned()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Some(format!(
+                "the disable sentinel could not be verified safely: {error}"
+            ));
+        }
+    }
+    match store.status(key) {
+        Ok(PluginArtifactStatus::Trusted) => None,
+        Ok(PluginArtifactStatus::ApprovalRequired) => {
+            Some("exact artifact trust was revoked".to_owned())
+        }
+        Ok(PluginArtifactStatus::Quarantined { reason }) => {
+            Some(format!("exact artifact is quarantined: {reason}"))
+        }
+        Err(error) => Some(format!("plugin state is unsafe or corrupt: {error}")),
     }
 }
 
@@ -1282,6 +1479,62 @@ fn has_analysis_capability(manifest: &resymbol_core::plugin_api::PluginManifest)
             || value == PluginCapability::MATCHER_FUNCTIONS
             || value == PluginCapability::RESOLVER_SYMBOLS
     })
+}
+
+fn runtime_supports_analysis(runtime: &PluginRuntime) -> bool {
+    matches!(runtime, PluginRuntime::ExternalProcess { .. })
+        || matches!(
+            runtime,
+            PluginRuntime::Native {
+                isolation: resymbol_core::plugin_api::NativeIsolation::OutOfProcess,
+                ..
+            }
+        )
+}
+
+fn resolve_native_host() -> std::result::Result<NativeProcessHost, String> {
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("cannot resolve the ReSymbol executable: {error}"))?;
+    let application_directory = executable
+        .parent()
+        .ok_or_else(|| "the ReSymbol executable has no application directory".to_owned())?;
+    let helper_name = format!("resymbol-native-host{}", std::env::consts::EXE_SUFFIX);
+    let helper_path = application_directory.join(helper_name);
+    let metadata = fs::symlink_metadata(&helper_path).map_err(|error| {
+        format!(
+            "native helper is unavailable at {}: {error}",
+            helper_path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "native helper at {} must be a regular, unlinked sibling executable",
+            helper_path.display()
+        ));
+    }
+    NativeProcessHost::new(helper_path, RuntimeLimits::default())
+        .map_err(|error| format!("native helper is unavailable: {error}"))
+}
+
+fn native_pe_image(analysis: &BinaryAnalysis) -> Option<NativePeImage> {
+    match analysis {
+        BinaryAnalysis::Pe(pe) => Some(NativePeImage {
+            identity: pe.identity.clone(),
+            size_of_headers: pe.size_of_headers,
+            size_of_image: pe.size_of_image,
+            sections: pe
+                .sections
+                .iter()
+                .map(|section| NativePeImageSection {
+                    virtual_address: section.virtual_address,
+                    virtual_size: section.virtual_size,
+                    raw_data_offset: section.raw_data_offset,
+                    raw_data_size: section.raw_data_size,
+                })
+                .collect(),
+        }),
+        _ => None,
+    }
 }
 
 fn requests_permission(
@@ -1664,9 +1917,27 @@ fn trust_plugin(plugin_dir: &Path, id: &str, expected_fingerprint: Option<&str>)
         .manifest
         .as_ref()
         .expect("resolved valid directory plugin has a manifest");
-    if !matches!(&manifest.runtime, PluginRuntime::ExternalProcess { .. }) {
+    let native_process = matches!(
+        &manifest.runtime,
+        PluginRuntime::Native {
+            isolation: resymbol_core::plugin_api::NativeIsolation::OutOfProcess,
+            ..
+        }
+    );
+    if !matches!(&manifest.runtime, PluginRuntime::ExternalProcess { .. }) && !native_process {
+        let detail = if matches!(
+            &manifest.runtime,
+            PluginRuntime::Native {
+                isolation: resymbol_core::plugin_api::NativeIsolation::InProcess,
+                ..
+            }
+        ) {
+            "in-process native execution is intentionally unsupported"
+        } else {
+            "this runtime has no implemented execution host"
+        };
         bail!(
-            "plugin trust currently applies only to external-process plugins; {id} uses {}",
+            "plugin trust does not apply to {} plugins ({detail}); {id} was not trusted",
             runtime_name(manifest.runtime.kind())
         );
     }
@@ -1704,21 +1975,19 @@ fn trust_plugin(plugin_dir: &Path, id: &str, expected_fingerprint: Option<&str>)
             1_024
         )
     );
-    println!(
-        "arguments (literal values; escaped and bounded for display; no shell interpretation):"
-    );
-    let args = match &manifest.runtime {
-        PluginRuntime::ExternalProcess { args, .. } => args.as_slice(),
-        _ => &[],
-    };
-    if args.is_empty() {
-        println!("  (none)");
-    } else {
-        for (index, argument) in args.iter().enumerate() {
-            println!(
-                "  [{index}] {}",
-                bounded_single_line(&format!("{argument:?}"), 1_024)
-            );
+    if let PluginRuntime::ExternalProcess { args, .. } = &manifest.runtime {
+        println!(
+            "arguments (literal values; escaped and bounded for display; no shell interpretation):"
+        );
+        if args.is_empty() {
+            println!("  (none)");
+        } else {
+            for (index, argument) in args.iter().enumerate() {
+                println!(
+                    "  [{index}] {}",
+                    bounded_single_line(&format!("{argument:?}"), 1_024)
+                );
+            }
         }
     }
     println!("fingerprint: {fingerprint}");
@@ -1730,9 +1999,15 @@ fn trust_plugin(plugin_dir: &Path, id: &str, expected_fingerprint: Option<&str>)
             println!("  {}", permission.as_str());
         }
     }
-    println!(
-        "WARNING: this plugin executes with your account's ambient filesystem, network, and process authority. Protocol permissions are advisory and are not an operating-system sandbox."
-    );
+    if native_process {
+        println!(
+            "WARNING: this native library executes in a disposable helper process with your account's ambient filesystem, network, and process authority. The helper contains ordinary crashes; it is not an operating-system sandbox, and protocol permissions are advisory."
+        );
+    } else {
+        println!(
+            "WARNING: this plugin executes with your account's ambient filesystem, network, and process authority. Protocol permissions are advisory and are not an operating-system sandbox."
+        );
+    }
 
     let change = store
         .trust(&key)
@@ -2189,6 +2464,38 @@ args = ["--stdio", "literal argument"]
             ),
         )
         .expect("write external plugin manifest");
+        plugin
+    }
+
+    fn create_native_plugin(root: &Path, id: &str, isolation: &str) -> PathBuf {
+        let plugin = root.join("native");
+        fs::create_dir(&plugin).expect("create native plugin directory");
+        fs::write(plugin.join("plugin.native"), b"native-placeholder")
+            .expect("write native entrypoint");
+        let permissions = if isolation == "in-process" {
+            r#"["binary.read", "claims.submit", "unsafe.in-process"]"#
+        } else {
+            r#"["binary.read", "claims.submit"]"#
+        };
+        fs::write(
+            plugin.join("plugin.toml"),
+            format!(
+                r#"manifest_version = 1
+id = "{id}"
+name = "Native CLI test plugin"
+version = "1.2.3"
+api = "^0.1.0"
+capabilities = ["analyzer.binary"]
+permissions = {permissions}
+
+[runtime]
+kind = "native"
+entrypoint = "plugin.native"
+isolation = "{isolation}"
+"#
+            ),
+        )
+        .expect("write native plugin manifest");
         plugin
     }
 
@@ -3382,22 +3689,120 @@ args = ["--stdio", "literal argument"]
     }
 
     #[test]
+    fn execution_policy_rechecks_exact_trust_and_disable_sentinel() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let plugin_path = create_external_plugin(temp.path(), "dev.resymbol.policy-race");
+        let fingerprint = fingerprint_plugin_directory(&plugin_path, FingerprintLimits::default())
+            .expect("fingerprint policy fixture")
+            .fingerprint;
+        let key = ArtifactStateKey::new(
+            PluginId::new("dev.resymbol.policy-race").expect("valid plugin ID"),
+            fingerprint,
+        );
+        let store = PluginStateStore::new(temp.path());
+        store.trust(&key).expect("trust exact policy fixture");
+        assert!(plugin_execution_policy_blocker(&store, &key, &plugin_path).is_none());
+
+        store.untrust(&key).expect("revoke exact trust");
+        assert!(
+            plugin_execution_policy_blocker(&store, &key, &plugin_path)
+                .expect("revocation blocks commit")
+                .contains("revoked")
+        );
+
+        store.trust(&key).expect("restore exact trust");
+        fs::write(plugin_path.join(PLUGIN_DISABLED_SENTINEL), b"disabled")
+            .expect("create disable sentinel");
+        assert!(
+            plugin_execution_policy_blocker(&store, &key, &plugin_path)
+                .expect("sentinel blocks commit")
+                .contains(PLUGIN_DISABLED_SENTINEL)
+        );
+    }
+
+    #[test]
+    fn native_out_of_process_plugins_are_eligible_and_fingerprint_trustable() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        create_native_plugin(temp.path(), "dev.resymbol.native", "out-of-process");
+        let report = scan_plugins(temp.path(), false).expect("discover native plugin");
+        let plugin = unique_valid_directory_plugin(&report, "dev.resymbol.native")
+            .expect("resolve native plugin");
+        let manifest = plugin.manifest.as_ref().expect("validated manifest");
+        assert!(runtime_supports_analysis(&manifest.runtime));
+
+        trust_plugin(temp.path(), "dev.resymbol.native", None)
+            .expect("trust exact native artifact");
+        let fingerprint = fingerprint_plugin_directory(&plugin.path, FingerprintLimits::default())
+            .expect("fingerprint native artifact")
+            .fingerprint;
+        let key = ArtifactStateKey::new(manifest.id.clone(), fingerprint);
+        assert_eq!(
+            PluginStateStore::new(temp.path())
+                .status(&key)
+                .expect("read native trust state"),
+            PluginArtifactStatus::Trusted
+        );
+    }
+
+    #[test]
+    fn native_in_process_plugins_are_neither_eligible_nor_trustable() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        create_native_plugin(temp.path(), "dev.resymbol.native", "in-process");
+        let report = scan_plugins(temp.path(), false).expect("discover native plugin");
+        let plugin = unique_valid_directory_plugin(&report, "dev.resymbol.native")
+            .expect("resolve native plugin");
+        assert!(!runtime_supports_analysis(
+            &plugin
+                .manifest
+                .as_ref()
+                .expect("validated manifest")
+                .runtime
+        ));
+        let error = trust_plugin(temp.path(), "dev.resymbol.native", None)
+            .expect_err("in-process native trust must be rejected");
+        assert!(error.to_string().contains("in-process native execution"));
+    }
+
+    #[test]
+    fn native_image_map_exactly_projects_validated_pe_sections() {
+        let analysis = analyze_bytes(&pe_fixture()).expect("analyze fixture");
+        let BinaryAnalysis::Pe(pe) = &analysis else {
+            panic!("PE analysis expected")
+        };
+        let image = native_pe_image(&analysis).expect("PE native image");
+        assert_eq!(image.identity, pe.identity);
+        assert_eq!(image.size_of_headers, pe.size_of_headers);
+        assert_eq!(image.size_of_image, pe.size_of_image);
+        assert_eq!(image.sections.len(), pe.sections.len());
+        for (native, section) in image.sections.iter().zip(&pe.sections) {
+            assert_eq!(native.virtual_address, section.virtual_address);
+            assert_eq!(native.virtual_size, section.virtual_size);
+            assert_eq!(native.raw_data_offset, section.raw_data_offset);
+            assert_eq!(native.raw_data_size, section.raw_data_size);
+        }
+    }
+
+    #[test]
     fn safe_mode_has_no_default_attempts_but_preserves_explicit_skips() {
         let temp = tempfile::tempdir().expect("create temporary directory");
         create_external_plugin(temp.path(), "dev.resymbol.external");
         let report = scan_plugins(temp.path(), true).expect("discover in safe mode");
-        let base = analyze_bytes(&pe_fixture()).expect("analyze fixture");
+        let fixture = pe_fixture();
+        let binary = temp.path().join("fixture.exe");
+        fs::write(&binary, &fixture).expect("write fixture binary");
+        let base = analyze_bytes(&fixture).expect("analyze fixture");
 
         let automatic =
-            execute_analysis_plugins(&base, &report, &BTreeSet::new(), true, temp.path())
+            execute_analysis_plugins(&base, &binary, &report, &BTreeSet::new(), true, temp.path())
                 .expect("safe automatic selection");
         assert!(automatic.attempts.is_empty());
         assert!(automatic.runs.is_empty());
 
         let selected =
             parse_plugin_selectors(&["dev.resymbol.external".to_owned()]).expect("valid selector");
-        let explicit = execute_analysis_plugins(&base, &report, &selected, true, temp.path())
-            .expect("safe explicit selection");
+        let explicit =
+            execute_analysis_plugins(&base, &binary, &report, &selected, true, temp.path())
+                .expect("safe explicit selection");
         assert_eq!(explicit.attempts.len(), 1);
         assert_eq!(explicit.attempts[0].status, PluginAttemptStatus::Skipped);
         assert!(explicit.attempts[0].detail.contains("safe mode"));

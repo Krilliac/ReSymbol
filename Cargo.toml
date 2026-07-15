@@ -4,6 +4,7 @@ members = [
     "crates/resymbol-cli",
     "crates/resymbol-core",
     "crates/resymbol-export",
+    "crates/resymbol-native-host",
     "crates/resymbol-package",
     "crates/resymbol-plugin-api",
     "crates/resymbol-plugin-runtime",

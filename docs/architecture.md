@@ -6,11 +6,11 @@ not necessarily behavior implemented in the current checkout.
 
 The current implementation covers bounded PE32+ x86-64 ingestion, a conservative metadata-derived
 symbol graph, modern MSVC x64 Rev1 RTTI/vftable discovery, canonical JSON `.resym` packages, plugin
-discovery/contracts, and the first trusted external-process analysis runtime. It also includes a
-validated, debugger-neutral export projection, deterministic Microsoft-linker-style MAP output,
-an exact-RSDS public-symbol PDB writer, and conservative standalone import-script generators for
-IDA and Ghidra. Broader disassembly-assisted discovery, matching, semantic inference, interactive
-debugger bridges, richer PDB and DWARF output, the workbench GUI, and the WASM/native/managed
+discovery/contracts, and trusted external-process and native C/C++ analysis runtimes. It also
+includes a validated, debugger-neutral export projection, deterministic Microsoft-linker-style MAP
+output, an exact-RSDS public-symbol PDB writer, and conservative standalone import-script generators
+for IDA and Ghidra. Broader disassembly-assisted discovery, matching, semantic inference,
+interactive debugger bridges, richer PDB and DWARF output, the workbench GUI, and the WASM/managed
 execution hosts remain design work.
 
 ## Goals
@@ -263,28 +263,43 @@ high-performance native analysis, managed tooling, model experiments, and debugg
 | Family | Intended use | Host boundary |
 |---|---|---|
 | WebAssembly | Portable analyzers, matchers, rules, and exporters | Planned capability sandbox |
-| Native C/C++ | Existing reversing libraries and performance-critical work | Planned separate native host process |
+| Native C/C++ | Existing reversing libraries and performance-critical work | Disposable sibling helper; bounded C ABI callbacks, but no OS sandbox |
 | Managed/.NET | Managed analyzers, SDK consumers, and ecosystem integrations | Planned self-contained managed host process |
 | External process | Python, model runtimes, proprietary SDKs, or heavyweight tools | Child process; bounded protocol, but no OS sandbox |
 | Tool-hosted bridge | IDA, Ghidra, Binary Ninja, and debugger adapters | The host tool's process and API |
 
-Native in-process loading may eventually be available as an explicit trusted performance mode. It
-is never the safe default. Rust's native ABI is not a public plugin contract; native plugins use a
-versioned C ABI with language wrappers.
+Native in-process loading is not implemented. It may eventually be available as an explicit trusted
+performance mode, but it is never the safe default. Rust's native ABI is not a public plugin
+contract; native plugins use a versioned C ABI with language wrappers.
 
-The first implemented execution host is deliberately narrower than the complete design. It starts
-an explicitly approved external-process plugin directly, without a shell, for one analysis request;
-exchanges size- and count-bounded NDJSON; enforces a deadline and bounded diagnostics; and accepts
-claims only as one validated transaction. Interactive `binary.read`/`read-binary` requests are
-reserved and are not serviced by this one-shot host. A plugin failure discards its claim batch but
-does not invalidate deterministic analysis or prevent the `.resym` package from being written.
+The implemented external-process host starts an explicitly approved plugin directly, without a
+shell, for one analysis request; exchanges size- and count-bounded NDJSON; enforces a deadline and
+bounded diagnostics; and accepts claims only as one validated transaction. Interactive
+`binary.read`/`read-binary` requests are reserved and are not serviced by this one-shot host.
 
-Process separation contains ordinary crashes, not authority. The child still has the ambient
-filesystem, network, and process access of the account running ReSymbol. Consequently a process
-plugin requires explicit approval tied to its complete directory fingerprint before first
-execution. The unchanged fingerprint may autoload later; any update invalidates that approval.
-Manifest permissions constrain ReSymbol's protocol operations and data projections, not the
-child's ambient operating-system access.
+The implemented native host keeps the same one-shot transactional boundary while loading the
+approved library only inside a disposable, version-matched `resymbol-native-host[.exe]` process
+shipped beside the application. ReSymbol never selects a helper from a plugin directory. The helper
+validates the manifest, C descriptor and ABI tables, lifecycle results, callback bounds, exact
+analyzed-binary identity, and approved directory fingerprint. Its permission-gated, size-bounded
+`binary.read` callback exposes only file-backed RVAs from the exact PE. Claims enter the session
+only after the complete batch and final fingerprint check validate. A plugin-attributable crash or
+post-load ABI, callback, resource, or output failure discards the entire batch and quarantines that
+exact artifact without invalidating deterministic analysis or preventing the `.resym` package from
+being written. Immediately before the first platform loader call, the helper writes and flushes a
+versioned marker that the parent observes independently of structured diagnostics and removes from
+user-visible stderr. A failure observed with that marker is plugin-attributable; one without the
+current marker is conservatively classified as host-side and does not quarantine the plugin.
+
+Process separation contains ordinary crashes, not authority. External and native child code still
+has the ambient filesystem, network, credential, and process access of the account running
+ReSymbol. Consequently executable plugins require explicit approval tied to their complete
+directory fingerprint before first execution. The unchanged fingerprint may autoload later; any
+fingerprinted-file update invalidates that approval. Manifest permissions constrain ReSymbol's
+protocol operations and data projections, not ambient operating-system access. A fingerprint
+identifies reviewed local directory bytes but neither authenticates a publisher nor eliminates the
+check-to-launch window while those files remain mutable. Native dynamic dependencies remain subject
+to the platform loader's documented search rules rather than an immutable dependency snapshot.
 
 The current standalone IDAPython and Ghidra Java exporters implement a small identity-checking,
 conservative application path without installing a persistent plugin in either tool. They do not
@@ -305,11 +320,14 @@ must preserve.
 
 ## Packaging boundary
 
-The application is centered on one Rust executable. Official archives may also contain prebuilt,
-version-matched plugin hosts and thin tool adapters, but ordinary users should not need to install a
-compiler, language runtime, build system, or package manager. In particular:
+The application is centered on the Rust CLI plus prebuilt, version-matched plugin hosts and thin
+tool adapters as they become implemented. Ordinary users should not need to install a compiler,
+language runtime, build system, or package manager. In particular:
 
-- managed hosts are distributed self-contained;
+- current archives ship `resymbol-native-host[.exe]` beside `resymbol[.exe]`;
+- Linux archives pair a static musl CLI with a GNU helper built on Ubuntu 22.04 for glibc 2.35 or
+  newer so ordinary glibc `.so` plugins can load;
+- planned managed hosts will be distributed self-contained;
 - ordinary plugins are distributed already compiled;
 - the implemented PDB exporter does not require a separate Visual Studio installation; and
 - optional external services remain optional rather than preventing deterministic analysis.
@@ -320,11 +338,12 @@ Developer toolchains are a contributor concern, not an end-user installation ste
 
 1. **Input binaries are untrusted.** Parsers apply bounds and resource limits and should avoid
    unsafe code.
-2. **Third-party plugins are untrusted by default.** External-process code is never launched before
-   an explicit fingerprint-bound trust decision. Trust and quarantine records live in the
-   host-owned `plugins/.resymbol/` directory, outside plugin-controlled directories.
-3. **Native in-process code is fully trusted.** Enabling it is an explicit decision with a clear
-   warning because it can corrupt memory or escape every application-level control.
+2. **Third-party plugins are untrusted by default.** External-process and native code is never
+   launched before an explicit fingerprint-bound trust decision. Trust and quarantine records live
+   in the host-owned `plugins/.resymbol/` directory, outside plugin-controlled directories.
+3. **Native code is crash-isolated, not sandboxed.** It runs only in the disposable sibling helper
+   in the current implementation, but retains the launching account's ambient authority. There is
+   no in-process native path.
 4. **Remote content is untrusted.** Symbol servers, source indexes, registries, and model endpoints
    cannot directly create trusted facts.
 5. **Tool bridges are separate trust domains.** A bridge must validate the binary identity and
@@ -334,9 +353,13 @@ The core should retain enough structured diagnostics to explain which boundary f
 logging binary contents, source material, or secrets by default.
 
 `plugin.disabled` remains an out-of-band manual stop switch and safe mode suppresses all
-third-party execution. Unsafe launch, runtime, resource, claim, or protocol failures quarantine the exact
-process-plugin fingerprint. Corrupt host state fails closed. Quarantine does not grant trust to an
-updated artifact, and plugin failure never deletes the installed files.
+third-party execution. Plugin-attributable launch, runtime, resource, claim, or protocol failures
+quarantine the exact out-of-process plugin fingerprint; confirmed host/helper preflight failures do
+not. Corrupt host state fails closed. Quarantine does not grant trust to an updated artifact,
+plugin failure never deletes the installed files, and a rejected run cannot leave a partially
+committed claim batch. Immediately before launch and again before committing a completed batch, the
+parent rechecks the disable sentinel and exact trust/quarantine state. That final recheck is the
+policy linearization point; a revocation observed there discards the full batch.
 
 ## Compatibility
 

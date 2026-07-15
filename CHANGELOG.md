@@ -8,6 +8,12 @@ prereleases; breaking changes remain explicit.
 
 ### Added
 
+- Added the first native C/C++ out-of-process analysis host. Drop-in plugins approved by exact
+  directory fingerprint run in a bundled disposable sibling helper, can use a permission-gated,
+  size-bounded PE `binary.read` callback, and commit claims only after full-batch validation; native
+  plugin faults discard the batch and quarantine that artifact, while confirmed pre-load helper
+  failures remain host-side. This is crash isolation, not an OS sandbox. Official Linux archives
+  pair the musl CLI with a GNU helper built on Ubuntu 22.04 for glibc 2.35 or newer.
 - Added bounded modern MSVC x64 Rev1 RTTI and vftable discovery, including validated stored type
   names, base-class records, virtual-slot targets, vftable names, and attributed function-to-class
   relationships.

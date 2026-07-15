@@ -3,7 +3,7 @@ use std::{
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
-    sync::mpsc,
+    sync::{Arc, Mutex, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -174,7 +174,7 @@ fn resolve_entrypoint(
     Ok((canonical_entrypoint, canonical_root))
 }
 
-fn preserve_operating_system_environment(command: &mut Command) {
+pub(crate) fn preserve_operating_system_environment(command: &mut Command) {
     // These variables can be required by Windows process initialization and
     // temporary-directory APIs. User credentials and arbitrary host variables
     // are deliberately not inherited.
@@ -213,6 +213,32 @@ enum CaptureStream {
     Stderr,
 }
 
+/// Raw stderr observed so far, independent of pipe EOF.
+///
+/// A timed-out plugin can leave a descendant holding the pipe open. Keeping a
+/// bounded live prefix lets native-host framing remain observable even when
+/// the final stderr worker result cannot arrive during cleanup.
+#[derive(Clone, Default)]
+struct ObservedStderr {
+    bytes: Arc<Mutex<Vec<u8>>>,
+}
+
+impl ObservedStderr {
+    fn append(&self, bytes: &[u8]) {
+        self.bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend_from_slice(bytes);
+    }
+
+    fn snapshot(&self) -> Vec<u8> {
+        self.bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
 #[derive(Default)]
 struct WorkerResults {
     stdin: Option<io::Result<()>>,
@@ -233,9 +259,8 @@ impl WorkerResults {
         self.stdin.is_some() && self.stdout.is_some() && self.stderr.is_some()
     }
 
-    fn has_failure(&self) -> bool {
-        self.stdin.as_ref().is_some_and(Result::is_err)
-            || self.stdout.as_ref().is_some_and(Result::is_err)
+    fn has_capture_failure(&self) -> bool {
+        self.stdout.as_ref().is_some_and(Result::is_err)
             || self.stderr.as_ref().is_some_and(Result::is_err)
     }
 }
@@ -250,13 +275,49 @@ enum AwaitOutcome {
     },
 }
 
-fn run_child(
+pub(crate) fn run_child(
     child: Child,
     input: Vec<u8>,
     manifest: &PluginManifest,
     request: &ExternalProcessRequest,
     limits: &RuntimeLimits,
     deadline: Instant,
+) -> Result<PluginExecution, PluginRuntimeError> {
+    run_child_observing_stderr(child, input, manifest, request, limits, deadline).0
+}
+
+/// Run one child while retaining the bounded raw stderr prefix independently
+/// from the structured result. Native-host stage framing must survive result
+/// variants that do not themselves carry [`ProcessDiagnostics`].
+pub(crate) fn run_child_observing_stderr(
+    child: Child,
+    input: Vec<u8>,
+    manifest: &PluginManifest,
+    request: &ExternalProcessRequest,
+    limits: &RuntimeLimits,
+    deadline: Instant,
+) -> (Result<PluginExecution, PluginRuntimeError>, Vec<u8>) {
+    let observed_stderr = ObservedStderr::default();
+    let result = run_child_inner(
+        child,
+        input,
+        manifest,
+        request,
+        limits,
+        deadline,
+        &observed_stderr,
+    );
+    (result, observed_stderr.snapshot())
+}
+
+fn run_child_inner(
+    child: Child,
+    input: Vec<u8>,
+    manifest: &PluginManifest,
+    request: &ExternalProcessRequest,
+    limits: &RuntimeLimits,
+    deadline: Instant,
+    observed_stderr: &ObservedStderr,
 ) -> Result<PluginExecution, PluginRuntimeError> {
     let mut guard = ChildGuard { child };
     let stdin = guard
@@ -281,12 +342,14 @@ fn run_child(
         stdout,
         limits.max_stdout_bytes,
         CaptureStream::Stdout,
+        None,
         result_sender.clone(),
     );
     spawn_capture_worker(
         stderr,
         limits.max_stderr_bytes,
         CaptureStream::Stderr,
+        Some(observed_stderr.clone()),
         result_sender,
     );
 
@@ -296,14 +359,14 @@ fn run_child(
             AwaitOutcome::Deadline { workers } => {
                 return Err(PluginRuntimeError::Timeout {
                     timeout: limits.request_timeout,
-                    diagnostics: diagnostics_from_results(&workers),
+                    diagnostics: diagnostics_from_results(&workers, observed_stderr),
                 });
             }
         };
     let stdin_result = workers.stdin.take().expect("complete worker results");
     let stdout_result = workers.stdout.take().expect("complete worker results");
     let stderr_result = workers.stderr.take().expect("complete worker results");
-    let diagnostics = diagnostics_from_capture(&stderr_result);
+    let diagnostics = diagnostics_from_capture(&stderr_result, observed_stderr);
     match stderr_result {
         Ok(_) => {}
         Err(CaptureFailure::Limit(_)) => {
@@ -336,18 +399,7 @@ fn run_child(
             });
         }
     };
-    if let Err(source) = stdin_result {
-        return Err(PluginRuntimeError::Io {
-            operation: "write plugin stdin",
-            source,
-        });
-    }
-    if !status.success() {
-        return Err(PluginRuntimeError::ProcessFailed {
-            code: status.code(),
-            diagnostics,
-        });
-    }
+    validate_child_completion(status, stdin_result, diagnostics.clone())?;
 
     parse_output(
         &stdout,
@@ -357,6 +409,27 @@ fn run_child(
         diagnostics,
         status.code(),
     )
+}
+
+fn validate_child_completion(
+    status: ExitStatus,
+    stdin_result: io::Result<()>,
+    diagnostics: ProcessDiagnostics,
+) -> Result<(), PluginRuntimeError> {
+    // A helper can reject bounded input and exit before the writer finishes.
+    // Preserve its stage-aware exit code instead of replacing it with the
+    // resulting BrokenPipe. A stdin failure remains host-side when the child
+    // itself reported success.
+    if !status.success() {
+        return Err(PluginRuntimeError::ProcessFailed {
+            code: status.code(),
+            diagnostics,
+        });
+    }
+    stdin_result.map_err(|source| PluginRuntimeError::Io {
+        operation: "write plugin stdin",
+        source,
+    })
 }
 
 fn spawn_stdin_worker(
@@ -375,10 +448,14 @@ fn spawn_capture_worker(
     reader: impl Read + Send + 'static,
     limit: usize,
     stream: CaptureStream,
+    observed_stderr: Option<ObservedStderr>,
     result_sender: mpsc::Sender<WorkerMessage>,
 ) {
     let _worker = thread::spawn(move || {
-        let result = read_bounded(reader, limit);
+        let result = match observed_stderr.as_ref() {
+            Some(observed) => read_bounded_observed(reader, limit, Some(observed)),
+            None => read_bounded(reader, limit),
+        };
         let message = match stream {
             CaptureStream::Stdout => WorkerMessage::Stdout(result),
             CaptureStream::Stderr => WorkerMessage::Stderr(result),
@@ -388,6 +465,14 @@ fn spawn_capture_worker(
 }
 
 fn read_bounded(mut reader: impl Read, limit: usize) -> Result<Vec<u8>, CaptureFailure> {
+    read_bounded_observed(&mut reader, limit, None)
+}
+
+fn read_bounded_observed(
+    mut reader: impl Read,
+    limit: usize,
+    observed: Option<&ObservedStderr>,
+) -> Result<Vec<u8>, CaptureFailure> {
     let mut captured = Vec::with_capacity(limit.min(8_192));
     let mut buffer = [0_u8; 8_192];
     loop {
@@ -398,9 +483,15 @@ fn read_bounded(mut reader: impl Read, limit: usize) -> Result<Vec<u8>, CaptureF
         if count > limit.saturating_sub(captured.len()) {
             let remaining = limit.saturating_sub(captured.len());
             captured.extend_from_slice(&buffer[..remaining]);
+            if let Some(observed) = observed {
+                observed.append(&buffer[..remaining]);
+            }
             return Err(CaptureFailure::Limit(captured));
         }
         captured.extend_from_slice(&buffer[..count]);
+        if let Some(observed) = observed {
+            observed.append(&buffer[..count]);
+        }
     }
 }
 
@@ -422,7 +513,11 @@ fn await_child_and_workers(
                 source,
             })?;
         }
-        if workers.has_failure() && status.is_none() {
+        // Stop immediately for failed/over-limit capture workers, but allow a
+        // stdin BrokenPipe to race naturally with the child's bounded exit.
+        // Otherwise an early native-host rejection could be killed before its
+        // stable 70/71 stage code becomes observable.
+        if workers.has_capture_failure() && status.is_none() {
             terminate(child)?;
             status = Some(child.wait().map_err(|source| PluginRuntimeError::Io {
                 operation: "reap plugin after I/O failure",
@@ -444,6 +539,7 @@ fn await_child_and_workers(
                     source,
                 })?;
             }
+            drain_worker_results_bounded(&mut workers, result_receiver);
             return Ok(AwaitOutcome::Deadline { workers });
         }
 
@@ -463,6 +559,30 @@ fn await_child_and_workers(
     }
 }
 
+fn drain_worker_results_bounded(
+    workers: &mut WorkerResults,
+    result_receiver: &mpsc::Receiver<WorkerMessage>,
+) {
+    const CLEANUP_GRACE: Duration = Duration::from_millis(50);
+    let cleanup_deadline = Instant::now() + CLEANUP_GRACE;
+    while !workers.is_complete() {
+        while let Ok(message) = result_receiver.try_recv() {
+            workers.record(message);
+        }
+        if workers.is_complete() {
+            return;
+        }
+        let remaining = cleanup_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        match result_receiver.recv_timeout(remaining) {
+            Ok(message) => workers.record(message),
+            Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => return,
+        }
+    }
+}
+
 fn terminate(child: &mut Child) -> Result<(), PluginRuntimeError> {
     match child.kill() {
         Ok(()) => Ok(()),
@@ -474,23 +594,43 @@ fn terminate(child: &mut Child) -> Result<(), PluginRuntimeError> {
     }
 }
 
-fn diagnostics_from_capture(capture: &Result<Vec<u8>, CaptureFailure>) -> ProcessDiagnostics {
+fn diagnostics_from_capture(
+    capture: &Result<Vec<u8>, CaptureFailure>,
+    observed_stderr: &ObservedStderr,
+) -> ProcessDiagnostics {
     match capture {
         Ok(bytes) | Err(CaptureFailure::Limit(bytes)) => ProcessDiagnostics::from_bytes(bytes),
-        Err(CaptureFailure::Io(_)) => ProcessDiagnostics::default(),
+        Err(CaptureFailure::Io(_)) => ProcessDiagnostics::from_bytes(&observed_stderr.snapshot()),
     }
 }
 
-fn diagnostics_from_results(results: &WorkerResults) -> ProcessDiagnostics {
-    results
-        .stderr
-        .as_ref()
-        .map_or_else(ProcessDiagnostics::default, diagnostics_from_capture)
+fn diagnostics_from_results(
+    results: &WorkerResults,
+    observed_stderr: &ObservedStderr,
+) -> ProcessDiagnostics {
+    results.stderr.as_ref().map_or_else(
+        || ProcessDiagnostics::from_bytes(&observed_stderr.snapshot()),
+        |capture| diagnostics_from_capture(capture, observed_stderr),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn failed_status(code: i32) -> ExitStatus {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        ExitStatus::from_raw(code << 8)
+    }
+
+    #[cfg(windows)]
+    fn failed_status(code: i32) -> ExitStatus {
+        use std::os::windows::process::ExitStatusExt as _;
+
+        ExitStatus::from_raw(code as u32)
+    }
 
     #[test]
     fn bounded_reader_keeps_only_the_configured_prefix() {
@@ -499,5 +639,46 @@ mod tests {
             CaptureFailure::Limit(bytes) => assert_eq!(bytes, b"abcd"),
             CaptureFailure::Io(error) => panic!("unexpected I/O error: {error}"),
         }
+    }
+
+    #[test]
+    fn failed_child_status_takes_precedence_over_stdin_broken_pipe() {
+        let diagnostics = ProcessDiagnostics {
+            stderr: "stage-aware failure".to_owned(),
+            stderr_was_lossy: false,
+        };
+        let stdin = Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed early"));
+        let error = validate_child_completion(failed_status(70), stdin, diagnostics.clone())
+            .expect_err("the nonzero child status must be retained");
+        assert!(matches!(
+            error,
+            PluginRuntimeError::ProcessFailed { code: Some(70), .. }
+        ));
+        assert_eq!(error.diagnostics(), Some(&diagnostics));
+    }
+
+    #[test]
+    fn timeout_diagnostics_use_raw_stderr_observed_before_pipe_eof() {
+        let observed = ObservedStderr::default();
+        observed.append(b"flushed marker\npartial plugin detail");
+        let diagnostics = diagnostics_from_results(&WorkerResults::default(), &observed);
+        assert_eq!(diagnostics.stderr, "flushed marker\npartial plugin detail");
+        assert!(!diagnostics.stderr_was_lossy);
+    }
+
+    #[test]
+    fn deadline_cleanup_records_results_delivered_after_the_worker_snapshot() {
+        let (sender, receiver) = mpsc::channel();
+        let mut workers = WorkerResults {
+            stdin: Some(Ok(())),
+            stdout: Some(Ok(Vec::new())),
+            stderr: None,
+        };
+        sender
+            .send(WorkerMessage::Stderr(Ok(b"late stderr".to_vec())))
+            .unwrap();
+        drain_worker_results_bounded(&mut workers, &receiver);
+        let diagnostics = diagnostics_from_results(&workers, &ObservedStderr::default());
+        assert_eq!(diagnostics.stderr, "late stderr");
     }
 }

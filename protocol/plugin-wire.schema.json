@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://resymbol.dev/schemas/plugin-wire-v1.json",
-  "title": "ReSymbol external-process plugin wire protocol",
-  "description": "Newline-delimited JSON messages exchanged over stdin/stdout with an out-of-process plugin. Stdout is protocol-only; diagnostics belong on stderr. Plugins submit claims and never mutate canonical symbol state directly.",
+  "title": "ReSymbol out-of-process plugin wire protocol",
+  "description": "Newline-delimited JSON messages exchanged across an out-of-process plugin boundary. A direct external plugin may use stdin/stdout itself; a native helper translates the same validated messages to the C ABI. Protocol stdout is message-only and diagnostics belong on stderr. Plugins submit claims and never mutate canonical symbol state directly.",
   "$comment": "A process boundary protects ReSymbol from plugin crashes but is not, by itself, an operating-system sandbox. Hosts must require artifact-bound trust unless they can enforce the declared permissions. A plugin declaration cannot opt itself into the ReSymbol process.",
   "oneOf": [
     { "$ref": "#/$defs/hello" },

@@ -49,6 +49,21 @@ quarantine the exact fingerprint without blocking base analysis or package creat
 separation is not an OS sandbox, and interactive binary reads remain reserved rather than
 implemented.
 
+The first native C/C++ analysis host is implemented for x86-64 PE sessions. An approved drop-in
+library loads only in the disposable, version-matched `resymbol-native-host[.exe]` shipped beside
+the application; there is no in-process path and a plugin cannot supply the helper. The host checks
+the exact plugin fingerprint, binary identity, C ABI and lifecycle, callback limits, and complete
+claim batch. Its permission-gated `binary.read` callback returns only bounded file-backed PE RVAs.
+A plugin-attributable native fault discards the full batch and quarantines that exact artifact
+without blocking package creation. The helper flushes a versioned marker immediately before its
+first platform loader call; failures observed without that marker remain conservatively host-side.
+This process boundary contains crashes, not ambient filesystem, network, credential, or process
+authority, and mutable plugin files retain a check-to-launch window.
+
+Official archives bundle the native helper. Linux releases pair the static musl main executable
+with a GNU helper built on Ubuntu 22.04 for glibc 2.35 or newer so ordinary glibc `.so` plugins can
+load without asking users to install a compiler.
+
 The first export checkpoint is implemented as a validated, debugger-neutral projection with
 deterministic JSON output, a bounded human-readable Markdown report, PE-only
 Microsoft-linker-style MAP text, an exact-RSDS public-symbol PDB, and standalone IDAPython and
@@ -88,8 +103,8 @@ The remaining Milestone 2 work is deliberately substantial: broader disassembly-
 discovery, indirect control flow and richer call-graph analysis, string-reference correlation,
 persisted basic-block modeling, broader RTTI/ABI coverage, an open fixture corpus, benchmarks, and
 continued malformed-input/resource-limit validation.
-The WASM, native C/C++, managed/.NET, and debugger-hosted execution paths remain future work; their
-contracts and architecture are present, but should not be mistaken for working hosts.
+The WASM, managed/.NET, and debugger-hosted execution paths remain future work; their contracts and
+architecture are present, but should not be mistaken for working hosts.
 
 ## Milestone 0: repository foundation
 
@@ -106,8 +121,8 @@ Implemented in the current alpha.
 
 This milestone establishes extensibility before analysis behavior becomes difficult to decouple.
 Core graph types, plugin discovery/health policy, initial multi-runtime contracts, and the first
-external-process execution host are implemented. Package installation and the other runtime hosts
-are still outstanding.
+external-process and native C/C++ execution hosts are implemented. Package installation and the
+WASM, managed, and debugger-hosted runtimes are still outstanding.
 
 - Binary identity and canonical address primitives
 - Versioned entities for functions, ranges, names, types, claims, evidence, and plugin runs
@@ -120,6 +135,8 @@ are still outstanding.
 - Safe mode and plugin diagnostics
 - Version negotiation, dependency compatibility diagnostics, limits, and permission records
 - Direct no-shell, timeout- and output-bounded one-shot external-process analysis
+- Disposable sibling-process native C/C++ analysis with bounded file-backed PE `binary.read`
+  callbacks and full-batch validation
 - Transactional plugin claims and failure-tolerant `AnalysisSession` packaging
 - Initial contracts and example packages for:
   - WebAssembly plugins
@@ -128,11 +145,11 @@ are still outstanding.
   - external-process plugins
   - debugger-hosted bridges
 
-The native and managed families are initial architecture requirements, not post-1.0 add-ons, but
-their current deliverables are contracts and SDK foundations rather than execution hosts.
-Out-of-process hosting is the default even when an in-process trusted fast path is eventually available. A
-child process is a crash boundary, not an OS security sandbox; platform sandboxing remains separate
-work.
+The native and managed families are initial architecture requirements, not post-1.0 add-ons. The
+native contract, SDK foundation, and first out-of-process host are implemented; the managed family
+still has contracts and SDK foundations rather than an execution host. Out-of-process hosting is
+the default even if an in-process trusted fast path is eventually designed. A child process is a
+crash boundary, not an OS security sandbox; platform sandboxing remains separate work.
 
 ## Milestone 2: useful native-binary MVP
 

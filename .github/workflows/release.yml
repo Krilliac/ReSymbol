@@ -65,29 +65,45 @@ jobs:
           - os: windows-2022
             platform: windows-x64
             target: x86_64-pc-windows-msvc
+            helper_target: x86_64-pc-windows-msvc
+            rustflags: -C target-feature=+crt-static
             executable: resymbol.exe
+            helper_executable: resymbol-native-host.exe
             archive: zip
           - os: ubuntu-22.04
             platform: linux-x64
             target: x86_64-unknown-linux-musl
+            # The static musl CLI stays maximally portable. Native plugins are
+            # ordinary GNU/glibc .so files, so their disposable loader is GNU.
+            helper_target: x86_64-unknown-linux-gnu
+            rustflags: ""
             executable: resymbol
+            helper_executable: resymbol-native-host
             archive: tar.gz
           - os: macos-15-intel
             platform: macos-x64
             target: x86_64-apple-darwin
+            helper_target: x86_64-apple-darwin
+            rustflags: ""
             executable: resymbol
+            helper_executable: resymbol-native-host
             archive: tar.gz
           - os: macos-15
             platform: macos-arm64
             target: aarch64-apple-darwin
+            helper_target: aarch64-apple-darwin
+            rustflags: ""
             executable: resymbol
+            helper_executable: resymbol-native-host
             archive: tar.gz
 
     runs-on: ${{ matrix.os }}
     env:
       RELEASE_TAG: ${{ github.ref_name }}
       TARGET: ${{ matrix.target }}
+      HELPER_TARGET: ${{ matrix.helper_target }}
       PLATFORM: ${{ matrix.platform }}
+      RUSTFLAGS: ${{ matrix.rustflags }}
 
     steps:
       - name: Check out tagged source
@@ -96,8 +112,16 @@ jobs:
       - name: Select pinned Rust toolchain
         run: rustup show active-toolchain
 
+      - name: Enable MSVC developer tools
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
       - name: Install Rust target
-        run: rustup target add "$TARGET"
+        run: |
+          rustup target add "$TARGET"
+          if [[ "$HELPER_TARGET" != "$TARGET" ]]; then
+            rustup target add "$HELPER_TARGET"
+          fi
         shell: bash
 
       - name: Install static Linux linker
@@ -106,19 +130,48 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes musl-tools
 
-      - name: Build release executable
+      - name: Build release executables
         run: cargo build --locked --release --target "$TARGET" --bin resymbol
+        shell: bash
+
+      - name: Build disposable native helper
+        run: >-
+          cargo build --locked --release --target "$HELPER_TARGET"
+          --bin resymbol-native-host
         shell: bash
 
       - name: Smoke-test executable
         if: runner.os != 'Windows'
-        run: "./target/${TARGET}/release/resymbol --version"
+        run: |
+          "./target/${TARGET}/release/resymbol" --version
+          "./target/${HELPER_TARGET}/release/${{ matrix.helper_executable }}" --version
         shell: bash
 
       - name: Smoke-test Windows executable
         if: runner.os == 'Windows'
-        run: "& \"target/$env:TARGET/release/resymbol.exe\" --version"
+        run: |
+          & "target/$env:TARGET/release/resymbol.exe" --version
+          & "target/$env:HELPER_TARGET/release/${{ matrix.helper_executable }}" --version
         shell: pwsh
+
+      - name: Verify Windows executables do not require the dynamic MSVC runtime
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $binaries = @(
+            "target/$env:TARGET/release/${{ matrix.executable }}",
+            "target/$env:HELPER_TARGET/release/${{ matrix.helper_executable }}"
+          )
+          foreach ($binary in $binaries) {
+            $dependencies = (& dumpbin /NOLOGO /DEPENDENTS $binary | Out-String)
+            if ($LASTEXITCODE -ne 0) {
+              throw "dumpbin failed for $binary"
+            }
+            if ($dependencies -match '(?im)^\s*(VCRUNTIME|MSVCP|UCRTBASE|api-ms-win-crt)[^\s]*\.dll\s*$') {
+              throw "$binary still depends on a dynamic MSVC/UCRT library`n$dependencies"
+            }
+          }
 
       - name: Package Unix archive and checksum
         if: matrix.archive == 'tar.gz'
@@ -129,8 +182,10 @@ jobs:
           stage="dist/${package_root}"
           mkdir -p "${stage}/plugins" "${stage}/docs"
           cp "target/${TARGET}/release/${{ matrix.executable }}" "${stage}/"
+          cp "target/${HELPER_TARGET}/release/${{ matrix.helper_executable }}" "${stage}/"
           cp README.md LICENSE-MIT LICENSE-APACHE "${stage}/"
           cp docs/install.md "${stage}/docs/"
+          cp docs/plugin-system.md "${stage}/docs/"
           cp packaging/plugins/README.txt "${stage}/plugins/"
 
           archive="dist/${package_root}.tar.gz"
@@ -150,8 +205,10 @@ jobs:
           New-Item -ItemType Directory -Path (Join-Path $stage "plugins") -Force | Out-Null
           New-Item -ItemType Directory -Path (Join-Path $stage "docs") -Force | Out-Null
           Copy-Item "target/$env:TARGET/release/${{ matrix.executable }}" $stage
+          Copy-Item "target/$env:HELPER_TARGET/release/${{ matrix.helper_executable }}" $stage
           Copy-Item README.md, LICENSE-MIT, LICENSE-APACHE $stage
           Copy-Item docs/install.md (Join-Path $stage "docs")
+          Copy-Item docs/plugin-system.md (Join-Path $stage "docs")
           Copy-Item packaging/plugins/README.txt (Join-Path $stage "plugins")
 
           $archive = Join-Path "dist" "$packageRoot.zip"
