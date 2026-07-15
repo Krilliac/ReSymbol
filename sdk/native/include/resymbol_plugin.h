@@ -17,9 +17,15 @@
 #if defined(__cplusplus)
 #define RESYMBOL_PLUGIN_EXTERN_C extern "C"
 #define RESYMBOL_PLUGIN_NOEXCEPT noexcept
+#if __cplusplus >= 201703L
 #define RESYMBOL_PLUGIN_FUNCTION_POINTER(name, result, parameters) \
     using name = result(RESYMBOL_PLUGIN_CALL *) parameters \
         RESYMBOL_PLUGIN_NOEXCEPT
+#else
+/* C++11/14 do not portably permit an exception specification in a typedef. */
+#define RESYMBOL_PLUGIN_FUNCTION_POINTER(name, result, parameters) \
+    typedef result(RESYMBOL_PLUGIN_CALL *name) parameters
+#endif
 #else
 #define RESYMBOL_PLUGIN_EXTERN_C extern
 #define RESYMBOL_PLUGIN_NOEXCEPT
@@ -262,11 +268,12 @@ typedef struct resymbol_plugin_descriptor_v1 {
 } resymbol_plugin_descriptor_v1;
 
 /*
- * No C++ exception may cross a plugin lifecycle boundary. The C++ aliases
- * below carry a noexcept call contract. C++17 and newer also make noexcept
- * part of the function type and reject potentially-throwing assignments;
- * C++11/14 plugin authors must apply RESYMBOL_PLUGIN_NOEXCEPT explicitly to
- * each callback definition, as demonstrated by the native C++ example.
+ * No C++ exception may cross a plugin lifecycle boundary. C++17 and newer
+ * encode noexcept in the aliases below and reject potentially-throwing
+ * assignments. C++11/14 cannot portably encode an exception specification in
+ * a function-pointer typedef, so plugin authors must apply
+ * RESYMBOL_PLUGIN_NOEXCEPT explicitly to every callback definition, as
+ * demonstrated by the native C++ example.
  */
 RESYMBOL_PLUGIN_FUNCTION_POINTER(
     resymbol_plugin_get_descriptor_fn,
