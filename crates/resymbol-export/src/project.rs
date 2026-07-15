@@ -1,6 +1,6 @@
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, btree_map::Entry},
+    collections::{BTreeMap, BTreeSet, btree_map::Entry},
     fmt::Write as _,
 };
 
@@ -13,8 +13,9 @@ use resymbol_core::{
 use crate::{
     AttributedText, ExportAttribution, ExportBinary, ExportBinaryFormat, ExportError,
     ExportFunction, ExportGlobal, ExportName, ExportProducer, ExportProjection, ExportProvenance,
-    ExportSubject, ExportType, MAX_DECLARATION_BYTES, MAX_NAME_BYTES, MAX_OUTPUT_NAME_BYTES,
-    MAX_TYPE_KEY_BYTES, ProjectionWarning, ProjectionWarningCode,
+    ExportSubject, ExportType, MAX_CLASS_MEMBERSHIPS_PER_FUNCTION, MAX_DECLARATION_BYTES,
+    MAX_NAME_BYTES, MAX_OUTPUT_NAME_BYTES, MAX_TYPE_KEY_BYTES, ProjectionWarning,
+    ProjectionWarningCode,
     model::{
         MAX_ARCHITECTURE_BYTES, MAX_CLAIMS, MAX_DECLARATIONS_PER_ENTITY, MAX_ENTITIES,
         MAX_NAMES_PER_ENTITY, MAX_WARNINGS, candidate_order, producer_authority, require_text,
@@ -22,9 +23,11 @@ use crate::{
 };
 
 #[derive(Debug, Default)]
-struct AddressAccumulator {
+struct AddressAccumulator<'claims> {
     names: BTreeMap<String, AttributedText>,
     declarations: BTreeMap<String, AttributedText>,
+    class_memberships: BTreeMap<String, AttributedText>,
+    distinct_class_memberships: BTreeSet<&'claims str>,
     sizes: BTreeMap<u64, ExportAttribution>,
 }
 
@@ -57,6 +60,18 @@ impl WarningAccumulator {
         code: ProjectionWarningCode,
         subject: Option<ExportSubject>,
     ) -> Result<(), ExportError> {
+        self.add_occurrences(code, subject, 1)
+    }
+
+    fn add_occurrences(
+        &mut self,
+        code: ProjectionWarningCode,
+        subject: Option<ExportSubject>,
+        occurrences: u64,
+    ) -> Result<(), ExportError> {
+        if occurrences == 0 {
+            return Ok(());
+        }
         let key = WarningKey { code, subject };
         if !self.values.contains_key(&key) && self.values.len() == MAX_WARNINGS {
             return Err(ExportError::LimitExceeded {
@@ -65,10 +80,12 @@ impl WarningAccumulator {
             });
         }
         let count = self.values.entry(key).or_default();
-        *count = count.checked_add(1).ok_or(ExportError::LimitExceeded {
-            resource: "warning occurrence",
-            limit: usize::MAX,
-        })?;
+        *count = count
+            .checked_add(occurrences)
+            .ok_or(ExportError::LimitExceeded {
+                resource: "warning occurrence",
+                limit: usize::MAX,
+            })?;
         Ok(())
     }
 
@@ -138,8 +155,8 @@ impl ExportProjection {
             });
         }
 
-        let mut functions = BTreeMap::<u64, AddressAccumulator>::new();
-        let mut globals = BTreeMap::<u64, AddressAccumulator>::new();
+        let mut functions = BTreeMap::<u64, AddressAccumulator<'_>>::new();
+        let mut globals = BTreeMap::<u64, AddressAccumulator<'_>>::new();
         let mut types = BTreeMap::<String, TypeAccumulator>::new();
         let mut entity_count = 0_usize;
         let mut warnings = WarningAccumulator::new();
@@ -177,7 +194,10 @@ impl ExportProjection {
 
         remove_overlapping_function_sizes(&mut functions, &mut warnings)?;
         functions.retain(|value| {
-            value.size.is_some() || value.selected_name.is_some() || !value.prototypes.is_empty()
+            value.size.is_some()
+                || value.selected_name.is_some()
+                || !value.prototypes.is_empty()
+                || !value.class_memberships.is_empty()
         });
 
         normalize_selected_names(&mut functions, &mut globals, &mut types, &mut warnings)?;
@@ -198,11 +218,11 @@ impl ExportProjection {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn project_claim(
-    claim: &SymbolClaim,
+fn project_claim<'claims>(
+    claim: &'claims SymbolClaim,
     image_size: u64,
-    functions: &mut BTreeMap<u64, AddressAccumulator>,
-    globals: &mut BTreeMap<u64, AddressAccumulator>,
+    functions: &mut BTreeMap<u64, AddressAccumulator<'claims>>,
+    globals: &mut BTreeMap<u64, AddressAccumulator<'claims>>,
     types: &mut BTreeMap<String, TypeAccumulator>,
     entity_count: &mut usize,
     warnings: &mut WarningAccumulator,
@@ -282,11 +302,11 @@ fn project_claim(
     }
 }
 
-fn project_address_assertion(
-    assertion: &SymbolAssertion,
+fn project_address_assertion<'claims>(
+    assertion: &'claims SymbolAssertion,
     subject_size: Option<u64>,
     attribution: ExportAttribution,
-    value: &mut AddressAccumulator,
+    value: &mut AddressAccumulator<'claims>,
     is_function: bool,
     subject: ExportSubject,
     warnings: &mut WarningAccumulator,
@@ -332,15 +352,29 @@ fn project_address_assertion(
                 insert_size(&mut value.sizes, *size, attribution);
             }
         }
+        SymbolAssertion::ClassMembership { class_name } if is_function => {
+            insert_class_membership(
+                &mut value.class_memberships,
+                &mut value.distinct_class_memberships,
+                class_name,
+                attribution.clone(),
+                &subject,
+                warnings,
+            )?;
+            if let Some(size) = subject_size {
+                insert_size(&mut value.sizes, size, attribution);
+            }
+        }
         SymbolAssertion::FunctionPrototype { .. }
         | SymbolAssertion::FunctionBoundary { .. }
+        | SymbolAssertion::ClassMembership { .. }
         | SymbolAssertion::TypeDefinition { .. } => {
             warnings.add(
                 ProjectionWarningCode::AssertionSubjectMismatch,
                 Some(subject),
             )?;
         }
-        SymbolAssertion::ClassMembership { .. } | SymbolAssertion::Comment { .. } => {
+        SymbolAssertion::Comment { .. } => {
             warnings.add(ProjectionWarningCode::UnsupportedAssertion, Some(subject))?;
         }
         _ => warnings.add(ProjectionWarningCode::UnsupportedAssertion, Some(subject))?,
@@ -376,13 +410,13 @@ fn project_type_assertion(
             &subject,
             warnings,
         ),
-        SymbolAssertion::FunctionPrototype { .. } | SymbolAssertion::FunctionBoundary { .. } => {
-            warnings.add(
-                ProjectionWarningCode::AssertionSubjectMismatch,
-                Some(subject),
-            )
-        }
-        SymbolAssertion::ClassMembership { .. } | SymbolAssertion::Comment { .. } => {
+        SymbolAssertion::FunctionPrototype { .. }
+        | SymbolAssertion::FunctionBoundary { .. }
+        | SymbolAssertion::ClassMembership { .. } => warnings.add(
+            ProjectionWarningCode::AssertionSubjectMismatch,
+            Some(subject),
+        ),
+        SymbolAssertion::Comment { .. } => {
             warnings.add(ProjectionWarningCode::UnsupportedAssertion, Some(subject))
         }
         _ => warnings.add(ProjectionWarningCode::UnsupportedAssertion, Some(subject)),
@@ -421,6 +455,56 @@ fn insert_text(
     Ok(())
 }
 
+fn insert_class_membership<'claims>(
+    values: &mut BTreeMap<String, AttributedText>,
+    distinct_values: &mut BTreeSet<&'claims str>,
+    text: &'claims str,
+    attribution: ExportAttribution,
+    subject: &ExportSubject,
+    warnings: &mut WarningAccumulator,
+) -> Result<(), ExportError> {
+    if !valid_text(text, MAX_NAME_BYTES) {
+        warnings.add(text_warning(text, MAX_NAME_BYTES), Some(subject.clone()))?;
+        return Ok(());
+    }
+    distinct_values.insert(text);
+    let candidate = AttributedText {
+        text: text.to_owned(),
+        attribution,
+    };
+    if let Some(current) = values.get_mut(text) {
+        if candidate_order(&candidate, current).is_lt() {
+            *current = candidate;
+        }
+        return Ok(());
+    }
+    if values.len() < MAX_CLASS_MEMBERSHIPS_PER_FUNCTION {
+        values.insert(text.to_owned(), candidate);
+        return Ok(());
+    }
+
+    // Keep the strongest bounded set independent of claim arrival order.
+    // Omission accounting is deferred until finalization so repeated claims
+    // for an overflowed class cannot make warning counts order-dependent.
+    let worst_key = values
+        .iter()
+        .max_by(|left, right| candidate_order(left.1, right.1))
+        .map(|(key, _)| key.clone())
+        .expect("a full class membership map is non-empty");
+    if candidate_order(
+        &candidate,
+        values
+            .get(&worst_key)
+            .expect("selected class membership remains present"),
+    )
+    .is_lt()
+    {
+        values.remove(&worst_key);
+        values.insert(text.to_owned(), candidate);
+    }
+    Ok(())
+}
+
 fn insert_size(
     values: &mut BTreeMap<u64, ExportAttribution>,
     size: u64,
@@ -439,14 +523,29 @@ fn insert_size(
 
 fn finish_function(
     rva: u64,
-    value: AddressAccumulator,
+    value: AddressAccumulator<'_>,
     warnings: &mut WarningAccumulator,
 ) -> Result<Option<ExportFunction>, ExportError> {
     let (size, size_attribution) =
         finish_size(&value.sizes, ExportSubject::Function { rva }, warnings)?;
     let (selected_name, alternate_names) = finish_names(value.names);
     let prototypes = finish_texts(value.declarations);
-    if selected_name.is_none() && size.is_none() && prototypes.is_empty() {
+    let distinct_class_membership_count = value.distinct_class_memberships.len();
+    let class_memberships = finish_texts(value.class_memberships);
+    let omitted_class_memberships = distinct_class_membership_count
+        .checked_sub(class_memberships.len())
+        .expect("retained class memberships are a subset of distinct claims");
+    warnings.add_occurrences(
+        ProjectionWarningCode::ClassMembershipLimitExceeded,
+        Some(ExportSubject::Function { rva }),
+        u64::try_from(omitted_class_memberships)
+            .expect("class membership count is bounded by the claim limit"),
+    )?;
+    if selected_name.is_none()
+        && size.is_none()
+        && prototypes.is_empty()
+        && class_memberships.is_empty()
+    {
         return Ok(None);
     }
     Ok(Some(ExportFunction {
@@ -456,12 +555,13 @@ fn finish_function(
         selected_name,
         alternate_names,
         prototypes,
+        class_memberships,
     }))
 }
 
 fn finish_global(
     rva: u64,
-    value: AddressAccumulator,
+    value: AddressAccumulator<'_>,
     warnings: &mut WarningAccumulator,
 ) -> Result<Option<ExportGlobal>, ExportError> {
     let (size, size_attribution) =
@@ -848,11 +948,11 @@ fn utf8_prefix(value: &str, max_bytes: usize) -> &str {
     &value[..end]
 }
 
-fn address_entry<'a>(
-    values: &'a mut BTreeMap<u64, AddressAccumulator>,
+fn address_entry<'map, 'claims>(
+    values: &'map mut BTreeMap<u64, AddressAccumulator<'claims>>,
     rva: u64,
     entity_count: &mut usize,
-) -> Result<&'a mut AddressAccumulator, ExportError> {
+) -> Result<&'map mut AddressAccumulator<'claims>, ExportError> {
     match values.entry(rva) {
         Entry::Occupied(entry) => Ok(entry.into_mut()),
         Entry::Vacant(entry) => {

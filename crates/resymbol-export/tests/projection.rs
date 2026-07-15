@@ -3,8 +3,9 @@ use resymbol_core::{
     EvidenceKind, SymbolAssertion, SymbolClaim, SymbolGraph, SymbolSubject, plugin_api::PluginId,
 };
 use resymbol_export::{
-    ExportError, ExportProducer, ExportProjection, ExportSubject, MAX_NAME_BYTES,
-    MAX_OUTPUT_NAME_BYTES, ProjectionWarningCode,
+    ExportError, ExportProducer, ExportProjection, ExportSubject,
+    MAX_CLASS_MEMBERSHIPS_PER_FUNCTION, MAX_NAME_BYTES, MAX_OUTPUT_NAME_BYTES,
+    ProjectionValidationError, ProjectionWarningCode,
 };
 
 fn binary() -> BinaryIdentity {
@@ -103,6 +104,25 @@ fn boundary(rva: u64, size: u64, confidence: f64, core_claim: bool, method: &str
     )
 }
 
+fn class_membership(rva: u64, class_name: &str, confidence: f64, core_claim: bool) -> SymbolClaim {
+    claim(
+        SymbolSubject::Function {
+            binary: binary().id,
+            rva,
+            size: None,
+        },
+        SymbolAssertion::ClassMembership {
+            class_name: class_name.to_owned(),
+        },
+        confidence,
+        if core_claim {
+            core("class-membership")
+        } else {
+            plugin("class-membership")
+        },
+    )
+}
+
 fn graph(claims: impl IntoIterator<Item = SymbolClaim>) -> SymbolGraph {
     let mut graph = SymbolGraph::default();
     graph
@@ -179,6 +199,203 @@ fn projection_is_stable_across_claim_order_and_core_names_outrank_plugins() {
     assert_eq!(
         serde_json::to_vec(&forward).expect("serialize projection"),
         serde_json::to_vec(&reverse).expect("serialize projection")
+    );
+}
+
+#[test]
+fn function_class_memberships_survive_projection_with_attribution() {
+    let projection = project([
+        class_membership(0x100, "demo::Base", 1.0, false),
+        class_membership(0x100, "demo::Widget", 0.9, true),
+        class_membership(0x100, "demo::Base", 0.8, true),
+    ]);
+
+    assert_eq!(projection.schema_version, 2);
+    assert_eq!(projection.functions.len(), 1);
+    assert_eq!(
+        projection.functions[0]
+            .class_memberships
+            .iter()
+            .map(|value| value.text.as_str())
+            .collect::<Vec<_>>(),
+        ["demo::Widget", "demo::Base"]
+    );
+    assert!(
+        projection.functions[0]
+            .class_memberships
+            .iter()
+            .all(|value| matches!(
+                value.attribution.provenance.producer,
+                ExportProducer::Core { .. }
+            ))
+    );
+    assert!(
+        !projection
+            .warnings
+            .iter()
+            .any(|warning| warning.code == ProjectionWarningCode::UnsupportedAssertion)
+    );
+    assert!(
+        serde_json::to_string(&projection)
+            .expect("serialize projection")
+            .contains("\"class_memberships\"")
+    );
+
+    let mut invalid = projection;
+    invalid.functions[0].class_memberships[0].text = "x".repeat(MAX_NAME_BYTES + 1);
+    assert!(matches!(
+        invalid.validate(),
+        Err(ProjectionValidationError::InvalidText {
+            field: "function.class_membership"
+        })
+    ));
+}
+
+#[test]
+fn function_accepts_more_class_memberships_than_the_name_candidate_cap() {
+    let projection = project(
+        (0..257).map(|index| class_membership(0x100, &format!("demo::Class{index:03}"), 0.9, true)),
+    );
+
+    assert_eq!(projection.functions[0].class_memberships.len(), 257);
+    assert!(
+        projection
+            .warnings
+            .iter()
+            .all(|warning| { warning.code != ProjectionWarningCode::ClassMembershipLimitExceeded })
+    );
+}
+
+#[test]
+fn class_membership_overflow_is_skipped_and_aggregated_as_a_warning() {
+    let projection = project(
+        (0..MAX_CLASS_MEMBERSHIPS_PER_FUNCTION + 2)
+            .map(|index| class_membership(0x100, &format!("demo::Class{index:04}"), 0.9, true)),
+    );
+
+    assert_eq!(
+        projection.functions[0].class_memberships.len(),
+        MAX_CLASS_MEMBERSHIPS_PER_FUNCTION
+    );
+    assert!(
+        projection.functions[0]
+            .class_memberships
+            .iter()
+            .all(|membership| membership.text != "demo::Class4096"
+                && membership.text != "demo::Class4097")
+    );
+    assert!(projection.warnings.iter().any(|warning| {
+        warning.code == ProjectionWarningCode::ClassMembershipLimitExceeded
+            && warning.subject == Some(ExportSubject::Function { rva: 0x100 })
+            && warning.occurrences == 2
+    }));
+
+    let mut invalid = projection;
+    let mut extra = invalid.functions[0].class_memberships[0].clone();
+    extra.text = "demo::Overflow".to_owned();
+    invalid.functions[0].class_memberships.push(extra);
+    assert!(matches!(
+        invalid.validate(),
+        Err(ProjectionValidationError::CollectionLimit {
+            collection: "function.class_membership"
+        })
+    ));
+}
+
+#[test]
+fn class_membership_overflow_is_invariant_under_adversarial_claim_order() {
+    let mut claims = (0..MAX_CLASS_MEMBERSHIPS_PER_FUNCTION)
+        .map(|index| class_membership(0x100, &format!("demo::Base{index:04}"), 0.5, true))
+        .collect::<Vec<_>>();
+    claims.push(class_membership(0x100, "demo::Target", 0.1, false));
+    claims.push(class_membership(0x100, "demo::Target", 1.0, true));
+
+    let forward = project(claims.clone());
+    claims.reverse();
+    let reverse = project(claims);
+
+    assert_eq!(forward, reverse);
+    assert_eq!(
+        forward.functions[0].class_memberships.len(),
+        MAX_CLASS_MEMBERSHIPS_PER_FUNCTION
+    );
+    assert!(
+        forward.functions[0]
+            .class_memberships
+            .iter()
+            .any(|membership| membership.text == "demo::Target")
+    );
+    assert!(forward.warnings.iter().any(|warning| {
+        warning.code == ProjectionWarningCode::ClassMembershipLimitExceeded
+            && warning.subject == Some(ExportSubject::Function { rva: 0x100 })
+            && warning.occurrences == 1
+    }));
+}
+
+#[test]
+fn repeated_omitted_class_membership_counts_once_in_any_claim_order() {
+    let mut claims = (0..MAX_CLASS_MEMBERSHIPS_PER_FUNCTION)
+        .map(|index| class_membership(0x100, &format!("demo::Retained{index:04}"), 0.9, true))
+        .collect::<Vec<_>>();
+    claims.push(class_membership(0x100, "demo::Omitted", 0.1, false));
+    claims.push(class_membership(0x100, "demo::Omitted", 0.2, false));
+
+    let forward = project(claims.clone());
+    claims.reverse();
+    let reverse = project(claims);
+
+    assert_eq!(forward, reverse);
+    assert!(
+        forward.functions[0]
+            .class_memberships
+            .iter()
+            .all(|membership| membership.text != "demo::Omitted")
+    );
+    assert!(forward.warnings.iter().any(|warning| {
+        warning.code == ProjectionWarningCode::ClassMembershipLimitExceeded
+            && warning.subject == Some(ExportSubject::Function { rva: 0x100 })
+            && warning.occurrences == 1
+    }));
+}
+
+#[test]
+fn class_memberships_on_non_function_subjects_warn_as_mismatches() {
+    let projection = project([
+        claim(
+            SymbolSubject::Global {
+                binary: binary().id,
+                rva: 0x100,
+                size: None,
+            },
+            SymbolAssertion::ClassMembership {
+                class_name: "demo::Widget".to_owned(),
+            },
+            0.9,
+            core("class-membership"),
+        ),
+        claim(
+            SymbolSubject::Type {
+                binary: binary().id,
+                key: "type.widget".to_owned(),
+            },
+            SymbolAssertion::ClassMembership {
+                class_name: "demo::Widget".to_owned(),
+            },
+            0.9,
+            core("class-membership"),
+        ),
+    ]);
+
+    assert!(projection.globals.is_empty());
+    assert!(projection.types.is_empty());
+    assert_eq!(
+        projection
+            .warnings
+            .iter()
+            .filter(|warning| warning.code == ProjectionWarningCode::AssertionSubjectMismatch)
+            .map(|warning| warning.occurrences)
+            .sum::<u64>(),
+        2
     );
 }
 

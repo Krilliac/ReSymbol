@@ -953,6 +953,29 @@ fn print_analysis_summary(analysis: &BinaryAnalysis) {
                 .iter()
                 .filter(|export| export.forwarded_to.is_some())
                 .count();
+            let rtti_type_count = pe
+                .msvc_rtti_vftables
+                .iter()
+                .flat_map(|vftable| {
+                    std::iter::once(vftable.type_descriptor_rva).chain(
+                        vftable
+                            .base_classes
+                            .iter()
+                            .map(|base| base.type_descriptor_rva),
+                    )
+                })
+                .collect::<BTreeSet<_>>()
+                .len();
+            let rtti_slot_count = pe
+                .msvc_rtti_vftables
+                .iter()
+                .map(|vftable| vftable.virtual_function_rvas.len())
+                .sum::<usize>();
+            let rtti_base_record_count = pe
+                .msvc_rtti_vftables
+                .iter()
+                .map(|vftable| vftable.base_classes.len())
+                .sum::<usize>();
 
             println!("format: PE32+ (x86-64)");
             println!("entry point: RVA 0x{:x}", pe.entry_point_rva);
@@ -969,6 +992,13 @@ fn print_analysis_summary(analysis: &BinaryAnalysis) {
                 forwarder_count
             );
             println!("runtime functions: {}", pe.runtime_functions.len());
+            println!(
+                "MSVC RTTI: {} vftable(s), {rtti_type_count} type(s), {rtti_base_record_count} base record(s), {rtti_slot_count} virtual slot(s)",
+                pe.msvc_rtti_vftables.len()
+            );
+            if pe.msvc_rtti_scan_truncated {
+                println!("MSVC RTTI scan: partial (a fixed discovery budget was reached)");
+            }
         }
         _ => println!("format: supported extension format"),
     }

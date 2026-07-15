@@ -4,8 +4,9 @@ use resymbol_core::BinaryId;
 use serde::Serialize;
 
 use crate::{
-    MAX_DECLARATION_BYTES, MAX_NAME_BYTES, MAX_OUTPUT_NAME_BYTES, MAX_PROVENANCE_TEXT_BYTES,
-    MAX_TYPE_KEY_BYTES, ProjectionValidationError,
+    MAX_CLASS_MEMBERSHIPS_PER_FUNCTION, MAX_DECLARATION_BYTES, MAX_NAME_BYTES,
+    MAX_OUTPUT_NAME_BYTES, MAX_PROVENANCE_TEXT_BYTES, MAX_TYPE_KEY_BYTES,
+    ProjectionValidationError,
 };
 
 pub(crate) const MAX_CLAIMS: usize = 1_000_000;
@@ -87,6 +88,11 @@ pub struct ExportFunction {
     pub selected_name: Option<ExportName>,
     pub alternate_names: Vec<AttributedText>,
     pub prototypes: Vec<AttributedText>,
+    /// Classes this function is attributed to by the source claim graph.
+    ///
+    /// Debugger-specific writers may ignore this relationship when their
+    /// target format cannot represent it without inventing extra symbols.
+    pub class_memberships: Vec<AttributedText>,
 }
 
 /// A global projected at one relative virtual address.
@@ -129,6 +135,7 @@ pub enum ProjectionWarningCode {
     InvalidText,
     TextLimitExceeded,
     InvalidProvenance,
+    ClassMembershipLimitExceeded,
     ConflictingSize,
     AmbiguousSize,
     OverlappingFunctionRange,
@@ -154,6 +161,9 @@ impl ProjectionWarningCode {
             Self::TextLimitExceeded => "claim text exceeds the neutral export byte limit",
             Self::InvalidProvenance => {
                 "claim provenance cannot be represented as bounded canonical text"
+            }
+            Self::ClassMembershipLimitExceeded => {
+                "function class membership exceeded the neutral export limit and was omitted"
             }
             Self::ConflictingSize => {
                 "competing symbol sizes were reduced to the highest-ranked value"
@@ -197,7 +207,7 @@ pub struct ExportProjection {
 }
 
 impl ExportProjection {
-    pub(crate) const SCHEMA_VERSION: u32 = 1;
+    pub(crate) const SCHEMA_VERSION: u32 = 2;
 
     /// Revalidate ordering, range, text, attribution, and uniqueness invariants.
     pub fn validate(&self) -> Result<(), ProjectionValidationError> {
@@ -255,6 +265,12 @@ impl ExportProjection {
                 MAX_DECLARATION_BYTES,
                 "function.prototype",
                 MAX_DECLARATIONS_PER_ENTITY,
+            )?;
+            validate_text_candidates(
+                &function.class_memberships,
+                MAX_NAME_BYTES,
+                "function.class_membership",
+                MAX_CLASS_MEMBERSHIPS_PER_FUNCTION,
             )?;
         }
         let mut previous_end = 0_u64;

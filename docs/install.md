@@ -12,14 +12,27 @@ CMake, Visual Studio, or another compiler to run an official archive.
 
 The current analyzer accepts native Windows x86-64 PE32+ input. It safely extracts image and section
 metadata, imports, exports, forwarded exports, and x64 exception-directory records. Exact export
-names and metadata-backed `RUNTIME_FUNCTION` ranges become evidence-bearing symbol-graph claims,
-and the result is written to a portable `.resym` package bound to the input's SHA-256 identity.
+names and metadata-backed `RUNTIME_FUNCTION` ranges become evidence-bearing symbol-graph claims.
+The built-in bounded RTTI pass also validates modern MSVC x64 Rev1 type descriptors, class and base
+records, vftables, and executable virtual-slot targets. Recovered class/type names, vftable names,
+and function-to-class relationships become evidence-bearing claims, and the result is written to a
+portable `.resym` package bound to the input's SHA-256 identity.
 
 This is not yet a disassembler or a full symbol-recovery pipeline. It does not infer names erased
-by compilation, reconstruct types, or analyze RTTI/vtables. It can export a neutral JSON projection
-or self-contained import scripts for IDA and Ghidra, but it does not yet produce PDB, MAP, DWARF, or
-native debugger-database files. Packed binaries, .NET assemblies, other CPU architectures, ELF,
-Mach-O, and richer debugger integration are future analysis milestones.
+by compilation, reconstruct general C++ layouts, or name virtual functions merely because their
+targets appear in a vftable. RTTI support deliberately accepts only the modern x64 Rev1 layout with
+28-byte base-class descriptors carrying a nested class-hierarchy reference; older/x86 RTTI and
+other ABI variants remain unsupported. It can export a neutral JSON projection or self-contained
+import scripts for IDA and Ghidra, but it does not yet produce PDB, MAP, DWARF, or native
+debugger-database files. Packed binaries, .NET assemblies, other CPU architectures, ELF, Mach-O,
+and richer debugger integration are future analysis milestones.
+
+The core PE/RTTI analysis is offline and never executes or disassembles the input. RTTI discovery
+scans at most 64 MiB of eligible read-only initialized data for candidate back-pointers; candidate
+validation then performs bounded reads of referenced metadata and contiguous executable slot
+candidates. It retains at most 16 MiB of RTTI name text, with additional record-count limits. If an
+aggregate limit is reached, the valid prefix is kept and explicitly marked partial rather than
+reported as a complete scan.
 
 The current release also includes the first external-process analysis-plugin runtime. Dropped-in
 plugins are discovered automatically, but process code requires explicit approval bound to its
@@ -105,6 +118,10 @@ printed in a readable form:
 ```console
 resymbol inspect results/application.resym --json
 ```
+
+Both `analyze` and `inspect` report MSVC RTTI vftable, unique-type, base-record, and virtual-slot
+counts. A second `MSVC RTTI scan: partial` line appears when a fixed scan or aggregate discovery
+budget was reached; the package preserves that status for downstream review.
 
 Export a package to a specific destination with `--output`:
 

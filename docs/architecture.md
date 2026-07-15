@@ -5,11 +5,12 @@ preserve. ReSymbol is in early development; sections marked as design describe t
 not necessarily behavior implemented in the current checkout.
 
 The current implementation covers bounded PE32+ x86-64 ingestion, a conservative metadata-derived
-symbol graph, canonical JSON `.resym` packages, plugin discovery/contracts, and the first trusted
-external-process analysis runtime. It also includes a validated, debugger-neutral export
-projection and conservative standalone import-script generators for IDA and Ghidra. Disassembly,
-matching, semantic inference, interactive debugger bridges, PDB/MAP/DWARF writers, the workbench
-GUI, and the WASM/native/managed execution hosts remain design work.
+symbol graph, modern MSVC x64 Rev1 RTTI/vftable discovery, canonical JSON `.resym` packages, plugin
+discovery/contracts, and the first trusted external-process analysis runtime. It also includes a
+validated, debugger-neutral export projection and conservative standalone import-script generators
+for IDA and Ghidra. Disassembly, matching, semantic inference, interactive debugger bridges,
+PDB/MAP/DWARF writers, the workbench GUI, and the WASM/native/managed execution hosts remain design
+work.
 
 ## Goals
 
@@ -74,10 +75,35 @@ Analysis should be incremental. A plugin that resolves RTTI should not require t
 unrelated signature index, and removing a plugin's results should not require rebuilding claims that
 have no dependency on that plugin.
 
-The implemented first slice extracts PE image/section metadata, imports, exports, forwarded
-exports, and x64 `RUNTIME_FUNCTION` records without loading or executing the input. It promotes only
-exact export names and corroborated, metadata-backed boundaries into the graph; broader candidate
-discovery and the remaining evidence sources above are planned.
+The implemented slice extracts PE image/section metadata, imports, exports, forwarded exports, x64
+`RUNTIME_FUNCTION` records, and a bounded modern MSVC x64 RTTI/vftable subset without loading,
+executing, or disassembling the input. Exact export names, corroborated metadata-backed boundaries,
+validated RTTI type/vftable names, and function-to-class relationships from virtual slots become
+evidence-bearing graph claims. Broader candidate discovery and the remaining evidence sources
+above are planned.
+
+The RTTI pass candidate-scans only file-backed initialized data sections that are readable,
+non-writable, and non-executable. Vftables and their back-pointers, complete object locators,
+class-hierarchy descriptors, base-class arrays, base-class descriptors, and nested hierarchy
+descriptors must remain in those read-only scan sections. A referenced TypeDescriptor may instead
+occupy any file-backed initialized, readable, non-executable data section, including normal
+writable `.data`; writable sections are never candidate-scanned. A candidate is committed only
+after that section policy, the Rev1 structure chain, and executable file-backed virtual targets
+agree. The supported base-class descriptor is deliberately the modern 28-byte form with the
+`BCD_HASPCHD` layout bit and nested class-hierarchy RVA; older descriptors and other ABI variants
+are rejected rather than guessed.
+
+The ABI does not encode a vftable slot count. ReSymbol therefore retains contiguous pointer-sized
+entries only while they resolve to file-backed executable bytes, stops at the first nonmatching
+entry, caps each table at 4,096 slots, and records slot-to-class relationships below the confidence
+of the RTTI type and vftable identity itself.
+
+Discovery scans at most 64 MiB of eligible section data for candidate back-pointers in RVA order;
+validating a candidate performs additional individually bounded reads of referenced metadata and
+slots. Locator candidates, vftables, base records, virtual slots, and name text are separately
+bounded. Retained RTTI names have a 16 MiB aggregate budget. Candidate-local failures discard that
+candidate; exhausting a scan or aggregate budget preserves already validated results and marks the
+analysis as partial. The deterministic core pass is offline and never executes the analyzed image.
 
 ### 3. Matching and semantic inference
 
@@ -138,9 +164,9 @@ the canonical graph into a debugger database.
 
 Exporters consume a bounded, read-only projection of one validated session. The initial projection
 selects deterministic names and boundaries, preserves competing names, prototypes, type
-definitions, confidence, and provenance where representable, assigns collision-safe output names,
-and emits structured warnings when graph information must be reduced or omitted. Writers revalidate
-that projection before serializing it.
+definitions, attributed class memberships, confidence, and provenance where representable, assigns
+collision-safe output names, and emits structured warnings when graph information must be reduced
+or omitted. Writers revalidate that projection before serializing it.
 
 The first writers serialize the projection as JSON or generate self-contained IDAPython and Ghidra
 Java import scripts. Each script checks the debugger's recorded input SHA-256 before mutation and
@@ -151,8 +177,10 @@ symbol cannot be applied. This is intentionally narrower than a long-lived tool-
 selected collision-safe function/global names and safe function boundaries are applied, while
 source spellings, alternate names, confidence, provenance, prototypes, types, comments, and
 relationships remain available in the neutral JSON but are not yet fully represented in the tool
-database. The generated Ghidra Java writer has a documented 20,000-record ceiling so its output
-stays within practical Java/Ghidra compilation bounds.
+database. In particular, validated vftable global names can be applied, but RTTI type creation and
+function-to-class membership metadata remain JSON-only; no virtual-method names are invented. The
+generated Ghidra Java writer has a documented 20,000-record ceiling so its output stays within
+practical Java/Ghidra compilation bounds.
 
 PDB, MAP, DWARF, IDA, Ghidra, and other targets have different capabilities and must not force
 their assumptions into the canonical graph. Native PDB/MAP/DWARF writers and interactive debugger

@@ -122,6 +122,208 @@ fn fixture() -> Vec<u8> {
     bytes
 }
 
+const RTTI_TEXT_RAW_OFFSET: usize = 0x200;
+const RTTI_TEXT_RVA: u32 = 0x1000;
+const RTTI_RDATA_RAW_OFFSET: usize = 0x400;
+const RTTI_RDATA_RVA: u32 = 0x2000;
+const RTTI_DATA_RAW_OFFSET: usize = 0x800;
+const RTTI_DATA_RVA: u32 = 0x3000;
+const RTTI_IMAGE_BASE: u64 = 0x0000_0001_4000_0000;
+
+fn rtti_file_offset(rva: u32) -> usize {
+    if (RTTI_TEXT_RVA..RTTI_TEXT_RVA + 0x200).contains(&rva) {
+        RTTI_TEXT_RAW_OFFSET
+            + usize::try_from(rva - RTTI_TEXT_RVA).expect("fixture text RVA fits usize")
+    } else if (RTTI_RDATA_RVA..RTTI_RDATA_RVA + 0x400).contains(&rva) {
+        RTTI_RDATA_RAW_OFFSET
+            + usize::try_from(rva - RTTI_RDATA_RVA).expect("fixture rdata RVA fits usize")
+    } else {
+        panic!("RVA 0x{rva:x} is outside the RTTI fixture")
+    }
+}
+
+fn put_rtti_rva_u32(bytes: &mut [u8], rva: u32, value: u32) {
+    put_u32(bytes, rtti_file_offset(rva), value);
+}
+
+fn put_rtti_rva_u64(bytes: &mut [u8], rva: u32, value: u64) {
+    put_u64(bytes, rtti_file_offset(rva), value);
+}
+
+fn rtti_data_file_offset(rva: u32) -> usize {
+    RTTI_DATA_RAW_OFFSET
+        + usize::try_from(rva - RTTI_DATA_RVA).expect("fixture data RVA fits usize")
+}
+
+fn put_writable_type_descriptor(bytes: &mut [u8], rva: u32, name: &str) {
+    let offset = rtti_data_file_offset(rva);
+    put_u64(bytes, offset, RTTI_IMAGE_BASE + 0x2050);
+    put_u64(bytes, offset + 8, 0);
+    put_c_string(bytes, offset + 16, name);
+}
+
+fn put_complete_object_locator(
+    bytes: &mut [u8],
+    rva: u32,
+    type_descriptor_rva: u32,
+    class_hierarchy_descriptor_rva: u32,
+) {
+    put_rtti_rva_u32(bytes, rva, 1);
+    put_rtti_rva_u32(bytes, rva + 4, 0);
+    put_rtti_rva_u32(bytes, rva + 8, 0);
+    put_rtti_rva_u32(bytes, rva + 12, type_descriptor_rva);
+    put_rtti_rva_u32(bytes, rva + 16, class_hierarchy_descriptor_rva);
+    put_rtti_rva_u32(bytes, rva + 20, rva);
+}
+
+fn put_class_hierarchy_descriptor(
+    bytes: &mut [u8],
+    rva: u32,
+    base_count: u32,
+    base_class_array_rva: u32,
+) {
+    put_rtti_rva_u32(bytes, rva, 0);
+    put_rtti_rva_u32(bytes, rva + 4, 0);
+    put_rtti_rva_u32(bytes, rva + 8, base_count);
+    put_rtti_rva_u32(bytes, rva + 12, base_class_array_rva);
+}
+
+fn put_base_class_descriptor(
+    bytes: &mut [u8],
+    rva: u32,
+    type_descriptor_rva: u32,
+    num_contained_bases: u32,
+    class_hierarchy_descriptor_rva: u32,
+) {
+    put_rtti_rva_u32(bytes, rva, type_descriptor_rva);
+    put_rtti_rva_u32(bytes, rva + 4, num_contained_bases);
+    put_rtti_rva_u32(bytes, rva + 8, 0);
+    put_rtti_rva_u32(bytes, rva + 12, u32::MAX);
+    put_rtti_rva_u32(bytes, rva + 16, 0);
+    put_rtti_rva_u32(bytes, rva + 20, 0x40);
+    put_rtti_rva_u32(bytes, rva + 24, class_hierarchy_descriptor_rva);
+}
+
+fn rtti_fixture() -> Vec<u8> {
+    let mut bytes = vec![0_u8; 0x800];
+    bytes[0..2].copy_from_slice(b"MZ");
+    put_u32(
+        &mut bytes,
+        0x3c,
+        u32::try_from(PE_OFFSET).expect("fixture offset"),
+    );
+    bytes[PE_OFFSET..PE_OFFSET + 4].copy_from_slice(b"PE\0\0");
+
+    put_u16(&mut bytes, COFF_OFFSET, 0x8664);
+    put_u16(&mut bytes, COFF_OFFSET + 2, 2);
+    put_u32(&mut bytes, COFF_OFFSET + 4, 0x1234_5678);
+    put_u16(&mut bytes, COFF_OFFSET + 16, 0xf0);
+    put_u16(&mut bytes, COFF_OFFSET + 18, 0x2022);
+
+    put_u16(&mut bytes, OPTIONAL_OFFSET, 0x020b);
+    put_u32(&mut bytes, OPTIONAL_OFFSET + 16, RTTI_TEXT_RVA);
+    put_u64(&mut bytes, OPTIONAL_OFFSET + 24, RTTI_IMAGE_BASE);
+    put_u32(&mut bytes, OPTIONAL_OFFSET + 32, 0x1000);
+    put_u32(&mut bytes, OPTIONAL_OFFSET + 36, 0x200);
+    put_u32(&mut bytes, OPTIONAL_OFFSET + 56, 0x3000);
+    put_u32(&mut bytes, OPTIONAL_OFFSET + 60, 0x200);
+    put_u16(&mut bytes, OPTIONAL_OFFSET + 68, 3);
+    put_u16(&mut bytes, OPTIONAL_OFFSET + 70, 0x8160);
+    put_u32(&mut bytes, OPTIONAL_OFFSET + 108, 16);
+    set_directory(&mut bytes, 3, 0x2000, 24);
+
+    bytes[SECTION_OFFSET..SECTION_OFFSET + 6].copy_from_slice(b".text\0");
+    put_u32(&mut bytes, SECTION_OFFSET + 8, 0x200);
+    put_u32(&mut bytes, SECTION_OFFSET + 12, RTTI_TEXT_RVA);
+    put_u32(&mut bytes, SECTION_OFFSET + 16, 0x200);
+    put_u32(
+        &mut bytes,
+        SECTION_OFFSET + 20,
+        u32::try_from(RTTI_TEXT_RAW_OFFSET).expect("fixture text raw offset"),
+    );
+    put_u32(&mut bytes, SECTION_OFFSET + 36, 0x6000_0020);
+
+    let rdata_section = SECTION_OFFSET + 40;
+    bytes[rdata_section..rdata_section + 7].copy_from_slice(b".rdata\0");
+    put_u32(&mut bytes, rdata_section + 8, 0x400);
+    put_u32(&mut bytes, rdata_section + 12, RTTI_RDATA_RVA);
+    put_u32(&mut bytes, rdata_section + 16, 0x400);
+    put_u32(
+        &mut bytes,
+        rdata_section + 20,
+        u32::try_from(RTTI_RDATA_RAW_OFFSET).expect("fixture rdata raw offset"),
+    );
+    put_u32(&mut bytes, rdata_section + 36, 0x4000_0040);
+
+    bytes[rtti_file_offset(0x1000)] = 0xc3;
+    bytes[rtti_file_offset(0x1020)] = 0xc3;
+    put_rtti_rva_u32(&mut bytes, 0x2000, 0x1000);
+    put_rtti_rva_u32(&mut bytes, 0x2004, 0x1010);
+    put_rtti_rva_u32(&mut bytes, 0x2008, 0x2080);
+    put_rtti_rva_u32(&mut bytes, 0x200c, 0x1020);
+    put_rtti_rva_u32(&mut bytes, 0x2010, 0x1030);
+    put_rtti_rva_u32(&mut bytes, 0x2014, 0x2084);
+
+    put_rtti_rva_u64(&mut bytes, 0x2100, RTTI_IMAGE_BASE + 0x2050);
+    put_rtti_rva_u64(&mut bytes, 0x2108, 0);
+    put_c_string(&mut bytes, rtti_file_offset(0x2110), ".?AVDerived@@");
+    put_rtti_rva_u64(&mut bytes, 0x2140, RTTI_IMAGE_BASE + 0x2050);
+    put_rtti_rva_u64(&mut bytes, 0x2148, 0);
+    put_c_string(&mut bytes, rtti_file_offset(0x2150), ".?AVBase@@");
+
+    put_complete_object_locator(&mut bytes, 0x2180, 0x2100, 0x21c0);
+    put_complete_object_locator(&mut bytes, 0x21a0, 0x2140, 0x21e0);
+    put_class_hierarchy_descriptor(&mut bytes, 0x21c0, 2, 0x2200);
+    put_class_hierarchy_descriptor(&mut bytes, 0x21e0, 1, 0x2210);
+
+    put_rtti_rva_u32(&mut bytes, 0x2200, 0x2220);
+    put_rtti_rva_u32(&mut bytes, 0x2204, 0x2240);
+    put_rtti_rva_u32(&mut bytes, 0x2210, 0x2240);
+    put_base_class_descriptor(&mut bytes, 0x2220, 0x2100, 1, 0x21c0);
+    put_base_class_descriptor(&mut bytes, 0x2240, 0x2140, 0, 0x21e0);
+
+    put_rtti_rva_u64(&mut bytes, 0x2280, RTTI_IMAGE_BASE + 0x2180);
+    put_rtti_rva_u64(&mut bytes, 0x2288, RTTI_IMAGE_BASE + 0x1000);
+    put_rtti_rva_u64(&mut bytes, 0x2290, RTTI_IMAGE_BASE + 0x1020);
+
+    put_rtti_rva_u64(&mut bytes, 0x22a0, RTTI_IMAGE_BASE + 0x21a0);
+    put_rtti_rva_u64(&mut bytes, 0x22a8, RTTI_IMAGE_BASE + 0x1020);
+
+    put_rtti_rva_u64(&mut bytes, 0x22c0, RTTI_IMAGE_BASE + 0x2180);
+    put_rtti_rva_u64(&mut bytes, 0x22c8, RTTI_IMAGE_BASE + 0x1000);
+    bytes
+}
+
+fn rtti_fixture_with_writable_type_descriptors() -> Vec<u8> {
+    let mut bytes = rtti_fixture();
+    bytes.resize(0xa00, 0);
+
+    put_u16(&mut bytes, COFF_OFFSET + 2, 3);
+    put_u32(&mut bytes, OPTIONAL_OFFSET + 56, 0x4000);
+
+    let data_section = SECTION_OFFSET + 80;
+    bytes[data_section..data_section + 6].copy_from_slice(b".data\0");
+    put_u32(&mut bytes, data_section + 8, 0x200);
+    put_u32(&mut bytes, data_section + 12, RTTI_DATA_RVA);
+    put_u32(&mut bytes, data_section + 16, 0x200);
+    put_u32(
+        &mut bytes,
+        data_section + 20,
+        u32::try_from(RTTI_DATA_RAW_OFFSET).expect("fixture data raw offset"),
+    );
+    put_u32(&mut bytes, data_section + 36, 0xc000_0040);
+
+    bytes[rtti_file_offset(0x2100)..rtti_file_offset(0x2160)].fill(0);
+    put_writable_type_descriptor(&mut bytes, 0x3000, ".?AVDerived@@");
+    put_writable_type_descriptor(&mut bytes, 0x3040, ".?AVBase@@");
+
+    put_rtti_rva_u32(&mut bytes, 0x218c, 0x3000);
+    put_rtti_rva_u32(&mut bytes, 0x21ac, 0x3040);
+    put_rtti_rva_u32(&mut bytes, 0x2220, 0x3000);
+    put_rtti_rva_u32(&mut bytes, 0x2240, 0x3040);
+    bytes
+}
+
 fn plugin_id() -> PluginId {
     PluginId::new("dev.resymbol.session-test").expect("valid plugin id")
 }
@@ -234,6 +436,276 @@ fn analyzes_minimal_pe_with_imports_exports_and_runtime_functions() {
             .expect("exact export evidence")
             .get(),
         1.0
+    );
+}
+
+#[test]
+fn extracts_msvc_rtti_with_shared_locators_and_reused_base_descriptors() {
+    let bytes = rtti_fixture();
+    let analysis = analyze_pe(&bytes).expect("valid PE with MSVC x64 RTTI");
+
+    assert_eq!(analysis.sections.len(), 2);
+    assert_eq!(analysis.runtime_functions.len(), 2);
+    assert!(!analysis.msvc_rtti_scan_truncated);
+    assert_eq!(analysis.msvc_rtti_vftables.len(), 3);
+
+    let derived = &analysis.msvc_rtti_vftables[0];
+    assert_eq!(derived.rva, 0x2288);
+    assert_eq!(derived.complete_object_locator_rva, 0x2180);
+    assert_eq!(derived.type_descriptor_rva, 0x2100);
+    assert_eq!(derived.class_hierarchy_descriptor_rva, 0x21c0);
+    assert_eq!(derived.base_class_array_rva, 0x2200);
+    assert_eq!(derived.decorated_class_name, ".?AVDerived@@");
+    assert_eq!(derived.class_name, "Derived");
+    assert_eq!(derived.virtual_function_rvas, [0x1000, 0x1020]);
+    assert_eq!(derived.base_classes.len(), 2);
+    assert_eq!(derived.base_classes[0].array_index, 0);
+    assert_eq!(derived.base_classes[0].descriptor_rva, 0x2220);
+    assert_eq!(derived.base_classes[0].name, "Derived");
+    assert_eq!(derived.base_classes[0].num_contained_bases, 1);
+    assert_eq!(derived.base_classes[1].array_index, 1);
+    assert_eq!(derived.base_classes[1].descriptor_rva, 0x2240);
+    assert_eq!(derived.base_classes[1].name, "Base");
+    assert_eq!(derived.base_classes[1].num_contained_bases, 0);
+
+    let base = &analysis.msvc_rtti_vftables[1];
+    assert_eq!(base.rva, 0x22a8);
+    assert_eq!(base.complete_object_locator_rva, 0x21a0);
+    assert_eq!(base.type_descriptor_rva, 0x2140);
+    assert_eq!(base.class_name, "Base");
+    assert_eq!(base.base_classes.len(), 1);
+    assert_eq!(base.virtual_function_rvas, [0x1020]);
+
+    let second_derived = &analysis.msvc_rtti_vftables[2];
+    assert_eq!(second_derived.rva, 0x22c8);
+    assert_eq!(second_derived.class_name, "Derived");
+    assert_eq!(second_derived.virtual_function_rvas, [0x1000]);
+
+    assert_eq!(
+        derived.complete_object_locator_rva, second_derived.complete_object_locator_rva,
+        "multiple vftables may share one complete object locator",
+    );
+    assert_eq!(
+        derived.base_classes[1].descriptor_rva, base.base_classes[0].descriptor_rva,
+        "one base descriptor may occur in multiple hierarchy arrays",
+    );
+    assert_eq!(
+        analysis.rebuild_symbol_graph().expect("rebuild RTTI graph"),
+        analysis.symbol_graph
+    );
+    assert!(analysis.symbol_graph.claims().iter().all(|claim| {
+        !matches!(
+            (claim.subject(), claim.assertion()),
+            (SymbolSubject::Function { .. }, SymbolAssertion::Name { .. })
+        )
+    }));
+
+    let json = serde_json::to_string(&analysis).expect("serialize RTTI analysis");
+    let decoded = serde_json::from_str(&json).expect("deserialize RTTI analysis");
+    assert_eq!(analysis, decoded);
+}
+
+#[test]
+fn accepts_writable_non_executable_msvc_type_descriptors() {
+    let bytes = rtti_fixture_with_writable_type_descriptors();
+    let analysis = analyze_pe(&bytes).expect("writable TypeDescriptors are valid MSVC metadata");
+
+    assert_eq!(analysis.sections.len(), 3);
+    assert_eq!(analysis.sections[2].name, ".data");
+    assert_eq!(analysis.sections[2].characteristics, 0xc000_0040);
+    assert!(!analysis.msvc_rtti_scan_truncated);
+    assert_eq!(analysis.msvc_rtti_vftables.len(), 3);
+    assert_eq!(analysis.msvc_rtti_vftables[0].type_descriptor_rva, 0x3000);
+    assert_eq!(analysis.msvc_rtti_vftables[0].class_name, "Derived");
+    assert_eq!(analysis.msvc_rtti_vftables[1].type_descriptor_rva, 0x3040);
+    assert_eq!(analysis.msvc_rtti_vftables[1].class_name, "Base");
+    assert_eq!(analysis.msvc_rtti_vftables[2].type_descriptor_rva, 0x3000);
+
+    let json = serde_json::to_string(&analysis).expect("serialize writable-TypeDescriptor RTTI");
+    let decoded = serde_json::from_str(&json).expect("validate writable-TypeDescriptor RTTI");
+    assert_eq!(analysis, decoded);
+}
+
+#[test]
+fn validated_deserialization_rejects_executable_type_descriptors_and_writable_rtti_anchors() {
+    let analysis = analyze_pe(&rtti_fixture_with_writable_type_descriptors())
+        .expect("valid PE with writable TypeDescriptors");
+
+    let mut executable_type_descriptors =
+        serde_json::to_value(&analysis).expect("serialize analysis");
+    executable_type_descriptors["sections"][2]["characteristics"] =
+        serde_json::json!(0xe000_0040_u32);
+    let error =
+        serde_json::from_value::<resymbol_analysis::PeAnalysis>(executable_type_descriptors)
+            .expect_err("TypeDescriptors in executable data must not enter the trusted model");
+    assert!(
+        error.to_string().contains("MSVC RTTI type descriptor"),
+        "unexpected validation error: {error}"
+    );
+
+    let mut writable_anchors = serde_json::to_value(analysis).expect("serialize analysis");
+    writable_anchors["sections"][1]["characteristics"] = serde_json::json!(0xc000_0040_u32);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(writable_anchors)
+        .expect_err("writable vftable and locator storage must remain invalid");
+    assert!(
+        error.to_string().contains("MSVC RTTI back-pointer"),
+        "unexpected validation error: {error}"
+    );
+}
+
+#[test]
+fn preserves_duplicate_descriptors_inside_one_base_class_array() {
+    let mut bytes = rtti_fixture();
+    put_rtti_rva_u32(&mut bytes, 0x21c8, 3);
+    put_rtti_rva_u32(&mut bytes, 0x2224, 2);
+    put_rtti_rva_u32(&mut bytes, 0x2208, 0x2240);
+
+    let analysis = analyze_pe(&bytes).expect("duplicate BCA entries are valid ABI metadata");
+    let derived_tables = analysis
+        .msvc_rtti_vftables
+        .iter()
+        .filter(|vftable| vftable.class_name == "Derived")
+        .collect::<Vec<_>>();
+    assert_eq!(derived_tables.len(), 2);
+    for vftable in derived_tables {
+        assert_eq!(
+            vftable
+                .base_classes
+                .iter()
+                .map(|base| (base.array_index, base.descriptor_rva))
+                .collect::<Vec<_>>(),
+            [(0, 0x2220), (1, 0x2240), (2, 0x2240)]
+        );
+    }
+}
+
+#[test]
+fn rejects_only_a_vftable_whose_first_slot_is_not_file_backed_executable_code() {
+    let mut bytes = rtti_fixture();
+    put_rtti_rva_u64(&mut bytes, 0x22c8, RTTI_IMAGE_BASE + 0x2100);
+
+    let analysis = analyze_pe(&bytes).expect("a bad RTTI candidate is non-fatal");
+    assert_eq!(
+        analysis
+            .msvc_rtti_vftables
+            .iter()
+            .map(|vftable| vftable.rva)
+            .collect::<Vec<_>>(),
+        [0x2288, 0x22a8]
+    );
+}
+
+#[test]
+fn an_rtti_free_pe_produces_no_rtti_records() {
+    let mut bytes = rtti_fixture();
+    let metadata_start = rtti_file_offset(0x2100);
+    let metadata_end = rtti_file_offset(0x2300);
+    bytes[metadata_start..metadata_end].fill(0);
+
+    let analysis = analyze_pe(&bytes).expect("RTTI is optional PE metadata");
+    assert!(!analysis.msvc_rtti_scan_truncated);
+    assert!(analysis.msvc_rtti_vftables.is_empty());
+    assert_eq!(analysis.runtime_functions.len(), 2);
+}
+
+#[test]
+fn skips_a_corrupt_rtti_locator_without_partially_retaining_its_vftables() {
+    let mut bytes = rtti_fixture();
+    put_rtti_rva_u32(&mut bytes, 0x2220 + 20, 0);
+
+    let analysis = analyze_pe(&bytes).expect("invalid RTTI candidates are non-fatal");
+    assert_eq!(analysis.msvc_rtti_vftables.len(), 1);
+    assert_eq!(analysis.msvc_rtti_vftables[0].rva, 0x22a8);
+    assert_eq!(analysis.msvc_rtti_vftables[0].class_name, "Base");
+    assert!(
+        analysis
+            .msvc_rtti_vftables
+            .iter()
+            .all(|vftable| vftable.complete_object_locator_rva != 0x2180),
+        "both candidates sharing the corrupt locator must be discarded",
+    );
+}
+
+#[test]
+fn validated_deserialization_rejects_tampered_msvc_rtti() {
+    let analysis = analyze_pe(&rtti_fixture()).expect("valid PE with RTTI");
+    let mut value = serde_json::to_value(analysis).expect("serialize analysis");
+    value["msvc_rtti_vftables"][0]["base_classes"][1]["name"] = serde_json::json!("ForgedBase");
+
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(value)
+        .expect_err("tampered demangled RTTI names must not enter the trusted model");
+    assert!(error.to_string().contains("MSVC RTTI"));
+}
+
+#[test]
+fn validated_deserialization_rejects_contradictory_shared_rtti_locators() {
+    let analysis = analyze_pe(&rtti_fixture()).expect("valid PE with shared RTTI locator");
+    let mut value = serde_json::to_value(analysis).expect("serialize analysis");
+    value["msvc_rtti_vftables"][2]["offset"] = serde_json::json!(8);
+
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(value)
+        .expect_err("one locator RVA cannot describe contradictory offsets");
+    assert!(
+        error.to_string().contains("shared complete object locator"),
+        "unexpected validation error: {error}"
+    );
+}
+
+#[test]
+fn validated_deserialization_rejects_contradictory_shared_class_hierarchies() {
+    let analysis = analyze_pe(&rtti_fixture()).expect("valid PE with shared class hierarchy");
+    let mut value = serde_json::to_value(analysis).expect("serialize analysis");
+    value["msvc_rtti_vftables"][2]["hierarchy_attributes"] = serde_json::json!(1);
+
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(value)
+        .expect_err("one CHD RVA cannot describe contradictory hierarchy attributes");
+    assert!(
+        error.to_string().contains("shared class hierarchy"),
+        "unexpected validation error: {error}"
+    );
+}
+
+#[test]
+fn validated_deserialization_accepts_shared_base_class_array_suffixes() {
+    let analysis = analyze_pe(&rtti_fixture()).expect("valid PE with distinct base-class arrays");
+    let mut value = serde_json::to_value(analysis).expect("serialize analysis");
+    value["msvc_rtti_vftables"][1]["base_class_array_rva"] = serde_json::json!(0x2204);
+
+    let decoded = serde_json::from_value::<resymbol_analysis::PeAnalysis>(value)
+        .expect("the Base hierarchy may reuse the matching suffix of Derived's BCA");
+    assert_eq!(decoded.msvc_rtti_vftables[1].base_class_array_rva, 0x2204);
+    assert_eq!(decoded.msvc_rtti_vftables[1].base_classes.len(), 1);
+    assert_eq!(
+        decoded.msvc_rtti_vftables[1].base_classes[0].descriptor_rva,
+        0x2240
+    );
+}
+
+#[test]
+fn validated_deserialization_rejects_contradictory_shared_base_class_arrays() {
+    let analysis = analyze_pe(&rtti_fixture()).expect("valid PE with distinct base-class arrays");
+    let mut value = serde_json::to_value(analysis).expect("serialize analysis");
+    value["msvc_rtti_vftables"][1]["base_class_array_rva"] = serde_json::json!(0x2200);
+
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(value)
+        .expect_err("one BCA RVA cannot describe contradictory descriptor order");
+    assert!(
+        error.to_string().contains("shared base-class array"),
+        "unexpected validation error: {error}"
+    );
+}
+
+#[test]
+fn validated_deserialization_rejects_contradictory_shared_base_descriptors() {
+    let analysis = analyze_pe(&rtti_fixture()).expect("valid PE with reused base descriptor");
+    let mut value = serde_json::to_value(analysis).expect("serialize analysis");
+    value["msvc_rtti_vftables"][0]["base_classes"][1]["member_displacement"] = serde_json::json!(8);
+
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(value)
+        .expect_err("one BCD RVA cannot describe contradictory PMD fields");
+    assert!(
+        error.to_string().contains("shared base-class descriptor"),
+        "unexpected validation error: {error}"
     );
 }
 

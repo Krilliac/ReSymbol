@@ -78,8 +78,14 @@ The `json` format is the loss-aware interchange output. It retains:
 - selected collision-safe output names and their source spellings;
 - competing names, confidence, and producer/run provenance;
 - supported function and global boundaries;
-- recovered function prototypes and type definitions that fit the neutral model; and
+- recovered function prototypes and type definitions that fit the neutral model;
+- attributed function-to-class membership relationships; and
 - structured, counted warnings for information that was reduced or omitted.
+
+The current neutral export uses `schema_version: 2`. Schema 2 adds the attributed
+`class_memberships` relationship array to each projected function. This projection schema is
+independent from the `.resym` package-envelope schema; consumers must validate the version of the
+artifact they are actually reading.
 
 Entries are emitted in stable order. Name and range conflicts are resolved conservatively, and
 colliding selected names receive deterministic output suffixes rather than silently referring to
@@ -87,6 +93,40 @@ the same debugger symbol.
 
 The JSON projection is not a PDB, MAP file, IDA database, or Ghidra project. It is the common input
 to target-specific writers and a useful artifact for plugins, review tools, and future exporters.
+
+### RTTI-derived projection
+
+Validated modern MSVC x64 RTTI contributes recovered type-descriptor names, selected global names
+for vftables, and attributed class-membership relationships for executable virtual-slot targets.
+The neutral JSON projection retains those function-to-class relationships with confidence and
+provenance. The complete base-class/PMD records remain in the source `.resym` package; the current
+neutral projection does not yet turn them into a general inheritance type model.
+
+Each function retains at most 4,096 distinct class memberships. If more are projected, ReSymbol
+deterministically keeps the strongest 4,096 according to the normal producer-authority,
+confidence, and stable tie-break ordering. The remaining distinct relationships are omitted under
+one `class-membership-limit-exceeded` warning group for that function, whose `occurrences` value
+counts the overflow reductions.
+
+The source records are deliberately limited to modern MSVC x64 Rev1 RTTI with 28-byte base-class
+descriptors carrying `BCD_HASPCHD`; older 24-byte descriptors and other ABI variants are not
+reinterpreted. Candidate scanning and the vftable/back-pointer, COL, CHD, BCA, BCD, and nested-CHD
+records remain restricted to file-backed read-only initialized non-executable data. Referenced
+TypeDescriptors may occupy file-backed initialized readable non-executable data, including normal
+writable `.data`, but writable sections are never candidate-scanned. Discovery is bounded and may
+be partial: when the section-scan or aggregate model budget is exhausted, the package retains
+validated results and sets `msvc_rtti_scan_truncated`. Inspect that flag before treating the
+projected set as exhaustive.
+
+MSVC RTTI does not encode a vftable slot count. ReSymbol therefore derives virtual-slot extent with
+a bounded contiguous-pointer heuristic that stops at the first target that is not in-image,
+file-backed executable code. A relationship means that the target occupied a validated candidate
+slot; it is not an authoritative table-size claim or a recovered source-level method name.
+
+The IDA and Ghidra scripts can apply a projected vftable global name when the address and existing
+tool state permit it. They do not create RTTI types, install class-membership metadata, or invent
+names for virtual functions. This keeps compiler metadata distinct from a source-level method name
+that may no longer exist in the binary.
 
 ## Import into IDA
 
@@ -163,9 +203,9 @@ The initial scripts intentionally apply less information than the JSON projectio
   script.
 - **Types:** type names, alternatives, and definitions remain in JSON and are not yet created in
   IDA or Ghidra.
-- **Comments and relationships:** unsupported graph assertions, class membership, evidence links,
-  and other relationships are not currently installed in the debugger. Projection warnings expose
-  reductions where possible.
+- **Comments and relationships:** class membership is retained in the neutral JSON projection but
+  is not currently installed in either debugger. Base-class/PMD records remain in `.resym`, and
+  evidence links and other unsupported relationships may be reduced with projection warnings.
 - **Existing tool state:** IDA user-authored names, Ghidra names from any source other than
   `DEFAULT`/`ANALYSIS`, and existing function bodies win. The scripts do not offer an override
   switch; an interactive review bridge is planned for choices that require user judgment.
