@@ -18,6 +18,10 @@ compile_commands.json
 CMakeFiles/
 CMakeCache.txt
 
+# Python test tooling
+__pycache__/
+*.py[cod]
+
 # ReSymbol runtime and generated analysis output
 **/.resymbol/
 /dist/

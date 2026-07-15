@@ -1,4 +1,4 @@
-use std::{io, time::Duration};
+use std::{io, path::PathBuf, time::Duration};
 
 use resymbol_core::{ClaimValidationError, plugin_api::PluginRuntimeKind};
 use serde_json::Value;
@@ -38,14 +38,61 @@ pub enum PluginRuntimeError {
     UnsupportedPluginSource,
     #[error("plugin is not loadable: {0}")]
     PluginNotLoadable(String),
-    #[error("runtime kind {0:?} is unsupported; only external-process plugins may execute")]
+    #[error("runtime kind {0:?} is unsupported by this process host")]
     UnsupportedRuntime(PluginRuntimeKind),
     #[error("invalid plugin manifest: {0}")]
     InvalidManifest(String),
     #[error("invalid request: {0}")]
     InvalidRequest(&'static str),
+    #[error("invalid native-plugin execution context: {0}")]
+    InvalidNativeContext(String),
+    #[error(
+        "native-plugin helper is unavailable at {path}: {reason}",
+        path = .path.display()
+    )]
+    NativeHostUnavailable { path: PathBuf, reason: String },
+    #[error(
+        "native-plugin helper failed before attributable plugin execution (code {code:?}): {reason}"
+    )]
+    NativeHostFailed {
+        code: Option<i32>,
+        reason: String,
+        diagnostics: ProcessDiagnostics,
+    },
+    #[error(
+        "exact native-plugin source binary is unavailable or changed at {path}: {reason}",
+        path = .path.display()
+    )]
+    NativeSourceBinary { path: PathBuf, reason: String },
+    #[error(
+        "exact native analysis input changed after helper launch at {path}: {reason}",
+        path = .path.display()
+    )]
+    NativeHostInputChanged {
+        path: PathBuf,
+        reason: String,
+        diagnostics: ProcessDiagnostics,
+    },
+    #[error(
+        "native-plugin artifact changed after helper launch but before platform load: {reason}"
+    )]
+    NativeHostArtifactChanged {
+        reason: String,
+        diagnostics: ProcessDiagnostics,
+    },
+    #[error(
+        "exact native analysis input changed during attributable plugin execution at {path}: {reason}",
+        path = .path.display()
+    )]
+    NativeExecutionInputChanged {
+        path: PathBuf,
+        reason: String,
+        diagnostics: ProcessDiagnostics,
+    },
     #[error("failed to encode bounded plugin input: {0}")]
     EncodeInput(#[source] serde_json::Error),
+    #[error("failed to encode bounded native-host bootstrap: {0}")]
+    EncodeNativeBootstrap(#[source] serde_json::Error),
     #[error("permission `{0}` was granted but is not requested by the plugin manifest")]
     PermissionNotRequested(String),
     #[error("plugin used ungranted permission `{permission}`")]
@@ -122,6 +169,11 @@ pub enum PluginRuntimeError {
         data: Option<Value>,
         diagnostics: ProcessDiagnostics,
     },
+    #[error("plugin artifact changed during native execution: {reason}")]
+    PluginArtifactChanged {
+        reason: String,
+        diagnostics: ProcessDiagnostics,
+    },
 }
 
 impl PluginRuntimeError {
@@ -134,11 +186,39 @@ impl PluginRuntimeError {
             | Self::PermissionDenied { diagnostics, .. }
             | Self::ClaimEventNotAllowed { diagnostics, .. }
             | Self::Timeout { diagnostics, .. }
+            | Self::NativeHostFailed { diagnostics, .. }
+            | Self::NativeHostInputChanged { diagnostics, .. }
+            | Self::NativeHostArtifactChanged { diagnostics, .. }
+            | Self::NativeExecutionInputChanged { diagnostics, .. }
             | Self::ProcessFailed { diagnostics, .. }
             | Self::InvalidJson { diagnostics, .. }
             | Self::Protocol { diagnostics, .. }
             | Self::InvalidClaim { diagnostics, .. }
-            | Self::PluginRejected { diagnostics, .. } => Some(diagnostics),
+            | Self::PluginRejected { diagnostics, .. }
+            | Self::PluginArtifactChanged { diagnostics, .. } => Some(diagnostics),
+            _ => None,
+        }
+    }
+
+    /// Mutably access captured child stderr for runtime-specific protocol
+    /// framing that must be removed before diagnostics leave this crate.
+    pub(crate) const fn diagnostics_mut(&mut self) -> Option<&mut ProcessDiagnostics> {
+        match self {
+            Self::StreamLimit { diagnostics, .. }
+            | Self::MessageLimit { diagnostics, .. }
+            | Self::PermissionDenied { diagnostics, .. }
+            | Self::ClaimEventNotAllowed { diagnostics, .. }
+            | Self::Timeout { diagnostics, .. }
+            | Self::NativeHostFailed { diagnostics, .. }
+            | Self::NativeHostInputChanged { diagnostics, .. }
+            | Self::NativeHostArtifactChanged { diagnostics, .. }
+            | Self::NativeExecutionInputChanged { diagnostics, .. }
+            | Self::ProcessFailed { diagnostics, .. }
+            | Self::InvalidJson { diagnostics, .. }
+            | Self::Protocol { diagnostics, .. }
+            | Self::InvalidClaim { diagnostics, .. }
+            | Self::PluginRejected { diagnostics, .. }
+            | Self::PluginArtifactChanged { diagnostics, .. } => Some(diagnostics),
             _ => None,
         }
     }

@@ -35,7 +35,8 @@ project maturity.
 
 - out-of-bounds reads, memory exhaustion, path traversal, or command execution caused by an input
   binary;
-- capability or sandbox escapes from a WASM or process-isolated plugin;
+- capability escapes from a sandboxed plugin host, or confusion between process separation and an
+  operating-system sandbox;
 - native or managed plugin trust being elevated without explicit consent;
 - signature, update, or package-confusion flaws that could substitute plugin code;
 - corruption or cross-contamination between analyses;
@@ -47,3 +48,16 @@ project maturity.
 The plugin isolation, permission, package-signing, and update designs are not yet stable security
 guarantees. Current implementation details—not roadmap statements—determine the protection a build
 provides. See [docs/plugin-system.md](docs/plugin-system.md) for the intended model.
+
+The current external and native plugin processes provide crash isolation, not an operating-system
+sandbox. Approved plugin code retains the ambient filesystem, network, credential, and process
+authority of the account launching ReSymbol. Manifest permissions gate ReSymbol protocol
+operations only. Treat an external executable or native library exactly as code run directly by
+that account.
+
+Executable plugins require approval bound to the complete plugin-directory fingerprint. This binds
+a decision to exact local bytes but does not authenticate a publisher, and trust must not transfer
+to a changed artifact. Keep plugin directories writable only by the intended user. Native plugins
+are always loaded by the application-local `resymbol-native-host[.exe]` sibling; placing a lookalike
+helper inside a plugin directory must never affect host selection. A native fault should terminate
+the disposable helper and discard that run's complete claim batch without terminating ReSymbol.

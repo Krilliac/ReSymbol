@@ -17,9 +17,14 @@
 #if defined(__cplusplus)
 #define RESYMBOL_PLUGIN_EXTERN_C extern "C"
 #define RESYMBOL_PLUGIN_NOEXCEPT noexcept
+#define RESYMBOL_PLUGIN_FUNCTION_POINTER(name, result, parameters) \
+    using name = result(RESYMBOL_PLUGIN_CALL *) parameters \
+        RESYMBOL_PLUGIN_NOEXCEPT
 #else
 #define RESYMBOL_PLUGIN_EXTERN_C extern
 #define RESYMBOL_PLUGIN_NOEXCEPT
+#define RESYMBOL_PLUGIN_FUNCTION_POINTER(name, result, parameters) \
+    typedef result(RESYMBOL_PLUGIN_CALL *name) parameters
 #endif
 
 #if defined(_WIN32)
@@ -53,6 +58,12 @@
 /* SemVer contract used by the `api` requirement in plugin.toml. */
 #define RESYMBOL_PLUGIN_CONTRACT_VERSION "0.1.0"
 
+/* Protocol-1 descriptor limits, measured in UTF-8 bytes where applicable. */
+#define RESYMBOL_PLUGIN_DESCRIPTOR_ID_MAX_BYTES UINT32_C(128)
+#define RESYMBOL_PLUGIN_DESCRIPTOR_NAME_MAX_BYTES UINT32_C(4096)
+#define RESYMBOL_PLUGIN_DESCRIPTOR_VERSION_MAX_BYTES UINT32_C(128)
+#define RESYMBOL_PLUGIN_DESCRIPTOR_IDENTIFIER_MAX_COUNT UINT32_C(4096)
+
 #define RESYMBOL_PLUGIN_ENTRYPOINT_NAME "resymbol_plugin_get_api"
 
 typedef int32_t resymbol_status;
@@ -65,6 +76,56 @@ typedef int32_t resymbol_status;
 #define RESYMBOL_STATUS_PERMISSION_DENIED ((resymbol_status)5)
 #define RESYMBOL_STATUS_CANCELLED ((resymbol_status)6)
 #define RESYMBOL_STATUS_RESOURCE_LIMIT ((resymbol_status)7)
+
+#if defined(__cplusplus)
+/*
+ * Optional C++11 helpers for keeping exceptions inside a plugin implementation.
+ * Status-returning lifecycle functions can translate an exception into a
+ * stable ABI status. Void cleanup functions have no error channel, so their
+ * helper deliberately contains all exceptions. When compiler exception support
+ * is disabled, both helpers reduce to a direct call.
+ */
+namespace resymbol_plugin_cpp {
+
+template <typename Operation>
+inline resymbol_status catch_to_status(
+    Operation &&operation,
+    resymbol_status failure_status = RESYMBOL_STATUS_INTERNAL_ERROR)
+    RESYMBOL_PLUGIN_NOEXCEPT
+{
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
+    try
+    {
+        return operation();
+    }
+    catch (...)
+    {
+        return failure_status;
+    }
+#else
+    (void)failure_status;
+    return operation();
+#endif
+}
+
+template <typename Operation>
+inline void catch_all(Operation &&operation) RESYMBOL_PLUGIN_NOEXCEPT
+{
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
+    try
+    {
+        operation();
+    }
+    catch (...)
+    {
+    }
+#else
+    operation();
+#endif
+}
+
+} /* namespace resymbol_plugin_cpp */
+#endif
 
 typedef uint32_t resymbol_log_level;
 
@@ -200,31 +261,47 @@ typedef struct resymbol_plugin_descriptor_v1 {
     void *reserved[8];
 } resymbol_plugin_descriptor_v1;
 
-typedef resymbol_status(RESYMBOL_PLUGIN_CALL *resymbol_plugin_get_descriptor_fn)(
-    void *plugin_context,
-    resymbol_plugin_descriptor_v1 *descriptor);
+/*
+ * No C++ exception may cross a plugin lifecycle boundary. The C++ aliases
+ * below carry a noexcept call contract. C++17 and newer also make noexcept
+ * part of the function type and reject potentially-throwing assignments;
+ * C++11/14 plugin authors must apply RESYMBOL_PLUGIN_NOEXCEPT explicitly to
+ * each callback definition, as demonstrated by the native C++ example.
+ */
+RESYMBOL_PLUGIN_FUNCTION_POINTER(
+    resymbol_plugin_get_descriptor_fn,
+    resymbol_status,
+    (void *plugin_context, resymbol_plugin_descriptor_v1 *descriptor));
 
 /* init_json_utf8 contains session identity, granted permissions, and limits. */
-typedef resymbol_status(RESYMBOL_PLUGIN_CALL *resymbol_plugin_initialize_fn)(
-    void *plugin_context,
-    resymbol_byte_view init_json_utf8);
+RESYMBOL_PLUGIN_FUNCTION_POINTER(
+    resymbol_plugin_initialize_fn,
+    resymbol_status,
+    (void *plugin_context, resymbol_byte_view init_json_utf8));
 
 /*
  * request_json_utf8 is a versioned analysis request. Results are emitted only
  * through host->submit_claim so ownership never crosses the ABI boundary.
  */
-typedef resymbol_status(RESYMBOL_PLUGIN_CALL *resymbol_plugin_analyze_fn)(
-    void *plugin_context,
-    resymbol_byte_view request_json_utf8);
+RESYMBOL_PLUGIN_FUNCTION_POINTER(
+    resymbol_plugin_analyze_fn,
+    resymbol_status,
+    (void *plugin_context, resymbol_byte_view request_json_utf8));
 
-typedef resymbol_status(RESYMBOL_PLUGIN_CALL *resymbol_plugin_health_check_fn)(
-    void *plugin_context);
+RESYMBOL_PLUGIN_FUNCTION_POINTER(
+    resymbol_plugin_health_check_fn,
+    resymbol_status,
+    (void *plugin_context));
 
-typedef void(RESYMBOL_PLUGIN_CALL *resymbol_plugin_shutdown_fn)(
-    void *plugin_context);
+RESYMBOL_PLUGIN_FUNCTION_POINTER(
+    resymbol_plugin_shutdown_fn,
+    void,
+    (void *plugin_context));
 
-typedef void(RESYMBOL_PLUGIN_CALL *resymbol_plugin_destroy_fn)(
-    void *plugin_context);
+RESYMBOL_PLUGIN_FUNCTION_POINTER(
+    resymbol_plugin_destroy_fn,
+    void,
+    (void *plugin_context));
 
 typedef struct resymbol_plugin_api_v1 {
     /*
@@ -252,10 +329,12 @@ typedef struct resymbol_plugin_api_v1 {
  * must not call host callbacks after destroy begins.
  */
 
-typedef resymbol_status(RESYMBOL_PLUGIN_CALL *resymbol_plugin_get_api_fn)(
-    uint32_t requested_abi_version,
-    const resymbol_host_api_v1 *host_api,
-    resymbol_plugin_api_v1 *plugin_api);
+RESYMBOL_PLUGIN_FUNCTION_POINTER(
+    resymbol_plugin_get_api_fn,
+    resymbol_status,
+    (uint32_t requested_abi_version,
+     const resymbol_host_api_v1 *host_api,
+     resymbol_plugin_api_v1 *plugin_api));
 
 /*
  * Every native plugin exports exactly this symbol. The binary ABI version is

@@ -30,6 +30,15 @@ jobs:
         run: |
           echo '#include <resymbol_plugin.h>' | cc -x c -std=c11 -Wall -Wextra -Werror -pedantic -fsyntax-only -Isdk/native/include -
           echo '#include <resymbol_plugin.h>' | c++ -x c++ -std=c++11 -Wall -Wextra -Werror -pedantic -fsyntax-only -Isdk/native/include -
+          cc -std=c11 -Wall -Wextra -Werror -pedantic -Isdk/native/include -c examples/plugins/native/claim_contract_example.c -o /tmp/resymbol-native-contract-c.o
+          c++ -x c++ -std=c++11 -Wall -Wextra -Werror -pedantic -Isdk/native/include -c examples/plugins/native/claim_contract_example.c -o /tmp/resymbol-native-contract-cpp.o
+          c++ -std=c++11 -Wall -Wextra -Werror -pedantic -Isdk/native/include -c examples/plugins/native/cpp_exception_safe_plugin.cpp -o /tmp/resymbol-native-exception-safe-cpp11.o
+          c++ -std=c++17 -Wall -Wextra -Werror -pedantic -Isdk/native/include -c examples/plugins/native/cpp_exception_safe_plugin.cpp -o /tmp/resymbol-native-exception-safe-cpp17.o
+          c++ -std=c++11 -fno-exceptions -Wall -Wextra -Werror -pedantic -Isdk/native/include -c examples/plugins/native/cpp_exception_safe_plugin.cpp -o /tmp/resymbol-native-exception-safe-no-exceptions.o
+          c++ -std=c++11 -shared -fPIC -fvisibility=hidden -Wall -Wextra -Werror -pedantic -Isdk/native/include examples/plugins/native/cpp_exception_safe_plugin.cpp -o /tmp/resymbol-native-exception-safe.so
+          nm -D --defined-only /tmp/resymbol-native-exception-safe.so | awk '$3 == "resymbol_plugin_get_api" { found = 1 } END { exit !found }'
+          c++ -std=c++11 -Wall -Wextra -Werror -pedantic -Isdk/native/include -c sdk/native/tests/cpp_noexcept_contract.cpp -o /tmp/resymbol-native-noexcept-contract-cpp11.o
+          c++ -std=c++17 -Wall -Wextra -Werror -pedantic -Isdk/native/include -c sdk/native/tests/cpp_noexcept_contract.cpp -o /tmp/resymbol-native-noexcept-contract-cpp17.o
 
       - name: Validate process protocol JSON
         run: jq empty protocol/plugin-wire.schema.json
@@ -52,6 +61,10 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v7
 
+      - name: Enable MSVC developer tools
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
       - name: Select pinned Rust toolchain
         run: rustup show active-toolchain
 
@@ -63,3 +76,22 @@ jobs:
 
       - name: Run tests
         run: cargo test --locked --workspace --all-features
+
+      - name: Build CLI and disposable native host
+        run: cargo build --locked --bin resymbol --bin resymbol-native-host
+
+      - name: Smoke-test C11 and C++11 native plugins
+        if: runner.os != 'Windows'
+        run: >-
+          python3 sdk/native/tests/smoke_host.py
+          --host target/debug/resymbol-native-host
+          --resymbol target/debug/resymbol
+          --cc cc --cxx c++ --compiler-style unix
+
+      - name: Smoke-test C and C++ native plugins with MSVC
+        if: runner.os == 'Windows'
+        run: >-
+          python sdk/native/tests/smoke_host.py
+          --host target/debug/resymbol-native-host.exe
+          --resymbol target/debug/resymbol.exe
+          --cc cl --cxx cl --compiler-style msvc

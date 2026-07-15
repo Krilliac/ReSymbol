@@ -1,9 +1,10 @@
 # Plugin system design
 
-This document separates the first implemented external-process runtime from the wider plugin
-architecture. Directory discovery, trust/quarantine state, one-shot process analysis, and the
-initial contracts are current. WASM, native, managed, tool-hosted execution, packaged-plugin
-installation, and richer lifecycle behavior remain design work until a release marks them stable.
+This document separates the implemented external-process and native C/C++ runtimes from the wider
+plugin architecture. Directory discovery, trust/quarantine state, one-shot process analysis, the
+disposable native helper, and the initial contracts are current. WASM, managed, tool-hosted
+execution, packaged-plugin installation, and richer lifecycle behavior remain design work until a
+release marks them stable.
 
 ## User experience
 
@@ -12,19 +13,20 @@ The current installation path is deliberately simple:
 1. Download a prebuilt plugin.
 2. Drop its directory into `plugins/` beside the ReSymbol executable.
 3. Launch ReSymbol.
-4. For an external-process plugin, explicitly trust the displayed directory fingerprint before its
-   first execution.
+4. For an external-process or native plugin, explicitly trust the displayed directory fingerprint
+   before its first execution.
 
 ReSymbol scans the directory, validates each candidate, resolves compatibility and dependencies,
-and autoloads eligible plugins. An unchanged trusted process artifact may run automatically during
-later analyses. Changing any fingerprinted file invalidates trust and requires a new decision. A
-plugin is never compiled, deleted, or rewritten automatically when it fails.
+and autoloads eligible plugins. An unchanged trusted out-of-process artifact may run automatically
+during later analyses. Changing any fingerprinted file invalidates trust and requires a new
+decision. A plugin is never compiled, deleted, or rewritten automatically when it fails.
 
 An intended portable layout is:
 
 ```text
 resymbol/
 ├── resymbol.exe
+├── resymbol-native-host.exe
 ├── plugins/
 │   ├── community.msvc-rtti/
 │   │   ├── plugin.toml
@@ -56,13 +58,14 @@ The current sequence is:
    safe mode.
 4. Parse bounded manifests, reject duplicate identities, and validate entrypoints, API ranges,
    runtimes, and dependencies.
-5. Fingerprint every file in an eligible process-plugin directory except the manual
+5. Fingerprint every file in an eligible out-of-process plugin directory except the manual
    `plugin.disabled` sentinel. Links, special files, excessive depth, and excessive file or byte
    counts are rejected.
 6. Read the exact fingerprint's trust and quarantine records from `plugins/.resymbol/`; corrupt or
    unsafe host state fails closed.
-7. Launch an eligible, trusted external-process analyzer for one bounded request and validate its
-   complete claim batch before adding it to the analysis session.
+7. Launch an eligible, trusted external-process analyzer directly or a native analyzer through the
+   application-local disposable helper. Validate its complete claim batch before adding it to the
+   analysis session.
 
 The application must finish starting even when every third-party plugin is invalid.
 
@@ -70,7 +73,7 @@ The application must finish starting even when every third-party plugin is inval
 
 | State | Meaning | Automatic behavior |
 |---|---|---|
-| Approval required | Valid process artifact, but its exact fingerprint has not been trusted | Discover and report; do not launch |
+| Approval required | Valid executable artifact, but its exact fingerprint has not been trusted | Discover and report; do not launch |
 | Enabled | Valid, compatible, healthy, trusted, and allowed | Load normally when its capability is eligible |
 | Disabled | Explicitly disabled by the user or policy | Do not launch |
 | Incompatible | API, ABI, platform, architecture, or dependency does not match | Keep installed and explain why |
@@ -80,8 +83,12 @@ The application must finish starting even when every third-party plugin is inval
 Trust and quarantine state is recorded outside plugin-controlled directories and is bound to both
 plugin ID and exact fingerprint. Updating a plugin therefore returns the new artifact to `Approval
 required`; trust never transfers by filename or version alone. Unsafe startup, runtime, claim,
-protocol, timeout, or output-limit failures quarantine the exact artifact and preserve a bounded
-diagnostic. A changed artifact is neither trusted nor covered by the old quarantine record.
+protocol, timeout, or output-limit failures attributable to plugin execution quarantine the exact
+artifact and preserve a bounded diagnostic. The native helper writes and flushes a versioned marker
+immediately before its first platform loader call. The parent observes that raw prefix independently
+of structured diagnostics, strips it from user-visible stderr, and treats a failure without the
+current marker conservatively as host-side. A changed artifact is neither trusted nor covered by the
+old quarantine record.
 
 A sentinel file provides an out-of-band recovery mechanism:
 
@@ -90,6 +97,10 @@ plugins/community.msvc-rtti/plugin.disabled
 ```
 
 This must work even if plugin metadata storage or the normal UI is unavailable.
+The parent checks both the sentinel and the exact artifact's trust/quarantine record immediately
+before launch and again before accepting a completed batch. The second check is the commit
+linearization point: a disable, untrust, quarantine, or corrupt-state result observed there discards
+all claims without newly blaming the plugin; a policy change after that point applies to later runs.
 
 The management and execution controls are:
 
@@ -113,12 +124,12 @@ removes that approval. `reset` clears quarantine for the current artifact but do
 new one. `plugin.disabled` remains independent of trust, so toggling it does not change the
 fingerprint.
 
-By default, analysis runs every eligible trusted external-process analysis plugin. Repeating
-`--plugin` selects specific IDs. Untrusted, quarantined, disabled, incompatible, and safe-mode
-plugins do not execute. A normal plugin failure is non-fatal: base analysis and a valid package are
-still produced, with partial plugin claims discarded. `--strict-plugins` writes that package first,
-then returns a failure status when an explicitly selected or otherwise eligible plugin could not
-run successfully.
+By default, analysis runs every eligible trusted external-process or native analysis plugin.
+Repeating `--plugin` selects specific IDs. Untrusted, quarantined, disabled, incompatible, and
+safe-mode plugins do not execute. A normal plugin failure is non-fatal: base analysis and a valid
+package are still produced, with partial plugin claims discarded. `--strict-plugins` writes that
+package first, then returns a failure status when an explicitly selected or otherwise eligible
+plugin could not run successfully.
 
 ## Current manifest
 
@@ -141,14 +152,17 @@ capabilities = [
 permissions = ["binary.read", "claims.submit"]
 
 [runtime]
-kind = "wasm"
-entrypoint = "plugin.wasm"
+kind = "native"
+entrypoint = "matcher.dll"
+isolation = "out-of-process"
 ```
 
 The current schema also supports dependency requirements and metadata fields. It rejects unknown
 fields, unsafe entrypoint paths, unsupported manifest versions, incompatible APIs, and native
-in-process requests that omit the `unsafe.in-process` permission. Platform artifacts, execution
-limits, permission rationale, integrity metadata, and publisher information remain planned.
+in-process requests that omit the `unsafe.in-process` permission. The implemented native host
+accepts only `isolation = "out-of-process"`; a manifest cannot opt itself into ReSymbol's process.
+Platform selectors, execution limits, permission rationale, integrity metadata, and publisher
+information remain planned.
 
 ## Capabilities
 
@@ -169,16 +183,19 @@ single global API version would cause unnecessary breakage.
 ## Permissions
 
 Plugins receive only the ReSymbol data projections and host protocol operations needed for their
-declared work. The one-shot process host uses manifest-declared projection and claim permissions;
-interactive binary reads are reserved. Wider planned permissions include temporary storage,
-package storage, approved network origins, subprocess execution, and explicit file selections. A
-permission grants a host operation; it does not convert a plugin's output into trusted fact.
+declared work. The one-shot external host uses manifest-declared projection and claim permissions;
+its interactive binary reads are reserved. The native helper implements a permission-gated,
+size-bounded `binary.read` callback for file-backed RVAs in the exact PE. Wider planned permissions
+include temporary storage, package storage, approved network origins, subprocess execution, and
+explicit file selections. A permission grants a host operation; it does not convert a plugin's
+output into trusted fact.
 
-For the current process runtime, those permissions are **not operating-system restrictions**. Once
-approved and launched, the child has the ambient filesystem, network, credential, and process
-access normally available to the account running ReSymbol. Clearing most inherited environment
-variables does not make that child sandboxed. Only approve a process plugin whose publisher and
-code you would be willing to execute directly. A future sandbox layer may make declared network or
+For the current external and native runtimes, those permissions are **not operating-system
+restrictions**. Once approved and launched, plugin code has the ambient filesystem, network,
+credential, and process access normally available to the account running ReSymbol. A separate
+helper contains crashes; it does not create an OS sandbox. Clearing most inherited environment
+variables does not change that boundary. Only approve a plugin whose publisher and exact code you
+would be willing to execute directly. A future sandbox layer may make declared network or
 filesystem permissions enforceable at the OS boundary.
 
 The fingerprint proves only which local bytes were approved; it does not authenticate a publisher.
@@ -200,26 +217,50 @@ The checked-in WIT package includes additive typed helpers for `string-literal` 
 inside `symbol-claim.claim-json`; retaining that field avoids breaking existing component bindings.
 The helper vocabulary uses `ascii`/`utf-16-le` and requires the nonzero `instruction-size` field.
 
-### Native C and C++ (planned host)
+### Native C and C++ (current first host)
 
 Native support is part of the initial architecture because important reversing libraries and SDKs
-already exist in C and C++.
+already exist in C and C++. The first host supports out-of-process analysis plugins for x86-64 PE
+sessions.
 
 - The public binary contract is a versioned C ABI, not the Rust ABI or a compiler-specific C++ ABI.
-- A C++ SDK provides wrappers, ownership helpers, and generated types over that C surface.
-- Native plugins will run in a version-matched helper process by default.
-- The host will validate every message, handle, range, and returned allocation.
-- An explicitly trusted in-process mode may be offered for workloads that justify the risk.
+- The same header is C++11-compatible and adds `noexcept` lifecycle types plus small
+  exception-containment helpers without changing the C ABI.
+- Native plugins run in the version-matched `resymbol-native-host[.exe]` process shipped beside
+  `resymbol[.exe]`; the application never accepts a helper from a plugin directory.
+- The helper validates the manifest, C descriptor, ABI table, lifecycle status, callback bounds,
+  exact analyzed-binary identity, and exact approved plugin-directory fingerprint. Claims are
+  returned only after a complete successful run and a final fingerprint check.
+- The current implementation has no in-process native path. A future explicitly trusted mode would
+  need a separate design and warning because native libraries generally cannot be unloaded safely.
 
 `sdk/native/include/resymbol_plugin.h` exposes protocol-1 assertion-kind/encoding constants and
 fixed-width `resymbol_string_literal_assertion_v1` and
-`resymbol_data_reference_assertion_v1` serializer helpers. They do not cross the C ABI: native
-plugins still submit the strict UTF-8 JSON claim envelope through `submit_claim`. The example under
-`examples/plugins/native/` is syntax-compatible with both C11 and C++11.
+`resymbol_data_reference_assertion_v1` vocabulary structures. These are not serializers and do not
+cross the C ABI: native plugins still submit the strict UTF-8 JSON claim envelope through
+`submit_claim`. The examples under `examples/plugins/native/` include a C11 claim contract and a
+C++11 exception-safe lifecycle implementation.
 
-The release archive will supply the native host. End users will not install a compiler, CMake, or
-Visual C++ build tools to use a prebuilt plugin. Platform runtime dependencies must be statically
-linked or shipped according to their licenses where practical.
+Protocol 1 caps descriptor IDs and versions at 128 UTF-8 bytes, names at 4,096 UTF-8 bytes, and
+each capability/permission list at 4,096 identifiers. The public header defines the same maxima,
+and the native runtime rejects an incompatible manifest before launching the helper.
+
+The first helper verifies and buffers at most 1 GiB of exact source PE bytes for bounded synchronous
+RVA callbacks. This source-image ceiling is separate from the wire protocol's advertised plugin
+memory budget, which is not an enforced process-memory sandbox. A future mapped/chunked image
+backend can reduce the helper's resident-memory cost without changing the C callback.
+
+Native libraries are host operating-system and CPU artifacts. A Windows `.dll`, Linux `.so`, and
+macOS `.dylib` are separate builds even when they analyze the same Windows executable. Private Unix
+dependencies should be bundled beside the plugin and linked relative to it with `$ORIGIN` on Linux
+or `@loader_path` on macOS. Windows loading adds only the plugin DLL directory and safe default
+application/system directories. The official Linux archive keeps a static musl main executable but
+ships a GNU helper built on Ubuntu 22.04 (glibc 2.35 or newer), allowing it to load ordinary glibc
+plugins.
+
+End users do not install a compiler, CMake, or Visual C++ build tools to use a prebuilt plugin.
+Process separation is crash isolation only: native code still has the ambient authority of the
+launching account and therefore requires exact-fingerprint trust.
 
 ### Managed/.NET (planned host)
 
@@ -250,7 +291,10 @@ committed only if the entire run validates.
 The first host is one process per analysis request. It sends the host greeting and one `analyze`
 request, closes input, and waits for the direct child while capturing bounded output. On a deadline
 it stops and reaps that direct child; it does not currently contain or terminate descendant
-processes. Interactive plugin-to-host `binary.read`/`read-binary`, cancellation, streaming
+processes. Stderr already observed before a timeout is retained, followed by a bounded 50 ms worker
+drain so the native load marker does not depend on pipe EOF. The single request deadline covers
+helper startup, helper preflight, and plugin execution. Interactive plugin-to-host
+`binary.read`/`read-binary`, cancellation, streaming
 backpressure, and a persistent lifecycle are reserved by the contracts but not implemented in this
 host. The process is not OS-sandboxed; fingerprint-bound trust is therefore mandatory before
 launch.
@@ -395,12 +439,12 @@ Persistent hot reload remains a design goal. Its target behavior is transactiona
 5. atomically switch capability routing; and
 6. retire the old instance.
 
-In the current one-shot host, a crashed or invalid plugin cannot leave a half-committed claim batch.
+In the current one-shot hosts, a crashed or invalid plugin cannot leave a half-committed claim batch.
 ReSymbol preserves bounded diagnostics, quarantines unsafe failures, and still writes deterministic
 base analysis and the plugin-run ledger without logging binary contents or secrets by default.
 
-Native in-process plugins generally cannot be unloaded safely and may require an application
-restart. The UI and CLI must state this before enabling that mode.
+Native in-process execution is not implemented. If it is designed later, the UI and CLI must state
+that such plugins generally cannot be unloaded safely and may require an application restart.
 
 ## Developer mode and compilation errors
 
@@ -427,10 +471,10 @@ Each supported family should receive:
 - deterministic fake binary and graph fixtures; and
 - packaging commands that produce a drop-in artifact.
 
-The repository currently checks in the shared WIT contract, the C11/C++11 native header, the .NET
-contract assembly, strict external-process JSON Schema, and minimal native/managed examples. These
-are additive protocol-1 authoring surfaces; the corresponding WASM, native, and managed hosts remain
-planned as described above.
+The repository currently checks in the shared WIT contract, the C11/C++11 native header and helper,
+the .NET contract assembly, a strict out-of-process JSON Schema, and minimal native/managed
+examples. The native contract is exercised by real C and C++ shared-library fixtures on each
+supported CI host. WASM and managed hosts remain planned as described above.
 
 The SDK is successful when plugin authors need their language's normal toolchain, while plugin users
 need only the compiled package and ReSymbol.

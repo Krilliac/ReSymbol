@@ -52,21 +52,30 @@ retains at most 16 MiB of RTTI name text, with additional record-count limits. I
 limit is reached, the valid prefix is kept and explicitly marked partial rather than reported as a
 complete scan.
 
-The current release also includes the first external-process analysis-plugin runtime. Dropped-in
-plugins are discovered automatically, but process code requires explicit approval bound to its
-exact directory fingerprint before it can execute. WASM, native C/C++, managed/.NET, and
-debugger-hosted contracts are present for plugin authors; their execution hosts remain future work.
+The current release includes external-process analysis plugins and the first native C/C++ analysis
+host. Dropped-in plugins are discovered automatically, but executable plugin code requires explicit
+approval bound to its exact directory fingerprint before it can run. Native plugins always load in
+the disposable `resymbol-native-host` sibling process; there is no in-process native path. WASM,
+managed/.NET, and debugger-hosted contracts are present for plugin authors, but their execution
+hosts remain future work.
+
+The first native helper verifies and buffers source PE files up to 1 GiB for its bounded
+`binary.read` callback. That explicit source-image limit is independent of the advisory plugin
+memory value in the process protocol; process memory is not currently sandbox-enforced.
 
 The command-line executable itself is built for these host platforms:
 
 | Archive suffix | Host |
 |---|---|
 | `windows-x64.zip` | 64-bit Windows 10 or newer |
-| `linux-x64.tar.gz` | 64-bit x86 Linux; statically linked with musl |
+| `linux-x64.tar.gz` | 64-bit x86 Linux; musl CLI plus GNU/glibc native helper |
 | `macos-x64.tar.gz` | Intel Mac |
 | `macos-arm64.tar.gz` | Apple silicon Mac |
 
-The host platform identifies where ReSymbol runs, not which binary format it can analyze.
+The host platform identifies where ReSymbol runs, not which binary format it can analyze. The
+Linux `resymbol` executable remains statically linked with musl. Its sibling native helper is built
+on Ubuntu 22.04 for GNU/glibc (glibc 2.35 or newer) so it can load ordinary glibc `.so` plugins; the
+helper is needed only when running a native plugin.
 
 ## Download and verify
 
@@ -218,11 +227,13 @@ Every archive contains this layout:
 ```text
 resymbol-v0.1.0-alpha.1-<platform>/
 ├── resymbol[.exe]
+├── resymbol-native-host[.exe]
 ├── README.md
 ├── LICENSE-APACHE
 ├── LICENSE-MIT
 ├── docs/
-│   └── install.md
+│   ├── install.md
+│   └── plugin-system.md
 └── plugins/
     └── README.txt
 ```
@@ -243,12 +254,19 @@ plugins/
 ├── community.example-process-resolver/
 │   ├── plugin.toml
 │   └── resolver[.exe]
+├── vendor.native-matcher/
+│   ├── plugin.toml
+│   └── matcher.{dll,so,dylib}
 └── .resymbol/                  # ReSymbol-owned trust/quarantine state
 ```
 
 Do not place plugin source code in this directory expecting ReSymbol to compile it. A process
 plugin must include a runnable entrypoint and any private runtime it needs; on Unix, that entrypoint
-must have execute permission. Ordinary users should not need the plugin author's compiler or SDK.
+must have execute permission. A native library is a prebuilt artifact for one host operating system
+and CPU architecture, not a portable Windows-binary analyzer module. Bundle its private libraries
+beside it and link Unix search paths relative to the plugin itself (`$ORIGIN` on Linux or
+`@loader_path` on macOS). Windows loads the plugin with its own DLL directory plus the safe default
+application/system directories. Ordinary users should not need the plugin author's compiler or SDK.
 
 Inspect the artifact and its requested protocol permissions, then approve its exact fingerprint:
 
@@ -264,16 +282,18 @@ For scripted installation, pin the value you reviewed so approval fails if the d
 resymbol plugin trust community.example-process-resolver --fingerprint <sha256>
 ```
 
-An unchanged trusted process analyzer is eligible to run automatically during later analyses. Any
-change to a fingerprinted file, including `plugin.toml`, its entrypoint, bundled libraries, or data,
-invalidates trust. The host-owned records under `plugins/.resymbol/` are outside plugin directories;
-do not copy them as part of a plugin package. Corrupt or unsafe state fails closed.
+An unchanged trusted external or native process analyzer is eligible to run automatically during
+later analyses. Any change to a fingerprinted file, including `plugin.toml`, its entrypoint, bundled
+libraries, or data, invalidates trust. The host-owned records under `plugins/.resymbol/` are outside
+plugin directories; do not copy them as part of a plugin package. Corrupt or unsafe state fails
+closed.
 
 > [!WARNING]
-> The external process is separated from ReSymbol, but it is not operating-system sandboxed. It
-> has the ambient filesystem, network, credential, and process access of the user launching it.
-> Manifest permissions limit ReSymbol protocol operations; they do not restrict ambient OS access.
-> Trust only plugins whose code and publisher you would run directly.
+> External and native helpers are separated from ReSymbol for crash containment, but they are not
+> operating-system sandboxes. Plugin code retains the ambient filesystem, network, credential, and
+> process authority of the account launching ReSymbol. Manifest permissions limit ReSymbol protocol
+> operations; they do not restrict ambient OS access. Trust only exact plugin artifacts whose code
+> and publisher you would run directly.
 
 Run a specific approved plugin by ID, or let analysis run all eligible trusted process analyzers:
 
@@ -283,9 +303,11 @@ resymbol analyze path/to/application.exe
 ```
 
 Plugin failures do not prevent base analysis or package creation, and partial claims are discarded.
-Unsafe startup, protocol, resource, claim, or runtime failures quarantine that exact artifact. Use
-strict mode in automation when plugin success is required; ReSymbol still writes the valid package
-before returning a failure status:
+Unsafe startup, protocol, resource, claim, or runtime failures attributable to plugin execution
+quarantine that exact artifact. The native helper flushes a versioned marker immediately before its
+first platform loader call; failures observed without the current marker remain conservative
+host-side diagnostics. Use strict mode in automation when plugin success is required;
+ReSymbol still writes the valid package before returning a failure status:
 
 ```console
 resymbol analyze path/to/application.exe \
@@ -293,8 +315,10 @@ resymbol analyze path/to/application.exe \
   --strict-plugins
 ```
 
-The first process host supports one-shot `analyze` requests. Interactive `binary.read`/
-`read-binary` requests are reserved and not yet available.
+The external-process host supports one-shot `analyze` requests; its interactive
+`binary.read`/`read-binary` wire operation remains reserved. The native helper instead exposes a
+permission-gated, size-bounded C callback that reads only file-backed RVAs from the exact PE being
+analyzed. Native faults terminate that helper process and discard its complete claim batch.
 
 Disable a discovered plugin without deleting it:
 
@@ -309,6 +333,9 @@ The disable command creates `plugin.disabled` in that plugin directory. It can a
 hand as an emergency recovery measure; it is excluded from the artifact fingerprint so disabling
 and re-enabling an unchanged plugin does not silently change its trust identity. `untrust` revokes
 approval. `reset` clears quarantine for the current artifact but does not trust a changed one.
+ReSymbol rechecks both the sentinel and the exact trust/quarantine record immediately before launch
+and at the completed-batch commit gate. A disable or revocation observed at that final gate discards
+the result without newly quarantining the plugin; a change after that point governs later runs.
 
 Safe mode suppresses all third-party plugin execution for that run:
 
@@ -332,9 +359,12 @@ git clone https://github.com/Krilliac/ReSymbol.git
 cd ReSymbol
 rustup show active-toolchain
 cargo test --workspace --all-features
-cargo build --release --bin resymbol
+cargo build --release --bin resymbol --bin resymbol-native-host
 ```
 
-The result is `target/release/resymbol.exe` on Windows or `target/release/resymbol` elsewhere. The
-.NET SDK is required only to develop the managed plugin SDK or host; it is not required for the
-Rust workspace or official executable archives.
+Keep `target/release/resymbol-native-host[.exe]` beside
+`target/release/resymbol[.exe]`; ReSymbol never searches the plugin directory for its trusted
+helper. A normal Linux source build uses the host GNU toolchain for both binaries. The official
+Linux release workflow instead builds the main CLI for musl and the helper for GNU/glibc. The .NET
+SDK is required only to develop the managed plugin SDK or host; it is not required for the Rust
+workspace or official executable archives.

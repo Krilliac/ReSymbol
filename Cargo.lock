@@ -253,6 +253,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -367,6 +377,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "resymbol-native-host"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "libloading",
+ "resymbol-core",
+ "resymbol-plugin-api",
+ "resymbol-plugin-state",
+ "semver",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "toml",
+]
+
+[[package]]
 name = "resymbol-package"
 version = "0.1.0-alpha.1"
 dependencies = [
@@ -393,9 +419,11 @@ name = "resymbol-plugin-runtime"
 version = "0.1.0-alpha.1"
 dependencies = [
  "resymbol-core",
+ "resymbol-plugin-state",
  "semver",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
 ]

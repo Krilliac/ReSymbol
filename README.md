@@ -14,7 +14,8 @@ IDA, Ghidra, debuggers, PDB consumers, and DWARF consumers.
 
 > [!IMPORTANT]
 > ReSymbol is an early alpha. The PE analyzer and `.resym` format are usable but intentionally
-> narrow. The first external-process plugin runtime is also usable, but it is not an OS sandbox.
+> narrow. The external-process and native C/C++ plugin runtimes are also usable, but process
+> separation is crash isolation rather than an OS sandbox.
 > The initial JSON, Markdown, Microsoft-linker-style MAP, exact-RSDS public-symbol PDB, IDAPython,
 > and Ghidra Java exporters are usable but deliberately conservative.
 > Plugin and data formats may change; DWARF and interactive debugger bridges are not implemented
@@ -56,6 +57,10 @@ The current alpha implements and tests an end-to-end, deliberately narrow analys
 - a first external-process analysis runtime with direct no-shell launch, bounded NDJSON,
   permission-gated claims, deadlines, output limits, transactional results, and automatic
   quarantine after unsafe runtime or protocol failures;
+- a first native C/C++ analysis runtime that loads an approved library only in the disposable,
+  application-local `resymbol-native-host` sibling process, exposes a permission-gated bounded
+  `binary.read` callback for file-backed PE RVAs, and validates the complete claim batch before
+  commit, while keeping helper/pre-load failures separate from plugin-attributable faults;
 - initial native C ABI, managed/.NET, WIT, and process-wire contracts; and
 - CLI discovery, diagnosis, enablement, disablement, fingerprint trust/revocation, quarantine reset,
   plugin selection, and strict automation behavior, plus manifest-only plugin examples.
@@ -83,10 +88,12 @@ embedded class-hierarchy reference. Candidate scanning and the vftable/back-poin
 BCA, BCD, and nested-CHD records remain in file-backed readable, read-only initialized
 non-executable data. Referenced TypeDescriptors may also occupy file-backed readable initialized
 non-executable data marked writable, including normal `.data`; writable sections are never
-candidate-scanned. The current process host supports one-shot analysis requests; interactive
-binary reads are reserved for a later protocol revision. Plugin package verification/extraction,
-WASM/native/managed execution hosts, cross-build matching, semantic inference, interactive debugger
-bridges, richer PDB records, and DWARF export are also **not implemented yet**.
+candidate-scanned. The current external-process host supports one-shot analysis requests; its
+interactive binary reads are reserved for a later protocol revision. The native host instead
+provides a bounded synchronous C callback for file-backed RVAs in the exact PE. Plugin package
+verification/extraction, WASM/managed execution hosts, cross-build matching, semantic inference,
+interactive debugger bridges, richer PDB records, and DWARF export are also **not implemented
+yet**.
 
 ## Why ReSymbol?
 
@@ -123,7 +130,7 @@ ReSymbol is growing from the working PE/package foundation toward:
   approved layout and themes currently documented as design rather than implemented behavior;
 - drop-in plugin discovery from a local `plugins/` directory;
 - WASM, native C/C++, managed/.NET, external-process, and debugger-hosted plugin families from the
-  initial architecture, with external-process execution implemented first; and
+  initial architecture, with external-process and native C/C++ execution implemented; and
 - automatic plugin validation, disablement, bounded execution, and quarantine so a faulty
   extension does not prevent the core application from starting.
 
@@ -164,7 +171,7 @@ resymbol export application.resym --format ida-python
 resymbol export application.resym --format ghidra-java
 resymbol plugin list
 resymbol plugin doctor
-# After reviewing a dropped-in process plugin:
+# After reviewing a dropped-in external-process or native plugin:
 resymbol plugin trust community.example-analyzer --fingerprint <sha256>
 resymbol analyze application.exe --plugin community.example-analyzer
 ```
@@ -227,16 +234,29 @@ remain roadmap work. See the
 [installation guide](docs/install.md) for portable prerelease archives and source-build steps.
 
 A normal plugin installation is dropping a prebuilt plugin directory into `plugins/`. ReSymbol
-discovers it automatically, but an external-process plugin cannot execute until the user explicitly
-trusts its exact directory fingerprint. That unchanged artifact autoloads on later analyses; any
-file update changes the fingerprint and requires a new decision. A `plugin.disabled` sentinel or a
+discovers it automatically, but an external-process or native plugin cannot execute until the user
+explicitly trusts its exact directory fingerprint. That unchanged artifact autoloads on later
+analyses; any fingerprinted-file update requires a new decision. A `plugin.disabled` sentinel or a
 CLI command disables it without deletion, and `--safe-mode` suppresses every third-party plugin.
 
-Process plugins run with the ambient access granted to an ordinary child process on the host. The
-manifest permissions govern ReSymbol protocol operations; they are not filesystem, network, or
-process restrictions enforced by the operating system. Only trust process plugins whose code and
-publisher you would run directly. A failed plugin never prevents base analysis or package creation;
-its partial claims are discarded and unsafe failures are quarantined under `plugins/.resymbol/`.
+Native libraries load only in the version-matched `resymbol-native-host[.exe]` shipped beside the
+main executable, never in ReSymbol itself or through a helper supplied by a plugin. The helper
+rechecks the approved fingerprint, exact analyzed-binary identity, C ABI and lifecycle, callback
+bounds, and complete output batch. A plugin-attributable native crash or post-load ABI, callback,
+or output failure discards every claim from that run and quarantines the exact artifact without
+preventing base analysis or package creation. Immediately before its first platform loader call,
+the helper writes and flushes a versioned marker that the parent removes from diagnostics. A
+failure observed with that marker is treated as plugin-attributable; one without the current marker
+is conservatively reported as host-side instead.
+
+External and native process plugins retain the ambient filesystem, network, credential, and process
+access of the launching account. Manifest permissions govern ReSymbol protocol operations; they are
+not restrictions enforced by the operating system. A fingerprint identifies reviewed local bytes,
+not a publisher, and mutable plugin files leave a check-to-launch window; dynamic dependencies still
+follow the platform loader's rules. Only trust artifacts whose code and publisher you would run
+directly. Official archives bundle the native helper beside `resymbol`; Linux archives pair the
+static musl main executable with a GNU helper built on Ubuntu 22.04 for glibc 2.35 or newer so it
+can load ordinary glibc `.so` plugins.
 
 ## Development
 
@@ -252,8 +272,9 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 Rust is the only required toolchain for the core workspace; x86-64 decoding uses a pure-Rust crate
 and does not require a native disassembler library. The .NET SDK is needed only when
 working on managed plugin SDK or host projects. Released managed components are intended to be
-self-contained. CI also syntax-checks the stable native header as both C11 and C++11 and validates
-the external-process protocol schema.
+self-contained. CI also syntax-checks the stable native header as both C11 and C++11, compiles and
+runs the native fixture through the disposable helper, and validates the external-process protocol
+schema.
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before proposing a substantial protocol or architecture
 change. During this early phase, opening an issue first helps avoid parallel designs that cannot be
