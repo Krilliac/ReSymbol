@@ -255,8 +255,14 @@ impl PluginManifest {
         if self.name.trim().is_empty() {
             return Err(ManifestValidationError::EmptyField("name"));
         }
+        if self.name.chars().any(char::is_control) {
+            return Err(ManifestValidationError::InvalidName);
+        }
 
         validate_relative_entrypoint(self.runtime.entrypoint())?;
+        if let PluginRuntime::Managed { entrypoint } = &self.runtime {
+            validate_managed_entrypoint(entrypoint)?;
+        }
 
         match &self.runtime {
             PluginRuntime::ToolAdapter { tool, .. } if tool.trim().is_empty() => {
@@ -299,6 +305,8 @@ impl PluginManifest {
 pub enum ManifestValidationError {
     #[error("{0} must not be empty")]
     EmptyField(&'static str),
+    #[error("plugin name must not contain control characters")]
+    InvalidName,
     #[error("invalid {field} `{value}`: use lowercase dotted identifiers")]
     InvalidIdentifier { field: &'static str, value: String },
     #[error("manifest version {found} is unsupported; this host supports {supported}")]
@@ -310,6 +318,8 @@ pub enum ManifestValidationError {
     },
     #[error("runtime entrypoint must be a non-empty relative path without parent components")]
     InvalidEntrypoint,
+    #[error("managed runtime entrypoint must be a portable relative .dll path")]
+    InvalidManagedEntrypoint,
     #[error("in-process native plugins must request the `unsafe.in-process` permission")]
     MissingInProcessPermission,
 }
@@ -349,6 +359,77 @@ fn validate_relative_entrypoint(entrypoint: &Path) -> Result<(), ManifestValidat
         return Err(ManifestValidationError::InvalidEntrypoint);
     }
     Ok(())
+}
+
+fn validate_managed_entrypoint(entrypoint: &Path) -> Result<(), ManifestValidationError> {
+    let Some(value) = entrypoint.to_str() else {
+        return Err(ManifestValidationError::InvalidManagedEntrypoint);
+    };
+    if value.trim().is_empty() || value.starts_with(['/', '\\']) || value.contains(['\0', ':']) {
+        return Err(ManifestValidationError::InvalidManagedEntrypoint);
+    }
+
+    let components = value.split(['/', '\\']).collect::<Vec<_>>();
+    if components
+        .iter()
+        .any(|component| !is_portable_managed_component(component))
+    {
+        return Err(ManifestValidationError::InvalidManagedEntrypoint);
+    }
+
+    let normalized = components.join("/");
+    let Some((stem, extension)) = normalized.rsplit_once('.') else {
+        return Err(ManifestValidationError::InvalidManagedEntrypoint);
+    };
+    if stem.rsplit('/').next().unwrap_or_default().is_empty()
+        || !extension.eq_ignore_ascii_case("dll")
+        || normalized
+            .rsplit('/')
+            .next()
+            .is_some_and(|name| name.eq_ignore_ascii_case("ReSymbol.PluginSdk.dll"))
+    {
+        return Err(ManifestValidationError::InvalidManagedEntrypoint);
+    }
+
+    Ok(())
+}
+
+fn is_portable_managed_component(component: &str) -> bool {
+    if component.trim().is_empty()
+        || matches!(component, "." | "..")
+        || component.contains(['/', '\\', ':', '\0', '<', '>', '"', '|', '?', '*'])
+        || component.chars().any(char::is_control)
+        || component.ends_with([' ', '.'])
+    {
+        return false;
+    }
+
+    let base = component.split('.').next().unwrap_or_default();
+    !matches!(
+        base.to_ascii_uppercase().as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
 }
 
 #[cfg(test)]
@@ -424,6 +505,58 @@ mod tests {
             manifest.validate(),
             Err(ManifestValidationError::InvalidEntrypoint)
         );
+    }
+
+    #[test]
+    fn plugin_names_reject_control_characters() {
+        for name in [
+            "Example\nplugin",
+            "Example\u{7f}plugin",
+            "Example\u{85}plugin",
+        ] {
+            let mut manifest = manifest(PluginRuntime::Wasm {
+                entrypoint: "plugin.wasm".into(),
+            });
+            manifest.name = name.to_owned();
+            assert_eq!(
+                manifest.validate(),
+                Err(ManifestValidationError::InvalidName),
+                "{name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn managed_entrypoints_require_portable_dll_paths() {
+        for entrypoint in [
+            "./Plugin.dll",
+            "a/./Plugin.dll",
+            "a//Plugin.dll",
+            ".\\Plugin.dll",
+            "a\\..\\Plugin.dll",
+            "C:\\Plugin.dll",
+            "Plugin.exe",
+            "ReSymbol.PluginSdk.dll",
+            "CON.dll",
+            "a/AUX/Plugin.dll",
+            "folder./Plugin.dll",
+            "folder /Plugin.dll",
+            "bad?/Plugin.dll",
+        ] {
+            let manifest = manifest(PluginRuntime::Managed {
+                entrypoint: entrypoint.into(),
+            });
+            assert!(manifest.validate().is_err(), "{entrypoint:?}");
+        }
+
+        for entrypoint in ["Plugin.dll", "lib/Plugin.DLL", "lib\\Plugin.dll"] {
+            let manifest = manifest(PluginRuntime::Managed {
+                entrypoint: entrypoint.into(),
+            });
+            manifest
+                .validate()
+                .unwrap_or_else(|error| panic!("{entrypoint:?}: {error}"));
+        }
     }
 
     #[test]

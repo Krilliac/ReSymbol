@@ -52,16 +52,25 @@ retains at most 16 MiB of RTTI name text, with additional record-count limits. I
 limit is reached, the valid prefix is kept and explicitly marked partial rather than reported as a
 complete scan.
 
-The current release includes external-process analysis plugins and the first native C/C++ analysis
-host. Dropped-in plugins are discovered automatically, but executable plugin code requires explicit
-approval bound to its exact directory fingerprint before it can run. Native plugins always load in
-the disposable `resymbol-native-host` sibling process; there is no in-process native path. WASM,
-managed/.NET, and debugger-hosted contracts are present for plugin authors, but their execution
-hosts remain future work.
+The current release includes external-process, native C/C++, and managed/.NET analysis plugins.
+Dropped-in plugins are discovered automatically, but executable plugin code requires explicit
+approval bound to its exact directory fingerprint before it can run. Native libraries and managed
+assemblies always load in their disposable `resymbol-native-host` and `resymbol-managed-host`
+sibling processes; there is no in-process path for either family. The first managed slice accepts
+prebuilt .NET 8 plugin DLLs for `analyze` on PE32+ x86-64 sessions. WASM and debugger-hosted
+contracts are present for plugin authors, but their execution hosts remain future work.
 
 The first native helper verifies and buffers source PE files up to 1 GiB for its bounded
 `binary.read` callback. That explicit source-image limit is independent of the advisory plugin
 memory value in the process protocol; process memory is not currently sandbox-enforced.
+
+The managed launcher and helper verify the complete plugin-directory fingerprint, a deterministic
+private-DLL closure, and the exact source binary before loading plugin code and again before
+committing output. The private closure and binary snapshot share the advertised byte budget (256
+MiB by default); the hard ceilings are 512 managed DLLs, 512 MiB of private DLLs, and a 1 GiB source
+binary. These are input-buffering gates, not a process-memory sandbox. The helper supplies the exact
+`ReSymbol.PluginSdk` assembly, so a plugin package contains its entry DLL and private dependencies,
+not a private SDK copy.
 
 The command-line executable itself is built for these host platforms:
 
@@ -81,6 +90,9 @@ helper is needed only when running a native plugin.
 
 Download the archive for your host and its adjacent `.sha256` file from the GitHub Releases page.
 Checksums detect an incomplete or modified download; they are not a substitute for code signing.
+Managed plugin authors can also download the matching
+`ReSymbol.PluginSdk.<version>.nupkg` and `.nupkg.sha256` release assets; the package is a compile-only
+contract and does not install a runtime SDK beside the plugin.
 
 On Windows PowerShell:
 
@@ -228,6 +240,7 @@ Every archive contains this layout:
 resymbol-v0.1.0-alpha.1-<platform>/
 ├── resymbol[.exe]
 ├── resymbol-native-host[.exe]
+├── resymbol-managed-host[.exe]
 ├── README.md
 ├── LICENSE-APACHE
 ├── LICENSE-MIT
@@ -257,6 +270,10 @@ plugins/
 ├── vendor.native-matcher/
 │   ├── plugin.toml
 │   └── matcher.{dll,so,dylib}
+├── vendor.managed-matcher/
+│   ├── plugin.toml
+│   ├── Matcher.Plugin.dll
+│   └── Matcher.PrivateDependency.dll
 └── .resymbol/                  # ReSymbol-owned trust/quarantine state
 ```
 
@@ -267,6 +284,14 @@ and CPU architecture, not a portable Windows-binary analyzer module. Bundle its 
 beside it and link Unix search paths relative to the plugin itself (`$ORIGIN` on Linux or
 `@loader_path` on macOS). Windows loads the plugin with its own DLL directory plus the safe default
 application/system directories. Ordinary users should not need the plugin author's compiler or SDK.
+
+A managed plugin is a prebuilt .NET 8 DLL directory. Its manifest uses `kind = "managed"` and a
+portable relative `.dll` entrypoint. Include every private managed dependency beneath that plugin
+directory and omit `ReSymbol.PluginSdk.dll`: the app-local, self-contained helper supplies and
+identity-checks its own SDK assembly. The first managed host runs only `analyze` against PE32+
+x86-64 input. It snapshots the verified DLL closure and exact binary under one cumulative byte
+budget before assembly loading. End users do not install .NET and ReSymbol never compiles dropped-in
+C# source.
 
 Inspect the artifact and its requested protocol permissions, then approve its exact fingerprint:
 
@@ -282,18 +307,24 @@ For scripted installation, pin the value you reviewed so approval fails if the d
 resymbol plugin trust community.example-process-resolver --fingerprint <sha256>
 ```
 
-An unchanged trusted external or native process analyzer is eligible to run automatically during
-later analyses. Any change to a fingerprinted file, including `plugin.toml`, its entrypoint, bundled
-libraries, or data, invalidates trust. The host-owned records under `plugins/.resymbol/` are outside
-plugin directories; do not copy them as part of a plugin package. Corrupt or unsafe state fails
-closed.
+An unchanged trusted external, native, or managed process analyzer is eligible to run automatically
+during later analyses. Any change to a fingerprinted file, including `plugin.toml`, its entrypoint,
+bundled libraries, or data, invalidates trust. The host-owned records under `plugins/.resymbol/` are
+outside plugin directories; do not copy them as part of a plugin package. Corrupt or unsafe state
+fails closed.
 
 > [!WARNING]
-> External and native helpers are separated from ReSymbol for crash containment, but they are not
-> operating-system sandboxes. Plugin code retains the ambient filesystem, network, credential, and
-> process authority of the account launching ReSymbol. Manifest permissions limit ReSymbol protocol
-> operations; they do not restrict ambient OS access. Trust only exact plugin artifacts whose code
-> and publisher you would run directly.
+> External, native, and managed helpers are separated from ReSymbol for crash containment, but they
+> are not operating-system sandboxes. Plugin code retains the ambient filesystem, network,
+> credential, and process authority of the account launching ReSymbol. Managed code can invoke
+> framework loading APIs directly, including explicit `Assembly` and `NativeLibrary` APIs; the
+> verified custom load context governs ordinary dependency resolution, not all .NET process
+> authority. Manifest permissions limit ReSymbol protocol operations; they do not restrict ambient
+> OS or runtime access. Trust only exact plugin artifacts whose code and publisher you would run
+> directly. ReSymbol stops and reaps only the direct plugin/helper child: it does not yet contain
+> plugin-created descendants in a Unix process group or Windows Job Object. Descendants can outlive
+> a timeout, and inherited stdout/stderr handles can keep capture readers alive until those handles
+> close even after the bounded result drain.
 
 Run a specific approved plugin by ID, or let analysis run all eligible trusted process analyzers:
 
@@ -304,9 +335,10 @@ resymbol analyze path/to/application.exe
 
 Plugin failures do not prevent base analysis or package creation, and partial claims are discarded.
 Unsafe startup, protocol, resource, claim, or runtime failures attributable to plugin execution
-quarantine that exact artifact. The native helper flushes a versioned marker immediately before its
-first platform loader call; failures observed without the current marker remain conservative
-host-side diagnostics. Use strict mode in automation when plugin success is required;
+quarantine that exact artifact. The native and managed helpers each flush a family-specific,
+versioned marker immediately before their first plugin load. The parent removes that marker from
+visible diagnostics; failures observed without the current marker remain conservative host-side
+diagnostics. Use strict mode in automation when plugin success is required;
 ReSymbol still writes the valid package before returning a failure status:
 
 ```console
@@ -318,7 +350,11 @@ resymbol analyze path/to/application.exe \
 The external-process host supports one-shot `analyze` requests; its interactive
 `binary.read`/`read-binary` wire operation remains reserved. The native helper instead exposes a
 permission-gated, size-bounded C callback that reads only file-backed RVAs from the exact PE being
-analyzed. Native faults terminate that helper process and discard its complete claim batch.
+analyzed. The managed helper exposes equivalent permission-gated services through
+`IPluginHost.ReadBinaryAsync` and `SubmitClaimAsync`. Service calls are phase-bound, and claim
+submission is accepted only during `AnalyzeAsync`. All managed logs and claims remain transactional
+through initialization, health, analysis, shutdown, disposal, and final identity checks. A fault or
+rejection discards the complete batch.
 
 Disable a discovered plugin without deleting it:
 
@@ -345,7 +381,8 @@ resymbol --safe-mode analyze path/to/application.exe
 
 ## Build from source
 
-Source builds are for contributors and platforms without a prerelease archive. They require:
+Source builds are for contributors and platforms without a prerelease archive. The Rust CLI and
+native helper require:
 
 - Git;
 - `rustup`, which installs the pinned Rust 1.85.0 toolchain from `rust-toolchain.toml`; and
@@ -365,6 +402,23 @@ cargo build --release --bin resymbol --bin resymbol-native-host
 Keep `target/release/resymbol-native-host[.exe]` beside
 `target/release/resymbol[.exe]`; ReSymbol never searches the plugin directory for its trusted
 helper. A normal Linux source build uses the host GNU toolchain for both binaries. The official
-Linux release workflow instead builds the main CLI for musl and the helper for GNU/glibc. The .NET
-SDK is required only to develop the managed plugin SDK or host; it is not required for the Rust
-workspace or official executable archives.
+Linux release workflow instead builds the main CLI for musl and the helper for GNU/glibc.
+
+To run managed plugins from a source build, install the .NET 8 SDK and publish the self-contained
+helper for the matching runtime identifier (`win-x64`, `linux-x64`, `osx-x64`, or `osx-arm64`):
+
+```console
+dotnet restore sdk/dotnet/ReSymbol.ManagedHost/ReSymbol.ManagedHost.csproj --runtime <RID>
+dotnet publish sdk/dotnet/ReSymbol.ManagedHost/ReSymbol.ManagedHost.csproj \
+  --configuration Release --runtime <RID> --self-contained true --no-restore \
+  --output target/managed/<RID>/publish \
+  -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true \
+  -p:IncludeAllContentForSelfExtract=true \
+  -p:PublishTrimmed=false -p:PublishReadyToRun=false -p:PublishAot=false \
+  -p:EnableCompressionInSingleFile=false
+```
+
+Copy the one published `resymbol-managed-host[.exe]` beside `resymbol[.exe]`. ReSymbol resolves
+only that regular, unlinked application-local sibling; it never searches `PATH` or a plugin
+directory. Official archives already include this self-contained helper, so ordinary users need
+neither a .NET runtime nor SDK. The SDK is needed only for source publishing or plugin development.

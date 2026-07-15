@@ -30,8 +30,9 @@ use resymbol_package::{
     SchemaCompatibility, read_file_with_options, write_file_new_bound,
 };
 use resymbol_plugin_runtime::{
-    ExternalProcessHost, ExternalProcessRequest, NativePeImage, NativePeImageSection,
-    NativeProcessHost, PluginMethod, PluginRuntimeError, RuntimeLimits, StreamKind,
+    ExternalProcessHost, ExternalProcessRequest, ManagedPeImage, ManagedPeImageSection,
+    ManagedProcessHost, NativePeImage, NativePeImageSection, NativeProcessHost, PluginMethod,
+    PluginRuntimeError, RuntimeLimits, StreamKind,
 };
 use resymbol_plugin_state::{
     ArtifactFingerprint, ArtifactStateKey, FingerprintLimits, PluginArtifactStatus,
@@ -227,8 +228,15 @@ struct SinglePluginResult {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AnalysisPluginRuntime {
-    ExternalProcess,
-    NativeProcess,
+    External,
+    Managed,
+    Native,
+}
+
+struct AnalysisPluginHosts<'a> {
+    external: &'a ExternalProcessHost,
+    managed: Option<&'a Result<ManagedProcessHost, String>>,
+    native: Option<&'a Result<NativeProcessHost, String>>,
 }
 
 fn analyze(args: AnalyzeArgs, safe_mode: bool, plugin_dir: PathBuf) -> Result<()> {
@@ -901,6 +909,15 @@ fn execute_analysis_plugins(
     let mut attempts = Vec::new();
     let store = PluginStateStore::new(plugin_dir);
     let external_host = ExternalProcessHost::default();
+    let managed_host = report
+        .plugins
+        .iter()
+        .filter_map(|plugin| plugin.manifest.as_ref())
+        .any(|manifest| {
+            has_analysis_capability(manifest)
+                && matches!(&manifest.runtime, PluginRuntime::Managed { .. })
+        })
+        .then(resolve_managed_host);
     let native_host = report
         .plugins
         .iter()
@@ -916,6 +933,11 @@ fn execute_analysis_plugins(
                 )
         })
         .then(resolve_native_host);
+    let hosts = AnalysisPluginHosts {
+        external: &external_host,
+        managed: managed_host.as_ref(),
+        native: native_host.as_ref(),
+    };
 
     for plugin in &report.plugins {
         let Some(manifest) = plugin.manifest.as_ref() else {
@@ -940,8 +962,7 @@ fn execute_analysis_plugins(
             plugin,
             safe_mode,
             &store,
-            &external_host,
-            native_host.as_ref(),
+            &hosts,
         )?;
         if let Some(run) = result.run {
             runs.push(run);
@@ -971,8 +992,7 @@ fn execute_one_plugin(
     plugin: &DiscoveredPlugin,
     safe_mode: bool,
     store: &PluginStateStore,
-    external_host: &ExternalProcessHost,
-    native_host: Option<&Result<NativeProcessHost, String>>,
+    hosts: &AnalysisPluginHosts<'_>,
 ) -> Result<SinglePluginResult> {
     let manifest = plugin
         .manifest
@@ -1007,11 +1027,12 @@ fn execute_one_plugin(
         ));
     }
     let runtime = match &manifest.runtime {
-        PluginRuntime::ExternalProcess { .. } => AnalysisPluginRuntime::ExternalProcess,
+        PluginRuntime::ExternalProcess { .. } => AnalysisPluginRuntime::External,
+        PluginRuntime::Managed { .. } => AnalysisPluginRuntime::Managed,
         PluginRuntime::Native {
             isolation: resymbol_core::plugin_api::NativeIsolation::OutOfProcess,
             ..
-        } => AnalysisPluginRuntime::NativeProcess,
+        } => AnalysisPluginRuntime::Native,
         PluginRuntime::Native {
             isolation: resymbol_core::plugin_api::NativeIsolation::InProcess,
             ..
@@ -1034,15 +1055,31 @@ fn execute_one_plugin(
             state_name(plugin.health.state)
         )));
     }
-    if runtime == AnalysisPluginRuntime::ExternalProcess
+    if runtime == AnalysisPluginRuntime::External
         && requests_permission(manifest, PluginPermission::BINARY_READ)
     {
         return Ok(skip(
             "binary.read is unavailable in the current one-shot host".to_owned(),
         ));
     }
-    if runtime == AnalysisPluginRuntime::NativeProcess {
-        match native_host {
+    if runtime == AnalysisPluginRuntime::Managed {
+        match hosts.managed {
+            Some(Ok(_)) => {}
+            Some(Err(error)) => return Ok(skip(error.clone())),
+            None => {
+                return Ok(skip(
+                    "managed helper was not resolved for this analysis".to_owned(),
+                ));
+            }
+        }
+        if managed_pe_image(base_analysis).is_none() {
+            return Ok(skip(
+                "managed plugins currently support only PE x86_64 analysis".to_owned(),
+            ));
+        }
+    }
+    if runtime == AnalysisPluginRuntime::Native {
+        match hosts.native {
             Some(Ok(_)) => {}
             Some(Err(error)) => return Ok(skip(error.clone())),
             None => {
@@ -1101,8 +1138,10 @@ fn execute_one_plugin(
             let value = permission.as_str();
             value == PluginPermission::SYMBOLS_READ
                 || value == PluginPermission::CLAIMS_SUBMIT
-                || (runtime == AnalysisPluginRuntime::NativeProcess
-                    && value == PluginPermission::BINARY_READ)
+                || (matches!(
+                    runtime,
+                    AnalysisPluginRuntime::Managed | AnalysisPluginRuntime::Native
+                ) && value == PluginPermission::BINARY_READ)
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -1148,9 +1187,19 @@ fn execute_one_plugin(
     }
 
     let execution = match runtime {
-        AnalysisPluginRuntime::ExternalProcess => external_host.execute_trusted(plugin, &request),
-        AnalysisPluginRuntime::NativeProcess => {
-            let native_host = native_host
+        AnalysisPluginRuntime::External => hosts.external.execute_trusted(plugin, &request),
+        AnalysisPluginRuntime::Managed => {
+            let managed_host = hosts
+                .managed
+                .and_then(|host| host.as_ref().ok())
+                .expect("managed host availability was checked before trust");
+            let image = managed_pe_image(base_analysis)
+                .expect("managed PE x86_64 compatibility was checked before trust");
+            managed_host.execute_trusted(plugin, &request, second.fingerprint, binary_path, &image)
+        }
+        AnalysisPluginRuntime::Native => {
+            let native_host = hosts
+                .native
                 .and_then(|host| host.as_ref().ok())
                 .expect("native host availability was checked before trust");
             let image = native_pe_image(base_analysis)
@@ -1248,44 +1297,14 @@ fn execute_one_plugin(
             }
         }
         Err(error) => {
-            if matches!(
-                &error,
-                PluginRuntimeError::InvalidNativeContext(_)
-                    | PluginRuntimeError::NativeHostUnavailable { .. }
-                    | PluginRuntimeError::NativeHostFailed { .. }
-                    | PluginRuntimeError::NativeHostArtifactChanged { .. }
-                    | PluginRuntimeError::NativeSourceBinary { .. }
-                    | PluginRuntimeError::NativeHostInputChanged { .. }
-                    | PluginRuntimeError::EncodeNativeBootstrap(_)
-            ) {
+            if let Some(host_runtime) = pre_attribution_host_runtime(&error) {
                 return Ok(skip(format!(
-                    "native host-side failure was not attributed to the plugin: {}",
+                    "{host_runtime} host-side failure was not attributed to the plugin: {}",
                     plugin_runtime_error_detail(&error)
                 )));
             }
-            let transient = matches!(
-                &error,
-                PluginRuntimeError::PluginRejected { code, .. } if code == "unavailable"
-            );
-            let host_side = matches!(
-                &error,
-                PluginRuntimeError::InvalidLimits(_)
-                    | PluginRuntimeError::InvalidRequest(_)
-                    | PluginRuntimeError::InvalidNativeContext(_)
-                    | PluginRuntimeError::EncodeInput(_)
-                    | PluginRuntimeError::EncodeNativeBootstrap(_)
-                    | PluginRuntimeError::NativeHostUnavailable { .. }
-                    | PluginRuntimeError::NativeHostFailed { .. }
-                    | PluginRuntimeError::NativeHostArtifactChanged { .. }
-                    | PluginRuntimeError::NativeSourceBinary { .. }
-                    | PluginRuntimeError::NativeHostInputChanged { .. }
-                    | PluginRuntimeError::PermissionNotRequested(_)
-                    | PluginRuntimeError::StreamLimit {
-                        stream: StreamKind::Stdin,
-                        ..
-                    }
-                    | PluginRuntimeError::WorkerPanicked(_)
-            );
+            let transient = is_transient_plugin_response(&error);
+            let host_side = is_host_side_runtime_failure(&error);
             let error_detail = plugin_runtime_error_detail(&error);
             let detail = if transient {
                 format!("transient plugin failure (not quarantined): {error_detail}")
@@ -1311,6 +1330,54 @@ fn execute_one_plugin(
             })
         }
     }
+}
+
+/// Return the helper family only when the trusted marker says execution never
+/// crossed into attributable plugin code. These failures are skips rather
+/// than failed ledger runs and never quarantine an exact artifact.
+fn pre_attribution_host_runtime(error: &PluginRuntimeError) -> Option<&'static str> {
+    match error {
+        PluginRuntimeError::InvalidNativeContext(_)
+        | PluginRuntimeError::NativeHostUnavailable { .. }
+        | PluginRuntimeError::NativeHostFailed { .. }
+        | PluginRuntimeError::NativeHostArtifactChanged { .. }
+        | PluginRuntimeError::NativeSourceBinary { .. }
+        | PluginRuntimeError::NativeHostInputChanged { .. }
+        | PluginRuntimeError::EncodeNativeBootstrap(_) => Some("native"),
+        PluginRuntimeError::InvalidManagedContext(_)
+        | PluginRuntimeError::ManagedHostUnavailable { .. }
+        | PluginRuntimeError::ManagedHostFailed { .. }
+        | PluginRuntimeError::ManagedArtifactMismatch { .. }
+        | PluginRuntimeError::ManagedAssemblyClosure { .. }
+        | PluginRuntimeError::ManagedSourceBinary { .. }
+        | PluginRuntimeError::ManagedHostInputChanged { .. }
+        | PluginRuntimeError::ManagedHostArtifactChanged { .. }
+        | PluginRuntimeError::EncodeManagedBootstrap(_) => Some("managed"),
+        _ => None,
+    }
+}
+
+fn is_transient_plugin_response(error: &PluginRuntimeError) -> bool {
+    matches!(
+        error,
+        PluginRuntimeError::PluginRejected { code, .. } if code == "unavailable"
+    )
+}
+
+fn is_host_side_runtime_failure(error: &PluginRuntimeError) -> bool {
+    pre_attribution_host_runtime(error).is_some()
+        || matches!(
+            error,
+            PluginRuntimeError::InvalidLimits(_)
+                | PluginRuntimeError::InvalidRequest(_)
+                | PluginRuntimeError::EncodeInput(_)
+                | PluginRuntimeError::PermissionNotRequested(_)
+                | PluginRuntimeError::StreamLimit {
+                    stream: StreamKind::Stdin,
+                    ..
+                }
+                | PluginRuntimeError::WorkerPanicked(_)
+        )
 }
 
 fn plugin_runtime_error_detail(error: &PluginRuntimeError) -> String {
@@ -1482,14 +1549,46 @@ fn has_analysis_capability(manifest: &resymbol_core::plugin_api::PluginManifest)
 }
 
 fn runtime_supports_analysis(runtime: &PluginRuntime) -> bool {
-    matches!(runtime, PluginRuntime::ExternalProcess { .. })
-        || matches!(
-            runtime,
-            PluginRuntime::Native {
-                isolation: resymbol_core::plugin_api::NativeIsolation::OutOfProcess,
-                ..
-            }
+    matches!(
+        runtime,
+        PluginRuntime::ExternalProcess { .. } | PluginRuntime::Managed { .. }
+    ) || matches!(
+        runtime,
+        PluginRuntime::Native {
+            isolation: resymbol_core::plugin_api::NativeIsolation::OutOfProcess,
+            ..
+        }
+    )
+}
+
+fn resolve_managed_host() -> std::result::Result<ManagedProcessHost, String> {
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("cannot resolve the ReSymbol executable: {error}"))?;
+    let application_directory = executable
+        .parent()
+        .ok_or_else(|| "the ReSymbol executable has no application directory".to_owned())?;
+    resolve_managed_host_in(application_directory)
+}
+
+fn resolve_managed_host_in(
+    application_directory: &Path,
+) -> std::result::Result<ManagedProcessHost, String> {
+    let helper_name = format!("resymbol-managed-host{}", std::env::consts::EXE_SUFFIX);
+    let helper_path = application_directory.join(helper_name);
+    let metadata = fs::symlink_metadata(&helper_path).map_err(|error| {
+        format!(
+            "managed helper is unavailable at {}: {error}",
+            helper_path.display()
         )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "managed helper at {} must be a regular, unlinked sibling executable",
+            helper_path.display()
+        ));
+    }
+    ManagedProcessHost::new(helper_path, RuntimeLimits::default())
+        .map_err(|error| format!("managed helper is unavailable: {error}"))
 }
 
 fn resolve_native_host() -> std::result::Result<NativeProcessHost, String> {
@@ -1514,6 +1613,27 @@ fn resolve_native_host() -> std::result::Result<NativeProcessHost, String> {
     }
     NativeProcessHost::new(helper_path, RuntimeLimits::default())
         .map_err(|error| format!("native helper is unavailable: {error}"))
+}
+
+fn managed_pe_image(analysis: &BinaryAnalysis) -> Option<ManagedPeImage> {
+    match analysis {
+        BinaryAnalysis::Pe(pe) if pe.identity.architecture == "x86_64" => ManagedPeImage::new(
+            pe.identity.clone(),
+            pe.size_of_headers,
+            pe.size_of_image,
+            pe.sections
+                .iter()
+                .map(|section| ManagedPeImageSection {
+                    virtual_address: section.virtual_address,
+                    virtual_size: section.virtual_size,
+                    raw_data_offset: section.raw_data_offset,
+                    raw_data_size: section.raw_data_size,
+                })
+                .collect(),
+        )
+        .ok(),
+        _ => None,
+    }
 }
 
 fn native_pe_image(analysis: &BinaryAnalysis) -> Option<NativePeImage> {
@@ -1924,7 +2044,11 @@ fn trust_plugin(plugin_dir: &Path, id: &str, expected_fingerprint: Option<&str>)
             ..
         }
     );
-    if !matches!(&manifest.runtime, PluginRuntime::ExternalProcess { .. }) && !native_process {
+    let managed_process = matches!(&manifest.runtime, PluginRuntime::Managed { .. });
+    if !matches!(&manifest.runtime, PluginRuntime::ExternalProcess { .. })
+        && !managed_process
+        && !native_process
+    {
         let detail = if matches!(
             &manifest.runtime,
             PluginRuntime::Native {
@@ -2002,6 +2126,10 @@ fn trust_plugin(plugin_dir: &Path, id: &str, expected_fingerprint: Option<&str>)
     if native_process {
         println!(
             "WARNING: this native library executes in a disposable helper process with your account's ambient filesystem, network, and process authority. The helper contains ordinary crashes; it is not an operating-system sandbox, and protocol permissions are advisory."
+        );
+    } else if managed_process {
+        println!(
+            "WARNING: this managed assembly executes in a disposable helper process with your account's ambient filesystem, network, and process authority. The helper contains ordinary crashes; it is not an operating-system sandbox, and protocol permissions are advisory."
         );
     } else {
         println!(
@@ -2496,6 +2624,32 @@ isolation = "{isolation}"
             ),
         )
         .expect("write native plugin manifest");
+        plugin
+    }
+
+    fn create_managed_plugin(root: &Path, id: &str) -> PathBuf {
+        let plugin = root.join("managed");
+        fs::create_dir(&plugin).expect("create managed plugin directory");
+        fs::write(plugin.join("Plugin.dll"), b"managed-placeholder")
+            .expect("write managed entry assembly");
+        fs::write(
+            plugin.join("plugin.toml"),
+            format!(
+                r#"manifest_version = 1
+id = "{id}"
+name = "Managed CLI test plugin"
+version = "1.2.3"
+api = "^0.1.0"
+capabilities = ["analyzer.binary"]
+permissions = ["binary.read", "claims.submit"]
+
+[runtime]
+kind = "managed"
+entrypoint = "Plugin.dll"
+"#
+            ),
+        )
+        .expect("write managed plugin manifest");
         plugin
     }
 
@@ -3718,6 +3872,149 @@ isolation = "{isolation}"
                 .expect("sentinel blocks commit")
                 .contains(PLUGIN_DISABLED_SENTINEL)
         );
+    }
+
+    #[test]
+    fn managed_plugins_are_analysis_eligible_and_fingerprint_trustable() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        create_managed_plugin(temp.path(), "dev.resymbol.managed");
+        let report = scan_plugins(temp.path(), false).expect("discover managed plugin");
+        let plugin = unique_valid_directory_plugin(&report, "dev.resymbol.managed")
+            .expect("resolve managed plugin");
+        let manifest = plugin.manifest.as_ref().expect("validated manifest");
+        assert!(runtime_supports_analysis(&manifest.runtime));
+
+        trust_plugin(temp.path(), "dev.resymbol.managed", None)
+            .expect("trust exact managed artifact");
+        let fingerprint = fingerprint_plugin_directory(&plugin.path, FingerprintLimits::default())
+            .expect("fingerprint managed artifact")
+            .fingerprint;
+        let key = ArtifactStateKey::new(manifest.id.clone(), fingerprint);
+        assert_eq!(
+            PluginStateStore::new(temp.path())
+                .status(&key)
+                .expect("read managed trust state"),
+            PluginArtifactStatus::Trusted
+        );
+    }
+
+    #[test]
+    fn managed_helper_resolution_never_falls_back_to_path() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let expected = temp.path().join(format!(
+            "resymbol-managed-host{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        let error = resolve_managed_host_in(temp.path())
+            .expect_err("missing app-local managed helper must be rejected");
+        assert!(error.contains("managed helper is unavailable"));
+        assert!(error.contains(&expected.display().to_string()));
+    }
+
+    #[test]
+    fn managed_image_map_exactly_projects_validated_pe_sections() {
+        let analysis = analyze_bytes(&pe_fixture()).expect("analyze fixture");
+        let BinaryAnalysis::Pe(pe) = &analysis else {
+            panic!("PE analysis expected")
+        };
+        let image = managed_pe_image(&analysis).expect("PE x86_64 managed image");
+        assert_eq!(image.identity, pe.identity);
+        assert_eq!(image.size_of_headers, pe.size_of_headers);
+        assert_eq!(image.size_of_image, pe.size_of_image);
+        assert_eq!(image.sections.len(), pe.sections.len());
+        for (managed, section) in image.sections.iter().zip(&pe.sections) {
+            assert_eq!(managed.virtual_address, section.virtual_address);
+            assert_eq!(managed.virtual_size, section.virtual_size);
+            assert_eq!(managed.raw_data_offset, section.raw_data_offset);
+            assert_eq!(managed.raw_data_size, section.raw_data_size);
+        }
+    }
+
+    #[test]
+    fn managed_pre_attribution_errors_are_host_side_but_marked_failures_are_not() {
+        use resymbol_plugin_runtime::ProcessDiagnostics;
+
+        let path = PathBuf::from("managed-test-path");
+        let json_error = serde_json::from_str::<Value>("{")
+            .expect_err("malformed JSON produces an encoding error fixture");
+        let host_side = vec![
+            PluginRuntimeError::InvalidManagedContext("invalid map".to_owned()),
+            PluginRuntimeError::ManagedHostUnavailable {
+                path: path.clone(),
+                reason: "missing".to_owned(),
+            },
+            PluginRuntimeError::ManagedHostFailed {
+                code: Some(1),
+                reason: "pre-load".to_owned(),
+                diagnostics: ProcessDiagnostics::default(),
+            },
+            PluginRuntimeError::ManagedArtifactMismatch {
+                reason: "mismatch".to_owned(),
+            },
+            PluginRuntimeError::ManagedAssemblyClosure {
+                path: path.clone(),
+                reason: "closure".to_owned(),
+            },
+            PluginRuntimeError::ManagedSourceBinary {
+                path: path.clone(),
+                reason: "source".to_owned(),
+            },
+            PluginRuntimeError::ManagedHostInputChanged {
+                path: path.clone(),
+                reason: "source changed before marker".to_owned(),
+                diagnostics: ProcessDiagnostics::default(),
+            },
+            PluginRuntimeError::ManagedHostArtifactChanged {
+                reason: "artifact changed before marker".to_owned(),
+                diagnostics: ProcessDiagnostics::default(),
+            },
+            PluginRuntimeError::EncodeManagedBootstrap(json_error),
+        ];
+        for error in &host_side {
+            assert_eq!(pre_attribution_host_runtime(error), Some("managed"));
+            assert!(is_host_side_runtime_failure(error));
+            assert!(!is_transient_plugin_response(error));
+        }
+
+        let attributable = [
+            PluginRuntimeError::ManagedExecutionInputChanged {
+                path: path.clone(),
+                reason: "source changed after marker".to_owned(),
+                diagnostics: ProcessDiagnostics::default(),
+            },
+            PluginRuntimeError::ManagedExecutionArtifactChanged {
+                reason: "artifact changed after marker".to_owned(),
+                diagnostics: ProcessDiagnostics::default(),
+            },
+            PluginRuntimeError::ProcessFailed {
+                code: Some(1),
+                diagnostics: ProcessDiagnostics::default(),
+            },
+            PluginRuntimeError::Protocol {
+                line: 1,
+                message: "bad output".to_owned(),
+                diagnostics: ProcessDiagnostics::default(),
+            },
+            PluginRuntimeError::StreamLimit {
+                stream: StreamKind::Stdout,
+                limit: 1,
+                diagnostics: ProcessDiagnostics::default(),
+            },
+        ];
+        for error in &attributable {
+            assert_eq!(pre_attribution_host_runtime(error), None);
+            assert!(!is_host_side_runtime_failure(error));
+            assert!(!is_transient_plugin_response(error));
+        }
+
+        let unavailable_response = PluginRuntimeError::PluginRejected {
+            code: "unavailable".to_owned(),
+            message: "try later".to_owned(),
+            data: None,
+            diagnostics: ProcessDiagnostics::default(),
+        };
+        assert!(is_transient_plugin_response(&unavailable_response));
+        assert!(!is_host_side_runtime_failure(&unavailable_response));
     }
 
     #[test]

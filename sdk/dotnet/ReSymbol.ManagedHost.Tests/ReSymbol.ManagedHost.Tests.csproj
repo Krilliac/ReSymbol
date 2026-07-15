@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <AssemblyName>ReSymbol.ManagedHost.Tests</AssemblyName>
+    <RootNamespace>ReSymbol.ManagedHost.Tests</RootNamespace>
+    <DefaultItemExcludes>$(DefaultItemExcludes);Fixtures/**/bin/**;Fixtures/**/obj/**</DefaultItemExcludes>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Remove="Fixtures/**/*.cs" />
+    <ProjectReference Include="../ReSymbol.ManagedHost/ReSymbol.ManagedHost.csproj" />
+    <ProjectReference Include="Fixtures/ValidPlugin/ValidPlugin.csproj"
+                      ReferenceOutputAssembly="false" />
+    <ProjectReference Include="Fixtures/FailingPlugin/FailingPlugin.csproj"
+                      ReferenceOutputAssembly="false" />
+    <ProjectReference Include="Fixtures/SlowPlugin/SlowPlugin.csproj"
+                      ReferenceOutputAssembly="false" />
+  </ItemGroup>
+
+  <Target Name="CopyManagedHostFixtures" AfterTargets="Build">
+    <ItemGroup>
+      <_ValidFixture Include="Fixtures/ValidPlugin/bin/$(Configuration)/net8.0/ReSymbol.ManagedHost.ValidFixture.dll" />
+      <_FailingFixture Include="Fixtures/FailingPlugin/bin/$(Configuration)/net8.0/ReSymbol.ManagedHost.FailingFixture.dll" />
+      <_SlowFixture Include="Fixtures/SlowPlugin/bin/$(Configuration)/net8.0/ReSymbol.ManagedHost.SlowFixture.dll" />
+    </ItemGroup>
+    <Copy SourceFiles="@(_ValidFixture)" DestinationFolder="$(OutDir)fixtures/valid" />
+    <Copy SourceFiles="@(_FailingFixture)" DestinationFolder="$(OutDir)fixtures/failing" />
+    <Copy SourceFiles="@(_SlowFixture)" DestinationFolder="$(OutDir)fixtures/slow" />
+  </Target>
+</Project>

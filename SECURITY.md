@@ -49,15 +49,42 @@ The plugin isolation, permission, package-signing, and update designs are not ye
 guarantees. Current implementation details—not roadmap statements—determine the protection a build
 provides. See [docs/plugin-system.md](docs/plugin-system.md) for the intended model.
 
-The current external and native plugin processes provide crash isolation, not an operating-system
-sandbox. Approved plugin code retains the ambient filesystem, network, credential, and process
-authority of the account launching ReSymbol. Manifest permissions gate ReSymbol protocol
-operations only. Treat an external executable or native library exactly as code run directly by
-that account.
+The current external, native, and managed plugin processes provide crash isolation, not an
+operating-system sandbox. Approved plugin code retains the ambient filesystem, network, credential,
+and process authority of the account launching ReSymbol. Manifest permissions gate ReSymbol
+protocol operations only. Treat an external executable, native library, or managed assembly exactly
+as code run directly by that account.
+
+The process runner currently owns, stops, and reaps only its direct plugin or helper child. It does
+not place that child in a contained Unix process group or Windows Job Object, so plugin-created
+descendants can outlive a timeout. A descendant that inherits the helper's stdout or stderr handle
+can also keep a capture reader blocked after the direct child exits; ReSymbol performs only a
+bounded 50 ms result drain and the reader remains until the inherited handle closes. Process-tree
+containment and inherited-handle hardening are future work, not current security guarantees.
 
 Executable plugins require approval bound to the complete plugin-directory fingerprint. This binds
 a decision to exact local bytes but does not authenticate a publisher, and trust must not transfer
-to a changed artifact. Keep plugin directories writable only by the intended user. Native plugins
-are always loaded by the application-local `resymbol-native-host[.exe]` sibling; placing a lookalike
-helper inside a plugin directory must never affect host selection. A native fault should terminate
-the disposable helper and discard that run's complete claim batch without terminating ReSymbol.
+to a changed artifact. Keep plugin directories writable only by the intended user. Native and
+managed plugins are always loaded by the application-local `resymbol-native-host[.exe]` and
+`resymbol-managed-host[.exe]` siblings; placing a lookalike helper inside a plugin directory must
+never affect host selection. A plugin-attributable fault should terminate the disposable helper and
+discard that run's complete claim batch without terminating ReSymbol.
+
+The first managed host verifies the exact directory fingerprint, private-DLL closure, source-binary
+identity, and cumulative DLL-plus-binary snapshot budget before loading an assembly. It supplies the
+exact `ReSymbol.PluginSdk`, resolves ordinary private dependencies from verified in-memory bytes,
+denies its custom load context's unmanaged-resolution callback, phase-bounds host services, and
+commits claims only after the complete lifecycle and final identity checks succeed. These are
+integrity and transaction controls, not a CLR sandbox. Plugin code can call framework APIs directly,
+including explicit `Assembly.Load*` paths that may engage another/default load context and
+`NativeLibrary.Load` paths that reach the platform loader. It can also use ordinary filesystem,
+network, environment, credential, reflection, interop, and process APIs with the launching account's
+authority.
+
+Native and managed helpers flush distinct versioned markers immediately before their first
+plugin-code load attempt. The parent strips the marker from user-visible diagnostics and uses it to
+attribute post-marker faults to the exact plugin artifact for quarantine. Pre-marker helper
+failures remain conservative host-side diagnostics. File snapshots and repeated fingerprints close
+ordinary load windows, but mutable same-account directories, hard links, and file-identity races are
+still platform-hardening concerns; install trusted plugins in directories other users and processes
+cannot modify.

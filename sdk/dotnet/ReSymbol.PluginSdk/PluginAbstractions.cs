@@ -6,6 +6,9 @@ namespace ReSymbol.PluginSdk;
 /// </summary>
 public interface IPluginHost
 {
+    /// <summary>Emits a transactionally buffered diagnostic for the current plugin run.</summary>
+    /// <param name="level">Severity assigned to the diagnostic.</param>
+    /// <param name="message">UTF-16 diagnostic text to encode as bounded UTF-8 output.</param>
     void Log(PluginLogLevel level, string message);
 
     /// <summary>
@@ -34,6 +37,7 @@ public interface IPluginHost
 /// </summary>
 public interface IReSymbolPlugin : IAsyncDisposable
 {
+    /// <summary>Gets immutable identity, capability, permission, and isolation metadata.</summary>
     PluginMetadata Metadata { get; }
 
     /// <summary>
@@ -44,10 +48,16 @@ public interface IReSymbolPlugin : IAsyncDisposable
         PluginInitialization initialization,
         CancellationToken cancellationToken = default);
 
+    /// <summary>Analyzes the exact binary bound to the current request.</summary>
+    /// <param name="request">Host-owned request and exact binary identity.</param>
+    /// <param name="cancellationToken">Token cancelled at the execution deadline.</param>
     ValueTask AnalyzeAsync(
         AnalysisRequest request,
         CancellationToken cancellationToken = default);
 
+    /// <summary>Reports whether the initialized plugin is ready to analyze.</summary>
+    /// <param name="cancellationToken">Token cancelled at the execution deadline.</param>
+    /// <returns>The plugin's current health state and bounded optional details.</returns>
     ValueTask<PluginHealth> CheckHealthAsync(
         CancellationToken cancellationToken = default);
 

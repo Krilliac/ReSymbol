@@ -53,6 +53,35 @@ jobs:
       - name: Run workspace tests
         run: cargo test --locked --workspace --all-features
 
+      - name: Set up .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Restore managed-host tests
+        run: >-
+          dotnet restore
+          sdk/dotnet/ReSymbol.ManagedHost.Tests/ReSymbol.ManagedHost.Tests.csproj
+          --nologo
+
+      - name: Build managed-host tests
+        run: >-
+          dotnet build
+          sdk/dotnet/ReSymbol.ManagedHost.Tests/ReSymbol.ManagedHost.Tests.csproj
+          --configuration Release
+          --no-restore
+          --nologo
+          --verbosity minimal
+          -warnaserror
+          -m:1
+
+      - name: Run managed-host tests
+        run: >-
+          dotnet run
+          --project sdk/dotnet/ReSymbol.ManagedHost.Tests/ReSymbol.ManagedHost.Tests.csproj
+          --configuration Release
+          --no-build
+
   build:
     name: Build ${{ matrix.platform }}
     needs: validate
@@ -69,6 +98,8 @@ jobs:
             rustflags: -C target-feature=+crt-static
             executable: resymbol.exe
             helper_executable: resymbol-native-host.exe
+            managed_rid: win-x64
+            managed_executable: resymbol-managed-host.exe
             archive: zip
           - os: ubuntu-22.04
             platform: linux-x64
@@ -79,6 +110,8 @@ jobs:
             rustflags: ""
             executable: resymbol
             helper_executable: resymbol-native-host
+            managed_rid: linux-x64
+            managed_executable: resymbol-managed-host
             archive: tar.gz
           - os: macos-15-intel
             platform: macos-x64
@@ -87,6 +120,8 @@ jobs:
             rustflags: ""
             executable: resymbol
             helper_executable: resymbol-native-host
+            managed_rid: osx-x64
+            managed_executable: resymbol-managed-host
             archive: tar.gz
           - os: macos-15
             platform: macos-arm64
@@ -95,6 +130,8 @@ jobs:
             rustflags: ""
             executable: resymbol
             helper_executable: resymbol-native-host
+            managed_rid: osx-arm64
+            managed_executable: resymbol-managed-host
             archive: tar.gz
 
     runs-on: ${{ matrix.os }}
@@ -103,6 +140,7 @@ jobs:
       TARGET: ${{ matrix.target }}
       HELPER_TARGET: ${{ matrix.helper_target }}
       PLATFORM: ${{ matrix.platform }}
+      MANAGED_RID: ${{ matrix.managed_rid }}
       RUSTFLAGS: ${{ matrix.rustflags }}
 
     steps:
@@ -111,6 +149,11 @@ jobs:
 
       - name: Select pinned Rust toolchain
         run: rustup show active-toolchain
+
+      - name: Set up .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
 
       - name: Enable MSVC developer tools
         if: runner.os == 'Windows'
@@ -140,6 +183,74 @@ jobs:
           --bin resymbol-native-host
         shell: bash
 
+      - name: Publish disposable managed helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          tagged_version="${RELEASE_TAG#v}"
+          publish_dir="target/managed/${MANAGED_RID}/publish"
+          dotnet restore \
+            sdk/dotnet/ReSymbol.ManagedHost/ReSymbol.ManagedHost.csproj \
+            --runtime "$MANAGED_RID" \
+            --nologo
+          dotnet publish \
+            sdk/dotnet/ReSymbol.ManagedHost/ReSymbol.ManagedHost.csproj \
+            --configuration Release \
+            --runtime "$MANAGED_RID" \
+            --self-contained true \
+            --no-restore \
+            --output "$publish_dir" \
+            -p:Version="$tagged_version" \
+            -p:InformationalVersion="$tagged_version" \
+            -p:IncludeSourceRevisionInInformationalVersion=false \
+            -p:ContinuousIntegrationBuild=true \
+            -p:PublishSingleFile=true \
+            -p:IncludeNativeLibrariesForSelfExtract=true \
+            -p:IncludeAllContentForSelfExtract=true \
+            -p:PublishTrimmed=false \
+            -p:PublishReadyToRun=false \
+            -p:PublishAot=false \
+            -p:EnableCompressionInSingleFile=false \
+            -p:DebugSymbols=false \
+            -p:DebugType=None
+
+      - name: Restore and build managed release example
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet restore \
+            examples/plugins/managed/Example.ManagedMatcher.csproj \
+            --nologo
+          dotnet build \
+            examples/plugins/managed/Example.ManagedMatcher.csproj \
+            --configuration Release \
+            --no-restore \
+            --nologo \
+            --verbosity minimal \
+            -warnaserror \
+            -m:1 \
+            -p:ContinuousIntegrationBuild=true
+
+      - name: Stage managed release example
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $buildOutput = "examples/plugins/managed/bin/Release/net8.0"
+          $entryAssembly = Join-Path $buildOutput "Example.ManagedMatcher.dll"
+          if (-not (Test-Path -LiteralPath $entryAssembly -PathType Leaf)) {
+            throw "Managed example entry assembly was not built: $entryAssembly"
+          }
+          $privateSdk = @(Get-ChildItem -LiteralPath $buildOutput -File -Recurse |
+            Where-Object { $_.Name -ieq "ReSymbol.PluginSdk.dll" })
+          if ($privateSdk.Count -ne 0) {
+            throw "Managed example copied a private SDK: $($privateSdk.FullName -join ', ')"
+          }
+
+          $staged = "target/managed-release-e2e/$env:MANAGED_RID/plugin"
+          New-Item -ItemType Directory -Path $staged -Force | Out-Null
+          Copy-Item -LiteralPath $entryAssembly -Destination $staged
+          Copy-Item -LiteralPath "examples/plugins/managed/plugin.toml" -Destination $staged
+
       - name: Smoke-test executable
         if: runner.os != 'Windows'
         run: |
@@ -153,6 +264,81 @@ jobs:
           & "target/$env:TARGET/release/resymbol.exe" --version
           & "target/$env:HELPER_TARGET/release/${{ matrix.helper_executable }}" --version
         shell: pwsh
+
+      - name: Relocate and smoke-test managed helper
+        shell: pwsh
+        env:
+          MANAGED_EXECUTABLE: ${{ matrix.managed_executable }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $publishDirectory = "target/managed/$env:MANAGED_RID/publish"
+          $published = @(Get-ChildItem -LiteralPath $publishDirectory -File)
+          if ($published.Count -ne 1 -or $published[0].Name -ne $env:MANAGED_EXECUTABLE) {
+            throw "Expected one self-contained managed helper; found: $($published.Name -join ', ')"
+          }
+
+          $relocation = Join-Path ([IO.Path]::GetTempPath()) ("resymbol-managed-release-" + [Guid]::NewGuid())
+          $extraction = Join-Path $relocation "bundle-extract"
+          New-Item -ItemType Directory -Path $extraction -Force | Out-Null
+          if (-not $IsWindows) {
+            & chmod 700 $relocation $extraction
+            if ($LASTEXITCODE -ne 0) { throw "chmod failed" }
+          }
+
+          $relocatedHost = Join-Path $relocation $env:MANAGED_EXECUTABLE
+          Copy-Item -LiteralPath $published[0].FullName -Destination $relocatedHost
+          if (-not $IsWindows) {
+            & chmod 700 $relocatedHost
+            if ($LASTEXITCODE -ne 0) { throw "chmod failed" }
+          }
+
+          $env:DOTNET_ROOT = Join-Path $relocation "missing-dotnet-root"
+          $env:DOTNET_MULTILEVEL_LOOKUP = "0"
+          $env:DOTNET_BUNDLE_EXTRACT_BASE_DIR = $extraction
+          $version = (& $relocatedHost --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) { throw "relocated managed helper failed" }
+          $expected = "resymbol-managed-host $($env:RELEASE_TAG.Substring(1))"
+          if ($version -ne $expected) {
+            throw "Unexpected managed-helper version: $version"
+          }
+
+          Remove-Item -LiteralPath $relocation -Recurse -Force
+
+      - name: Run exact release managed process integration
+        shell: pwsh
+        env:
+          MANAGED_EXECUTABLE: ${{ matrix.managed_executable }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $hostPath = Join-Path "target/managed/$env:MANAGED_RID/publish" $env:MANAGED_EXECUTABLE
+          $pluginPath = "target/managed-release-e2e/$env:MANAGED_RID/plugin"
+          $env:RESYMBOL_MANAGED_E2E_HOST = (Resolve-Path -LiteralPath $hostPath).Path
+          $env:RESYMBOL_MANAGED_E2E_PLUGIN_DIR = (Resolve-Path -LiteralPath $pluginPath).Path
+
+          & cargo test --locked -p resymbol-plugin-runtime --test managed_process -- `
+            --ignored --exact real_managed_process_round_trip --nocapture
+          if ($LASTEXITCODE -ne 0) {
+            throw "Exact release managed-process integration failed"
+          }
+
+      - name: Run exact release managed CLI drop-in integration
+        shell: pwsh
+        env:
+          MANAGED_EXECUTABLE: ${{ matrix.managed_executable }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $hostPath = Join-Path "target/managed/$env:MANAGED_RID/publish" $env:MANAGED_EXECUTABLE
+          $pluginPath = "target/managed-release-e2e/$env:MANAGED_RID/plugin"
+          $cliPath = "target/$env:TARGET/release/${{ matrix.executable }}"
+          $env:RESYMBOL_MANAGED_E2E_HOST = (Resolve-Path -LiteralPath $hostPath).Path
+          $env:RESYMBOL_MANAGED_E2E_PLUGIN_DIR = (Resolve-Path -LiteralPath $pluginPath).Path
+          $env:RESYMBOL_MANAGED_E2E_CLI = (Resolve-Path -LiteralPath $cliPath).Path
+
+          & cargo test --locked -p resymbol-cli --test managed_cli_drop_in -- `
+            --ignored --exact real_managed_cli_drop_in_round_trip --nocapture
+          if ($LASTEXITCODE -ne 0) {
+            throw "Exact release managed CLI drop-in integration failed"
+          }
 
       - name: Verify Windows executables do not require the dynamic MSVC runtime
         if: runner.os == 'Windows'
@@ -183,6 +369,7 @@ jobs:
           mkdir -p "${stage}/plugins" "${stage}/docs"
           cp "target/${TARGET}/release/${{ matrix.executable }}" "${stage}/"
           cp "target/${HELPER_TARGET}/release/${{ matrix.helper_executable }}" "${stage}/"
+          cp "target/managed/${MANAGED_RID}/publish/${{ matrix.managed_executable }}" "${stage}/"
           cp README.md LICENSE-MIT LICENSE-APACHE "${stage}/"
           cp docs/install.md "${stage}/docs/"
           cp docs/plugin-system.md "${stage}/docs/"
@@ -206,6 +393,7 @@ jobs:
           New-Item -ItemType Directory -Path (Join-Path $stage "docs") -Force | Out-Null
           Copy-Item "target/$env:TARGET/release/${{ matrix.executable }}" $stage
           Copy-Item "target/$env:HELPER_TARGET/release/${{ matrix.helper_executable }}" $stage
+          Copy-Item "target/managed/$env:MANAGED_RID/publish/${{ matrix.managed_executable }}" $stage
           Copy-Item README.md, LICENSE-MIT, LICENSE-APACHE $stage
           Copy-Item docs/install.md (Join-Path $stage "docs")
           Copy-Item docs/plugin-system.md (Join-Path $stage "docs")
@@ -228,9 +416,87 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  managed-sdk:
+    name: Package managed plugin SDK
+    needs: validate
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v7
+
+      - name: Set up .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Restore managed plugin SDK
+        run: >-
+          dotnet restore
+          sdk/dotnet/ReSymbol.PluginSdk/ReSymbol.PluginSdk.csproj
+          --nologo
+
+      - name: Build and pack managed plugin SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          tagged_version="${RELEASE_TAG#v}"
+          dotnet build \
+            sdk/dotnet/ReSymbol.PluginSdk/ReSymbol.PluginSdk.csproj \
+            --configuration Release \
+            --no-restore \
+            --nologo \
+            --verbosity minimal \
+            -warnaserror \
+            -m:1 \
+            -p:Version="$tagged_version" \
+            -p:PackageVersion="$tagged_version" \
+            -p:ContinuousIntegrationBuild=true
+          dotnet pack \
+            sdk/dotnet/ReSymbol.PluginSdk/ReSymbol.PluginSdk.csproj \
+            --configuration Release \
+            --no-build \
+            --nologo \
+            --output artifacts/managed-sdk \
+            -m:1 \
+            -p:Version="$tagged_version" \
+            -p:PackageVersion="$tagged_version" \
+            -p:ContinuousIntegrationBuild=true
+
+      - name: Verify compile-only SDK package and consumer
+        shell: bash
+        run: |
+          set -euo pipefail
+          tagged_version="${RELEASE_TAG#v}"
+          bash sdk/dotnet/ReSymbol.PluginSdk/verify-package.sh \
+            "artifacts/managed-sdk/ReSymbol.PluginSdk.${tagged_version}.nupkg" \
+            "$tagged_version"
+
+      - name: Create managed SDK checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd artifacts/managed-sdk
+          package="ReSymbol.PluginSdk.${RELEASE_TAG#v}.nupkg"
+          sha256sum "$package" > "$package.sha256"
+
+      - name: Upload managed SDK release asset
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-managed-sdk
+          path: |
+            artifacts/managed-sdk/*.nupkg
+            artifacts/managed-sdk/*.nupkg.sha256
+          if-no-files-found: error
+          retention-days: 7
+
   publish:
     name: Publish GitHub prerelease
-    needs: build
+    needs: [build, managed-sdk]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -251,8 +517,8 @@ jobs:
         run: |
           set -euo pipefail
           mapfile -t assets < <(find release-assets -maxdepth 1 -type f -print | sort)
-          if [[ "${#assets[@]}" -ne 8 ]]; then
-            printf 'Expected 8 release assets, found %s:\n' "${#assets[@]}" >&2
+          if [[ "${#assets[@]}" -ne 10 ]]; then
+            printf 'Expected 10 release assets, found %s:\n' "${#assets[@]}" >&2
             printf '  %s\n' "${assets[@]}" >&2
             exit 1
           fi

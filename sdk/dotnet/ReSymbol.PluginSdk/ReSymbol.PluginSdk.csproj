@@ -6,9 +6,25 @@
     <LangVersion>latest</LangVersion>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <IsPackable>true</IsPackable>
+    <!-- Compile-time contract only: the app-local helper supplies this assembly. -->
+    <BuildOutputTargetFolder>ref</BuildOutputTargetFolder>
+    <!-- NU5131 assumes every ref-only package also needs a runtime assembly. -->
+    <NoWarn>$(NoWarn);NU5131</NoWarn>
     <PackageId>ReSymbol.PluginSdk</PackageId>
-    <Version>0.1.0</Version>
+    <Version>0.1.0-alpha.1</Version>
+    <!-- Keep binary references compatible throughout the managed API 0.1 line. -->
+    <AssemblyVersion>0.1.0.0</AssemblyVersion>
     <Description>Stable managed plugin contracts for ReSymbol.</Description>
     <Authors>ReSymbol contributors</Authors>
+    <PackageLicenseExpression>MIT OR Apache-2.0</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/Krilliac/ReSymbol</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/Krilliac/ReSymbol</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageTags>reverse-engineering;plugins;symbols;debugging</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
   </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="/" />
+  </ItemGroup>
 </Project>

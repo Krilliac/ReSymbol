@@ -7,6 +7,8 @@
     <RootNamespace>Example.ManagedMatcher</RootNamespace>
   </PropertyGroup>
   <ItemGroup>
-    <ProjectReference Include="../../../sdk/dotnet/ReSymbol.PluginSdk/ReSymbol.PluginSdk.csproj" />
+    <!-- The self-contained ReSymbol host supplies this exact contract assembly. -->
+    <ProjectReference Include="../../../sdk/dotnet/ReSymbol.PluginSdk/ReSymbol.PluginSdk.csproj"
+                      Private="false" />
   </ItemGroup>
 </Project>
