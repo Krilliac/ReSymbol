@@ -1,10 +1,10 @@
 # Plugin system design
 
-This document separates the implemented external-process, native C/C++, and managed/.NET runtimes
-from the wider plugin architecture. Directory discovery, trust/quarantine state, one-shot process
-analysis, the disposable native and managed helpers, and the initial contracts are current. WASM,
-tool-hosted execution, packaged-plugin installation, and richer lifecycle behavior remain design
-work until a release marks them stable.
+This document separates the implemented WebAssembly Component Model, external-process, native
+C/C++, and managed/.NET runtimes from the wider plugin architecture. Directory discovery,
+trust/quarantine state, sandboxed WASM analysis, one-shot process analysis, the disposable native
+and managed helpers, and the initial contracts are current. Tool-hosted execution, packaged-plugin
+installation, and richer persistent lifecycle behavior remain design work.
 
 ## User experience
 
@@ -13,13 +13,15 @@ The current installation path is deliberately simple:
 1. Download a prebuilt plugin.
 2. Drop its directory into `plugins/` beside the ReSymbol executable.
 3. Launch ReSymbol.
-4. For an external-process or native plugin, explicitly trust the displayed directory fingerprint
-   before its first execution.
+4. A sandboxed WASM component is immediately eligible to autoload. For an external-process,
+   native, or managed plugin, explicitly trust the displayed directory fingerprint before its
+   first execution.
 
 ReSymbol scans the directory, validates each candidate, resolves compatibility and dependencies,
-and autoloads eligible plugins. An unchanged trusted out-of-process artifact may run automatically
-during later analyses. Changing any fingerprinted file invalidates trust and requires a new
-decision. A plugin is never compiled, deleted, or rewritten automatically when it fails.
+and autoloads eligible plugins. Sandboxed WASM needs no trust record; an unchanged trusted process
+artifact may run automatically during later analyses. Changing any fingerprinted process-plugin
+file invalidates trust and requires a new decision. A plugin is never compiled, deleted, or
+rewritten automatically when it fails.
 
 An intended portable layout is:
 
@@ -27,6 +29,7 @@ An intended portable layout is:
 resymbol/
 ├── resymbol.exe
 ├── resymbol-native-host.exe
+├── resymbol-managed-host.exe
 ├── plugins/
 │   ├── community.msvc-rtti/
 │   │   ├── plugin.toml
@@ -58,14 +61,16 @@ The current sequence is:
    safe mode.
 4. Parse bounded manifests, reject duplicate identities, and validate entrypoints, API ranges,
    runtimes, and dependencies.
-5. Fingerprint every file in an eligible out-of-process plugin directory except the manual
+5. Fingerprint every file in an eligible executable plugin directory except the manual
    `plugin.disabled` sentinel. Links, special files, excessive depth, and excessive file or byte
    counts are rejected.
-6. Read the exact fingerprint's trust and quarantine records from `plugins/.resymbol/`; corrupt or
-   unsafe host state fails closed.
-7. Launch an eligible, trusted external-process analyzer directly, or a native/managed analyzer
-   through its application-local disposable helper. Validate its complete claim batch before adding
-   it to the analysis session.
+6. Read the exact fingerprint's applicable policy records from `plugins/.resymbol/`; corrupt or
+   unsafe host state fails closed. WASM ignores approval records but still enforces disablement and
+   exact quarantine. Process runtimes require exact trust and enforce exact quarantine.
+7. Launch eligible WASM in the no-WASI in-process component host, an eligible trusted
+   external-process analyzer directly, or a trusted native/managed analyzer through its
+   application-local disposable helper. Validate its complete claim batch before adding it to the
+   analysis session.
 
 The application must finish starting even when every third-party plugin is invalid.
 
@@ -73,22 +78,24 @@ The application must finish starting even when every third-party plugin is inval
 
 | State | Meaning | Automatic behavior |
 |---|---|---|
-| Approval required | Valid executable artifact, but its exact fingerprint has not been trusted | Discover and report; do not launch |
-| Enabled | Valid, compatible, healthy, trusted, and allowed | Load normally when its capability is eligible |
+| Approval required | Valid process artifact, but its exact fingerprint has not been trusted | Discover and report; do not launch |
+| Enabled | Valid, compatible, healthy, and allowed under its runtime's policy | Load normally when its capability is eligible |
 | Disabled | Explicitly disabled by the user or policy | Do not launch |
 | Incompatible | API, ABI, platform, architecture, or dependency does not match | Keep installed and explain why |
 | Quarantined | Validation, startup, runtime, or resource-limit failures make loading unsafe | Do not launch until reviewed and reset |
 | Development error | An opt-in development build failed | Preserve compiler diagnostics; disable that build |
 
 Trust and quarantine state is recorded outside plugin-controlled directories and is bound to both
-plugin ID and exact fingerprint. Updating a plugin therefore returns the new artifact to `Approval
-required`; trust never transfers by filename or version alone. Unsafe startup, runtime, claim,
+plugin ID and exact fingerprint. Updating a process plugin therefore returns the new artifact to
+`Approval required`; trust never transfers by filename or version alone. A changed WASM component
+remains eligible for sandboxed autoload, but neither an old quarantine nor reset transfers to its
+new fingerprint. Unsafe startup, runtime, claim,
 protocol, timeout, or output-limit failures attributable to plugin execution quarantine the exact
 artifact and preserve a bounded diagnostic. The native and managed helpers write and flush
 family-specific versioned markers immediately before their first plugin-load operation. The parent
 observes that raw prefix independently of structured diagnostics, strips it from user-visible
 stderr, and treats a failure without the current marker conservatively as host-side. A changed
-artifact is neither trusted nor covered by the old quarantine record.
+process artifact is not trusted, and no changed artifact is covered by an old quarantine record.
 
 A sentinel file provides an out-of-band recovery mechanism:
 
@@ -97,10 +104,11 @@ plugins/community.msvc-rtti/plugin.disabled
 ```
 
 This must work even if plugin metadata storage or the normal UI is unavailable.
-The parent checks both the sentinel and the exact artifact's trust/quarantine record immediately
+The parent checks both the sentinel and the exact artifact's applicable policy state immediately
 before launch and again before accepting a completed batch. The second check is the commit
-linearization point: a disable, untrust, quarantine, or corrupt-state result observed there discards
-all claims without newly blaming the plugin; a policy change after that point applies to later runs.
+linearization point: a disablement, applicable trust revocation, quarantine, or corrupt-state
+result observed there discards all claims without newly blaming the plugin; a policy change after
+that point applies to later runs.
 
 The management and execution controls are:
 
@@ -118,18 +126,22 @@ resymbol analyze application.exe --plugin first.id --plugin second.id --strict-p
 resymbol --safe-mode analyze application.exe
 ```
 
-`trust` approves only the exact fingerprint shown by ReSymbol; the optional `--fingerprint` value
+`trust` applies only to external-process, native, and managed artifacts and approves only the exact
+fingerprint shown by ReSymbol; the optional `--fingerprint` value
 lets an automation script fail if the installed artifact is not the one reviewed. `untrust`
 removes that approval. `reset` clears quarantine for the current artifact but does not approve a
 new one. `plugin.disabled` remains independent of trust, so toggling it does not change the
 fingerprint.
 
-By default, analysis runs every eligible trusted external-process or native analysis plugin.
-Repeating `--plugin` selects specific IDs. Untrusted, quarantined, disabled, incompatible, and
-safe-mode plugins do not execute. A normal plugin failure is non-fatal: base analysis and a valid
-package are still produced, with partial plugin claims discarded. `--strict-plugins` writes that
-package first, then returns a failure status when an explicitly selected or otherwise eligible
-plugin could not run successfully.
+Sandboxed WASM reports `sandboxed-autoload`; its `trust` command is rejected with an explanation.
+Use `plugin disable`, safe mode, or exact-artifact quarantine to block a component.
+
+By default, analysis runs every eligible sandboxed WASM component and eligible trusted process
+analysis plugin. Repeating `--plugin` selects specific IDs. Approval-required process plugins and
+quarantined, disabled, incompatible, or safe-mode plugins do not execute. A normal plugin failure
+is non-fatal: base analysis and a valid package are still produced, with partial plugin claims
+discarded. `--strict-plugins` writes that package first, then returns a failure status when an
+explicitly selected or otherwise eligible plugin could not run successfully.
 
 ## Current manifest
 
@@ -184,11 +196,11 @@ single global API version would cause unnecessary breakage.
 
 Plugins receive only the ReSymbol data projections and host protocol operations needed for their
 declared work. The one-shot external host uses manifest-declared projection and claim permissions;
-its interactive binary reads are reserved. The native and managed helpers implement
-permission-gated, size-bounded `binary.read` callbacks for file-backed RVAs in the exact PE. Wider planned permissions
-include temporary storage, package storage, approved network origins, subprocess execution, and
-explicit file selections. A permission grants a host operation; it does not convert a plugin's
-output into trusted fact.
+its interactive binary reads are reserved. The WASM, native, and managed hosts implement
+permission-gated, size-bounded `binary.read` callbacks for file-backed RVAs in the exact PE. Wider
+planned permissions include temporary storage, package storage, approved network origins,
+subprocess execution, and explicit file selections. A permission grants a host operation; it does
+not convert a plugin's output into trusted fact.
 
 For the current external, native, and managed runtimes, those permissions are **not
 operating-system restrictions**. Once approved and launched, plugin code has the ambient filesystem, network,
@@ -196,7 +208,8 @@ credential, and process access normally available to the account running ReSymbo
 helper contains crashes; it does not create an OS sandbox. Clearing most inherited environment
 variables does not change that boundary. Only approve a plugin whose publisher and exact code you
 would be willing to execute directly. A future sandbox layer may make declared network or
-filesystem permissions enforceable at the OS boundary.
+filesystem permissions enforceable at the OS boundary. Sandboxed WASM already enforces the narrower
+linked-interface model described below; it exposes no WASI capability.
 
 The shared process runner controls and reaps only the direct external plugin or native/managed
 helper. It does not currently create a contained Unix process group or Windows Job Object. A plugin
@@ -212,17 +225,98 @@ channel, and re-run analysis if local software could have replaced files during 
 
 ## Extension families
 
-### WebAssembly (planned host)
+### WebAssembly (current first host)
 
-WASM is the intended default for portable analyzers, matchers, resolvers, and exporters. The host
-will expose versioned interfaces and capability-scoped resources. Plugins have no ambient
-filesystem, network, clock, environment, or process access unless a specific interface grants it.
-Memory, fuel or execution time, output size, and concurrency will be bounded.
+WASM is the portable, capability-limited runtime for analyzers, matchers, resolvers, and eventually
+exporters. The first host accepts `analyze` work for an exact validated PE32+ x86-64 image and
+implements the `resymbol:plugin@0.1.0` Component Model world. It calls metadata, initialize, health,
+analyze, and shutdown in a bounded transaction. Descriptor identity, version, capabilities, and
+requested permissions must agree with the manifest; every claim is decoded and validated by the
+same core rules as a process-plugin claim.
+
+The linker exposes only ReSymbol's WIT `host` interface: bounded logging, `binary.read`,
+`submit-claim`, and cancellation. It deliberately links no WASI filesystem, sockets, environment,
+clock, random, or process interfaces. A component cannot acquire ambient authority through the
+declared host surface. Because this boundary does not require a publisher/code trust decision,
+eligible components autoload without an approval record and `resymbol plugin trust` rejects WASM
+IDs. Safe mode and `plugin.disabled` still stop execution; attributable validation, lifecycle,
+host-call, claim, trap, fuel, timeout, or resource failures discard the transaction and quarantine
+the exact ID and fingerprint. `plugin reset` clears that exact quarantine without affecting a
+different build.
+
+The host fingerprints the complete plugin directory before component loading and again after the
+lifecycle. It reads the component as bounded bytes, validates the Component Model binary, and
+checks disable/quarantine policy again before committing output. The PE image exposed through
+`binary.read` is an immutable, digest-checked file-to-RVA mapping; reads outside mapped headers or
+section data are rejected rather than reaching the host filesystem.
+
+Default input and instantiated-guest ceilings are:
+
+- 64 MiB of component bytes, 256 MiB of linear memory, one memory, two tables, 32 instances, and a
+  100,000-element table limit;
+- 100,000,000 fuel, a 2 MiB WebAssembly stack, and a 30-second guest epoch deadline;
+- 1 MiB per host event, 8 MiB of aggregate event output, and 4,096 events; and
+- 1 MiB per `binary.read`, 64 MiB of aggregate requested reads, and a 1 GiB exact source-image
+  ceiling.
+
+Configured limits also have hard validation ceilings. Guest-limit exhaustion traps or rejects the
+invocation; no partial claim batch is retained. The configurable hard maxima are 256 MiB of
+component bytes, 4 GiB of linear memory, 10,000,000,000 fuel, an 8 MiB stack, 1 GiB of aggregate
+reads, a 24-hour deadline, and 1,000,000 host events. Wasmtime itself executes and compiles
+components inside the ReSymbol process. No-WASI capability isolation therefore does not provide
+process containment: an engine, generated-code, or host-binding vulnerability can crash or
+compromise ReSymbol. Fuel,
+epoch interruption, store limits, and transactional commit constrain instantiated guest behavior,
+not sandbox-engine escapes. The epoch timer is armed before synchronous component validation/JIT,
+but it cannot interrupt compilation, and the guest store-memory limit does not cap compiler or
+other host allocations. Except for the component-byte cap, a pathological component can therefore
+exceed the configured guest deadline or memory limit during compilation.
 
 The checked-in WIT package includes additive typed helpers for `string-literal` and
 `data-reference` recovery assertions. Protocol 1.0 still carries the canonical tagged assertion
 inside `symbol-claim.claim-json`; retaining that field avoids breaking existing component bindings.
-The helper vocabulary uses `ascii`/`utf-16-le` and requires the nonzero `instruction-size` field.
+The WIT helper enum uses `ascii`/`utf16-le`, while canonical claim JSON continues to use
+`ascii`/`utf-16-le`; the WIT data-reference helper requires a nonzero `instruction-size` field.
+
+#### WASM plugin author quickstart
+
+The source-backed example uses the repository's Rust 1.86 toolchain, `wit-bindgen`, and an
+example-local `wit-component` encoder. Add the core-WASM target and build it from the repository
+root; no `cargo-component`, WASI SDK, C/C++ compiler, or global `wasm-tools` binary is needed:
+
+```console
+rustup target add wasm32-unknown-unknown
+./examples/plugins/wasm/build.sh
+```
+
+Windows authors can run `examples\plugins\wasm\build.ps1`. Both scripts write
+`examples/plugins/wasm/example-resolver.wasm` and keep intermediate files under the repository
+`target/` directory. Direct dependencies are exact and the checked-in example `Cargo.lock` makes
+subsequent builds use `--locked`.
+
+Stage the two runtime files on a POSIX shell:
+
+```console
+stage=plugins/dev.resymbol.example.wasm-resolver
+mkdir -p "$stage"
+cp examples/plugins/wasm/plugin.toml "$stage/"
+cp examples/plugins/wasm/example-resolver.wasm "$stage/"
+```
+
+Or with PowerShell:
+
+```powershell
+$stage = "plugins/dev.resymbol.example.wasm-resolver"
+New-Item -ItemType Directory -Path $stage -Force | Out-Null
+Copy-Item examples/plugins/wasm/plugin.toml $stage
+Copy-Item examples/plugins/wasm/example-resolver.wasm $stage
+```
+
+The example reads the exact DOS `MZ` bytes through `binary.read`, logs through the host, and submits
+one binary-bound comment claim with byte evidence. ReSymbol discovers and autoloads it; use
+`plugin disable` or safe mode when you do not want it to participate. Release archives already
+contain this two-file example, and CI rebuilds the checked-in component and runs the staged fixture
+through each exact platform release CLI.
 
 ### Native C and C++ (current first host)
 
@@ -541,11 +635,12 @@ Each supported family should receive:
 - deterministic fake binary and graph fixtures; and
 - packaging commands that produce a drop-in artifact.
 
-The repository currently checks in the shared WIT contract, the C11/C++11 native header and helper,
-the .NET contract assembly and managed helper, a strict out-of-process JSON Schema, and minimal
-native/managed examples. The native contract is exercised by real C and C++ shared-library fixtures,
-and the managed host is built, tested, and self-contained-published across supported CI hosts. WASM
-hosting remains planned as described above.
+The repository currently checks in the shared WIT contract and source-backed component, the
+C11/C++11 native header and helper, the .NET contract assembly and managed helper, a strict
+out-of-process JSON Schema, and minimal examples. CI reproducibly rebuilds the WASM fixture, runs it
+through the real component host and exact release CLI, exercises the native contract with real C and
+C++ shared libraries, and builds, tests, and self-contained-publishes the managed host across
+supported release platforms.
 
 The SDK is successful when plugin authors need their language's normal toolchain, while plugin users
 need only the compiled package and ReSymbol.

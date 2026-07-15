@@ -1,0 +1,15 @@
+[package]
+name = "resymbol-wasm-violation-fixture"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.86"
+publish = false
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "=0.41.0"
+

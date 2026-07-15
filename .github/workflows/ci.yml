@@ -19,7 +19,7 @@ env:
 
 jobs:
   contracts:
-    name: Language-neutral contracts
+    name: Plugin contracts and fixtures
     runs-on: ubuntu-latest
 
     steps:
@@ -42,6 +42,54 @@ jobs:
 
       - name: Validate process protocol JSON
         run: jq empty protocol/plugin-wire.schema.json
+
+      - name: Install Rust target for the WASM example
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Rebuild source-backed WASM component
+        run: bash examples/plugins/wasm/build.sh
+
+      - name: Verify checked-in WASM component is reproducible
+        shell: bash
+        run: |
+          set -euo pipefail
+          git ls-files --error-unmatch \
+            examples/plugins/wasm/Cargo.lock \
+            examples/plugins/wasm/example-resolver.wasm >/dev/null
+          git diff --exit-code -- \
+            examples/plugins/wasm/Cargo.lock \
+            examples/plugins/wasm/example-resolver.wasm
+
+      - name: Rebuild adversarial WASM runtime fixture
+        run: >-
+          bash
+          crates/resymbol-plugin-runtime/tests/fixtures/wasm-violations/build.sh
+
+      - name: Verify adversarial WASM fixture is reproducible
+        shell: bash
+        run: |
+          set -euo pipefail
+          fixture="crates/resymbol-plugin-runtime/tests/fixtures/wasm-violations"
+          git ls-files --error-unmatch \
+            "${fixture}/Cargo.lock" \
+            "${fixture}/component.wasm" >/dev/null
+          git diff --exit-code -- \
+            "${fixture}/Cargo.lock" \
+            "${fixture}/component.wasm"
+
+      - name: Run real WASM drop-in through the exact CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          staged="${RUNNER_TEMP}/resymbol-wasm-e2e-plugin"
+          mkdir -p "$staged"
+          cp examples/plugins/wasm/plugin.toml "$staged/"
+          cp examples/plugins/wasm/example-resolver.wasm "$staged/"
+          cargo build --locked --bin resymbol
+          export RESYMBOL_WASM_E2E_PLUGIN_DIR="$(realpath "$staged")"
+          export RESYMBOL_WASM_E2E_CLI="$(realpath target/debug/resymbol)"
+          cargo test --locked -p resymbol-cli --test wasm_cli_drop_in -- \
+            --ignored --exact real_wasm_cli_drop_in_round_trip --nocapture
 
   rust:
     name: Rust (${{ matrix.os-name }})

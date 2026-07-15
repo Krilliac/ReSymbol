@@ -3,6 +3,7 @@ use std::{
     fs,
     io::Write as _,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use anyhow::{Context, Result, bail};
@@ -32,11 +33,13 @@ use resymbol_package::{
 use resymbol_plugin_runtime::{
     ExternalProcessHost, ExternalProcessRequest, ManagedPeImage, ManagedPeImageSection,
     ManagedProcessHost, NativePeImage, NativePeImageSection, NativeProcessHost, PluginMethod,
-    PluginRuntimeError, RuntimeLimits, StreamKind,
+    PluginRuntimeError, RuntimeLimits, StreamKind, WasmComponentHost, WasmPeImage,
+    WasmPeImageSection, WasmRuntimeLimits,
 };
 use resymbol_plugin_state::{
-    ArtifactFingerprint, ArtifactStateKey, FingerprintLimits, PluginArtifactStatus,
-    PluginStateStore, StateChange, fingerprint_plugin_directory,
+    ArtifactFingerprint, ArtifactStateKey, ArtifactTrustPolicy, FingerprintLimits,
+    PluginArtifactStatus, PluginExecutionPolicy, PluginStateStore, StateChange,
+    fingerprint_plugin_directory,
 };
 use serde_json::{Map, Value};
 
@@ -231,12 +234,14 @@ enum AnalysisPluginRuntime {
     External,
     Managed,
     Native,
+    Wasm,
 }
 
 struct AnalysisPluginHosts<'a> {
     external: &'a ExternalProcessHost,
     managed: Option<&'a Result<ManagedProcessHost, String>>,
     native: Option<&'a Result<NativeProcessHost, String>>,
+    wasm: Option<&'a Result<WasmComponentHost, String>>,
 }
 
 fn analyze(args: AnalyzeArgs, safe_mode: bool, plugin_dir: PathBuf) -> Result<()> {
@@ -244,8 +249,9 @@ fn analyze(args: AnalyzeArgs, safe_mode: bool, plugin_dir: PathBuf) -> Result<()
         .binary
         .canonicalize()
         .with_context(|| format!("cannot open binary {}", args.binary.display()))?;
-    let bytes =
-        fs::read(&binary).with_context(|| format!("cannot read binary {}", binary.display()))?;
+    let bytes = Arc::<[u8]>::from(
+        fs::read(&binary).with_context(|| format!("cannot read binary {}", binary.display()))?,
+    );
     let base_analysis = analyze_bytes(&bytes)
         .with_context(|| format!("cannot analyze binary {}", binary.display()))?;
     let output = args.output.unwrap_or_else(|| default_package_path(&binary));
@@ -256,6 +262,7 @@ fn analyze(args: AnalyzeArgs, safe_mode: bool, plugin_dir: PathBuf) -> Result<()
     let execution = execute_analysis_plugins(
         &base_analysis,
         &binary,
+        &bytes,
         &report,
         &selectors,
         safe_mode,
@@ -890,6 +897,7 @@ fn parse_plugin_selectors(values: &[String]) -> Result<BTreeSet<PluginId>> {
 fn execute_analysis_plugins(
     base_analysis: &BinaryAnalysis,
     binary_path: &Path,
+    binary_bytes: &Arc<[u8]>,
     report: &resymbol_core::PluginDiscoveryReport,
     selectors: &BTreeSet<PluginId>,
     safe_mode: bool,
@@ -933,10 +941,22 @@ fn execute_analysis_plugins(
                 )
         })
         .then(resolve_native_host);
+    let wasm_host = report
+        .plugins
+        .iter()
+        .filter_map(|plugin| plugin.manifest.as_ref())
+        .any(|manifest| {
+            has_analysis_capability(manifest)
+                && matches!(&manifest.runtime, PluginRuntime::Wasm { .. })
+        })
+        .then(|| {
+            WasmComponentHost::new(WasmRuntimeLimits::default()).map_err(|error| error.to_string())
+        });
     let hosts = AnalysisPluginHosts {
         external: &external_host,
         managed: managed_host.as_ref(),
         native: native_host.as_ref(),
+        wasm: wasm_host.as_ref(),
     };
 
     for plugin in &report.plugins {
@@ -959,6 +979,7 @@ fn execute_analysis_plugins(
         let result = execute_one_plugin(
             base_analysis,
             binary_path,
+            binary_bytes,
             plugin,
             safe_mode,
             &store,
@@ -989,6 +1010,7 @@ fn execute_analysis_plugins(
 fn execute_one_plugin(
     base_analysis: &BinaryAnalysis,
     binary_path: &Path,
+    binary_bytes: &Arc<[u8]>,
     plugin: &DiscoveredPlugin,
     safe_mode: bool,
     store: &PluginStateStore,
@@ -1027,6 +1049,7 @@ fn execute_one_plugin(
         ));
     }
     let runtime = match &manifest.runtime {
+        PluginRuntime::Wasm { .. } => AnalysisPluginRuntime::Wasm,
         PluginRuntime::ExternalProcess { .. } => AnalysisPluginRuntime::External,
         PluginRuntime::Managed { .. } => AnalysisPluginRuntime::Managed,
         PluginRuntime::Native {
@@ -1094,26 +1117,56 @@ fn execute_one_plugin(
             ));
         }
     }
+    let wasm_image = if runtime == AnalysisPluginRuntime::Wasm {
+        match hosts.wasm {
+            Some(Ok(_)) => {}
+            Some(Err(error)) => return Ok(skip(error.clone())),
+            None => {
+                return Ok(skip(
+                    "WASM component host was not initialized for this analysis".to_owned(),
+                ));
+            }
+        }
+        match wasm_pe_image(base_analysis, Arc::clone(binary_bytes)) {
+            Some(image) => Some(image),
+            None => {
+                return Ok(skip(
+                    "WASM plugins require an exact validated PE image snapshot".to_owned(),
+                ));
+            }
+        }
+    } else {
+        None
+    };
     if manifest.version.to_string().len() > 128 {
         return Ok(skip(
             "plugin version is too long for the auditable session ledger".to_owned(),
         ));
     }
+    let trust_policy = if runtime == AnalysisPluginRuntime::Wasm {
+        ArtifactTrustPolicy::Sandboxed
+    } else {
+        ArtifactTrustPolicy::RequireApproval
+    };
+    let requires_trust = trust_policy == ArtifactTrustPolicy::RequireApproval;
 
     let first = match fingerprint_plugin_directory(&plugin.path, FingerprintLimits::default()) {
         Ok(report) => report,
         Err(error) => return Ok(skip(format!("artifact fingerprint failed: {error}"))),
     };
     let key = ArtifactStateKey::new(manifest.id.clone(), first.fingerprint);
-    match store.status(&key) {
-        Ok(PluginArtifactStatus::Trusted) => {}
-        Ok(PluginArtifactStatus::ApprovalRequired) => {
+    match store.execution_policy(&plugin.path, &key, trust_policy) {
+        Ok(PluginExecutionPolicy::Allowed) => {}
+        Ok(PluginExecutionPolicy::Disabled) => {
+            return Ok(skip("plugin.disabled is present".to_owned()));
+        }
+        Ok(PluginExecutionPolicy::ApprovalRequired) => {
             return Ok(skip(format!(
                 "approval required for exact fingerprint {}",
                 first.fingerprint
             )));
         }
-        Ok(PluginArtifactStatus::Quarantined { reason }) => {
+        Ok(PluginExecutionPolicy::Quarantined { reason }) => {
             return Ok(skip(format!("exact artifact is quarantined: {reason}")));
         }
         Err(error) => return Ok(skip(format!("plugin state is unsafe or corrupt: {error}"))),
@@ -1136,11 +1189,13 @@ fn execute_one_plugin(
         .iter()
         .filter(|permission| {
             let value = permission.as_str();
-            value == PluginPermission::SYMBOLS_READ
+            (runtime != AnalysisPluginRuntime::Wasm && value == PluginPermission::SYMBOLS_READ)
                 || value == PluginPermission::CLAIMS_SUBMIT
                 || (matches!(
                     runtime,
-                    AnalysisPluginRuntime::Managed | AnalysisPluginRuntime::Native
+                    AnalysisPluginRuntime::Managed
+                        | AnalysisPluginRuntime::Native
+                        | AnalysisPluginRuntime::Wasm
                 ) && value == PluginPermission::BINARY_READ)
         })
         .cloned()
@@ -1175,12 +1230,17 @@ fn execute_one_plugin(
         }
     };
     if second.fingerprint != first.fingerprint {
+        let policy = if requires_trust {
+            "new approval is required"
+        } else {
+            "the new sandboxed artifact will be evaluated on the next run"
+        };
         return Ok(skip(format!(
-            "artifact changed after trust check to {}; new approval is required",
+            "artifact changed after policy check to {}; {policy}",
             second.fingerprint
         )));
     }
-    if let Some(reason) = plugin_execution_policy_blocker(store, &key, &plugin.path) {
+    if let Some(reason) = plugin_execution_policy_blocker(store, &key, &plugin.path, trust_policy) {
         return Ok(skip(format!(
             "plugin policy changed immediately before launch: {reason}"
         )));
@@ -1206,9 +1266,19 @@ fn execute_one_plugin(
                 .expect("native PE compatibility was checked before trust");
             native_host.execute_trusted(plugin, &request, second.fingerprint, binary_path, &image)
         }
+        AnalysisPluginRuntime::Wasm => {
+            let wasm_host = hosts
+                .wasm
+                .and_then(|host| host.as_ref().ok())
+                .expect("WASM host availability was checked before execution");
+            let image = wasm_image
+                .as_ref()
+                .expect("exact WASM PE image compatibility was checked before execution");
+            wasm_host.execute_sandboxed(plugin, &request, second.fingerprint, image)
+        }
     };
 
-    if let Some(reason) = plugin_execution_policy_blocker(store, &key, &plugin.path) {
+    if let Some(reason) = plugin_execution_policy_blocker(store, &key, &plugin.path, trust_policy) {
         let failed = failed_run_record(manifest, &run_id, second.fingerprint)?;
         return Ok(SinglePluginResult {
             run: Some(failed),
@@ -1353,6 +1423,9 @@ fn pre_attribution_host_runtime(error: &PluginRuntimeError) -> Option<&'static s
         | PluginRuntimeError::ManagedHostInputChanged { .. }
         | PluginRuntimeError::ManagedHostArtifactChanged { .. }
         | PluginRuntimeError::EncodeManagedBootstrap(_) => Some("managed"),
+        PluginRuntimeError::InvalidWasmContext(_)
+        | PluginRuntimeError::WasmEngineUnavailable { .. }
+        | PluginRuntimeError::WasmArtifactMismatch { .. } => Some("wasm"),
         _ => None,
     }
 }
@@ -1434,27 +1507,22 @@ fn quarantine_failed_artifact(
 
 /// Return the current policy reason that prevents an in-flight result from
 /// committing. This check is the parent-side linearization point for manual
-/// disablement, trust revocation, quarantine, and corrupt state.
+/// disablement, quarantine, corrupt state, and trust revocation for runtimes
+/// that require explicit artifact trust. Sandboxed WASM remains subject to
+/// every policy check except approval state.
 fn plugin_execution_policy_blocker(
     store: &PluginStateStore,
     key: &ArtifactStateKey,
     plugin_path: &Path,
+    trust_policy: ArtifactTrustPolicy,
 ) -> Option<String> {
-    match fs::symlink_metadata(plugin_path.join(PLUGIN_DISABLED_SENTINEL)) {
-        Ok(_) => return Some("plugin.disabled is present".to_owned()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Some(format!(
-                "the disable sentinel could not be verified safely: {error}"
-            ));
-        }
-    }
-    match store.status(key) {
-        Ok(PluginArtifactStatus::Trusted) => None,
-        Ok(PluginArtifactStatus::ApprovalRequired) => {
+    match store.execution_policy(plugin_path, key, trust_policy) {
+        Ok(PluginExecutionPolicy::Allowed) => None,
+        Ok(PluginExecutionPolicy::Disabled) => Some("plugin.disabled is present".to_owned()),
+        Ok(PluginExecutionPolicy::ApprovalRequired) => {
             Some("exact artifact trust was revoked".to_owned())
         }
-        Ok(PluginArtifactStatus::Quarantined { reason }) => {
+        Ok(PluginExecutionPolicy::Quarantined { reason }) => {
             Some(format!("exact artifact is quarantined: {reason}"))
         }
         Err(error) => Some(format!("plugin state is unsafe or corrupt: {error}")),
@@ -1551,7 +1619,9 @@ fn has_analysis_capability(manifest: &resymbol_core::plugin_api::PluginManifest)
 fn runtime_supports_analysis(runtime: &PluginRuntime) -> bool {
     matches!(
         runtime,
-        PluginRuntime::ExternalProcess { .. } | PluginRuntime::Managed { .. }
+        PluginRuntime::Wasm { .. }
+            | PluginRuntime::ExternalProcess { .. }
+            | PluginRuntime::Managed { .. }
     ) || matches!(
         runtime,
         PluginRuntime::Native {
@@ -1653,6 +1723,28 @@ fn native_pe_image(analysis: &BinaryAnalysis) -> Option<NativePeImage> {
                 })
                 .collect(),
         }),
+        _ => None,
+    }
+}
+
+fn wasm_pe_image(analysis: &BinaryAnalysis, binary_bytes: Arc<[u8]>) -> Option<WasmPeImage> {
+    match analysis {
+        BinaryAnalysis::Pe(pe) => WasmPeImage::new(
+            pe.identity.clone(),
+            pe.size_of_headers,
+            pe.size_of_image,
+            pe.sections
+                .iter()
+                .map(|section| WasmPeImageSection {
+                    virtual_address: section.virtual_address,
+                    virtual_size: section.virtual_size,
+                    raw_data_offset: section.raw_data_offset,
+                    raw_data_size: section.raw_data_size,
+                })
+                .collect(),
+            binary_bytes,
+        )
+        .ok(),
         _ => None,
     }
 }
@@ -2003,17 +2095,31 @@ fn print_plugin(plugin: &DiscoveredPlugin, store: &PluginStateStore) -> usize {
         .manifest
         .as_ref()
         .expect("valid directory branch checked above");
+    let sandboxed_wasm = matches!(&manifest.runtime, PluginRuntime::Wasm { .. });
+    let trust_policy = if sandboxed_wasm {
+        ArtifactTrustPolicy::Sandboxed
+    } else {
+        ArtifactTrustPolicy::RequireApproval
+    };
     let key = ArtifactStateKey::new(manifest.id.clone(), report.fingerprint);
-    match store.status(&key) {
-        Ok(PluginArtifactStatus::ApprovalRequired) => {
-            println!("  policy: approval-required");
+    match store.execution_policy(&plugin.path, &key, trust_policy) {
+        Ok(PluginExecutionPolicy::Allowed) if sandboxed_wasm => {
+            println!("  policy: sandboxed-autoload");
             0
         }
-        Ok(PluginArtifactStatus::Trusted) => {
+        Ok(PluginExecutionPolicy::Allowed) => {
             println!("  policy: trusted");
             0
         }
-        Ok(PluginArtifactStatus::Quarantined { reason }) => {
+        Ok(PluginExecutionPolicy::Disabled) => {
+            println!("  policy: disabled");
+            0
+        }
+        Ok(PluginExecutionPolicy::ApprovalRequired) => {
+            println!("  policy: approval-required");
+            0
+        }
+        Ok(PluginExecutionPolicy::Quarantined { reason }) => {
             println!(
                 "  policy: quarantined ({})",
                 bounded_single_line(&reason, 768)
@@ -2037,6 +2143,11 @@ fn trust_plugin(plugin_dir: &Path, id: &str, expected_fingerprint: Option<&str>)
         .manifest
         .as_ref()
         .expect("resolved valid directory plugin has a manifest");
+    if matches!(&manifest.runtime, PluginRuntime::Wasm { .. }) {
+        bail!(
+            "plugin trust does not apply to sandboxed WASM plugins; {id} autoloads without ambient authority or an approval record (use plugin disable to block it)"
+        );
+    }
     let native_process = matches!(
         &manifest.runtime,
         PluginRuntime::Native {
@@ -2651,6 +2762,22 @@ entrypoint = "Plugin.dll"
         )
         .expect("write managed plugin manifest");
         plugin
+    }
+
+    fn only_state_record(store: &PluginStateStore, kind: &str) -> PathBuf {
+        let directory = store.state_root().join("v1").join(kind);
+        let records = fs::read_dir(&directory)
+            .unwrap_or_else(|error| panic!("cannot read {}: {error}", directory.display()))
+            .map(|entry| entry.expect("read plugin state record").path())
+            .collect::<Vec<_>>();
+        let [record] = records.as_slice() else {
+            panic!(
+                "expected one {kind} record below {}, found {}",
+                directory.display(),
+                records.len()
+            )
+        };
+        record.clone()
     }
 
     #[test]
@@ -3855,23 +3982,163 @@ entrypoint = "Plugin.dll"
         );
         let store = PluginStateStore::new(temp.path());
         store.trust(&key).expect("trust exact policy fixture");
-        assert!(plugin_execution_policy_blocker(&store, &key, &plugin_path).is_none());
+        assert!(
+            plugin_execution_policy_blocker(
+                &store,
+                &key,
+                &plugin_path,
+                ArtifactTrustPolicy::RequireApproval,
+            )
+            .is_none()
+        );
 
         store.untrust(&key).expect("revoke exact trust");
         assert!(
-            plugin_execution_policy_blocker(&store, &key, &plugin_path)
-                .expect("revocation blocks commit")
-                .contains("revoked")
+            plugin_execution_policy_blocker(
+                &store,
+                &key,
+                &plugin_path,
+                ArtifactTrustPolicy::RequireApproval,
+            )
+            .expect("revocation blocks commit")
+            .contains("revoked")
         );
 
         store.trust(&key).expect("restore exact trust");
         fs::write(plugin_path.join(PLUGIN_DISABLED_SENTINEL), b"disabled")
             .expect("create disable sentinel");
         assert!(
-            plugin_execution_policy_blocker(&store, &key, &plugin_path)
-                .expect("sentinel blocks commit")
-                .contains(PLUGIN_DISABLED_SENTINEL)
+            plugin_execution_policy_blocker(
+                &store,
+                &key,
+                &plugin_path,
+                ArtifactTrustPolicy::RequireApproval,
+            )
+            .expect("sentinel blocks commit")
+            .contains(PLUGIN_DISABLED_SENTINEL)
         );
+    }
+
+    #[test]
+    fn sandboxed_wasm_autoload_policy_still_honors_quarantine_and_reset() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let plugin_path = create_plugin(temp.path(), "dev.resymbol.wasm-policy");
+        let report = scan_plugins(temp.path(), false).expect("discover WASM policy fixture");
+        let plugin = unique_valid_directory_plugin(&report, "dev.resymbol.wasm-policy")
+            .expect("resolve WASM policy fixture");
+        assert!(runtime_supports_analysis(
+            &plugin
+                .manifest
+                .as_ref()
+                .expect("validated manifest")
+                .runtime
+        ));
+        let fingerprint = fingerprint_plugin_directory(&plugin_path, FingerprintLimits::default())
+            .expect("fingerprint WASM policy fixture")
+            .fingerprint;
+        let key = ArtifactStateKey::new(
+            PluginId::new("dev.resymbol.wasm-policy").expect("valid plugin ID"),
+            fingerprint,
+        );
+        let store = PluginStateStore::new(temp.path());
+        assert_eq!(
+            store.status(&key).expect("read initial WASM state"),
+            PluginArtifactStatus::ApprovalRequired
+        );
+        assert!(
+            plugin_execution_policy_blocker(
+                &store,
+                &key,
+                &plugin_path,
+                ArtifactTrustPolicy::Sandboxed,
+            )
+            .is_none(),
+            "sandboxed WASM must not require an approval record"
+        );
+        assert!(
+            plugin_execution_policy_blocker(
+                &store,
+                &key,
+                &plugin_path,
+                ArtifactTrustPolicy::RequireApproval,
+            )
+            .expect("trust-requiring runtime must remain blocked")
+            .contains("revoked")
+        );
+
+        store
+            .trust(&key)
+            .expect("create an irrelevant WASM trust record");
+        fs::write(only_state_record(&store, "trust"), b"not valid JSON")
+            .expect("corrupt irrelevant WASM trust record");
+        assert!(
+            plugin_execution_policy_blocker(
+                &store,
+                &key,
+                &plugin_path,
+                ArtifactTrustPolicy::Sandboxed,
+            )
+            .is_none(),
+            "sandboxed WASM must not consume irrelevant trust state"
+        );
+        list_plugins(temp.path(), false)
+            .expect("WASM listing must ignore an irrelevant corrupt trust record");
+        assert!(
+            plugin_execution_policy_blocker(
+                &store,
+                &key,
+                &plugin_path,
+                ArtifactTrustPolicy::RequireApproval,
+            )
+            .expect("corrupt trust must fail closed for ambient runtimes")
+            .contains("unsafe or corrupt")
+        );
+
+        store
+            .quarantine(&key, "attributable WASM trap")
+            .expect("quarantine exact WASM artifact");
+        assert!(
+            plugin_execution_policy_blocker(
+                &store,
+                &key,
+                &plugin_path,
+                ArtifactTrustPolicy::Sandboxed,
+            )
+            .expect("quarantine must block WASM autoload")
+            .contains("quarantined")
+        );
+        fs::write(only_state_record(&store, "quarantine"), b"not valid JSON")
+            .expect("corrupt exact WASM quarantine record");
+        assert!(
+            plugin_execution_policy_blocker(
+                &store,
+                &key,
+                &plugin_path,
+                ArtifactTrustPolicy::Sandboxed,
+            )
+            .expect("corrupt quarantine must fail closed for sandboxed WASM")
+            .contains("unsafe or corrupt")
+        );
+        assert!(
+            list_plugins(temp.path(), false)
+                .expect_err("WASM listing must fail closed on corrupt quarantine state")
+                .to_string()
+                .contains("fingerprint/state error")
+        );
+        store.reset(&key).expect("reset exact WASM quarantine");
+        assert!(
+            plugin_execution_policy_blocker(
+                &store,
+                &key,
+                &plugin_path,
+                ArtifactTrustPolicy::Sandboxed,
+            )
+            .is_none()
+        );
+
+        let error = trust_plugin(temp.path(), "dev.resymbol.wasm-policy", None)
+            .expect_err("sandboxed WASM trust must be unnecessary");
+        assert!(error.to_string().contains("autoloads without"));
     }
 
     #[test]
@@ -4018,6 +4285,38 @@ entrypoint = "Plugin.dll"
     }
 
     #[test]
+    fn wasm_error_attribution_quarantines_only_plugin_controlled_failures() {
+        let host_side = [
+            PluginRuntimeError::InvalidWasmContext("invalid PE map".to_owned()),
+            PluginRuntimeError::WasmEngineUnavailable {
+                reason: "engine configuration".to_owned(),
+            },
+            PluginRuntimeError::WasmArtifactMismatch {
+                reason: "changed before compilation".to_owned(),
+            },
+        ];
+        for error in &host_side {
+            assert_eq!(pre_attribution_host_runtime(error), Some("wasm"));
+            assert!(is_host_side_runtime_failure(error));
+        }
+
+        let attributable = [
+            PluginRuntimeError::WasmComponent {
+                stage: "analyze",
+                reason: "guest trap".to_owned(),
+            },
+            PluginRuntimeError::WasmResourceLimit {
+                resource: "fuel",
+                limit: 1,
+            },
+        ];
+        for error in &attributable {
+            assert_eq!(pre_attribution_host_runtime(error), None);
+            assert!(!is_host_side_runtime_failure(error));
+        }
+    }
+
+    #[test]
     fn native_out_of_process_plugins_are_eligible_and_fingerprint_trustable() {
         let temp = tempfile::tempdir().expect("create temporary directory");
         create_native_plugin(temp.path(), "dev.resymbol.native", "out-of-process");
@@ -4080,26 +4379,67 @@ entrypoint = "Plugin.dll"
     }
 
     #[test]
+    fn wasm_image_snapshot_exactly_projects_the_validated_pe() {
+        let bytes = Arc::<[u8]>::from(pe_fixture());
+        let analysis = analyze_bytes(&bytes).expect("analyze fixture");
+        let BinaryAnalysis::Pe(pe) = &analysis else {
+            panic!("PE analysis expected")
+        };
+        let image = wasm_pe_image(&analysis, Arc::clone(&bytes)).expect("exact WASM PE image");
+        assert_eq!(image.identity, pe.identity);
+        assert_eq!(image.size_of_headers, pe.size_of_headers);
+        assert_eq!(image.size_of_image, pe.size_of_image);
+        assert_eq!(image.sections.len(), pe.sections.len());
+        for (wasm, section) in image.sections.iter().zip(&pe.sections) {
+            assert_eq!(wasm.virtual_address, section.virtual_address);
+            assert_eq!(wasm.virtual_size, section.virtual_size);
+            assert_eq!(wasm.raw_data_offset, section.raw_data_offset);
+            assert_eq!(wasm.raw_data_size, section.raw_data_size);
+        }
+
+        let mut changed = bytes.as_ref().to_vec();
+        changed[0x200] ^= 0xff;
+        assert!(
+            wasm_pe_image(&analysis, Arc::from(changed)).is_none(),
+            "WASM execution must not pair a validated map with changed bytes"
+        );
+    }
+
+    #[test]
     fn safe_mode_has_no_default_attempts_but_preserves_explicit_skips() {
         let temp = tempfile::tempdir().expect("create temporary directory");
         create_external_plugin(temp.path(), "dev.resymbol.external");
         let report = scan_plugins(temp.path(), true).expect("discover in safe mode");
-        let fixture = pe_fixture();
+        let fixture = Arc::<[u8]>::from(pe_fixture());
         let binary = temp.path().join("fixture.exe");
-        fs::write(&binary, &fixture).expect("write fixture binary");
+        fs::write(&binary, fixture.as_ref()).expect("write fixture binary");
         let base = analyze_bytes(&fixture).expect("analyze fixture");
 
-        let automatic =
-            execute_analysis_plugins(&base, &binary, &report, &BTreeSet::new(), true, temp.path())
-                .expect("safe automatic selection");
+        let automatic = execute_analysis_plugins(
+            &base,
+            &binary,
+            &fixture,
+            &report,
+            &BTreeSet::new(),
+            true,
+            temp.path(),
+        )
+        .expect("safe automatic selection");
         assert!(automatic.attempts.is_empty());
         assert!(automatic.runs.is_empty());
 
         let selected =
             parse_plugin_selectors(&["dev.resymbol.external".to_owned()]).expect("valid selector");
-        let explicit =
-            execute_analysis_plugins(&base, &binary, &report, &selected, true, temp.path())
-                .expect("safe explicit selection");
+        let explicit = execute_analysis_plugins(
+            &base,
+            &binary,
+            &fixture,
+            &report,
+            &selected,
+            true,
+            temp.path(),
+        )
+        .expect("safe explicit selection");
         assert_eq!(explicit.attempts.len(), 1);
         assert_eq!(explicit.attempts[0].status, PluginAttemptStatus::Skipped);
         assert!(explicit.attempts[0].detail.contains("safe mode"));

@@ -50,6 +50,21 @@ jobs:
       - name: Select pinned Rust toolchain
         run: rustup show active-toolchain
 
+      - name: Install Rust target for the WASM example
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Rebuild and verify source-backed WASM component
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash examples/plugins/wasm/build.sh
+          git ls-files --error-unmatch \
+            examples/plugins/wasm/Cargo.lock \
+            examples/plugins/wasm/example-resolver.wasm >/dev/null
+          git diff --exit-code -- \
+            examples/plugins/wasm/Cargo.lock \
+            examples/plugins/wasm/example-resolver.wasm
+
       - name: Run workspace tests
         run: cargo test --locked --workspace --all-features
 
@@ -251,6 +266,20 @@ jobs:
           Copy-Item -LiteralPath $entryAssembly -Destination $staged
           Copy-Item -LiteralPath "examples/plugins/managed/plugin.toml" -Destination $staged
 
+      - name: Stage WASM release example
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $staged = "target/wasm-release-e2e/plugin"
+          New-Item -ItemType Directory -Path $staged -Force | Out-Null
+          Copy-Item -LiteralPath "examples/plugins/wasm/plugin.toml" -Destination $staged
+          Copy-Item -LiteralPath "examples/plugins/wasm/example-resolver.wasm" -Destination $staged
+
+          $files = @(Get-ChildItem -LiteralPath $staged -File)
+          if ($files.Count -ne 2) {
+            throw "Expected the staged WASM plugin to contain two files; found: $($files.Name -join ', ')"
+          }
+
       - name: Smoke-test executable
         if: runner.os != 'Windows'
         run: |
@@ -264,6 +293,21 @@ jobs:
           & "target/$env:TARGET/release/resymbol.exe" --version
           & "target/$env:HELPER_TARGET/release/${{ matrix.helper_executable }}" --version
         shell: pwsh
+
+      - name: Run exact release WASM CLI drop-in integration
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $pluginPath = "target/wasm-release-e2e/plugin"
+          $cliPath = "target/$env:TARGET/release/${{ matrix.executable }}"
+          $env:RESYMBOL_WASM_E2E_PLUGIN_DIR = (Resolve-Path -LiteralPath $pluginPath).Path
+          $env:RESYMBOL_WASM_E2E_CLI = (Resolve-Path -LiteralPath $cliPath).Path
+
+          & cargo test --locked -p resymbol-cli --test wasm_cli_drop_in -- `
+            --ignored --exact real_wasm_cli_drop_in_round_trip --nocapture
+          if ($LASTEXITCODE -ne 0) {
+            throw "Exact release WASM CLI drop-in integration failed"
+          }
 
       - name: Relocate and smoke-test managed helper
         shell: pwsh
@@ -374,6 +418,10 @@ jobs:
           cp docs/install.md "${stage}/docs/"
           cp docs/plugin-system.md "${stage}/docs/"
           cp packaging/plugins/README.txt "${stage}/plugins/"
+          wasm_plugin="${stage}/plugins/dev.resymbol.example.wasm-resolver"
+          mkdir -p "$wasm_plugin"
+          cp examples/plugins/wasm/plugin.toml "$wasm_plugin/"
+          cp examples/plugins/wasm/example-resolver.wasm "$wasm_plugin/"
 
           archive="dist/${package_root}.tar.gz"
           tar -C dist -czf "$archive" "$package_root"
@@ -398,6 +446,10 @@ jobs:
           Copy-Item docs/install.md (Join-Path $stage "docs")
           Copy-Item docs/plugin-system.md (Join-Path $stage "docs")
           Copy-Item packaging/plugins/README.txt (Join-Path $stage "plugins")
+          $wasmPlugin = Join-Path $stage "plugins/dev.resymbol.example.wasm-resolver"
+          New-Item -ItemType Directory -Path $wasmPlugin -Force | Out-Null
+          Copy-Item examples/plugins/wasm/plugin.toml $wasmPlugin
+          Copy-Item examples/plugins/wasm/example-resolver.wasm $wasmPlugin
 
           $archive = Join-Path "dist" "$packageRoot.zip"
           Compress-Archive -Path $stage -DestinationPath $archive -CompressionLevel Optimal
@@ -517,6 +569,8 @@ jobs:
         run: |
           set -euo pipefail
           mapfile -t assets < <(find release-assets -maxdepth 1 -type f -print | sort)
+          # Four platform archives plus checksums and one managed SDK package plus checksum.
+          # The portable WASM example is staged inside each archive, not published as a new asset.
           if [[ "${#assets[@]}" -ne 10 ]]; then
             printf 'Expected 10 release assets, found %s:\n' "${#assets[@]}" >&2
             printf '  %s\n' "${assets[@]}" >&2
@@ -544,6 +598,27 @@ jobs:
               --prerelease \
               --generate-notes
           fi
+
+          mapfile -t published_assets < <(
+            gh release view "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json assets \
+              --jq '.assets[].name'
+          )
+          for published_asset in "${published_assets[@]}"; do
+            desired=false
+            for asset_path in release-assets/*; do
+              if [[ "${asset_path##*/}" == "$published_asset" ]]; then
+                desired=true
+                break
+              fi
+            done
+            if [[ "$desired" != true ]]; then
+              gh release delete-asset "$RELEASE_TAG" "$published_asset" \
+                --repo "$GITHUB_REPOSITORY" \
+                --yes
+            fi
+          done
 
           gh release upload "$RELEASE_TAG" release-assets/* \
             --repo "$GITHUB_REPOSITORY" \

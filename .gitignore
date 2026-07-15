@@ -1,5 +1,7 @@
 # Rust
 /target/
+/examples/plugins/wasm/target/
+/crates/resymbol-plugin-runtime/tests/fixtures/wasm-violations/target/
 **/*.rs.bk
 *.profraw
 *.profdata

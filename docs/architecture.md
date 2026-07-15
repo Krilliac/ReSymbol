@@ -6,13 +6,13 @@ not necessarily behavior implemented in the current checkout.
 
 The current implementation covers bounded PE32+ x86-64 ingestion, a conservative metadata-derived
 symbol graph, modern MSVC x64 Rev1 RTTI/vftable discovery, canonical JSON `.resym` packages, plugin
-discovery/contracts, and trusted external-process, native C/C++, and managed/.NET analysis
-runtimes. It also
-includes a validated, debugger-neutral export projection, deterministic Microsoft-linker-style MAP
-output, an exact-RSDS public-symbol PDB writer, and conservative standalone import-script generators
+discovery/contracts, a no-WASI WebAssembly Component Model host, and trusted external-process,
+native C/C++, and managed/.NET analysis runtimes. It also includes a validated, debugger-neutral
+export projection, deterministic Microsoft-linker-style MAP output, an exact-RSDS public-symbol PDB
+writer, and conservative standalone import-script generators
 for IDA and Ghidra. Broader disassembly-assisted discovery, matching, semantic inference,
-interactive debugger bridges, richer PDB and DWARF output, the workbench GUI, and the WASM
-execution host remain design work.
+interactive debugger bridges, richer PDB and DWARF output, and the workbench GUI remain design
+work.
 
 ## Goals
 
@@ -263,7 +263,7 @@ high-performance native analysis, managed tooling, model experiments, and debugg
 
 | Family | Intended use | Host boundary |
 |---|---|---|
-| WebAssembly | Portable analyzers, matchers, rules, and exporters | Planned capability sandbox |
+| WebAssembly | Portable analyzers, matchers, rules, and exporters | In-process Wasmtime component; no WASI, bounded WIT imports |
 | Native C/C++ | Existing reversing libraries and performance-critical work | Disposable sibling helper; bounded C ABI callbacks, but no OS sandbox |
 | Managed/.NET | Managed analyzers, SDK consumers, and ecosystem integrations | App-local self-contained sibling helper; verified assembly snapshots, but no OS sandbox |
 | External process | Python, model runtimes, proprietary SDKs, or heavyweight tools | Child process; bounded protocol, but no OS sandbox |
@@ -272,6 +272,28 @@ high-performance native analysis, managed tooling, model experiments, and debugg
 Native in-process loading is not implemented. It may eventually be available as an explicit trusted
 performance mode, but it is never the safe default. Rust's native ABI is not a public plugin
 contract; native plugins use a versioned C ABI with language wrappers.
+
+The implemented WebAssembly host runs Component Model plugins in an in-process Wasmtime engine and
+links only the versioned ReSymbol WIT imports. No WASI filesystem, network, environment, clock, or
+process interface is linked. The first host accepts exact validated PE32+ x86-64 analysis context,
+exposes permission- and phase-bounded file-backed `binary.read` and claim submission plus bounded
+logging and cancellation checks, and executes metadata, initialize, health, analyze, and shutdown
+as one transaction.
+Component bytes are capped before compilation. Store linear memory, tables, instances, guest stack,
+fuel, epoch time, host-event bytes and counts, and per-call/aggregate binary reads are bounded after
+compilation. The complete plugin fingerprint and exact binary identity are checked around execution,
+and no claims commit until lifecycle, resource, claim, and final policy validation succeeds.
+
+Because the no-WASI host grants no ambient authority through its declared surface, eligible WASM
+components autoload without a trust record. Manual disablement, safe mode, exact-artifact
+quarantine, and reset remain enforced. This is a no-WASI capability boundary inside the process,
+not process containment: a vulnerability in Wasmtime, its generated native code, or ReSymbol's host
+bindings can cross the boundary or terminate the application. Normal traps, fuel exhaustion,
+deadlines, and invalid output are transactionally contained after instantiation, but the fuel,
+epoch, stack, and store controls do not interrupt synchronous validation/JIT compilation or cap
+compiler and other host allocations. A pathological component can exceed the guest deadline or
+memory limit while compiling, and there is no separate process protecting ReSymbol from compiler
+resource exhaustion or an engine escape.
 
 The implemented external-process host starts an explicitly approved plugin directly, without a
 shell, for one analysis request; exchanges size- and count-bounded NDJSON; enforces a deadline and
@@ -319,11 +341,11 @@ which quarantine the exact artifact, from conservative helper preflight failures
 crashed, or rejected managed run cannot partially commit claims or prevent base package creation.
 
 Process separation contains ordinary crashes, not authority. External, native, and managed child
-code still has the ambient filesystem, network, credential, and process access of the account running
-ReSymbol. Consequently executable plugins require explicit approval tied to their complete
-directory fingerprint before first execution. The unchanged fingerprint may autoload later; any
-fingerprinted-file update invalidates that approval. Manifest permissions constrain ReSymbol's
-protocol operations and data projections, not ambient operating-system access. A fingerprint
+code still has the ambient filesystem, network, credential, and process access of the account
+running ReSymbol. Consequently executable process plugins require explicit approval tied to their
+complete directory fingerprint before first execution. The unchanged fingerprint may autoload
+later; any fingerprinted-file update invalidates that approval. Manifest permissions constrain
+ReSymbol's protocol operations and data projections, not ambient operating-system access. A fingerprint
 identifies reviewed local directory bytes but neither authenticates a publisher nor eliminates the
 check-to-launch window while those files remain mutable. Native dynamic dependencies remain subject
 to the platform loader's documented search rules rather than an immutable dependency snapshot.
@@ -356,11 +378,13 @@ The application is centered on the Rust CLI plus prebuilt, version-matched plugi
 tool adapters as they become implemented. Ordinary users should not need to install a compiler,
 language runtime, build system, or package manager. In particular:
 
-- current archives ship `resymbol-native-host[.exe]` and a single-file, self-contained
+- current archives ship a prebuilt source-backed WASM example under `plugins/`,
+  `resymbol-native-host[.exe]`, and a single-file, self-contained
   `resymbol-managed-host[.exe]` beside `resymbol[.exe]`;
 - Linux archives pair a static musl CLI with a GNU helper built on Ubuntu 22.04 for glibc 2.35 or
   newer so ordinary glibc `.so` plugins can load;
 - ordinary managed-plugin users need neither a system .NET runtime nor SDK;
+- ordinary WASM-plugin users need no Rust toolchain, WASI SDK, or component build tool;
 - ordinary plugins are distributed already compiled;
 - the implemented PDB exporter does not require a separate Visual Studio installation; and
 - optional external services remain optional rather than preventing deterministic analysis.
@@ -371,18 +395,22 @@ Developer toolchains are a contributor concern, not an end-user installation ste
 
 1. **Input binaries are untrusted.** Parsers apply bounds and resource limits and should avoid
    unsafe code.
-2. **Third-party plugins are untrusted by default.** External-process, native, and managed code is never
-   launched before an explicit fingerprint-bound trust decision. Trust and quarantine records live
-   in the host-owned `plugins/.resymbol/` directory, outside plugin-controlled directories.
-3. **Native code is crash-isolated, not sandboxed.** It runs only in the disposable sibling helper
+2. **WASM components are capability-sandboxed in-process.** They autoload without trust because no
+   WASI or ambient interface is linked, but manual disablement and exact quarantine still apply.
+   Wasmtime or host-binding vulnerabilities are not process-contained.
+3. **Executable process plugins are untrusted by default.** External-process, native, and managed
+   code is never launched before an explicit fingerprint-bound trust decision. Trust and
+   quarantine records live in the host-owned `plugins/.resymbol/` directory, outside
+   plugin-controlled directories.
+4. **Native code is crash-isolated, not sandboxed.** It runs only in the disposable sibling helper
    in the current implementation, but retains the launching account's ambient authority. There is
    no in-process native path.
-4. **Managed code is process-isolated, not sandboxed.** Its verified assembly closure and
+5. **Managed code is process-isolated, not sandboxed.** Its verified assembly closure and
    transactional services constrain normal host integration, but default-context/explicit loading
    APIs and all other ambient authority remain available. There is no in-process managed path.
-5. **Remote content is untrusted.** Symbol servers, source indexes, registries, and model endpoints
+6. **Remote content is untrusted.** Symbol servers, source indexes, registries, and model endpoints
    cannot directly create trusted facts.
-6. **Tool bridges are separate trust domains.** A bridge must validate the binary identity and
+7. **Tool bridges are separate trust domains.** A bridge must validate the binary identity and
    address mapping before applying an analysis inside another program.
 
 The core should retain enough structured diagnostics to explain which boundary failed without
@@ -390,12 +418,13 @@ logging binary contents, source material, or secrets by default.
 
 `plugin.disabled` remains an out-of-band manual stop switch and safe mode suppresses all
 third-party execution. Plugin-attributable launch, runtime, resource, claim, or protocol failures
-quarantine the exact out-of-process plugin fingerprint; confirmed host/helper preflight failures do
-not. Corrupt host state fails closed. Quarantine does not grant trust to an updated artifact,
+quarantine the exact plugin fingerprint; confirmed host/helper preflight failures do not. Corrupt
+applicable host state fails closed. Quarantine does not grant trust to an updated process artifact,
 plugin failure never deletes the installed files, and a rejected run cannot leave a partially
 committed claim batch. Immediately before launch and again before committing a completed batch, the
-parent rechecks the disable sentinel and exact trust/quarantine state. That final recheck is the
-policy linearization point; a revocation observed there discards the full batch.
+parent rechecks the disable sentinel and applicable exact policy state. That final recheck is the
+policy linearization point; a disablement, trust revocation, or quarantine observed there discards
+the full batch.
 
 ## Compatibility
 

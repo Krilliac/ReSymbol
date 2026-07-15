@@ -37,7 +37,9 @@ project maturity.
   binary;
 - capability escapes from a sandboxed plugin host, or confusion between process separation and an
   operating-system sandbox;
-- native or managed plugin trust being elevated without explicit consent;
+- memory-safety, JIT/compiler, or host-binding defects that let a WASM component escape the
+  in-process Wasmtime boundary or terminate ReSymbol;
+- external-process, native, or managed plugin trust being elevated without explicit consent;
 - signature, update, or package-confusion flaws that could substitute plugin code;
 - corruption or cross-contamination between analyses;
 - unsafe handling of symbol-server, source, or model responses; and
@@ -55,6 +57,30 @@ and process authority of the account launching ReSymbol. Manifest permissions ga
 protocol operations only. Treat an external executable, native library, or managed assembly exactly
 as code run directly by that account.
 
+The current WebAssembly host is a different boundary. It links only the versioned ReSymbol WIT
+imports and deliberately does not link WASI, so a component has no ambient filesystem, network,
+environment, clock, or process interface. `binary.read` and claim submission are permission- and
+phase-gated, with range, count, and byte limits. Logging is available in every lifecycle phase but
+is count- and output-byte-bounded, while cancellation reports the guest deadline. Fuel, linear
+memory, stack, and epoch-deadline limits govern instantiated guest execution. Eligible WASM
+plugins therefore autoload without an explicit trust record; `resymbol plugin trust` does not
+grant or revoke their execution authority. Safe mode, `plugin.disabled`, exact-artifact
+quarantine, reset, component validation, and before/after fingerprint and policy checks still
+apply.
+
+Wasmtime executes and compiles the component inside the ReSymbol process. The absence of WASI
+removes ambient interfaces but does not place the engine behind a process boundary. A vulnerability
+in Wasmtime, its generated native code, or ReSymbol's host bindings could crash or compromise
+ReSymbol. A 64 MiB default component-byte cap applies before compilation, but the fuel, epoch,
+stack, and store controls do not interrupt synchronous Wasmtime validation/JIT compilation or cap
+compiler and other host allocations. A pathological component can therefore exceed the configured
+guest deadline or memory limit while compiling. The guest controls and transactional claim commit
+protect against ordinary instantiated-component faults and resource abuse; they are not defenses
+against compiler resource exhaustion or a sandbox escape. Because a changed eligible WASM artifact
+can autoload without a new approval prompt, anyone who can write the plugin directory can choose the
+next component presented to the in-process engine. Keep the plugin tree writable only by the
+intended account even when every installed plugin is WASM.
+
 The process runner currently owns, stops, and reaps only its direct plugin or helper child. It does
 not place that child in a contained Unix process group or Windows Job Object, so plugin-created
 descendants can outlive a timeout. A descendant that inherits the helper's stdout or stderr handle
@@ -62,13 +88,16 @@ can also keep a capture reader blocked after the direct child exits; ReSymbol pe
 bounded 50 ms result drain and the reader remains until the inherited handle closes. Process-tree
 containment and inherited-handle hardening are future work, not current security guarantees.
 
-Executable plugins require approval bound to the complete plugin-directory fingerprint. This binds
-a decision to exact local bytes but does not authenticate a publisher, and trust must not transfer
-to a changed artifact. Keep plugin directories writable only by the intended user. Native and
+External-process, native, and managed plugins require approval bound to the complete plugin-directory
+fingerprint. This binds a decision to exact local bytes but does not authenticate a publisher, and
+trust must not transfer to a changed artifact. Sandboxed WASM does not require approval, but its
+quarantine remains bound to the exact ID and fingerprint, so replacing a failed component is not a
+reset of another artifact. Keep plugin directories writable only by the intended user. Native and
 managed plugins are always loaded by the application-local `resymbol-native-host[.exe]` and
 `resymbol-managed-host[.exe]` siblings; placing a lookalike helper inside a plugin directory must
-never affect host selection. A plugin-attributable fault should terminate the disposable helper and
-discard that run's complete claim batch without terminating ReSymbol.
+never affect host selection. A plugin-attributable process fault should terminate the disposable
+helper and discard that run's complete claim batch without terminating ReSymbol; a component fault
+must discard the in-process WASM transaction and quarantine that exact artifact.
 
 The first managed host verifies the exact directory fingerprint, private-DLL closure, source-binary
 identity, and cumulative DLL-plus-binary snapshot budget before loading an assembly. It supplies the

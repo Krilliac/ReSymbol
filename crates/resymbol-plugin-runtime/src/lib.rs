@@ -1,10 +1,11 @@
-//! Bounded execution for ReSymbol out-of-process plugins.
+//! Bounded execution for ReSymbol plugins.
 //!
-//! External-process manifests launch their entrypoint directly. Native and
+//! WebAssembly components run in a capability-limited Wasmtime store without
+//! WASI. External-process manifests launch their entrypoint directly. Native and
 //! managed manifests launch versioned sibling helpers that contain library or
-//! runtime faults outside the main ReSymbol process. Every path avoids a shell,
-//! exchange bounded newline-delimited JSON over pipes, terminate processes
-//! that exceed their deadline, and convert claim events into validated
+//! runtime faults outside the main ReSymbol process. Process paths avoid a shell,
+//! exchange bounded newline-delimited JSON over pipes, and terminate processes
+//! that exceed their deadline. Every host converts claim events into validated
 //! [`resymbol_core::SymbolClaim`] values.
 //!
 //! Process isolation is not a full operating-system sandbox. Protocol grants
@@ -18,11 +19,13 @@
 //! [`ManagedProcessHost::execute_trusted`] additionally performs its own
 //! pre-launch and post-child artifact checks.
 
+mod claim;
 mod error;
 mod host;
 mod managed;
 mod native;
 mod types;
+mod wasm;
 mod wire;
 
 pub use error::{PluginRuntimeError, StreamKind};
@@ -33,3 +36,4 @@ pub use types::{
     ExternalProcessRequest, PluginDescriptor, PluginExecution, PluginLog, PluginMethod,
     PluginResponse, ProcessDiagnostics, RuntimeLimits,
 };
+pub use wasm::{WasmComponentHost, WasmPeImage, WasmPeImageSection, WasmRuntimeLimits};

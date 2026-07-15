@@ -52,13 +52,23 @@ retains at most 16 MiB of RTTI name text, with additional record-count limits. I
 limit is reached, the valid prefix is kept and explicitly marked partial rather than reported as a
 complete scan.
 
-The current release includes external-process, native C/C++, and managed/.NET analysis plugins.
-Dropped-in plugins are discovered automatically, but executable plugin code requires explicit
-approval bound to its exact directory fingerprint before it can run. Native libraries and managed
-assemblies always load in their disposable `resymbol-native-host` and `resymbol-managed-host`
-sibling processes; there is no in-process path for either family. The first managed slice accepts
-prebuilt .NET 8 plugin DLLs for `analyze` on PE32+ x86-64 sessions. WASM and debugger-hosted
-contracts are present for plugin authors, but their execution hosts remain future work.
+The current release includes WebAssembly Component Model, external-process, native C/C++, and
+managed/.NET analysis plugins. Dropped-in plugins are discovered automatically. Capability-limited
+WASM components autoload without a trust record; external-process, native, and managed code requires
+explicit approval bound to its exact directory fingerprint. Native libraries and managed assemblies
+always load in their disposable `resymbol-native-host` and `resymbol-managed-host` sibling
+processes; there is no in-process path for either family. The first WASM and managed slices accept
+`analyze` work for PE32+ x86-64 sessions. Debugger-hosted contracts remain future work.
+
+The WASM host links the checked-in ReSymbol WIT interface and no WASI interfaces. Its default input
+cap is a 64 MiB component. Instantiated guest execution receives a 256 MiB linear-memory limit,
+100,000,000 fuel, a 2 MiB WebAssembly stack, a 30-second epoch deadline, 4,096 host events/8 MiB of
+event output, and 64 MiB of aggregate `binary.read` calls (1 MiB per call). The exact source PE is
+capped at 1 GiB. The engine runs inside ReSymbol: no-WASI capability isolation is materially
+stronger than an ambient process plugin, but an engine/compiler/host-binding vulnerability is not
+contained by a separate process. The guest fuel, epoch, stack, and store limits do not interrupt
+synchronous validation/JIT compilation or cap compiler and other host allocations, so compilation
+can exceed the configured guest deadline or memory limit.
 
 The first native helper verifies and buffers source PE files up to 1 GiB for its bounded
 `binary.read` callback. That explicit source-image limit is independent of the advisory plugin
@@ -248,7 +258,10 @@ resymbol-v0.1.0-alpha.1-<platform>/
 │   ├── install.md
 │   └── plugin-system.md
 └── plugins/
-    └── README.txt
+    ├── README.txt
+    └── dev.resymbol.example.wasm-resolver/
+        ├── plugin.toml
+        └── example-resolver.wasm
 ```
 
 For the simplest portable setup, run ReSymbol from the extracted directory. The default
@@ -264,6 +277,9 @@ entrypoint:
 
 ```text
 plugins/
+├── community.example-wasm-resolver/
+│   ├── plugin.toml
+│   └── resolver.wasm
 ├── community.example-process-resolver/
 │   ├── plugin.toml
 │   └── resolver[.exe]
@@ -293,7 +309,14 @@ x86-64 input. It snapshots the verified DLL closure and exact binary under one c
 budget before assembly loading. End users do not install .NET and ReSymbol never compiles dropped-in
 C# source.
 
-Inspect the artifact and its requested protocol permissions, then approve its exact fingerprint:
+A WASM plugin is a prebuilt Component Model `.wasm` plus its manifest. ReSymbol does not compile
+Rust or another guest language during discovery, and ordinary users need no WASM SDK. Official
+archives include `dev.resymbol.example.wasm-resolver`, which reads the exact `MZ` signature through
+the bounded host interface and submits one evidence-backed comment claim. Disable it normally if
+you do not want the example to participate in analysis.
+
+Inspect every artifact and its requested protocol permissions, then approve a process plugin's exact
+fingerprint:
 
 ```console
 resymbol plugin list
@@ -307,11 +330,15 @@ For scripted installation, pin the value you reviewed so approval fails if the d
 resymbol plugin trust community.example-process-resolver --fingerprint <sha256>
 ```
 
-An unchanged trusted external, native, or managed process analyzer is eligible to run automatically
-during later analyses. Any change to a fingerprinted file, including `plugin.toml`, its entrypoint,
-bundled libraries, or data, invalidates trust. The host-owned records under `plugins/.resymbol/` are
-outside plugin directories; do not copy them as part of a plugin package. Corrupt or unsafe state
-fails closed.
+An eligible WASM analyzer reports `sandboxed-autoload` and runs without `plugin trust`; attempting
+to trust it produces an explanation instead of an approval record. An unchanged trusted external,
+native, or managed process analyzer is eligible to run automatically during later analyses. Any
+change to a fingerprinted process-plugin file, including `plugin.toml`, its entrypoint, bundled
+libraries, or data, invalidates trust. WASM updates also receive a new fingerprint: they still
+autoload under the sandboxed policy, but neither an old quarantine nor a reset silently transfers
+between artifacts. The host-owned records under `plugins/.resymbol/` are outside plugin
+directories; do not copy them as part of a plugin package. Corrupt or unsafe applicable state fails
+closed.
 
 > [!WARNING]
 > External, native, and managed helpers are separated from ReSymbol for crash containment, but they
@@ -326,7 +353,16 @@ fails closed.
 > a timeout, and inherited stdout/stderr handles can keep capture readers alive until those handles
 > close even after the bounded result drain.
 
-Run a specific approved plugin by ID, or let analysis run all eligible trusted process analyzers:
+> [!WARNING]
+> WASM components have no linked WASI filesystem, network, environment, clock, or process
+> interfaces, but Wasmtime compiles and executes them in the ReSymbol process. Fuel, memory, stack,
+> event, read, and epoch-deadline limits constrain instantiated guest execution. Except for the
+> component-byte cap, they do not bound synchronous validation/JIT compilation or its allocations,
+> and they cannot contain a vulnerability in the engine, generated native code, or ReSymbol host
+> bindings.
+
+Run a specific plugin by ID, or let analysis run all eligible sandboxed WASM and trusted process
+analyzers:
 
 ```console
 resymbol analyze path/to/application.exe --plugin community.example-process-resolver
@@ -347,8 +383,11 @@ resymbol analyze path/to/application.exe \
   --strict-plugins
 ```
 
-The external-process host supports one-shot `analyze` requests; its interactive
-`binary.read`/`read-binary` wire operation remains reserved. The native helper instead exposes a
+The WASM host implements the WIT metadata/initialize/health/analyze/shutdown lifecycle and exposes
+permission- and phase-gated claim submission and bounded file-backed PE `binary.read`, plus
+output-bounded logging in every phase and cancellation checks. The external-process host supports
+one-shot `analyze` requests; its interactive `binary.read`/`read-binary` wire operation remains
+reserved. The native helper instead exposes a
 permission-gated, size-bounded C callback that reads only file-backed RVAs from the exact PE being
 analyzed. The managed helper exposes equivalent permission-gated services through
 `IPluginHost.ReadBinaryAsync` and `SubmitClaimAsync`. Service calls are phase-bound, and claim
@@ -363,12 +402,15 @@ resymbol plugin disable community.example-process-resolver
 resymbol plugin enable community.example-process-resolver
 resymbol plugin untrust community.example-process-resolver
 resymbol plugin reset community.example-process-resolver
+resymbol plugin disable dev.resymbol.example.wasm-resolver
+resymbol plugin reset dev.resymbol.example.wasm-resolver
 ```
 
 The disable command creates `plugin.disabled` in that plugin directory. It can also be created by
 hand as an emergency recovery measure; it is excluded from the artifact fingerprint so disabling
 and re-enabling an unchanged plugin does not silently change its trust identity. `untrust` revokes
-approval. `reset` clears quarantine for the current artifact but does not trust a changed one.
+process-plugin approval. `reset` clears quarantine for the current artifact; it neither grants
+process-plugin trust nor changes the sandboxed policy for a different WASM fingerprint.
 ReSymbol rechecks both the sentinel and the exact trust/quarantine record immediately before launch
 and at the completed-batch commit gate. A disable or revocation observed at that final gate discards
 the result without newly quarantining the plugin; a change after that point governs later runs.
@@ -385,7 +427,7 @@ Source builds are for contributors and platforms without a prerelease archive. T
 native helper require:
 
 - Git;
-- `rustup`, which installs the pinned Rust 1.85.0 toolchain from `rust-toolchain.toml`; and
+- `rustup`, which installs the pinned Rust 1.86.0 toolchain from `rust-toolchain.toml`; and
 - the normal platform linker: Visual Studio Build Tools with the MSVC C++ workload on Windows,
   Xcode Command Line Tools on macOS, or a C toolchain such as GCC on Linux.
 
@@ -398,6 +440,29 @@ rustup show active-toolchain
 cargo test --workspace --all-features
 cargo build --release --bin resymbol --bin resymbol-native-host
 ```
+
+To rebuild the source-backed WASM example, add the ordinary Rust core-WASM target and run the
+platform script. It uses `wit-bindgen` plus an example-local `wit-component` encoder; no
+`cargo-component`, WASI SDK, C/C++ compiler, or global `wasm-tools` executable is required:
+
+```console
+rustup target add wasm32-unknown-unknown
+./examples/plugins/wasm/build.sh
+```
+
+On Windows PowerShell, run `examples\plugins\wasm\build.ps1`. The generated entrypoint is
+`examples/plugins/wasm/example-resolver.wasm`. Stage only that component and its manifest:
+
+```console
+stage=plugins/dev.resymbol.example.wasm-resolver
+mkdir -p "$stage"
+cp examples/plugins/wasm/plugin.toml "$stage/"
+cp examples/plugins/wasm/example-resolver.wasm "$stage/"
+```
+
+ReSymbol discovers the staged component on the next analysis and does not ask for a trust record.
+Use `resymbol plugin disable dev.resymbol.example.wasm-resolver` or `--safe-mode` to prevent it from
+running.
 
 Keep `target/release/resymbol-native-host[.exe]` beside
 `target/release/resymbol[.exe]`; ReSymbol never searches the plugin directory for its trusted
