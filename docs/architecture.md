@@ -6,12 +6,13 @@ not necessarily behavior implemented in the current checkout.
 
 The current implementation covers bounded PE32+ x86-64 ingestion, a conservative metadata-derived
 symbol graph, modern MSVC x64 Rev1 RTTI/vftable discovery, canonical JSON `.resym` packages, plugin
-discovery/contracts, and trusted external-process and native C/C++ analysis runtimes. It also
+discovery/contracts, and trusted external-process, native C/C++, and managed/.NET analysis
+runtimes. It also
 includes a validated, debugger-neutral export projection, deterministic Microsoft-linker-style MAP
 output, an exact-RSDS public-symbol PDB writer, and conservative standalone import-script generators
 for IDA and Ghidra. Broader disassembly-assisted discovery, matching, semantic inference,
-interactive debugger bridges, richer PDB and DWARF output, the workbench GUI, and the WASM/managed
-execution hosts remain design work.
+interactive debugger bridges, richer PDB and DWARF output, the workbench GUI, and the WASM
+execution host remain design work.
 
 ## Goals
 
@@ -264,7 +265,7 @@ high-performance native analysis, managed tooling, model experiments, and debugg
 |---|---|---|
 | WebAssembly | Portable analyzers, matchers, rules, and exporters | Planned capability sandbox |
 | Native C/C++ | Existing reversing libraries and performance-critical work | Disposable sibling helper; bounded C ABI callbacks, but no OS sandbox |
-| Managed/.NET | Managed analyzers, SDK consumers, and ecosystem integrations | Planned self-contained managed host process |
+| Managed/.NET | Managed analyzers, SDK consumers, and ecosystem integrations | App-local self-contained sibling helper; verified assembly snapshots, but no OS sandbox |
 | External process | Python, model runtimes, proprietary SDKs, or heavyweight tools | Child process; bounded protocol, but no OS sandbox |
 | Tool-hosted bridge | IDA, Ghidra, Binary Ninja, and debugger adapters | The host tool's process and API |
 
@@ -291,8 +292,34 @@ versioned marker that the parent observes independently of structured diagnostic
 user-visible stderr. A failure observed with that marker is plugin-attributable; one without the
 current marker is conservatively classified as host-side and does not quarantine the plugin.
 
-Process separation contains ordinary crashes, not authority. External and native child code still
-has the ambient filesystem, network, credential, and process access of the account running
+The implemented managed host is an `analyze`-only .NET 8 slice for PE32+ x86-64 sessions. The Rust
+parent resolves only the regular, unlinked, app-local `resymbol-managed-host[.exe]` sibling, clears
+the inherited environment except for required operating-system state, and gives each launch a
+private single-file bundle-extraction directory. It binds the exact trusted plugin fingerprint,
+source-binary identity and PE map, manifest metadata, granted permissions, deadline, and a
+deterministically ordered closure of at most 512 private DLLs into a strict bootstrap. A packaged
+`ReSymbol.PluginSdk.dll` remains in the complete artifact fingerprint but its exact basename is
+excluded from that closure. The host supplies and exact-identity-checks the SDK, so references bind
+only to the host's contract assembly rather than privately loading the packaged copy.
+
+Before assembly loading, both processes verify the plugin artifact and source, and the helper reads
+the declared DLL closure plus exact binary into snapshots under one cumulative advertised byte
+gate. The custom collectible load context resolves ordinary private dependencies only from those
+verified bytes, rejects platform-assembly shadow names, and denies its unmanaged-resolution callback.
+Service calls are permission-, phase-, count-, range-, and byte-bounded; claims may be submitted
+only during `AnalyzeAsync`. Initialization, health, analysis, shutdown, disposal, logs, and claims
+form one transaction. Any lifecycle, service, claim, identity, deadline, or cleanup failure discards
+the batch, and final source, assembly, artifact, disable, trust, and quarantine checks run before
+commit.
+
+The managed helper writes and flushes its own versioned marker immediately before the first assembly
+load, where module initializers or type discovery can begin plugin-controlled execution. The parent
+strips exactly that marker from visible stderr and uses it to distinguish attributable failures,
+which quarantine the exact artifact, from conservative helper preflight failures. A killed,
+crashed, or rejected managed run cannot partially commit claims or prevent base package creation.
+
+Process separation contains ordinary crashes, not authority. External, native, and managed child
+code still has the ambient filesystem, network, credential, and process access of the account running
 ReSymbol. Consequently executable plugins require explicit approval tied to their complete
 directory fingerprint before first execution. The unchanged fingerprint may autoload later; any
 fingerprinted-file update invalidates that approval. Manifest permissions constrain ReSymbol's
@@ -300,6 +327,11 @@ protocol operations and data projections, not ambient operating-system access. A
 identifies reviewed local directory bytes but neither authenticates a publisher nor eliminates the
 check-to-launch window while those files remain mutable. Native dynamic dependencies remain subject
 to the platform loader's documented search rules rather than an immutable dependency snapshot.
+Likewise, a managed custom load context closes ordinary dependency resolution only. Plugin code can
+call framework APIs directly, including explicit `Assembly.Load*` and `NativeLibrary.Load` paths
+that can engage the default load context or platform loader, and can access any other ambient .NET
+or operating-system capability available to the account. The managed host is not a CLR security
+sandbox.
 
 The current standalone IDAPython and Ghidra Java exporters implement a small identity-checking,
 conservative application path without installing a persistent plugin in either tool. They do not
@@ -324,10 +356,11 @@ The application is centered on the Rust CLI plus prebuilt, version-matched plugi
 tool adapters as they become implemented. Ordinary users should not need to install a compiler,
 language runtime, build system, or package manager. In particular:
 
-- current archives ship `resymbol-native-host[.exe]` beside `resymbol[.exe]`;
+- current archives ship `resymbol-native-host[.exe]` and a single-file, self-contained
+  `resymbol-managed-host[.exe]` beside `resymbol[.exe]`;
 - Linux archives pair a static musl CLI with a GNU helper built on Ubuntu 22.04 for glibc 2.35 or
   newer so ordinary glibc `.so` plugins can load;
-- planned managed hosts will be distributed self-contained;
+- ordinary managed-plugin users need neither a system .NET runtime nor SDK;
 - ordinary plugins are distributed already compiled;
 - the implemented PDB exporter does not require a separate Visual Studio installation; and
 - optional external services remain optional rather than preventing deterministic analysis.
@@ -338,15 +371,18 @@ Developer toolchains are a contributor concern, not an end-user installation ste
 
 1. **Input binaries are untrusted.** Parsers apply bounds and resource limits and should avoid
    unsafe code.
-2. **Third-party plugins are untrusted by default.** External-process and native code is never
+2. **Third-party plugins are untrusted by default.** External-process, native, and managed code is never
    launched before an explicit fingerprint-bound trust decision. Trust and quarantine records live
    in the host-owned `plugins/.resymbol/` directory, outside plugin-controlled directories.
 3. **Native code is crash-isolated, not sandboxed.** It runs only in the disposable sibling helper
    in the current implementation, but retains the launching account's ambient authority. There is
    no in-process native path.
-4. **Remote content is untrusted.** Symbol servers, source indexes, registries, and model endpoints
+4. **Managed code is process-isolated, not sandboxed.** Its verified assembly closure and
+   transactional services constrain normal host integration, but default-context/explicit loading
+   APIs and all other ambient authority remain available. There is no in-process managed path.
+5. **Remote content is untrusted.** Symbol servers, source indexes, registries, and model endpoints
    cannot directly create trusted facts.
-5. **Tool bridges are separate trust domains.** A bridge must validate the binary identity and
+6. **Tool bridges are separate trust domains.** A bridge must validate the binary identity and
    address mapping before applying an analysis inside another program.
 
 The core should retain enough structured diagnostics to explain which boundary failed without

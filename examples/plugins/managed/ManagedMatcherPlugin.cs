@@ -24,14 +24,55 @@ public sealed class ManagedMatcherPlugin : IReSymbolPlugin
         return ValueTask.CompletedTask;
     }
 
-    public ValueTask AnalyzeAsync(
+    public async ValueTask AnalyzeAsync(
         AnalysisRequest request,
         CancellationToken cancellationToken = default)
     {
-        host?.Log(
+        if (request.BaseAnalysis is not { ValueKind: JsonValueKind.Object })
+        {
+            throw new InvalidOperationException(
+                "The managed example requires its granted symbols.read base analysis.");
+        }
+        var activeHost = host ?? throw new InvalidOperationException(
+            "The managed example was analyzed before initialization.");
+        var signature = new byte[2];
+        var bytesRead = await activeHost.ReadBinaryAsync(
+            0,
+            signature,
+            cancellationToken);
+        if (bytesRead != signature.Length || signature[0] != (byte)'M' ||
+            signature[1] != (byte)'Z')
+        {
+            activeHost.Log(
+                PluginLogLevel.Warning,
+                "Example found no exact DOS MZ signature; no claim was submitted.");
+            return;
+        }
+
+        var subject = JsonSerializer.SerializeToElement(new
+        {
+            kind = "global",
+            binary = request.Binary.Sha256,
+            rva = 0UL,
+            size = 2UL,
+        });
+        var assertion = JsonSerializer.SerializeToElement(new
+        {
+            kind = "comment",
+            text = "Managed example verified the DOS MZ signature via binary.read.",
+        });
+        await activeHost.SubmitClaimAsync(
+            new SymbolClaim(
+                subject,
+                assertion,
+                1.0,
+                [new ClaimEvidence(
+                    "binary-read",
+                    "exact image bytes at RVA 0 were 4d 5a")]),
+            cancellationToken);
+        activeHost.Log(
             PluginLogLevel.Debug,
-            "Example initialized; use ClaimContractExample after validating binary evidence.");
-        return ValueTask.CompletedTask;
+            "Example received base analysis and submitted one exact MZ evidence claim.");
     }
 
     public ValueTask<PluginHealth> CheckHealthAsync(

@@ -1,10 +1,10 @@
 # Plugin system design
 
-This document separates the implemented external-process and native C/C++ runtimes from the wider
-plugin architecture. Directory discovery, trust/quarantine state, one-shot process analysis, the
-disposable native helper, and the initial contracts are current. WASM, managed, tool-hosted
-execution, packaged-plugin installation, and richer lifecycle behavior remain design work until a
-release marks them stable.
+This document separates the implemented external-process, native C/C++, and managed/.NET runtimes
+from the wider plugin architecture. Directory discovery, trust/quarantine state, one-shot process
+analysis, the disposable native and managed helpers, and the initial contracts are current. WASM,
+tool-hosted execution, packaged-plugin installation, and richer lifecycle behavior remain design
+work until a release marks them stable.
 
 ## User experience
 
@@ -63,9 +63,9 @@ The current sequence is:
    counts are rejected.
 6. Read the exact fingerprint's trust and quarantine records from `plugins/.resymbol/`; corrupt or
    unsafe host state fails closed.
-7. Launch an eligible, trusted external-process analyzer directly or a native analyzer through the
-   application-local disposable helper. Validate its complete claim batch before adding it to the
-   analysis session.
+7. Launch an eligible, trusted external-process analyzer directly, or a native/managed analyzer
+   through its application-local disposable helper. Validate its complete claim batch before adding
+   it to the analysis session.
 
 The application must finish starting even when every third-party plugin is invalid.
 
@@ -84,11 +84,11 @@ Trust and quarantine state is recorded outside plugin-controlled directories and
 plugin ID and exact fingerprint. Updating a plugin therefore returns the new artifact to `Approval
 required`; trust never transfers by filename or version alone. Unsafe startup, runtime, claim,
 protocol, timeout, or output-limit failures attributable to plugin execution quarantine the exact
-artifact and preserve a bounded diagnostic. The native helper writes and flushes a versioned marker
-immediately before its first platform loader call. The parent observes that raw prefix independently
-of structured diagnostics, strips it from user-visible stderr, and treats a failure without the
-current marker conservatively as host-side. A changed artifact is neither trusted nor covered by the
-old quarantine record.
+artifact and preserve a bounded diagnostic. The native and managed helpers write and flush
+family-specific versioned markers immediately before their first plugin-load operation. The parent
+observes that raw prefix independently of structured diagnostics, strips it from user-visible
+stderr, and treats a failure without the current marker conservatively as host-side. A changed
+artifact is neither trusted nor covered by the old quarantine record.
 
 A sentinel file provides an out-of-band recovery mechanism:
 
@@ -184,19 +184,26 @@ single global API version would cause unnecessary breakage.
 
 Plugins receive only the ReSymbol data projections and host protocol operations needed for their
 declared work. The one-shot external host uses manifest-declared projection and claim permissions;
-its interactive binary reads are reserved. The native helper implements a permission-gated,
-size-bounded `binary.read` callback for file-backed RVAs in the exact PE. Wider planned permissions
+its interactive binary reads are reserved. The native and managed helpers implement
+permission-gated, size-bounded `binary.read` callbacks for file-backed RVAs in the exact PE. Wider planned permissions
 include temporary storage, package storage, approved network origins, subprocess execution, and
 explicit file selections. A permission grants a host operation; it does not convert a plugin's
 output into trusted fact.
 
-For the current external and native runtimes, those permissions are **not operating-system
-restrictions**. Once approved and launched, plugin code has the ambient filesystem, network,
+For the current external, native, and managed runtimes, those permissions are **not
+operating-system restrictions**. Once approved and launched, plugin code has the ambient filesystem, network,
 credential, and process access normally available to the account running ReSymbol. A separate
 helper contains crashes; it does not create an OS sandbox. Clearing most inherited environment
 variables does not change that boundary. Only approve a plugin whose publisher and exact code you
 would be willing to execute directly. A future sandbox layer may make declared network or
 filesystem permissions enforceable at the OS boundary.
+
+The shared process runner controls and reaps only the direct external plugin or native/managed
+helper. It does not currently create a contained Unix process group or Windows Job Object. A plugin
+can therefore leave descendants running after its direct child is stopped, and an inherited stdout
+or stderr handle can keep a capture reader blocked after the bounded 50 ms result drain. Those
+readers finish only when the inherited handles close. Process-tree containment and stricter handle
+inheritance are tracked as future platform hardening.
 
 The fingerprint proves only which local bytes were approved; it does not authenticate a publisher.
 There is also an unavoidable check-to-launch window while plugin files remain mutable. Keep the
@@ -242,6 +249,10 @@ cross the C ABI: native plugins still submit the strict UTF-8 JSON claim envelop
 `submit_claim`. The examples under `examples/plugins/native/` include a C11 claim contract and a
 C++11 exception-safe lifecycle implementation.
 
+Native plugin code must never call `printf`, `puts`, or otherwise write directly to stdout. Stdout
+is the helper's strict plugin-wire protocol; use the host `log` callback instead. Stderr is also a
+bounded helper-diagnostic and load-attempted-marker channel, not an unbounded plugin log stream.
+
 Protocol 1 caps descriptor IDs and versions at 128 UTF-8 bytes, names at 4,096 UTF-8 bytes, and
 each capability/permission list at 4,096 identifiers. The public header defines the same maxima,
 and the native runtime rejects an incompatible manifest before launching the helper.
@@ -263,21 +274,79 @@ End users do not install a compiler, CMake, or Visual C++ build tools to use a p
 Process separation is crash isolation only: native code still has the ambient authority of the
 launching account and therefore requires exact-fingerprint trust.
 
-### Managed/.NET (planned host)
+### Managed/.NET (current first host)
 
-Managed plugins will run through a version-matched .NET host and a strongly typed SDK. Official
-hosts will be published self-contained for supported platforms, so installing .NET is a developer
-requirement, not an end-user requirement.
+Managed plugins run through the version-matched `resymbol-managed-host[.exe]` sibling and a
+strongly typed .NET 8 SDK. Official hosts are published as self-contained single-file executables
+for supported platforms, so installing .NET is a plugin-development requirement rather than an
+end-user requirement. The current slice accepts one `analyze` request for a PE32+/x86-64 session.
 
-Out-of-process hosting remains the intended default. Assembly loading will be constrained to the
-plugin package and declared shared contracts. A managed exception, unload failure, runaway task, or
-protocol violation will be able to terminate that host without terminating ReSymbol.
+The parent requires exact-fingerprint trust, resolves only its application-local helper, hashes the
+complete private DLL closure, supplies an exact PE image map and binary identity, and enforces the
+wall-clock deadline by terminating the helper. Any packaged `ReSymbol.PluginSdk.dll` remains in the
+complete artifact fingerprint but its exact basename is excluded from the private-DLL closure, so
+SDK references exact-identity-bind only to the helper's contract assembly. The helper reads verified
+assembly snapshots, shares that SDK and platform assemblies through ordinary dependency resolution,
+rejects private platform-assembly shadows, and checks the binary, assembly sources, disable sentinel,
+and full artifact fingerprint again before committing output. A managed exception, invalid claim,
+permission failure, timeout, cleanup failure, source drift, crash, or protocol violation discards
+the transaction. Plugin-attributable failures quarantine only the exact artifact.
 
 The managed SDK provides `StringEncoding`, validated `StringLiteralAssertion` and
 `DataReferenceAssertion` records, and `ClaimAssertions` helpers that emit canonical `JsonElement`
 payloads. `examples/plugins/managed/` shows those payloads inside complete `SymbolClaim` values;
 the SDK rejects unsupported encoding names, invalid literal text, and zero instruction sizes before
-submission.
+submission. `AnalysisRequest.BaseAnalysis` contains the detached canonical base analysis only when
+`symbols.read` was granted; without that permission it is `null`.
+
+#### Managed plugin author quickstart
+
+From the repository root with the .NET 8 SDK, build the checked-in example exactly as CI does:
+
+```console
+dotnet restore examples/plugins/managed/Example.ManagedMatcher.csproj
+dotnet build examples/plugins/managed/Example.ManagedMatcher.csproj \
+  --configuration Release --no-restore -warnaserror -m:1
+```
+
+Stage only its manifest and entry assembly. On PowerShell:
+
+```powershell
+$stage = "plugins/dev.resymbol.example.managed-matcher"
+New-Item -ItemType Directory -Path $stage -Force | Out-Null
+Copy-Item examples/plugins/managed/plugin.toml $stage
+Copy-Item examples/plugins/managed/bin/Release/net8.0/Example.ManagedMatcher.dll $stage
+```
+
+Or on a POSIX shell:
+
+```console
+stage=plugins/dev.resymbol.example.managed-matcher
+mkdir -p "$stage"
+cp examples/plugins/managed/plugin.toml "$stage/"
+cp examples/plugins/managed/bin/Release/net8.0/Example.ManagedMatcher.dll "$stage/"
+```
+
+For a real plugin, copy its private dependency DLLs into the same directory too, while omitting
+`ReSymbol.PluginSdk.dll`. Keep the manifest's portable relative `entrypoint` synchronized with the
+staged entry assembly. ReSymbol will discover this directory automatically; inspect it with
+`resymbol plugin list`, then approve its exact fingerprint before analysis.
+
+Never call `Console.Write*` or otherwise write directly to stdout from managed plugin code. Stdout
+is the strict plugin-wire protocol, so any extra output invalidates the transaction; use
+`IPluginHost.Log` instead. Stderr is the helper's bounded diagnostic and load-attempted-marker
+channel, so `Console.Error` is not a plugin logging API either.
+
+The verified DLL-plus-binary snapshot has a cumulative byte gate, and individual service calls,
+aggregate binary reads, messages, stdout, diagnostics, and lifecycle phases are independently
+bounded. That advertised byte gate is not a bound on total CLR process memory.
+
+The collectible load context is a dependency-resolution and ordinary unload boundary, not a
+security boundary. Managed code retains ambient framework APIs and may explicitly access files,
+network, credentials, processes, the default load context, `Assembly.Load`, `NativeLibrary.Load`,
+or other native interop paths. Direct unmanaged resolution through the plugin load context is
+denied, but that does not prevent a plugin from invoking equivalent APIs itself. Only approve a
+managed plugin whose exact code you would execute directly.
 
 ### External process (current first host)
 
@@ -291,10 +360,10 @@ committed only if the entire run validates.
 
 The first host is one process per analysis request. It sends the host greeting and one `analyze`
 request, closes input, and waits for the direct child while capturing bounded output. On a deadline
-it stops and reaps that direct child; it does not currently contain or terminate descendant
-processes. Stderr already observed before a timeout is retained, followed by a bounded 50 ms worker
-drain so the native load marker does not depend on pipe EOF. The single request deadline covers
-helper startup, helper preflight, and plugin execution. Interactive plugin-to-host
+it stops and reaps that direct child subject to the shared descendant-process limitation above.
+Stderr already observed before a timeout is retained, followed by the bounded worker drain so a
+native or managed load marker does not depend on pipe EOF. The single request deadline covers helper
+startup, helper preflight, and plugin execution. Interactive plugin-to-host
 `binary.read`/`read-binary`, cancellation, streaming
 backpressure, and a persistent lifecycle are reserved by the contracts but not implemented in this
 host. The process is not OS-sandboxed; fingerprint-bound trust is therefore mandatory before
@@ -473,9 +542,10 @@ Each supported family should receive:
 - packaging commands that produce a drop-in artifact.
 
 The repository currently checks in the shared WIT contract, the C11/C++11 native header and helper,
-the .NET contract assembly, a strict out-of-process JSON Schema, and minimal native/managed
-examples. The native contract is exercised by real C and C++ shared-library fixtures on each
-supported CI host. WASM and managed hosts remain planned as described above.
+the .NET contract assembly and managed helper, a strict out-of-process JSON Schema, and minimal
+native/managed examples. The native contract is exercised by real C and C++ shared-library fixtures,
+and the managed host is built, tested, and self-contained-published across supported CI hosts. WASM
+hosting remains planned as described above.
 
 The SDK is successful when plugin authors need their language's normal toolchain, while plugin users
 need only the compiled package and ReSymbol.

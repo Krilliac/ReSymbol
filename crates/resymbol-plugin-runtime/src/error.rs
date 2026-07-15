@@ -46,6 +46,8 @@ pub enum PluginRuntimeError {
     InvalidRequest(&'static str),
     #[error("invalid native-plugin execution context: {0}")]
     InvalidNativeContext(String),
+    #[error("invalid managed-plugin execution context: {0}")]
+    InvalidManagedContext(String),
     #[error(
         "native-plugin helper is unavailable at {path}: {reason}",
         path = .path.display()
@@ -89,10 +91,64 @@ pub enum PluginRuntimeError {
         reason: String,
         diagnostics: ProcessDiagnostics,
     },
+    #[error(
+        "managed-plugin helper is unavailable at {path}: {reason}",
+        path = .path.display()
+    )]
+    ManagedHostUnavailable { path: PathBuf, reason: String },
+    #[error(
+        "managed-plugin helper failed before attributable plugin execution (code {code:?}): {reason}"
+    )]
+    ManagedHostFailed {
+        code: Option<i32>,
+        reason: String,
+        diagnostics: ProcessDiagnostics,
+    },
+    #[error("managed plugin artifact is unavailable or does not match trust state: {reason}")]
+    ManagedArtifactMismatch { reason: String },
+    #[error("managed assembly closure is invalid at {path}: {reason}", path = .path.display())]
+    ManagedAssemblyClosure { path: PathBuf, reason: String },
+    #[error(
+        "exact managed analysis source binary is unavailable or changed at {path}: {reason}",
+        path = .path.display()
+    )]
+    ManagedSourceBinary { path: PathBuf, reason: String },
+    #[error(
+        "exact managed analysis input changed after helper launch at {path}: {reason}",
+        path = .path.display()
+    )]
+    ManagedHostInputChanged {
+        path: PathBuf,
+        reason: String,
+        diagnostics: ProcessDiagnostics,
+    },
+    #[error(
+        "managed plugin artifact changed after helper launch but before attributable plugin execution: {reason}"
+    )]
+    ManagedHostArtifactChanged {
+        reason: String,
+        diagnostics: ProcessDiagnostics,
+    },
+    #[error(
+        "exact managed analysis input changed during attributable plugin execution at {path}: {reason}",
+        path = .path.display()
+    )]
+    ManagedExecutionInputChanged {
+        path: PathBuf,
+        reason: String,
+        diagnostics: ProcessDiagnostics,
+    },
+    #[error("managed plugin artifact changed during attributable plugin execution: {reason}")]
+    ManagedExecutionArtifactChanged {
+        reason: String,
+        diagnostics: ProcessDiagnostics,
+    },
     #[error("failed to encode bounded plugin input: {0}")]
     EncodeInput(#[source] serde_json::Error),
     #[error("failed to encode bounded native-host bootstrap: {0}")]
     EncodeNativeBootstrap(#[source] serde_json::Error),
+    #[error("failed to encode bounded managed-host bootstrap: {0}")]
+    EncodeManagedBootstrap(#[source] serde_json::Error),
     #[error("permission `{0}` was granted but is not requested by the plugin manifest")]
     PermissionNotRequested(String),
     #[error("plugin used ungranted permission `{permission}`")]
@@ -190,6 +246,11 @@ impl PluginRuntimeError {
             | Self::NativeHostInputChanged { diagnostics, .. }
             | Self::NativeHostArtifactChanged { diagnostics, .. }
             | Self::NativeExecutionInputChanged { diagnostics, .. }
+            | Self::ManagedHostFailed { diagnostics, .. }
+            | Self::ManagedHostInputChanged { diagnostics, .. }
+            | Self::ManagedHostArtifactChanged { diagnostics, .. }
+            | Self::ManagedExecutionInputChanged { diagnostics, .. }
+            | Self::ManagedExecutionArtifactChanged { diagnostics, .. }
             | Self::ProcessFailed { diagnostics, .. }
             | Self::InvalidJson { diagnostics, .. }
             | Self::Protocol { diagnostics, .. }
@@ -213,6 +274,11 @@ impl PluginRuntimeError {
             | Self::NativeHostInputChanged { diagnostics, .. }
             | Self::NativeHostArtifactChanged { diagnostics, .. }
             | Self::NativeExecutionInputChanged { diagnostics, .. }
+            | Self::ManagedHostFailed { diagnostics, .. }
+            | Self::ManagedHostInputChanged { diagnostics, .. }
+            | Self::ManagedHostArtifactChanged { diagnostics, .. }
+            | Self::ManagedExecutionInputChanged { diagnostics, .. }
+            | Self::ManagedExecutionArtifactChanged { diagnostics, .. }
             | Self::ProcessFailed { diagnostics, .. }
             | Self::InvalidJson { diagnostics, .. }
             | Self::Protocol { diagnostics, .. }

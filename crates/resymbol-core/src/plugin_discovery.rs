@@ -516,6 +516,35 @@ entrypoint = "plugin.wasm"
         plugin
     }
 
+    fn create_managed_plugin(
+        root: &Path,
+        directory: &str,
+        id: &str,
+        name_literal: &str,
+        entrypoint: &str,
+    ) -> PathBuf {
+        let plugin = root.join(directory);
+        fs::create_dir_all(&plugin).expect("create managed plugin directory");
+        fs::write(plugin.join("Plugin.dll"), b"placeholder").expect("write managed entrypoint");
+        fs::write(
+            plugin.join(PLUGIN_MANIFEST_FILE),
+            format!(
+                r#"manifest_version = 1
+id = "{id}"
+name = {name_literal}
+version = "1.0.0"
+api = "^0.1"
+
+[runtime]
+kind = "managed"
+entrypoint = {entrypoint:?}
+"#
+            ),
+        )
+        .expect("write managed manifest");
+        plugin
+    }
+
     #[test]
     fn missing_root_is_an_empty_report() {
         let temp = TempDir::new().expect("temp directory");
@@ -628,6 +657,48 @@ entrypoint = "plugin.wasm"
             plugin.health.state == PluginHealthState::Quarantined && plugin.manifest.is_none()
         }));
         assert_eq!(report.loadable().count(), 1);
+    }
+
+    #[test]
+    fn managed_contract_failures_are_quarantined_during_discovery() {
+        let temp = TempDir::new().expect("temp directory");
+        create_managed_plugin(
+            temp.path(),
+            "control-name",
+            "community.control-name",
+            r#""Bad\nName""#,
+            "Plugin.dll",
+        );
+        for (index, entrypoint) in [
+            "./Plugin.dll",
+            "a//Plugin.dll",
+            "CON.dll",
+            "folder./Plugin.dll",
+            "bad?/Plugin.dll",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            create_managed_plugin(
+                temp.path(),
+                &format!("invalid-entrypoint-{index}"),
+                &format!("community.invalid-entrypoint-{index}"),
+                r#""Managed plugin""#,
+                entrypoint,
+            );
+        }
+
+        let report = discover_plugins(temp.path(), &PluginDiscoveryOptions::default())
+            .expect("discover managed plugins");
+        assert_eq!(report.plugins.len(), 6);
+        assert!(report.plugins.iter().all(|plugin| {
+            plugin.health.state == PluginHealthState::Quarantined
+                && plugin
+                    .health
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == PluginDiagnosticCode::InvalidManifest)
+        }));
     }
 
     #[test]

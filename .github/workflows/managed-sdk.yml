@@ -1,15 +1,35 @@
-name: Managed SDK
+name: Managed SDK and host
 
 on:
   push:
     branches: [main]
     paths:
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "rust-toolchain.toml"
+      - "crates/resymbol-cli/**"
+      - "crates/resymbol-core/**"
+      - "crates/resymbol-plugin-api/**"
+      - "crates/resymbol-plugin-runtime/**"
+      - "crates/resymbol-plugin-state/**"
+      - "examples/plugins/managed/**"
       - "sdk/dotnet/**"
       - ".github/workflows/managed-sdk.yml"
+      - ".github/workflows/release.yml"
   pull_request:
     paths:
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "rust-toolchain.toml"
+      - "crates/resymbol-cli/**"
+      - "crates/resymbol-core/**"
+      - "crates/resymbol-plugin-api/**"
+      - "crates/resymbol-plugin-runtime/**"
+      - "crates/resymbol-plugin-state/**"
+      - "examples/plugins/managed/**"
       - "sdk/dotnet/**"
       - ".github/workflows/managed-sdk.yml"
+      - ".github/workflows/release.yml"
   workflow_dispatch:
 
 permissions:
@@ -20,9 +40,16 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build:
-    name: .NET 8 validation
-    runs-on: ubuntu-latest
+  tests:
+    name: Tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-22.04
+          - windows-2022
+          - macos-15-intel
+    runs-on: ${{ matrix.os }}
 
     steps:
       - name: Check out repository
@@ -33,26 +60,269 @@ jobs:
         with:
           dotnet-version: 8.0.x
 
-      - name: Validate managed projects
-        shell: pwsh
+      - name: Restore managed-host tests
+        run: >-
+          dotnet restore
+          sdk/dotnet/ReSymbol.ManagedHost.Tests/ReSymbol.ManagedHost.Tests.csproj
+          --nologo
+
+      - name: Build managed-host tests
+        run: >-
+          dotnet build
+          sdk/dotnet/ReSymbol.ManagedHost.Tests/ReSymbol.ManagedHost.Tests.csproj
+          --configuration Release
+          --no-restore
+          --nologo
+          --verbosity minimal
+          -warnaserror
+          -m:1
+
+      - name: Run managed-host tests
+        run: >-
+          dotnet run
+          --project sdk/dotnet/ReSymbol.ManagedHost.Tests/ReSymbol.ManagedHost.Tests.csproj
+          --configuration Release
+          --no-build
+
+  sdk-package:
+    name: SDK package and protocol contracts
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Validate managed-host bootstrap schema
+        run: jq empty sdk/dotnet/ReSymbol.ManagedHost/managed-host-bootstrap.schema.json
+
+      - name: Restore managed plugin SDK
+        run: >-
+          dotnet restore
+          sdk/dotnet/ReSymbol.PluginSdk/ReSymbol.PluginSdk.csproj
+          --nologo
+
+      - name: Build managed plugin SDK
+        run: >-
+          dotnet build
+          sdk/dotnet/ReSymbol.PluginSdk/ReSymbol.PluginSdk.csproj
+          --configuration Release
+          --no-restore
+          --nologo
+          --verbosity minimal
+          -warnaserror
+
+      - name: Pack managed plugin SDK
+        run: >-
+          dotnet pack
+          sdk/dotnet/ReSymbol.PluginSdk/ReSymbol.PluginSdk.csproj
+          --configuration Release
+          --no-build
+          --nologo
+          --output artifacts/managed-sdk
+
+      - name: Verify compile-only SDK package and consumer
+        shell: bash
         run: |
-          dotnet --info
+          set -euo pipefail
+          workspace_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          bash sdk/dotnet/ReSymbol.PluginSdk/verify-package.sh \
+            "artifacts/managed-sdk/ReSymbol.PluginSdk.${workspace_version}.nupkg" \
+            "$workspace_version"
 
-          $solutions = @(Get-ChildItem -Path . -Recurse -File -Filter *.sln)
-          if ($solutions.Count -gt 0) {
-            $targets = $solutions
-          }
-          else {
-            $targets = @(Get-ChildItem -Path . -Recurse -File -Filter *.csproj)
+      - name: Upload managed SDK package
+        uses: actions/upload-artifact@v4
+        with:
+          name: resymbol-managed-sdk
+          path: artifacts/managed-sdk/*.nupkg
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-smoke:
+    name: Self-contained host (${{ matrix.rid }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            rid: win-x64
+            executable: resymbol-managed-host.exe
+          - os: ubuntu-22.04
+            rid: linux-x64
+            executable: resymbol-managed-host
+          - os: macos-15-intel
+            rid: osx-x64
+            executable: resymbol-managed-host
+          - os: macos-15
+            rid: osx-arm64
+            executable: resymbol-managed-host
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Restore managed host for RID
+        run: >-
+          dotnet restore
+          sdk/dotnet/ReSymbol.ManagedHost/ReSymbol.ManagedHost.csproj
+          --runtime ${{ matrix.rid }}
+          --nologo
+
+      - name: Restore managed example plugin
+        run: >-
+          dotnet restore
+          examples/plugins/managed/Example.ManagedMatcher.csproj
+          --nologo
+
+      - name: Publish single-file managed host
+        run: >-
+          dotnet publish
+          sdk/dotnet/ReSymbol.ManagedHost/ReSymbol.ManagedHost.csproj
+          --configuration Release
+          --runtime ${{ matrix.rid }}
+          --self-contained true
+          --no-restore
+          --output target/managed/${{ matrix.rid }}/publish
+          -p:Version=0.1.0-ci.1
+          -p:InformationalVersion=0.1.0-ci.1
+          -p:IncludeSourceRevisionInInformationalVersion=false
+          -p:ContinuousIntegrationBuild=true
+          -p:PublishSingleFile=true
+          -p:IncludeNativeLibrariesForSelfExtract=true
+          -p:IncludeAllContentForSelfExtract=true
+          -p:PublishTrimmed=false
+          -p:PublishReadyToRun=false
+          -p:PublishAot=false
+          -p:EnableCompressionInSingleFile=false
+          -p:GenerateDocumentationFile=false
+          -p:DebugSymbols=false
+          -p:DebugType=None
+          -m:1
+
+      - name: Build managed example plugin
+        run: >-
+          dotnet build
+          examples/plugins/managed/Example.ManagedMatcher.csproj
+          --configuration Release
+          --no-restore
+          --nologo
+          --verbosity minimal
+          -warnaserror
+          -m:1
+          -p:ContinuousIntegrationBuild=true
+
+      - name: Stage managed example without a private SDK
+        shell: pwsh
+        env:
+          MANAGED_RID: ${{ matrix.rid }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $buildOutput = "examples/plugins/managed/bin/Release/net8.0"
+          $entryAssembly = Join-Path $buildOutput "Example.ManagedMatcher.dll"
+          if (-not (Test-Path -LiteralPath $entryAssembly -PathType Leaf)) {
+            throw "Managed example entry assembly was not built: $entryAssembly"
           }
 
-          if ($targets.Count -eq 0) {
-            throw "No managed solution or project was found."
+          $privateSdk = @(Get-ChildItem -LiteralPath $buildOutput -File -Recurse |
+            Where-Object { $_.Name -ieq "ReSymbol.PluginSdk.dll" })
+          if ($privateSdk.Count -ne 0) {
+            throw "Managed example must not copy ReSymbol.PluginSdk.dll: $($privateSdk.FullName -join ', ')"
           }
 
-          foreach ($target in $targets) {
-            dotnet build $target.FullName --configuration Release --nologo --verbosity minimal
-            if ($LASTEXITCODE -ne 0) {
-              exit $LASTEXITCODE
-            }
+          $staged = "target/managed-e2e/$env:MANAGED_RID/plugin"
+          New-Item -ItemType Directory -Path $staged -Force | Out-Null
+          Copy-Item -LiteralPath $entryAssembly -Destination $staged
+          Copy-Item -LiteralPath "examples/plugins/managed/plugin.toml" -Destination $staged
+
+          $stagedSdk = @(Get-ChildItem -LiteralPath $staged -File -Recurse |
+            Where-Object { $_.Name -ieq "ReSymbol.PluginSdk.dll" })
+          if ($stagedSdk.Count -ne 0) {
+            throw "Staged managed plugin contains a private SDK copy"
+          }
+
+      - name: Relocate and smoke-test managed host
+        shell: pwsh
+        env:
+          PUBLISH_DIR: target/managed/${{ matrix.rid }}/publish
+          HOST_EXECUTABLE: ${{ matrix.executable }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $published = @(Get-ChildItem -LiteralPath $env:PUBLISH_DIR -File)
+          if ($published.Count -ne 1 -or $published[0].Name -ne $env:HOST_EXECUTABLE) {
+            throw "Expected one self-contained executable; found: $($published.Name -join ', ')"
+          }
+
+          $relocation = Join-Path ([IO.Path]::GetTempPath()) ("resymbol-managed-smoke-" + [Guid]::NewGuid())
+          $extraction = Join-Path $relocation "bundle-extract"
+          New-Item -ItemType Directory -Path $extraction -Force | Out-Null
+          if (-not $IsWindows) {
+            & chmod 700 $relocation $extraction
+            if ($LASTEXITCODE -ne 0) { throw "chmod failed" }
+          }
+
+          $relocatedHost = Join-Path $relocation $env:HOST_EXECUTABLE
+          Copy-Item -LiteralPath $published[0].FullName -Destination $relocatedHost
+          if (-not $IsWindows) {
+            & chmod 700 $relocatedHost
+            if ($LASTEXITCODE -ne 0) { throw "chmod failed" }
+          }
+
+          $env:DOTNET_ROOT = Join-Path $relocation "missing-dotnet-root"
+          $env:DOTNET_MULTILEVEL_LOOKUP = "0"
+          $env:DOTNET_BUNDLE_EXTRACT_BASE_DIR = $extraction
+          $version = (& $relocatedHost --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) { throw "relocated managed host failed" }
+          if ($version -ne "resymbol-managed-host 0.1.0-ci.1") {
+            throw "Unexpected managed-host version: $version"
+          }
+
+          Remove-Item -LiteralPath $relocation -Recurse -Force
+
+      - name: Show Rust toolchain
+        run: rustup show active-toolchain
+
+      - name: Run real managed process integration
+        shell: pwsh
+        env:
+          MANAGED_RID: ${{ matrix.rid }}
+          HOST_EXECUTABLE: ${{ matrix.executable }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $hostPath = Join-Path "target/managed/$env:MANAGED_RID/publish" $env:HOST_EXECUTABLE
+          $pluginPath = "target/managed-e2e/$env:MANAGED_RID/plugin"
+          $env:RESYMBOL_MANAGED_E2E_HOST = (Resolve-Path -LiteralPath $hostPath).Path
+          $env:RESYMBOL_MANAGED_E2E_PLUGIN_DIR = (Resolve-Path -LiteralPath $pluginPath).Path
+
+          & cargo test --locked -p resymbol-plugin-runtime --test managed_process -- `
+            --ignored --exact real_managed_process_round_trip --nocapture
+          if ($LASTEXITCODE -ne 0) {
+            throw "Real managed process integration test failed"
+          }
+
+      - name: Run real managed CLI drop-in integration
+        shell: pwsh
+        env:
+          MANAGED_RID: ${{ matrix.rid }}
+          HOST_EXECUTABLE: ${{ matrix.executable }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $hostPath = Join-Path "target/managed/$env:MANAGED_RID/publish" $env:HOST_EXECUTABLE
+          $pluginPath = "target/managed-e2e/$env:MANAGED_RID/plugin"
+          $env:RESYMBOL_MANAGED_E2E_HOST = (Resolve-Path -LiteralPath $hostPath).Path
+          $env:RESYMBOL_MANAGED_E2E_PLUGIN_DIR = (Resolve-Path -LiteralPath $pluginPath).Path
+
+          & cargo test --locked -p resymbol-cli --test managed_cli_drop_in -- `
+            --ignored --exact real_managed_cli_drop_in_round_trip --nocapture
+          if ($LASTEXITCODE -ne 0) {
+            throw "Real managed CLI drop-in integration test failed"
           }

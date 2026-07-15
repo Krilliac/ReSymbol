@@ -1,0 +1,38 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <AssemblyName>resymbol-managed-host</AssemblyName>
+    <RootNamespace>ReSymbol.ManagedHost</RootNamespace>
+    <Version>0.1.0-alpha.1</Version>
+    <AssemblyVersion>0.1.0.0</AssemblyVersion>
+    <Description>Disposable out-of-process host for ReSymbol managed plugins.</Description>
+    <!-- The SDK XML belongs in its NuGet package, not beside the one-file helper. -->
+    <AllowedReferenceRelatedFileExtensions />
+    <!-- Required one-file defaults; the caller still selects a RID and self-contained publish. -->
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <!-- Preserve the normal TPA catalog for the verified collectible load context. -->
+    <IncludeAllContentForSelfExtract>true</IncludeAllContentForSelfExtract>
+    <PublishTrimmed>false</PublishTrimmed>
+    <PublishReadyToRun>false</PublishReadyToRun>
+    <PublishAot>false</PublishAot>
+    <EnableCompressionInSingleFile>false</EnableCompressionInSingleFile>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(PublishSingleFile)' == 'true'">
+    <!-- Keep the publish directory to the one executable promised by the distribution contract. -->
+    <DebugSymbols>false</DebugSymbols>
+    <DebugType>None</DebugType>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../ReSymbol.PluginSdk/ReSymbol.PluginSdk.csproj">
+      <!-- A single-file publish must not leave the referenced SDK's PDB beside the bundle. -->
+      <AdditionalProperties Condition="'$(PublishSingleFile)' == 'true'">DebugSymbols=false;DebugType=None</AdditionalProperties>
+    </ProjectReference>
+  </ItemGroup>
+</Project>

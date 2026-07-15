@@ -14,6 +14,16 @@ prereleases; breaking changes remain explicit.
   plugin faults discard the batch and quarantine that artifact, while confirmed pre-load helper
   failures remain host-side. This is crash isolation, not an OS sandbox. Official Linux archives
   pair the musl CLI with a GNU helper built on Ubuntu 22.04 for glibc 2.35 or newer.
+- Added the first managed/.NET out-of-process analysis host for PE32+ x86-64 sessions. Approved
+  prebuilt .NET 8 plugins run through a bundled, self-contained `resymbol-managed-host` sibling,
+  receive a strongly typed SDK plus permission- and phase-bounded `binary.read` and claim services,
+  and commit logs and claims only after their complete lifecycle and final identity checks. The
+  parent and helper bind the exact plugin fingerprint, private-DLL closure, source binary, PE map,
+  limits, and deadline; family-specific load markers distinguish plugin-attributable quarantine
+  from helper preflight failures. This is crash and dependency-resolution isolation, not an OS or
+  CLR sandbox, and official archives require no separately installed .NET runtime. The managed SDK
+  is also published as a compile-only NuGet release asset; `AnalysisRequest.BaseAnalysis` exposes
+  the detached canonical base analysis only when `symbols.read` is granted.
 - Added bounded modern MSVC x64 Rev1 RTTI and vftable discovery, including validated stored type
   names, base-class records, virtual-slot targets, vftable names, and attributed function-to-class
   relationships.
@@ -115,6 +125,8 @@ version and validate serialized schema versions independently.
   package schema 3 or projection schema 4.
 - PDB export consumes the same current session and projection plus a byte-backed inspection of the
   exact original PE. It does not add fields to package schema 3 or projection schema 4.
+- Managed-plugin execution adds no package-schema field: successful runs and validated claims use
+  the existing `AnalysisSession` plugin ledger and claim representation.
 
 ### Safety and limits
 
@@ -155,3 +167,8 @@ version and validate serialized schema versions independently.
   malformed, or second RSDS identity; a source/session mismatch; a selected symbol outside the PE
   sections; and unsupported names or layouts before creating the destination. A selected function
   wins over a selected global at the same RVA, while an unnamed function suppresses nothing.
+- The first managed host accepts at most 512 private DLLs and snapshots at most 512 MiB of private
+  assemblies plus a 1 GiB source binary. Their combined bytes must fit the advertised snapshot gate
+  (256 MiB with current defaults). Messages, stdout, diagnostics, service calls, binary-read totals,
+  phases, and deadlines have independent bounds. These gates do not constrain total CLR process
+  memory or the plugin's ambient account authority.
