@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, fmt};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    io::{self, Read},
+};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use sha2::{Digest, Sha256};
@@ -61,6 +65,8 @@ impl<'de> Deserialize<'de> for Confidence {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BinaryId(String);
 
+const BINARY_ID_HASH_BUFFER_BYTES: usize = 64 * 1024;
+
 impl BinaryId {
     pub fn from_sha256(value: impl Into<String>) -> Result<Self, ClaimValidationError> {
         let value = value.into();
@@ -73,8 +79,40 @@ impl BinaryId {
     #[must_use]
     pub fn digest(bytes: &[u8]) -> Self {
         let digest = Sha256::digest(bytes);
+        Self::from_digest_bytes(&digest)
+    }
+
+    /// Streams an exact binary identity without materializing the complete input.
+    ///
+    /// The returned byte count lets callers enforce an independently trusted
+    /// size while hashing the same reader handle.
+    pub fn digest_reader(mut reader: impl Read) -> io::Result<(Self, u64)> {
+        let mut hasher = Sha256::new();
+        let mut buffer = [0_u8; BINARY_ID_HASH_BUFFER_BYTES];
+        let mut total = 0_u64;
+        loop {
+            let read = match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            };
+            let read_u64 = u64::try_from(read)
+                .map_err(|_| io::Error::other("binary read size does not fit u64"))?;
+            total = total
+                .checked_add(read_u64)
+                .ok_or_else(|| io::Error::other("binary read size exceeds u64"))?;
+            hasher.update(&buffer[..read]);
+        }
+
+        let digest = hasher.finalize();
+        Ok((Self::from_digest_bytes(&digest), total))
+    }
+
+    fn from_digest_bytes(digest: &[u8]) -> Self {
+        debug_assert_eq!(digest.len(), 32);
         let mut encoded = String::with_capacity(64);
-        for byte in digest {
+        for &byte in digest {
             const HEX: &[u8; 16] = b"0123456789abcdef";
             encoded.push(char::from(HEX[usize::from(byte >> 4)]));
             encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
@@ -1077,5 +1115,44 @@ mod tests {
             BinaryId::digest(b"abc").as_str(),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn streamed_binary_hash_matches_slice_and_uses_a_fixed_buffer() {
+        use std::{
+            cell::Cell,
+            io::{Cursor, Read},
+            rc::Rc,
+        };
+
+        struct TrackingReader {
+            inner: Cursor<Vec<u8>>,
+            largest_request: Rc<Cell<usize>>,
+        }
+
+        impl Read for TrackingReader {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                self.largest_request
+                    .set(self.largest_request.get().max(buffer.len()));
+                self.inner.read(buffer)
+            }
+        }
+
+        let bytes = (0..BINARY_ID_HASH_BUFFER_BYTES * 2 + 17)
+            .map(|index| u8::try_from(index % 251).expect("bounded test byte"))
+            .collect::<Vec<_>>();
+        let largest_request = Rc::new(Cell::new(0));
+        let reader = TrackingReader {
+            inner: Cursor::new(bytes.clone()),
+            largest_request: Rc::clone(&largest_request),
+        };
+
+        let (streamed, size) = BinaryId::digest_reader(reader).expect("stream binary identity");
+        assert_eq!(streamed, BinaryId::digest(&bytes));
+        assert_eq!(
+            size,
+            u64::try_from(bytes.len()).expect("test input size fits u64")
+        );
+        assert_eq!(largest_request.get(), BINARY_ID_HASH_BUFFER_BYTES);
     }
 }

@@ -9,6 +9,7 @@ Create, inspect, and export a package with the current CLI:
 ```console
 resymbol analyze application.exe
 resymbol inspect application.resym
+resymbol inspect application.resym --binary application.exe
 resymbol inspect application.resym --json
 resymbol export application.resym --format json
 resymbol export application.resym --format markdown
@@ -54,6 +55,14 @@ meaningful evidence.
 Package reads are size-bounded and reject malformed binary identities, unsupported schema versions,
 invalid payloads, and files that exceed the configured limit. Writes use create-new semantics: an
 existing destination is never silently replaced.
+
+`resymbol inspect PACKAGE --binary EXACT_ORIGINAL_BINARY` optionally verifies the package against
+the bytes it names. ReSymbol fully validates the package, canonicalizes and reads the supplied file,
+and requires its exact size and SHA-256 to match before emitting inspection output to stdout.
+Failures report on stderr. A successful human summary includes
+`source binary: <canonical-path>` and `identity gate: matched`. With `--json`, stdout stays pure
+package JSON and omits both status lines. This gate applies to supported schemas 1 through 6 but
+performs no reanalysis, legacy-result reconstruction, or rewrite of either input.
 
 A package must not be applied to a loaded program until its SHA-256 identity has been compared with
 that program. A matching filename, product version, timestamp, or image size is insufficient.
@@ -103,8 +112,9 @@ post-schema-1 control-flow record; schemas 2 through 5 explicitly reject a deter
 source valid only through schema-6 transitive endpoint seeding. Changing only the envelope label is
 not migration. Plugin-supplied exact thunk claims remain independent of the built-in base-analysis
 seed invariant.
-`inspect --json` emits the validated original schema 1 representation rather than placing the
-migrated current payload beneath a legacy schema label.
+`inspect --json`, with or without the optional binary gate, emits only package JSON. For schema 1 it
+preserves the validated original representation rather than placing the migrated current payload
+beneath a legacy schema label.
 
 ## Current `AnalysisSession` payload
 

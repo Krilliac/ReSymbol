@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeSet,
     fs,
-    io::Write as _,
+    io::{Read as _, Write as _},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -101,6 +101,10 @@ struct AnalyzeArgs {
 struct InspectArgs {
     /// `.resym` package to validate and inspect.
     package: PathBuf,
+
+    /// Exact original binary to verify against the validated package identity.
+    #[arg(long, value_name = "EXACT_ORIGINAL_BINARY")]
+    binary: Option<PathBuf>,
 
     /// Print the complete package as pretty JSON.
     #[arg(long)]
@@ -327,6 +331,11 @@ fn inspect(args: InspectArgs) -> Result<()> {
         .with_context(|| format!("cannot open package {}", args.package.display()))?;
     let loaded = read_analysis_package(&package_path, args.json)
         .with_context(|| format!("cannot read package {}", package_path.display()))?;
+    let verified_binary = args
+        .binary
+        .as_deref()
+        .map(|binary| verify_inspection_binary(&loaded, binary))
+        .transpose()?;
 
     if args.json {
         let json = loaded.to_pretty_inspection_json()?;
@@ -337,6 +346,10 @@ fn inspect(args: InspectArgs) -> Result<()> {
     println!("package: {}", package_path.display());
     println!("schema: {}", loaded.package.schema_version());
     println!("generator: {}", loaded.package.generator_version());
+    if let Some(binary) = verified_binary {
+        println!("source binary: {}", binary.display());
+        println!("identity gate: matched");
+    }
     print_session_summary(
         loaded.package.payload(),
         loaded.code_recovery_availability,
@@ -346,6 +359,51 @@ fn inspect(args: InspectArgs) -> Result<()> {
     )?;
 
     Ok(())
+}
+
+fn verify_inspection_binary(loaded: &LoadedAnalysisPackage, binary: &Path) -> Result<PathBuf> {
+    let canonical = binary
+        .canonicalize()
+        .with_context(|| format!("cannot open source binary {}", binary.display()))?;
+    let file = fs::File::open(&canonical)
+        .with_context(|| format!("cannot open source binary {}", canonical.display()))?;
+    let expected_size = loaded.package.payload().base_analysis().identity().size;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("cannot inspect source binary {}", canonical.display()))?;
+    if !metadata.is_file() {
+        bail!(
+            "source binary {} is not a regular file",
+            canonical.display()
+        );
+    }
+    let actual_size = metadata.len();
+    if actual_size != expected_size {
+        bail!(
+            "source binary {} has {actual_size} byte(s), but the validated package describes {expected_size} byte(s)",
+            canonical.display()
+        );
+    }
+
+    let read_limit = expected_size.saturating_add(1);
+    let (actual_id, read_size) = BinaryId::digest_reader(file.take(read_limit))
+        .with_context(|| format!("cannot read source binary {}", canonical.display()))?;
+    if read_size != expected_size {
+        bail!(
+            "source binary {} changed while being read: the validated package describes {expected_size} byte(s), but {read_size} byte(s) were read",
+            canonical.display()
+        );
+    }
+    loaded
+        .package
+        .ensure_bound_to(&actual_id)
+        .with_context(|| {
+            format!(
+                "source binary {} does not match the validated package identity",
+                canonical.display()
+            )
+        })?;
+    Ok(canonical)
 }
 
 fn analysis_package_read_options() -> PackageOptions {
@@ -3177,13 +3235,29 @@ entrypoint = "Plugin.dll"
         );
         assert!(args.strict_plugins);
 
-        let cli = Cli::try_parse_from(["resymbol", "inspect", "analysis.resym", "--json"])
-            .expect("inspect arguments parse");
+        let cli = Cli::try_parse_from([
+            "resymbol",
+            "inspect",
+            "analysis.resym",
+            "--binary",
+            "application.exe",
+            "--json",
+        ])
+        .expect("inspect arguments parse");
         let Command::Inspect(args) = cli.command else {
             panic!("inspect command expected");
         };
         assert_eq!(args.package, PathBuf::from("analysis.resym"));
+        assert_eq!(args.binary, Some(PathBuf::from("application.exe")));
         assert!(args.json);
+
+        let cli = Cli::try_parse_from(["resymbol", "inspect", "analysis.resym"])
+            .expect("inspection binary remains optional");
+        let Command::Inspect(args) = cli.command else {
+            panic!("inspect command expected");
+        };
+        assert_eq!(args.binary, None);
+        assert!(!args.json);
     }
 
     #[test]
@@ -3824,11 +3898,13 @@ entrypoint = "Plugin.dll"
 
         inspect(InspectArgs {
             package: output.clone(),
+            binary: None,
             json: false,
         })
         .expect("inspect validates package");
         inspect(InspectArgs {
             package: output,
+            binary: None,
             json: true,
         })
         .expect("JSON inspection serializes validated package");
@@ -3914,6 +3990,116 @@ entrypoint = "Plugin.dll"
         value["payload"]["plugin_runs"] =
             serde_json::to_value(vec![run]).expect("serialize legacy plugin run");
         value["payload"]["plugin_claims"] = Value::Array(claims);
+    }
+
+    fn write_current_inspection_fixture(root: &Path) -> (PathBuf, PathBuf, Vec<u8>) {
+        let bytes = pe_fixture();
+        let binary_path = root.join("inspection-fixture.exe");
+        let package_path = root.join("inspection-fixture.resym");
+        fs::write(&binary_path, &bytes).expect("write inspection binary fixture");
+        let base_analysis = analyze_bytes(&bytes).expect("analyze inspection binary fixture");
+        let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
+            .expect("create inspection session");
+        let package = ResymPackage::from_bound_payload(env!("CARGO_PKG_VERSION"), session)
+            .expect("create inspection package");
+        write_file_new_bound(&package_path, &package).expect("write inspection package");
+        (package_path, binary_path, bytes)
+    }
+
+    #[test]
+    fn inspect_binary_gate_accepts_exact_current_binary_and_preserves_package() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let (package_path, binary_path, _) = write_current_inspection_fixture(temp.path());
+        let original_package = fs::read(&package_path).expect("read original inspection package");
+        let loaded = read_analysis_package(&package_path, true)
+            .expect("read current package before binary verification");
+
+        let verified = verify_inspection_binary(&loaded, &binary_path)
+            .expect("exact current binary passes the inspection gate");
+        assert_eq!(
+            verified,
+            binary_path.canonicalize().expect("canonical binary")
+        );
+
+        let json = loaded
+            .to_pretty_inspection_json()
+            .expect("render pure JSON inspection");
+        let inspected: Value =
+            serde_json::from_str(&json).expect("inspection is one JSON document");
+        assert_eq!(inspected["schema_version"], CURRENT_SCHEMA_VERSION);
+        assert!(!json.contains("identity gate: matched"));
+        assert!(!json.contains("source binary:"));
+
+        inspect(InspectArgs {
+            package: package_path.clone(),
+            binary: Some(binary_path),
+            json: true,
+        })
+        .expect("JSON inspection accepts an exact verified binary");
+        assert_eq!(
+            fs::read(&package_path).expect("read preserved inspection package"),
+            original_package
+        );
+    }
+
+    #[test]
+    fn inspect_binary_gate_accepts_exact_legacy_schema_binary() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let package_path = temp.path().join("legacy-inspection.resym");
+        let binary_path = temp.path().join("legacy-inspection.exe");
+        let bytes = pe_fixture();
+        fs::write(&binary_path, &bytes).expect("write legacy inspection binary");
+        let (value, binary_id) = schema_v1_package_skeleton();
+        assert_eq!(binary_id, BinaryId::digest(&bytes));
+        fs::write(
+            &package_path,
+            serde_json::to_vec(&value).expect("encode legacy inspection package"),
+        )
+        .expect("write legacy inspection package");
+        let original_package = fs::read(&package_path).expect("read original legacy package");
+        let loaded = read_analysis_package(&package_path, true)
+            .expect("migrate and validate legacy package before binary verification");
+
+        verify_inspection_binary(&loaded, &binary_path)
+            .expect("exact binary passes the legacy package identity gate");
+        inspect(InspectArgs {
+            package: package_path.clone(),
+            binary: Some(binary_path),
+            json: false,
+        })
+        .expect("human inspection accepts an exact legacy binary");
+        assert_eq!(
+            fs::read(&package_path).expect("read preserved legacy package"),
+            original_package
+        );
+    }
+
+    #[test]
+    fn inspect_binary_gate_rejects_same_size_mutation_and_wrong_size() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let (package_path, _, bytes) = write_current_inspection_fixture(temp.path());
+        let loaded = read_analysis_package(&package_path, false)
+            .expect("read package before negative binary verification");
+
+        let same_size_path = temp.path().join("same-size-mutation.exe");
+        let mut same_size = bytes.clone();
+        same_size[RAW_OFFSET] ^= 0xff;
+        fs::write(&same_size_path, &same_size).expect("write same-size mutation");
+        let error = verify_inspection_binary(&loaded, &same_size_path)
+            .expect_err("same-size mutation must fail the digest gate");
+        let diagnostic = format!("{error:#}");
+        assert!(diagnostic.contains("does not match the validated package identity"));
+        assert!(diagnostic.contains(BinaryId::digest(&same_size).as_str()));
+        assert!(diagnostic.contains(loaded.package.binary_sha256().as_str()));
+
+        let wrong_size_path = temp.path().join("wrong-size.exe");
+        let wrong_size = &bytes[..bytes.len() - 1];
+        fs::write(&wrong_size_path, wrong_size).expect("write wrong-size binary");
+        let error = verify_inspection_binary(&loaded, &wrong_size_path)
+            .expect_err("wrong-size binary must fail before hashing");
+        let diagnostic = format!("{error:#}");
+        assert!(diagnostic.contains(&format!("has {} byte(s)", wrong_size.len())));
+        assert!(diagnostic.contains(&format!("describes {} byte(s)", bytes.len())));
     }
 
     #[test]
@@ -4205,6 +4391,7 @@ entrypoint = "Plugin.dll"
 
         inspect(InspectArgs {
             package: path,
+            binary: None,
             json: false,
         })
         .expect("CLI inspection accepts the prior package schema");
@@ -4301,6 +4488,7 @@ entrypoint = "Plugin.dll"
 
         inspect(InspectArgs {
             package: path,
+            binary: None,
             json: false,
         })
         .expect("CLI inspection accepts schema 2");
@@ -4356,6 +4544,7 @@ entrypoint = "Plugin.dll"
 
         inspect(InspectArgs {
             package: path.clone(),
+            binary: None,
             json: false,
         })
         .expect("CLI inspection accepts schema 3");
@@ -4448,6 +4637,7 @@ entrypoint = "Plugin.dll"
 
         inspect(InspectArgs {
             package: path.clone(),
+            binary: None,
             json: false,
         })
         .expect("CLI inspection accepts schema 4");
@@ -4509,6 +4699,7 @@ entrypoint = "Plugin.dll"
 
         inspect(InspectArgs {
             package: path.clone(),
+            binary: None,
             json: false,
         })
         .expect("CLI inspection accepts schema 5");

@@ -211,6 +211,7 @@ Analyze a supported PE file and inspect the validated package:
 ```console
 resymbol analyze application.exe
 resymbol inspect application.resym
+resymbol inspect application.resym --binary application.exe
 resymbol inspect application.resym --json
 resymbol export application.resym --format json
 resymbol export application.resym --format markdown
@@ -230,6 +231,14 @@ path. ReSymbol refuses to replace an existing package, so an earlier analysis ca
 accident. `inspect` validates the package schema, payload, and embedded binary identity before
 displaying it. `export` stages and flushes a complete artifact before a no-clobber publish; use
 `--output` to choose a destination instead of replacing an existing export artifact.
+
+Pass `inspect --binary EXACT_ORIGINAL_BINARY` to add an optional byte-identity gate. Before printing
+inspection data to stdout, ReSymbol validates the package and requires the supplied file's exact
+size and SHA-256 to match. Failures remain actionable on stderr. Human output then includes
+`source binary: <canonical-path>` and `identity gate: matched`.
+With `--json`, stdout remains the pure validated package JSON and does not gain those status lines.
+The gate works for every supported package schema, 1 through 6; it does not rerun analysis,
+reconstruct missing legacy results, or rewrite either file.
 
 New analyses write package schema 6. `inspect` and `export` also accept schemas 1 through 5 through
 validated in-memory compatibility paths. Migration does not rewrite the source package or rerun

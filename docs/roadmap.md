@@ -24,6 +24,12 @@ through 4, read-only function-pointer calls and thunks in schemas 2 and 3, strin
 in schemas 1 and 2, and all code recovery when starting from schema 1. Relabeled schema-6-only
 transitive base-thunk sources are rejected under schema 1-through-5 envelopes.
 
+For every supported package schema, 1 through 6, `resymbol inspect` can optionally accept the exact
+original binary and require its size and SHA-256 to match before inspection data reaches stdout;
+failures report on stderr. Human inspection reports the canonical source path and a matched identity
+gate, while JSON remains pure package data. This is an identity check only: it does not rerun
+analysis, recover omitted legacy results, or rewrite either file.
+
 A bounded modern MSVC x64 Rev1 RTTI/vftable slice is now implemented. It validates compiler
 metadata through complete object locators, type descriptors, legacy 24-byte and `BCD_HASPCHD`
 28-byte base-class descriptors, class hierarchies, and executable virtual-slot targets. Descriptor

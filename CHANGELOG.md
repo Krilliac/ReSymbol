@@ -116,6 +116,12 @@ prereleases; breaking changes remain explicit.
   slice deliberately omits private symbols, compilands, source lines, locals, prototypes, function
   extents, and types; ordinary generation requires no Visual Studio, DIA, LLVM, or compiler
   installation.
+- Added optional `resymbol inspect PACKAGE --binary EXACT_ORIGINAL_BINARY` verification for package
+  schemas 1 through 6. Inspection validates the package first, then requires the supplied file's
+  exact size and SHA-256 to match before any inspection output reaches stdout. Failures report on
+  stderr. Human summaries add
+  `source binary: <canonical-path>` and `identity gate: matched`; `--json` remains pure package JSON.
+  The check neither reruns analysis nor rewrites the package or binary.
 - Added Windows PDB compatibility CI covering native `llvm-pdbutil` stream inspection, its
   DIA-backed view, and a direct DIA probe for exact GUID+age validation and public function/global
   enumeration.

@@ -155,6 +155,7 @@ Open a terminal in the extracted directory, then check the executable:
 resymbol --version
 resymbol analyze path/to/application.exe
 resymbol inspect path/to/application.resym
+resymbol inspect path/to/application.resym --binary path/to/application.exe
 resymbol export path/to/application.resym --format json
 resymbol export path/to/application.resym --format markdown
 resymbol export path/to/application.resym --format map
@@ -183,6 +184,20 @@ printed in a readable form:
 ```console
 resymbol inspect results/application.resym --json
 ```
+
+To prove that a package still names the exact original file, add the optional binary gate:
+
+```console
+resymbol inspect results/application.resym --binary path/to/application.exe
+resymbol inspect results/application.resym --json --binary path/to/application.exe
+```
+
+Inspection validates the package first and emits no inspection data to stdout unless the supplied
+file's exact size and SHA-256 match; failures report on stderr. Human output includes
+`source binary: <canonical-path>` and `identity gate: matched` after a successful check. JSON mode
+emits only the validated package JSON, with neither status line mixed into stdout. This works for
+supported package schemas 1 through 6 and only verifies identity: it does not rerun analysis, fill
+in results absent from an older schema, or rewrite the package or binary.
 
 Both `analyze` and `inspect` report recovered direct-call, thunk, string, and data-reference counts
 and whether each bounded recovery pass was complete or partial. They also report MSVC RTTI vftable,
