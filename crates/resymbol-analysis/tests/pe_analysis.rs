@@ -2323,6 +2323,235 @@ fn enforces_section_count_limit_before_allocating() {
 }
 
 #[test]
+fn enforces_declared_pe_limits_before_allocating() {
+    #[derive(Debug)]
+    enum ExpectedError {
+        PeHeaderOffset {
+            offset: u32,
+            limit: u32,
+        },
+        LimitExceeded {
+            kind: &'static str,
+            count: u64,
+            limit: u64,
+        },
+    }
+
+    struct Case {
+        name: &'static str,
+        mutate: fn(&mut [u8]),
+        expected: ExpectedError,
+    }
+
+    fn exceed_pe_header_offset(bytes: &mut [u8]) {
+        put_u32(bytes, 0x3c, 16_777_217);
+    }
+
+    fn exceed_data_directory_count(bytes: &mut [u8]) {
+        put_u32(bytes, OPTIONAL_OFFSET + 108, 17);
+    }
+
+    fn exceed_import_directory_size(bytes: &mut [u8]) {
+        set_directory(bytes, 1, 0x1200, 67_108_865);
+    }
+
+    fn exceed_import_descriptor_count(bytes: &mut [u8]) {
+        set_directory(bytes, 1, 0x1200, 4_097 * 20);
+    }
+
+    fn exceed_export_directory_size(bytes: &mut [u8]) {
+        set_directory(bytes, 0, 0x1100, 67_108_865);
+    }
+
+    fn exceed_export_function_count(bytes: &mut [u8]) {
+        put_u32(bytes, file_offset(0x1100) + 20, 65_537);
+    }
+
+    fn exceed_export_name_count(bytes: &mut [u8]) {
+        put_u32(bytes, file_offset(0x1100) + 24, 65_537);
+    }
+
+    fn exceed_exception_record_count(bytes: &mut [u8]) {
+        set_directory(bytes, 3, 0x1300, 262_145 * 12);
+    }
+
+    fn exceed_exception_directory_size(bytes: &mut [u8]) {
+        set_directory(bytes, 3, 0x1300, 67_108_865);
+    }
+
+    let cases = [
+        Case {
+            name: "PE header offset",
+            mutate: exceed_pe_header_offset,
+            expected: ExpectedError::PeHeaderOffset {
+                offset: 16_777_217,
+                limit: 16_777_216,
+            },
+        },
+        Case {
+            name: "data-directory count",
+            mutate: exceed_data_directory_count,
+            expected: ExpectedError::LimitExceeded {
+                kind: "data-directory",
+                count: 17,
+                limit: 16,
+            },
+        },
+        Case {
+            name: "import-directory byte size",
+            mutate: exceed_import_directory_size,
+            expected: ExpectedError::LimitExceeded {
+                kind: "import-directory byte",
+                count: 67_108_865,
+                limit: 67_108_864,
+            },
+        },
+        Case {
+            name: "import descriptor count",
+            mutate: exceed_import_descriptor_count,
+            expected: ExpectedError::LimitExceeded {
+                kind: "import-library descriptor",
+                count: 4_097,
+                limit: 4_096,
+            },
+        },
+        Case {
+            name: "export-directory byte size",
+            mutate: exceed_export_directory_size,
+            expected: ExpectedError::LimitExceeded {
+                kind: "export-directory byte",
+                count: 67_108_865,
+                limit: 67_108_864,
+            },
+        },
+        Case {
+            name: "export function count",
+            mutate: exceed_export_function_count,
+            expected: ExpectedError::LimitExceeded {
+                kind: "export function",
+                count: 65_537,
+                limit: 65_536,
+            },
+        },
+        Case {
+            name: "export name count",
+            mutate: exceed_export_name_count,
+            expected: ExpectedError::LimitExceeded {
+                kind: "export name",
+                count: 65_537,
+                limit: 65_536,
+            },
+        },
+        Case {
+            name: "exception-directory byte size",
+            mutate: exceed_exception_directory_size,
+            expected: ExpectedError::LimitExceeded {
+                kind: "exception-directory byte",
+                count: 67_108_865,
+                limit: 67_108_864,
+            },
+        },
+        Case {
+            name: "exception record count",
+            mutate: exceed_exception_record_count,
+            expected: ExpectedError::LimitExceeded {
+                kind: "runtime function",
+                count: 262_145,
+                limit: 262_144,
+            },
+        },
+    ];
+
+    for case in cases {
+        let mut bytes = fixture();
+        (case.mutate)(&mut bytes);
+
+        match (analyze_pe(&bytes), case.expected) {
+            (
+                Err(AnalysisError::PeHeaderOffsetLimit { offset, limit }),
+                ExpectedError::PeHeaderOffset {
+                    offset: expected_offset,
+                    limit: expected_limit,
+                },
+            ) => {
+                assert_eq!(offset, expected_offset, "{} offset", case.name);
+                assert_eq!(limit, expected_limit, "{} limit", case.name);
+            }
+            (
+                Err(AnalysisError::LimitExceeded { kind, count, limit }),
+                ExpectedError::LimitExceeded {
+                    kind: expected_kind,
+                    count: expected_count,
+                    limit: expected_limit,
+                },
+            ) => assert_eq!(
+                (kind, count, limit),
+                (expected_kind, expected_count, expected_limit),
+                "{}",
+                case.name
+            ),
+            (Ok(_), expected) => {
+                panic!(
+                    "{} unexpectedly succeeded; expected {expected:?}",
+                    case.name
+                )
+            }
+            (Err(error), expected) => {
+                panic!("{} returned {error:?}; expected {expected:?}", case.name)
+            }
+        }
+    }
+}
+
+#[test]
+fn enforces_raw_and_validated_pe_string_limits() {
+    const LONG_NAME_RVA: u32 = 0x1400;
+    const STRING_SCAN_LIMIT: usize = 4_096;
+    const EXPANDED_SECTION_SIZE: u32 = 0x1600;
+
+    let mut unterminated = fixture();
+    unterminated.resize(
+        RAW_OFFSET + usize::try_from(EXPANDED_SECTION_SIZE).expect("fixture section size"),
+        0,
+    );
+    put_u32(&mut unterminated, OPTIONAL_OFFSET + 56, 0x3000);
+    put_u32(&mut unterminated, SECTION_OFFSET + 8, EXPANDED_SECTION_SIZE);
+    put_u32(
+        &mut unterminated,
+        SECTION_OFFSET + 16,
+        EXPANDED_SECTION_SIZE,
+    );
+    put_u32(&mut unterminated, file_offset(0x1200) + 12, LONG_NAME_RVA);
+    let name_offset = file_offset(LONG_NAME_RVA);
+    unterminated[name_offset..name_offset + STRING_SCAN_LIMIT].fill(b'a');
+    unterminated[name_offset + STRING_SCAN_LIMIT] = 0;
+
+    let error = analyze_pe(&unterminated).expect_err("the raw C-string scan is bounded");
+    assert!(matches!(
+        error,
+        AnalysisError::UnterminatedString {
+            context: "import DLL name",
+            rva: LONG_NAME_RVA,
+            limit: STRING_SCAN_LIMIT,
+        }
+    ));
+
+    let mut analysis = analyze_pe(&fixture()).expect("the base fixture is valid");
+    analysis.export_library_name = Some("a".repeat(STRING_SCAN_LIMIT));
+    let error = analysis
+        .validate()
+        .expect_err("a decoded string cannot consume the NUL-inclusive scan limit");
+    assert!(matches!(
+        error,
+        AnalysisError::LimitExceeded {
+            kind: "export DLL-name byte",
+            count: 4_096,
+            limit: 4_095,
+        }
+    ));
+}
+
+#[test]
 fn rejects_unknown_formats_without_guessing() {
     assert!(matches!(
         analyze_bytes(b"\x7fELFtest"),

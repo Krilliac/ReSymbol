@@ -230,18 +230,6 @@ fn malformed_debug_directory_and_rsds_ranges_fail_before_allocation() {
     let error = inspect_pe_codeview(&misaligned).expect_err("entry table is misaligned");
     assert!(error.to_string().contains("28-byte"));
 
-    let mut excessive = fixture(b"fixture.pdb");
-    set_directory(&mut excessive, DEBUG_DIRECTORY_RVA, 28 * 4_097);
-    let error = inspect_pe_codeview(&excessive).expect_err("entry count is bounded");
-    assert!(matches!(
-        error,
-        AnalysisError::LimitExceeded {
-            kind: "debug-directory entry",
-            count: 4_097,
-            limit: 4_096,
-        }
-    ));
-
     let mut short = fixture(b"fixture.pdb");
     let entry = file_offset(DEBUG_DIRECTORY_RVA);
     put_u32(&mut short, entry + 16, 23);
@@ -254,6 +242,56 @@ fn malformed_debug_directory_and_rsds_ranges_fail_before_allocation() {
     put_u32(&mut outside, entry + 16, 32);
     let error = inspect_pe_codeview(&outside).expect_err("raw range leaves the file");
     assert!(matches!(error, AnalysisError::Truncated { .. }));
+}
+
+#[test]
+fn declared_debug_directory_entry_count_is_bounded_before_mapping() {
+    let mut bytes = fixture(b"fixture.pdb");
+    set_directory(&mut bytes, DEBUG_DIRECTORY_RVA, 28 * 4_097);
+
+    let error = inspect_pe_codeview(&bytes)
+        .expect_err("the declared entry count is rejected before mapping its table");
+    assert!(matches!(
+        error,
+        AnalysisError::LimitExceeded {
+            kind: "debug-directory entry",
+            count: 4_097,
+            limit: 4_096,
+        }
+    ));
+}
+
+#[test]
+fn declared_codeview_byte_limits_are_explicit() {
+    let mut oversized_debug_data = fixture(b"fixture.pdb");
+    let entry = file_offset(DEBUG_DIRECTORY_RVA);
+    put_u32(&mut oversized_debug_data, entry + 16, 67_108_865);
+    let error = inspect_pe_codeview(&oversized_debug_data)
+        .expect_err("the debug-data size is rejected before reading its bytes");
+    assert!(matches!(
+        error,
+        AnalysisError::LimitExceeded {
+            kind: "CodeView debug-data byte",
+            count: 67_108_865,
+            limit: 67_108_864,
+        }
+    ));
+
+    let record_size = 65_537;
+    let mut oversized_rsds = fixture(b"fixture.pdb");
+    oversized_rsds.resize(OVERLAY_OFFSET + record_size, 0);
+    put_debug_entry(&mut oversized_rsds, 0, 0, OVERLAY_OFFSET, record_size);
+    oversized_rsds[OVERLAY_OFFSET..OVERLAY_OFFSET + 4].copy_from_slice(b"RSDS");
+    let error = inspect_pe_codeview(&oversized_rsds)
+        .expect_err("the identified RSDS record size is bounded");
+    assert!(matches!(
+        error,
+        AnalysisError::LimitExceeded {
+            kind: "RSDS record byte",
+            count: 65_537,
+            limit: 65_536,
+        }
+    ));
 }
 
 #[test]

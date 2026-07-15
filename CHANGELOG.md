@@ -101,6 +101,10 @@ prereleases; breaking changes remain explicit.
 
 ### Changed
 
+- Expanded exact public parser-boundary regressions for oversized PE header offsets, directory and
+  table declarations, runtime-function counts, bounded PE strings, and CodeView payload and
+  RSDS-record sizes. The matrix pins fail-fast errors before untrusted declared sizes can drive
+  large mappings or allocations where the format permits an early decision.
 - Added diagnostic-bearing `ProcessIo` and `ProcessWorkerPanicked` runtime errors. Execution-stage
   process polling, process-tree termination, reaping, pipe I/O, and pipe-worker failures now retain
   the bounded stderr observed before the failure, are classified as host infrastructure failures,
