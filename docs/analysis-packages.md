@@ -12,6 +12,7 @@ resymbol inspect application.resym
 resymbol inspect application.resym --json
 resymbol export application.resym --format json
 resymbol export application.resym --format markdown
+resymbol export application.resym --format map
 resymbol export application.resym --format ida-python
 resymbol export application.resym --format ghidra-java
 ```
@@ -65,7 +66,15 @@ may evolve between prereleases, but an incompatible reader must fail explicitly 
 When the CLI opens schema 1, it decodes the legacy payload into a current in-memory
 `AnalysisSession`, revalidates the persisted PE metadata, plugin ledger, claims, and binary-identity
 binding, and rebuilds the deterministic base graph from the persisted schema 1 analysis. It does
-not rewrite or upgrade the package on disk. A `.resym` package does not contain the original binary
+not rewrite or upgrade the package on disk. Legacy plugin claims pass through a closed schema 1
+assertion decoder: only name, function-prototype, function-boundary, type-definition,
+class-membership, and comment assertions are accepted. Function-entry, direct-call, thunk-target,
+string-literal, data-reference, and any future assertion kinds are rejected even if their current
+representation would otherwise validate. Accepted legacy assertions still undergo the current
+claim, provenance, successful-run ledger, binary-binding, and address-range validation; the
+allowlist is not a validation bypass.
+
+A `.resym` package does not contain the original binary
 bytes, so migration cannot retroactively run code recovery: direct-call and thunk arrays stay empty
 and the migrated session is not evidence that the decoder found no relationships. Analyze the exact
 original executable again to create a schema 3 package containing current recovery results. Schema

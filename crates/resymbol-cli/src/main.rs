@@ -11,16 +11,17 @@ use resymbol_analysis::{
     AnalysisSession, BinaryAnalysis, PeAnalysis, PluginRunRecord, PluginRunStatus, analyze_bytes,
 };
 use resymbol_core::{
-    BinaryId, DiscoveredPlugin, PLUGIN_DISABLED_SENTINEL, PluginDiscoveryOptions, PluginSource,
-    SymbolClaim, discover_plugins,
+    BinaryId, ClaimProvenance, Confidence, DiscoveredPlugin, Evidence, PLUGIN_DISABLED_SENTINEL,
+    PluginDiscoveryOptions, PluginSource, SymbolAssertion, SymbolClaim, SymbolSubject,
+    discover_plugins,
     plugin_api::{
         DiagnosticSeverity, PluginCapability, PluginHealthState, PluginId, PluginPermission,
         PluginRuntime, PluginRuntimeKind,
     },
 };
 use resymbol_export::{
-    ExportProjection, render_ghidra_java, render_ida_python, render_markdown,
-    validate_ghidra_java_class_name,
+    ExportProjection, MAX_MAP_MODULE_NAME_BYTES, render_ghidra_java, render_ida_python, render_map,
+    render_markdown, validate_ghidra_java_class_name,
 };
 #[cfg(test)]
 use resymbol_package::read_file_bound;
@@ -116,6 +117,8 @@ enum ExportFormat {
     Json,
     #[value(name = "markdown")]
     Markdown,
+    #[value(name = "map")]
+    Map,
     #[value(name = "ida-python")]
     IdaPython,
     #[value(name = "ghidra-java")]
@@ -127,6 +130,7 @@ impl ExportFormat {
         match self {
             Self::Json => "debugger-neutral JSON",
             Self::Markdown => "Markdown report",
+            Self::Map => "Microsoft-linker-style MAP",
             Self::IdaPython => "IDA Python",
             Self::GhidraJava => "Ghidra Java",
         }
@@ -403,17 +407,86 @@ fn read_analysis_package(
 struct SchemaV1AnalysisSession {
     base_analysis: SchemaV1BinaryAnalysis,
     plugin_runs: Vec<PluginRunRecord>,
-    plugin_claims: Vec<SymbolClaim>,
+    plugin_claims: Vec<SchemaV1SymbolClaim>,
 }
 
 impl SchemaV1AnalysisSession {
     fn migrate(self) -> Result<AnalysisSession> {
+        let plugin_claims = self
+            .plugin_claims
+            .into_iter()
+            .enumerate()
+            .map(|(index, claim)| {
+                claim
+                    .migrate()
+                    .with_context(|| format!("cannot migrate schema-v1 plugin claim {index}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
         AnalysisSession::new(
             self.base_analysis.migrate()?,
             self.plugin_runs,
-            self.plugin_claims,
+            plugin_claims,
         )
         .context("migrated schema-v1 analysis session is invalid")
+    }
+}
+
+/// Exact assertion vocabulary understood by schema 1.
+///
+/// This must remain a closed compatibility decoder rather than reusing the
+/// current [`SymbolAssertion`] deserializer. Otherwise a package carrying a
+/// legacy envelope could opt into claim kinds whose validation and semantics
+/// did not exist when schema 1 was defined.
+#[derive(serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+enum SchemaV1SymbolAssertion {
+    Name { name: String },
+    FunctionPrototype { declaration: String },
+    FunctionBoundary { size: u64 },
+    TypeDefinition { declaration: String },
+    ClassMembership { class_name: String },
+    Comment { text: String },
+}
+
+impl From<SchemaV1SymbolAssertion> for SymbolAssertion {
+    fn from(assertion: SchemaV1SymbolAssertion) -> Self {
+        match assertion {
+            SchemaV1SymbolAssertion::Name { name } => Self::Name { name },
+            SchemaV1SymbolAssertion::FunctionPrototype { declaration } => {
+                Self::FunctionPrototype { declaration }
+            }
+            SchemaV1SymbolAssertion::FunctionBoundary { size } => Self::FunctionBoundary { size },
+            SchemaV1SymbolAssertion::TypeDefinition { declaration } => {
+                Self::TypeDefinition { declaration }
+            }
+            SchemaV1SymbolAssertion::ClassMembership { class_name } => {
+                Self::ClassMembership { class_name }
+            }
+            SchemaV1SymbolAssertion::Comment { text } => Self::Comment { text },
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SchemaV1SymbolClaim {
+    subject: SymbolSubject,
+    assertion: SchemaV1SymbolAssertion,
+    confidence: Confidence,
+    evidence: Vec<Evidence>,
+    provenance: ClaimProvenance,
+}
+
+impl SchemaV1SymbolClaim {
+    fn migrate(self) -> Result<SymbolClaim> {
+        SymbolClaim::new(
+            self.subject,
+            self.assertion.into(),
+            self.confidence,
+            self.evidence,
+            self.provenance,
+        )
+        .context("schema-v1 plugin claim is invalid")
     }
 }
 
@@ -525,6 +598,12 @@ fn export(args: ExportArgs) -> Result<()> {
         ExportFormat::Markdown => {
             render_markdown(&projection).context("cannot render Markdown report")?
         }
+        ExportFormat::Map => render_map(
+            package_data.package.payload(),
+            &projection,
+            &map_module_name(&package, projection.binary.id.as_str()),
+        )
+        .context("cannot render Microsoft-linker-style MAP")?,
         ExportFormat::IdaPython => {
             render_ida_python(&projection).context("cannot render IDA Python import script")?
         }
@@ -589,6 +668,9 @@ fn export(args: ExportArgs) -> Result<()> {
         ExportFormat::Json | ExportFormat::Markdown => println!(
             "identity binding: projection records the exact binary SHA-256; no debugger program was modified"
         ),
+        ExportFormat::Map => println!(
+            "identity notice: MAP comments record the exact binary SHA-256, but a MAP loader cannot enforce it; verify the input manually"
+        ),
         ExportFormat::IdaPython | ExportFormat::GhidraJava => println!(
             "identity gate: importer verifies the loaded program SHA-256 before any mutation"
         ),
@@ -601,6 +683,7 @@ fn default_export_path(package: &Path, format: ExportFormat, binary_sha256: &str
     match format {
         ExportFormat::Json => package.with_extension("symbols.json"),
         ExportFormat::Markdown => package.with_extension("symbols.md"),
+        ExportFormat::Map => package.with_extension("map"),
         ExportFormat::IdaPython => package.with_extension("ida.py"),
         ExportFormat::GhidraJava => {
             let prefix = binary_sha256
@@ -612,6 +695,37 @@ fn default_export_path(package: &Path, format: ExportFormat, binary_sha256: &str
                 .unwrap_or_else(|| Path::new(""))
                 .join(filename)
         }
+    }
+}
+
+fn map_module_name(package: &Path, binary_sha256: &str) -> String {
+    let fallback = || {
+        let prefix = binary_sha256
+            .get(..12)
+            .expect("a validated binary SHA-256 has at least 12 ASCII bytes");
+        format!("resymbol_{prefix}")
+    };
+    let Some(stem) = package.file_stem().and_then(|value| value.to_str()) else {
+        return fallback();
+    };
+
+    let mut sanitized = String::with_capacity(stem.len().min(MAX_MAP_MODULE_NAME_BYTES));
+    for byte in stem.bytes() {
+        if sanitized.len() == MAX_MAP_MODULE_NAME_BYTES {
+            break;
+        }
+        sanitized.push(
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.') {
+                char::from(byte)
+            } else {
+                '_'
+            },
+        );
+    }
+    if sanitized.is_empty() || matches!(sanitized.as_str(), "." | "..") {
+        fallback()
+    } else {
+        sanitized
     }
 }
 
@@ -2056,6 +2170,7 @@ args = ["--stdio", "literal argument"]
         for (value, expected) in [
             ("json", ExportFormat::Json),
             ("markdown", ExportFormat::Markdown),
+            ("map", ExportFormat::Map),
             ("ida-python", ExportFormat::IdaPython),
             ("ghidra-java", ExportFormat::GhidraJava),
         ] {
@@ -2266,6 +2381,10 @@ args = ["--stdio", "literal argument"]
             PathBuf::from("build/application.symbols.md")
         );
         assert_eq!(
+            default_export_path(package, ExportFormat::Map, sha256),
+            PathBuf::from("build/application.map")
+        );
+        assert_eq!(
             default_export_path(package, ExportFormat::IdaPython, sha256),
             PathBuf::from("build/application.ida.py")
         );
@@ -2290,6 +2409,16 @@ args = ["--stdio", "literal argument"]
                 "{invalid} must be rejected"
             );
         }
+
+        assert_eq!(map_module_name(package, sha256), "application");
+        assert_eq!(
+            map_module_name(Path::new("build/My App!.resym"), sha256),
+            "My_App_"
+        );
+        assert_eq!(
+            map_module_name(Path::new("build/.."), sha256),
+            "resymbol_0123456789ab"
+        );
     }
 
     #[test]
@@ -2360,6 +2489,30 @@ args = ["--stdio", "literal argument"]
         assert_eq!(
             fs::read(&markdown_path).expect("read preserved Markdown export"),
             markdown_bytes
+        );
+
+        export(ExportArgs {
+            package: package.clone(),
+            format: ExportFormat::Map,
+            output: None,
+        })
+        .expect("export Microsoft-linker-style MAP");
+        let map_path = package.with_extension("map");
+        let map_bytes = fs::read(&map_path).expect("read MAP export");
+        let map = std::str::from_utf8(&map_bytes).expect("MAP export is UTF-8");
+        assert!(map.contains("Publics by Value"));
+        assert!(map.contains(BinaryId::digest(&bytes).as_str()));
+
+        let error = export(ExportArgs {
+            package: package.clone(),
+            format: ExportFormat::Map,
+            output: None,
+        })
+        .expect_err("existing MAP export must not be overwritten");
+        assert!(error.to_string().contains("refusing to overwrite"));
+        assert_eq!(
+            fs::read(&map_path).expect("read preserved MAP export"),
+            map_bytes
         );
 
         export(ExportArgs {
@@ -2471,6 +2624,262 @@ args = ["--stdio", "literal argument"]
             json: true,
         })
         .expect("JSON inspection serializes validated package");
+    }
+
+    fn schema_v1_package_skeleton() -> (Value, BinaryId) {
+        let base_analysis = analyze_bytes(&pe_fixture()).expect("analyze PE fixture");
+        let binary = base_analysis.identity().id.clone();
+        let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
+            .expect("create base-only session");
+        let package = ResymPackage::from_bound_payload("0.1.0-alpha.1", session)
+            .expect("create current package value");
+        let mut value = serde_json::to_value(package).expect("serialize package value");
+        value["schema_version"] = serde_json::json!(1);
+
+        let pe = value
+            .pointer_mut("/payload/base_analysis/analysis")
+            .and_then(Value::as_object_mut)
+            .expect("serialized PE analysis object");
+        for field in [
+            "code_recovery_scan_truncated",
+            "direct_calls",
+            "thunks",
+            "string_recovery_scan_truncated",
+            "strings",
+            "data_reference_scan_truncated",
+            "data_references",
+        ] {
+            pe.remove(field);
+        }
+        pe.get_mut("symbol_graph")
+            .and_then(|graph| graph.get_mut("claims"))
+            .and_then(Value::as_array_mut)
+            .expect("serialized base claims")
+            .retain(|claim| {
+                !matches!(
+                    claim.pointer("/assertion/kind").and_then(Value::as_str),
+                    Some(
+                        "function-entry"
+                            | "direct-call"
+                            | "thunk-target"
+                            | "string-literal"
+                            | "data-reference"
+                    )
+                )
+            });
+        (value, binary)
+    }
+
+    fn schema_v1_plugin_claim(subject: Value, assertion: Value) -> Value {
+        serde_json::json!({
+            "subject": subject,
+            "assertion": assertion,
+            "confidence": 0.75,
+            "evidence": [{
+                "kind": "signature-match",
+                "summary": "matched a deterministic legacy signature"
+            }],
+            "provenance": {
+                "producer": {
+                    "kind": "plugin",
+                    "id": "dev.resymbol.schema1-test",
+                    "version": "1.2.3"
+                },
+                "method": "schema1-test",
+                "run_id": "legacy-run-001"
+            }
+        })
+    }
+
+    fn install_schema_v1_plugin_claims(value: &mut Value, claims: Vec<Value>) {
+        let accepted_claim_count =
+            u64::try_from(claims.len()).expect("test claim count fits the run ledger");
+        let run = PluginRunRecord::new(
+            PluginId::new("dev.resymbol.schema1-test").expect("valid plugin id"),
+            "1.2.3",
+            "legacy-run-001",
+            BinaryId::digest(b"schema-v1 plugin artifact").to_string(),
+            PluginRunStatus::Succeeded,
+            accepted_claim_count,
+        )
+        .expect("valid legacy plugin run");
+        value["payload"]["plugin_runs"] =
+            serde_json::to_value(vec![run]).expect("serialize legacy plugin run");
+        value["payload"]["plugin_claims"] = Value::Array(claims);
+    }
+
+    #[test]
+    fn schema_v1_migration_accepts_only_the_genuine_legacy_assertion_vocabulary() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let path = temp.path().join("legacy-claims.resym");
+        let (mut value, binary) = schema_v1_package_skeleton();
+        let function_subject = || {
+            serde_json::json!({
+                "kind": "function",
+                "binary": binary,
+                "rva": 0x1000,
+                "size": 0x10
+            })
+        };
+        let type_subject = || {
+            serde_json::json!({
+                "kind": "type",
+                "binary": binary,
+                "key": "legacy::Widget"
+            })
+        };
+        install_schema_v1_plugin_claims(
+            &mut value,
+            vec![
+                schema_v1_plugin_claim(
+                    function_subject(),
+                    serde_json::json!({"kind": "name", "name": "LegacyFunction"}),
+                ),
+                schema_v1_plugin_claim(
+                    function_subject(),
+                    serde_json::json!({
+                        "kind": "function-prototype",
+                        "declaration": "void LegacyFunction(void)"
+                    }),
+                ),
+                schema_v1_plugin_claim(
+                    function_subject(),
+                    serde_json::json!({"kind": "function-boundary", "size": 0x10}),
+                ),
+                schema_v1_plugin_claim(
+                    type_subject(),
+                    serde_json::json!({
+                        "kind": "type-definition",
+                        "declaration": "struct Widget { int value; };"
+                    }),
+                ),
+                schema_v1_plugin_claim(
+                    function_subject(),
+                    serde_json::json!({
+                        "kind": "class-membership",
+                        "class_name": "legacy::Widget"
+                    }),
+                ),
+                schema_v1_plugin_claim(
+                    function_subject(),
+                    serde_json::json!({"kind": "comment", "text": "legacy evidence"}),
+                ),
+            ],
+        );
+        fs::write(
+            &path,
+            serde_json::to_vec(&value).expect("encode schema-v1 package"),
+        )
+        .expect("write schema-v1 package");
+
+        let decoded = read_analysis_package(&path, false)
+            .expect("all genuine schema-v1 assertions migrate and revalidate");
+        let claims = decoded.package.payload().plugin_claims();
+        assert_eq!(claims.len(), 6);
+        assert!(matches!(
+            claims[0].assertion(),
+            SymbolAssertion::Name { .. }
+        ));
+        assert!(matches!(
+            claims[1].assertion(),
+            SymbolAssertion::FunctionPrototype { .. }
+        ));
+        assert!(matches!(
+            claims[2].assertion(),
+            SymbolAssertion::FunctionBoundary { .. }
+        ));
+        assert!(matches!(
+            claims[3].assertion(),
+            SymbolAssertion::TypeDefinition { .. }
+        ));
+        assert!(matches!(
+            claims[4].assertion(),
+            SymbolAssertion::ClassMembership { .. }
+        ));
+        assert!(matches!(
+            claims[5].assertion(),
+            SymbolAssertion::Comment { .. }
+        ));
+        assert_eq!(decoded.package.payload().plugin_runs().len(), 1);
+        assert_eq!(
+            decoded.package.payload().plugin_runs()[0].accepted_claim_count(),
+            6
+        );
+    }
+
+    #[test]
+    fn schema_v1_migration_rejects_post_schema_v1_plugin_assertions() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let cases = [
+            (
+                "function-entry",
+                serde_json::json!({"kind": "function-entry"}),
+            ),
+            (
+                "direct-call",
+                serde_json::json!({
+                    "kind": "direct-call",
+                    "call_site_rva": 0x1000,
+                    "target": {"kind": "function", "rva": 0x1010}
+                }),
+            ),
+            (
+                "thunk-target",
+                serde_json::json!({
+                    "kind": "thunk-target",
+                    "target": {"kind": "function", "rva": 0x1010}
+                }),
+            ),
+            (
+                "string-literal",
+                serde_json::json!({
+                    "kind": "string-literal",
+                    "encoding": "ascii",
+                    "value": "legacy smuggling"
+                }),
+            ),
+            (
+                "data-reference",
+                serde_json::json!({
+                    "kind": "data-reference",
+                    "instruction_rva": 0x1000,
+                    "instruction_size": 7,
+                    "target_rva": 0x1100
+                }),
+            ),
+        ];
+
+        for (kind, assertion) in cases {
+            let (mut value, binary) = schema_v1_package_skeleton();
+            let subject = serde_json::json!({
+                "kind": "function",
+                "binary": binary,
+                "rva": 0x1000,
+                "size": 0x10
+            });
+            install_schema_v1_plugin_claims(
+                &mut value,
+                vec![schema_v1_plugin_claim(subject, assertion)],
+            );
+            let path = temp.path().join(format!("smuggled-{kind}.resym"));
+            fs::write(
+                &path,
+                serde_json::to_vec(&value).expect("encode adversarial schema-v1 package"),
+            )
+            .expect("write adversarial schema-v1 package");
+
+            let error = match read_analysis_package(&path, false) {
+                Ok(_) => {
+                    panic!("post-schema-v1 assertion {kind} must be rejected by the legacy decoder")
+                }
+                Err(error) => error,
+            };
+            let diagnostic = format!("{error:#}");
+            assert!(
+                diagnostic.contains("unknown variant") && diagnostic.contains(kind),
+                "unexpected diagnostic for {kind}: {diagnostic}"
+            );
+        }
     }
 
     #[test]

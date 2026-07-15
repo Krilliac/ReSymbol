@@ -46,19 +46,27 @@ separation is not an OS sandbox, and interactive binary reads remain reserved ra
 implemented.
 
 The first export checkpoint is implemented as a validated, debugger-neutral projection with
-deterministic JSON output, a bounded human-readable Markdown report, and standalone IDAPython and
-Ghidra Java import scripts. Markdown is presentation-only rather than a stable interchange schema;
-JSON remains the machine-consumable artifact. The current formats use package schema 3 and neutral
-projection schema 4. The scripts bind to the exact loaded binary SHA-256, resolve
+deterministic JSON output, a bounded human-readable Markdown report, PE-only
+Microsoft-linker-style MAP text, and standalone IDAPython and Ghidra Java import scripts. Markdown
+is presentation-only rather than a stable interchange schema; JSON remains the machine-consumable
+artifact. The current formats use package schema 3 and neutral projection schema 4; MAP adds no
+schema fields. The scripts bind to the exact loaded binary SHA-256, resolve
 addresses as loaded image base plus RVA, preserve user-authored names and existing function bodies,
 and continue past per-symbol application errors. They are deliberately narrower than the planned
 interactive debugger bridges: prototypes, types, alternate names, provenance comments, and richer
 relationships are retained or diagnosed by the projection but are not yet fully applied inside the
 tools.
 
+The MAP writer emits selected named symbols in deterministic RVA order using one-based PE
+`section:offset` and preferred-image-base-plus-RVA values. A selected function wins over a selected
+global at the same RVA; an unnamed function suppresses nothing. `<resymbol>` marks synthetic
+provenance, and unsafe raw section-name bytes are escaped. Exact SHA-256 and file-size comments are
+informational because MAP text cannot enforce the identity of a binary loaded by another tool.
+
 The neutral projection intentionally retains larger model-validation caps of 262,144 direct calls,
 262,144 data references, 65,536 strings, and 65,536 thunks. Those bounds support combined or
-plugin-produced graphs and are separate from the built-in recovery passes' lower caps.
+plugin-produced graphs and are separate from the built-in recovery passes' lower caps. MAP export
+separately accepts at most 262,144 selected named function/global candidates and 64 MiB of output.
 
 The remaining Milestone 2 work is deliberately substantial: broader disassembly-assisted candidate
 discovery, indirect control flow and richer call-graph analysis, string-reference correlation,
@@ -143,14 +151,14 @@ The MVP should be useful without AI, a network connection, Ghidra, or IDA.
 - Standalone IDAPython importer for applying the initial safe graph subset (implemented)
 - Standalone Ghidra Java importer with equivalent identity checks (implemented)
 - Interactive IDA and Ghidra bridges for preview, selective application, and provenance comments
-- MAP or simple public-symbol export
+- MAP or simple public-symbol export (PE MAP implemented for selected named symbols)
 - Synthetic PDB export for validated public functions
 - Explicit lossy-export diagnostics
 
 The neutral projection already emits structured diagnostics for reductions such as unsupported
 assertions, name collisions, conflicting sizes, and overlapping ranges. Target-specific loss
-summaries and richer in-tool review remain part of this milestone. MAP and PDB are explicitly later
-outputs; the first import scripts do not generate either format.
+summaries and richer in-tool review remain part of this milestone. The first PE MAP writer is now a
+separate `resymbol export` format; synthetic PDB output and richer MAP coverage remain planned.
 
 ## Milestone 4: richer reconstruction
 

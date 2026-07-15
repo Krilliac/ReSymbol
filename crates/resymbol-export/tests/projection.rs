@@ -1129,10 +1129,20 @@ fn entities_group_by_kind_and_rva_and_equal_authority_size_conflicts_are_omitted
         warning.code == ProjectionWarningCode::AmbiguousSize
             && warning.subject == Some(ExportSubject::Function { rva: 0x100 })
     }));
-    assert!(projection.warnings.iter().any(|warning| {
-        warning.code == ProjectionWarningCode::AddressKindCollision
-            && warning.subject == Some(ExportSubject::Global { rva: 0x100 })
-    }));
+    let collision = projection
+        .warnings
+        .iter()
+        .find(|warning| warning.code == ProjectionWarningCode::AddressKindCollision)
+        .expect("address-kind collision warning");
+    assert_eq!(
+        collision.subject,
+        Some(ExportSubject::Global { rva: 0x100 })
+    );
+    assert_eq!(collision.occurrences, 1);
+    assert_eq!(
+        collision.message,
+        "function and global claims share an RVA; debugger bridges suppress the global only when they emit a function record"
+    );
 }
 
 #[test]

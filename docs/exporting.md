@@ -1,22 +1,23 @@
 # Export ReSymbol results
 
 `resymbol export` turns one validated `.resym` analysis package into a deterministic,
-debugger-neutral JSON projection, a bounded human-readable Markdown report, or a self-contained
-import script for IDA or Ghidra.
+debugger-neutral JSON projection, a bounded human-readable Markdown report,
+Microsoft-linker-style MAP text, or a self-contained import script for IDA or Ghidra.
 
 ```console
 resymbol export PACKAGE --format json [--output PATH]
 resymbol export PACKAGE --format markdown [--output PATH]
+resymbol export PACKAGE --format map [--output PATH]
 resymbol export PACKAGE --format ida-python [--output PATH]
 resymbol export PACKAGE --format ghidra-java [--output PATH]
 ```
 
 The current formats are deliberately small and auditable. JSON is the machine-consumable
-interchange artifact, Markdown is a presentation-only report for review, and the scripts apply a
-conservative subset inside their target debugger. They do not require a ReSymbol plugin, compiler,
-or separately installed language runtime beyond the scripting support included with the target
-debugger. PDB and MAP generation, richer type application, and interactive in-tool bridges are
-later milestones.
+interchange artifact, Markdown is a presentation-only report for review, MAP is PE-only text for
+tools that support the Microsoft-linker-style layout, and the scripts apply a conservative subset
+inside their target debugger. They do not require a ReSymbol plugin, compiler, or separately
+installed language runtime beyond the scripting support included with the target debugger. PDB
+generation, richer type application, and interactive in-tool bridges are later milestones.
 
 ## Output paths and overwrite policy
 
@@ -26,6 +27,7 @@ Without `--output`, ReSymbol chooses a deterministic destination beside the pack
 |---|---|---|
 | `json` | `application.resym` | `application.symbols.json` |
 | `markdown` | `application.resym` | `application.symbols.md` |
+| `map` | `application.resym` | `application.map` |
 | `ida-python` | `application.resym` | `application.ida.py` |
 | `ghidra-java` | `application.resym` | `ReSymbolImport_<sha12>.java` |
 
@@ -49,6 +51,12 @@ resymbol export application.resym \
 
 The generated source then contains `public class ReviewedSymbols`; renaming only the file afterward
 will make Ghidra's Java compilation fail. Regenerate the export under the desired filename instead.
+
+The MAP header's display module name is derived from the package filename stem, independently from
+the output filename. Every non-ASCII byte or byte outside `[A-Za-z0-9_.-]` becomes `_`, and the
+result is capped at 255 bytes. An empty or non-UTF-8 stem, or a result equal to `.` or `..`, uses the
+deterministic fallback `resymbol_<sha12>`. Thus `My App.resym` produces `My_App`. Supplying a custom
+MAP `--output` path does not change that module name.
 
 ## Safety model
 
@@ -104,6 +112,16 @@ current recovery relationships in the export.
 Entries are emitted in stable order. Name and range conflicts are resolved conservatively, and
 colliding selected names receive deterministic output suffixes rather than silently referring to
 the same debugger symbol.
+
+The projection's `address-kind-collision` warning states the mutation-aware rule verbatim:
+
+```text
+function and global claims share an RVA; debugger bridges suppress the global only when they emit a function record
+```
+
+A selected function name or an accepted function size produces such a record; entry-only function
+evidence does not. The named global can therefore still be offered for an entry-only collision,
+subject to the debugger-state checks described below.
 
 The JSON projection is not a PDB, MAP file, IDA database, or Ghidra project. It is the common input
 to target-specific writers and a useful artifact for plugins, review tools, and future exporters.
@@ -255,6 +273,49 @@ columns, raw HTML, or unintended entities. If the complete rendered document wou
 export fails before creating the output file. These are report-writer limits only; they do not
 silently reduce the JSON projection or rewrite the `.resym` package.
 
+## Microsoft-linker-style MAP text
+
+Generate PE MAP text for a consumer that supports a Microsoft-linker-style layout:
+
+```console
+resymbol export application.resym --format map
+```
+
+The default destination is `application.map`. This is a deterministic text export, not a claim that
+every debugger or linker will accept it. ReSymbol currently rejects non-PE sessions and
+projections, mismatched session/projection binary fields, selected symbol RVAs outside real PE
+sections, and a nonzero entry point outside those sections. MAP does not change the `.resym`
+package or neutral projection schemas; current new artifacts remain package schema 3 and projection
+schema 4.
+
+The writer emits the PE timestamp and preferred load address, one group for each final PE section,
+selected public names in RVA order, and the entry-point `section:offset`. Section numbers are
+one-based and offsets are relative to the section's virtual address. The `Rva+Base` column is the
+preferred image base plus each symbol RVA. Section length is the greater of virtual size and raw
+data size. Section bytes safe in the whitespace-delimited format are retained; unsafe bytes become
+`_xhh_` escapes with lowercase hexadecimal digits (for example, a space byte becomes `_x20_`), and
+an empty raw name becomes `_x00_`.
+
+Only functions and globals with a selected output name are emitted. A selected function wins over
+a selected global at the same RVA; an unnamed function suppresses nothing. This target-specific
+rule does not alter the projection warning or the mutating-script policy described above: IDA and
+Ghidra suppress a same-RVA global only when they actually emit a function record. Every MAP row uses
+`<resymbol>` as explicit synthetic provenance because a parsed final image does not retain a
+trustworthy source object/COMDAT mapping.
+
+The header includes semicolon-prefixed comments with the exact binary SHA-256, exact file size, and
+virtual image size. Those comments are conventional ReSymbol additions, not fields guaranteed by
+Microsoft's published `/MAP` contract. More importantly, text MAP consumers cannot enforce the
+identity check performed by the generated IDA and Ghidra scripts. Compare the exact executable's
+SHA-256 and file size manually before relying on the symbols, and independently verify compatibility
+when a consumer requires byte-for-byte `link.exe` output.
+
+MAP generation counts selected function/global candidates before same-RVA collision reduction and
+rejects more than 262,144. The complete UTF-8 output is capped at 64 MiB. Either condition fails
+before the create-new destination is written. MAP currently carries selected names and section
+addresses only; prototypes, types, alternate names, confidence, recovered strings, relationships,
+and other rich projection data remain available through JSON. Synthetic PDB output remains planned.
+
 ## Import into IDA
 
 Generate the script:
@@ -339,5 +400,6 @@ The initial scripts intentionally apply less information than the JSON projectio
   switch; an interactive review bridge is planned for choices that require user judgment.
 
 These omissions prevent a low-confidence or lossy conversion from masquerading as full symbol
-recovery. Future IDA/Ghidra bridges will add preview and selective application. MAP output and a
-synthetic PDB writer are planned separately and are not produced by any current export format.
+recovery. Future IDA/Ghidra bridges will add preview and selective application. The current MAP
+writer exposes only selected PE function/global names and addresses; a synthetic PDB writer remains
+planned separately.
