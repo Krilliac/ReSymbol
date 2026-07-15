@@ -1267,9 +1267,7 @@ mod tests {
 
     use resymbol_core::{
         BinaryId,
-        plugin_api::{
-            MANIFEST_VERSION, PluginCapability, PluginId, PluginPermission,
-        },
+        plugin_api::{MANIFEST_VERSION, PluginCapability, PluginId, PluginPermission},
     };
     use semver::{Version, VersionReq};
     use serde_json::{Map, Value};
