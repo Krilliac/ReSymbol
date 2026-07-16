@@ -413,6 +413,11 @@ impl CapabilityReport {
                 });
             }
         }
+        for capability in DebugCapability::ALL {
+            if !seen.contains(&capability) {
+                return Err(ProtocolValidationError::MissingCapability { capability });
+            }
+        }
         Ok(())
     }
 }
@@ -1302,6 +1307,8 @@ pub enum ProtocolValidationError {
     TooManyCapabilityStatuses { actual: usize, maximum: usize },
     #[error("duplicate capability status for {capability:?}")]
     DuplicateCapability { capability: DebugCapability },
+    #[error("capability report is missing an explicit status for {capability:?}")]
+    MissingCapability { capability: DebugCapability },
     #[error("reason must be nonempty, single-line, and at most 1024 UTF-8 bytes")]
     InvalidReason,
     #[error("memory read cannot be empty")]
@@ -1642,18 +1649,7 @@ mod tests {
     }
 
     #[test]
-    fn capability_unavailability_is_bounded_and_duplicate_free() {
-        CapabilityReport {
-            statuses: DebugCapability::ALL
-                .map(|capability| CapabilityStatus {
-                    capability,
-                    availability: CapabilityAvailability::Available,
-                })
-                .into(),
-        }
-        .validate()
-        .expect("complete capability catalog is unique and bounded");
-
+    fn capability_report_is_complete_bounded_and_duplicate_free() {
         let status = CapabilityStatus {
             capability: DebugCapability::LiveMemoryWrite,
             availability: CapabilityAvailability::Unavailable {
@@ -1661,16 +1657,39 @@ mod tests {
                 reason: "snapshot sessions are immutable".to_owned(),
             },
         };
-        CapabilityReport {
-            statuses: vec![status.clone()],
-        }
-        .validate()
-        .unwrap();
+        let report = CapabilityReport {
+            statuses: DebugCapability::ALL
+                .map(|capability| {
+                    if capability == status.capability {
+                        status.clone()
+                    } else {
+                        CapabilityStatus {
+                            capability,
+                            availability: CapabilityAvailability::Available,
+                        }
+                    }
+                })
+                .into(),
+        };
+        report
+            .validate()
+            .expect("complete capability catalog is unique and bounded");
+
+        let mut missing = report.clone();
+        missing
+            .statuses
+            .retain(|entry| entry.capability != DebugCapability::SnapshotRead);
         assert_eq!(
-            CapabilityReport {
-                statuses: vec![status.clone(), status],
-            }
-            .validate(),
+            missing.validate(),
+            Err(ProtocolValidationError::MissingCapability {
+                capability: DebugCapability::SnapshotRead,
+            })
+        );
+
+        let mut duplicate = report;
+        duplicate.statuses.push(status);
+        assert_eq!(
+            duplicate.validate(),
             Err(ProtocolValidationError::DuplicateCapability {
                 capability: DebugCapability::LiveMemoryWrite,
             })

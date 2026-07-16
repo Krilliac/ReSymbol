@@ -235,9 +235,10 @@ The current seam is intentionally narrow:
 - failure, attestation, and cleanup events are bound both to the outer event session and to the
   reducer's exact binary or inherited process, policy, provider, helper build, provisioning epoch,
   and cleanup expectation before failure can be retained or `Closed` can be accepted and released;
-- connection-level capability probing is explicit; the synthetic host reports every platform
-  capability as unavailable, supports only offline open/close, and rejects every other operation
-  without producing security evidence;
+- connection-level capability probing is explicit and complete: every protocol capability must
+  appear exactly once as available or with a typed unavailability reason. The synthetic host
+  reports every platform capability as unavailable, supports only offline open/close, and rejects
+  every other operation without producing security evidence;
 - the production offline-image host reports only offline analysis as available, binds open to one
   preverified canonical snapshot, treats memory addresses as RVAs, and returns only exact
   file-backed header/section prefixes under the protocol and response budgets;

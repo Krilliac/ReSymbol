@@ -248,6 +248,9 @@ prereleases; breaking changes remain explicit.
 
 ### Changed
 
+- Debugger capability probes must now report every protocol capability exactly once. Unsupported
+  capabilities remain explicit typed `Unavailable` entries instead of becoming ambiguous through
+  omission; duplicate and partial reports fail protocol validation.
 - Bumped the debugger wire and typed-command protocol to 1.2. Sandbox failures now bind the exact
   session, provisioning epoch, policy digest, provider, and launch binary/helper or inherited
   process/mode context. The controller validates an exact command-stage-kind-phase matrix before
