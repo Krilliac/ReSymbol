@@ -102,15 +102,20 @@ tests:
 1. Every command is bound to one session and a monotonically increasing correlation identifier.
 2. State-sensitive commands carry the exact current generation and, when stopped, a fresh stop
    token. Accepted mutations invalidate queued stop-sensitive actions.
-3. Launch binds the exact source `BinaryId`, requested provider, canonical policy digest, helper
-   build, and provider descriptor.
+3. Host launch and attach require a host-local, registered one-use risk lease. The lease binds the
+   session and exact operation to either the launch `BinaryId` or an attach identity containing PID,
+   trusted process-start key, executable `BinaryId`, and attach mode; a wire payload cannot mint authority.
 4. A target is created suspended. Continue is impossible until the expected attestation is accepted
-   for that exact session, binary, policy, provider, and build.
+   for that exact session, binary, policy, provider, build, and fresh 256-bit provisioning epoch.
 5. Memory writes are bounded equal-length compare-before-write operations with complete-write and
    readback verification.
 6. Events are ordered, command outcomes are correlated, replayed commands are rejected, and terminal
    states cannot return to a live state.
-7. Helper loss enters cleanup; it never implies that containment or cleanup succeeded.
+7. A sandbox-owned attach requires a provider/host-registered one-use ownership lease bound to the
+   exact process identity, attach mode, provider, policy digest, session, and provisioning epoch. A PID or claimed
+   owner session in a command is never proof of ownership.
+8. Cleanup receipts carry the same provisioning epoch as attestation, so evidence from an otherwise
+   identical earlier provisioning instance is rejected. Helper loss never implies cleanup succeeded.
 
 The pure reducers, typed client, and in-memory host now exercise these ordering and binding rules. They
 remain requirements for a future process-executing provider, not evidence that such a provider exists.
@@ -119,6 +124,7 @@ remain requirements for a future process-executing provider, not evidence that s
 
 The current seam is intentionally narrow:
 
+- debugger wire and typed-command protocol 1.1 carries the lease identifiers and provisioning epoch;
 - a four-byte length prefix is validated before allocating a bounded control buffer;
 - controller and host roles, directions, nonzero challenge nonce, expected build identities, offered
   protocol version, response kind, and independent frame sequences are verified before commands;
@@ -133,6 +139,9 @@ The current seam is intentionally narrow:
   may not change client state;
 - connection-level capability probing is explicit; the in-memory host reports every platform
   capability as unavailable and rejects target-data operations it cannot honestly model;
+- host-risk and sandbox-ownership grant objects are host-local and non-serializable. Commands carry
+  only strict 64-character lowercase-hex lease IDs; the reducer bounds registrations, consumes a
+  presented lease even on mismatch, and drops every unused lease after a target opens;
 - only `Closed` sessions can be released, and sandbox closure requires the exact cleanup receipt that
   the reducer validates; and
 - the client and transport expose value types only. Future process, pipe, token, Job, VM, and provider
@@ -192,15 +201,18 @@ separate address spaces.
 
 Protection findings are bounded artifact evidence. They are neither malware signatures nor an
 authorization to execute. Offline opening should keep those findings reviewable without training the
-user to dismiss an execution warning. A blocking acknowledgement belongs at the live launch/attach
-boundary and must be bound to the exact binary, operation, provider, policy digest, and expiration.
+user to dismiss an execution warning. A blocking approval belongs at the live launch/attach boundary
+and becomes a host-local, one-use lease bound to the exact operation and target identity. Production
+lease IDs and provisioning epochs require 256 bits from a cryptographically secure random source;
+their constructors validate the wire representation, not entropy provenance.
 
 ## Verification gates
 
 No process-executing provider should merge until the project has evidence for:
 
-- legal session transitions, replay rejection, stale generation/stop rejection, attestation-gated
-  resume, compare-write conflicts, sequence overflow, and terminal cleanup behavior;
+- legal session transitions, cross-target and replayed lease rejection, stale generation/stop
+  rejection, provisioning-epoch-bound attestation and cleanup, attestation-gated resume,
+  compare-write conflicts, sequence overflow, and terminal cleanup behavior;
 - strict wire decoding, Hello-first/once handshake, role/build/version/nonce agreement, bounded
   allocation before payload reads, and crash recovery;
 - benign Windows probes showing allowed staged reads and scratch writes while profile sentinels,

@@ -7,7 +7,7 @@
 use thiserror::Error;
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 0;
+pub const PROTOCOL_MINOR: u16 = 1;
 pub const MAX_CONTROL_BYTES: usize = 64 * 1024;
 pub const MAX_RAW_BYTES: u32 = 8 * 1024 * 1024;
 pub const MAX_BUILD_ID_BYTES: usize = 256;

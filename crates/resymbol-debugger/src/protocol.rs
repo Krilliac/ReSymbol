@@ -14,14 +14,12 @@ use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
-pub use crate::identity::SessionId;
-use crate::sandbox::{
-    RiskAcknowledgementId, SandboxAttestation, SandboxLifecycleEvent, SandboxPolicy,
-};
+pub use crate::identity::{HostRiskLeaseId, SandboxOwnershipLeaseId, SessionId};
+use crate::sandbox::{SandboxAttestation, SandboxLifecycleEvent, SandboxPolicy};
 use resymbol_core::BinaryId;
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 0;
+pub const PROTOCOL_MINOR: u16 = 1;
 pub const MAX_LAUNCH_ARGUMENTS: usize = 128;
 pub const MAX_LAUNCH_ARGUMENT_BYTES: usize = 256 * 1024;
 pub const MAX_MEMORY_READ_BYTES: u32 = 1024 * 1024;
@@ -66,6 +64,7 @@ nonzero_id!(StateGeneration, u64, "state generation");
 nonzero_id!(StopId, u64, "stop");
 nonzero_id!(RunId, u64, "run");
 nonzero_id!(ProcessId, u32, "process");
+nonzero_id!(ProcessStartKey, u64, "process start key");
 nonzero_id!(ThreadId, u32, "thread");
 nonzero_id!(BreakpointId, u64, "breakpoint");
 nonzero_id!(SnapshotId, u64, "snapshot");
@@ -159,6 +158,18 @@ impl MemoryAddress {
     }
 }
 
+/// Stable identity for one concrete process instance, not merely a reusable
+/// operating-system PID. Providers derive `start_key` from a trusted process
+/// creation identity (for example, Windows creation `FILETIME`) and verify the
+/// executable bytes against `binary_id` before registering an attach lease.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessIdentity {
+    pub process_id: ProcessId,
+    pub start_key: ProcessStartKey,
+    pub binary_id: BinaryId,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LaunchTarget {
@@ -220,12 +231,8 @@ impl LaunchTarget {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "environment", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum LaunchEnvironment {
-    Sandboxed {
-        policy: SandboxPolicy,
-    },
-    Host {
-        risk_acknowledgement: RiskAcknowledgementId,
-    },
+    Sandboxed { policy: SandboxPolicy },
+    Host { risk_lease: HostRiskLeaseId },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -242,12 +249,12 @@ pub enum AttachMode {
 #[serde(tag = "scope", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum AttachScope {
     Host {
-        process_id: ProcessId,
-        risk_acknowledgement: RiskAcknowledgementId,
+        process: ProcessIdentity,
+        risk_lease: HostRiskLeaseId,
     },
     OwnedSandbox {
-        owner_session_id: SessionId,
-        process_id: ProcessId,
+        process: ProcessIdentity,
+        ownership_lease: SandboxOwnershipLeaseId,
     },
 }
 

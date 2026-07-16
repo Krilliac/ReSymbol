@@ -1,18 +1,25 @@
 //! Pure debugger-session state reduction.
 
+use std::collections::BTreeMap;
+
 use resymbol_core::BinaryId;
 use thiserror::Error;
 
+use crate::authorization::{
+    HostRiskLease, HostRiskOperation, SandboxOwnershipBinding, SandboxOwnershipLease,
+};
+use crate::identity::{HostRiskLeaseId, ProvisioningEpoch, SandboxOwnershipLeaseId};
 use crate::protocol::{
     AttachMode, AttachScope, CommandEnvelope, CommandId, DebugCommand, DebugTargetRequest,
     ProcessId, ProtocolValidationError, RunId, RunToken, SessionId, SessionState, SessionStateKind,
     StateGeneration, StateToken, StopId, StopReason, StopToken, ThreadId,
 };
 use crate::sandbox::{
-    ExpectedSandboxAttestation, HelperBuildId, PolicyValidationError, RiskAcknowledgementId,
-    SandboxAttestation, SandboxCleanupReceipt, SandboxLifecycleState, SandboxMachine,
-    SandboxMachineError,
+    ExpectedSandboxAttestation, HelperBuildId, PolicyValidationError, SandboxAttestation,
+    SandboxCleanupReceipt, SandboxLifecycleState, SandboxMachine, SandboxMachineError,
 };
+
+pub const MAX_REGISTERED_AUTHORIZATION_LEASES: usize = 64;
 
 /// Single-owner, value-only reducer for one debugger session.
 ///
@@ -23,6 +30,7 @@ use crate::sandbox::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionMachine {
     session_id: SessionId,
+    provisioning_epoch: ProvisioningEpoch,
     helper_build: HelperBuildId,
     state: SessionState,
     target: Option<DebugTargetRequest>,
@@ -31,6 +39,9 @@ pub struct SessionMachine {
     last_run_id: u64,
     execution_gate: ExecutionGate,
     sandbox: Option<SandboxMachine>,
+    inherited_sandbox: Option<SandboxOwnershipBinding>,
+    host_risk_leases: BTreeMap<HostRiskLeaseId, Option<HostRiskLease>>,
+    sandbox_ownership_leases: BTreeMap<SandboxOwnershipLeaseId, Option<SandboxOwnershipLease>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,13 +55,18 @@ enum ExecutionGate {
 
 impl SessionMachine {
     #[must_use]
-    pub fn new(session_id: SessionId, helper_build: HelperBuildId) -> Self {
+    pub fn new(
+        session_id: SessionId,
+        provisioning_epoch: ProvisioningEpoch,
+        helper_build: HelperBuildId,
+    ) -> Self {
         let token = StateToken {
             session_id,
             generation: StateGeneration::new(1).expect("initial generation is nonzero"),
         };
         Self {
             session_id,
+            provisioning_epoch,
             helper_build,
             state: SessionState::Idle { token },
             target: None,
@@ -59,12 +75,20 @@ impl SessionMachine {
             last_run_id: 0,
             execution_gate: ExecutionGate::NotApplicable,
             sandbox: None,
+            inherited_sandbox: None,
+            host_risk_leases: BTreeMap::new(),
+            sandbox_ownership_leases: BTreeMap::new(),
         }
     }
 
     #[must_use]
     pub const fn session_id(&self) -> SessionId {
         self.session_id
+    }
+
+    #[must_use]
+    pub const fn provisioning_epoch(&self) -> &ProvisioningEpoch {
+        &self.provisioning_epoch
     }
 
     #[must_use]
@@ -100,6 +124,55 @@ impl SessionMachine {
     #[must_use]
     pub fn sandbox_state(&self) -> Option<SandboxLifecycleState> {
         self.sandbox.as_ref().map(SandboxMachine::state)
+    }
+
+    #[must_use]
+    pub const fn inherited_sandbox(&self) -> Option<&SandboxOwnershipBinding> {
+        self.inherited_sandbox.as_ref()
+    }
+
+    /// Registers one host-local approval. This method is called only by the
+    /// trusted session worker; command payloads cannot register authority.
+    pub fn register_host_risk_lease(
+        &mut self,
+        lease: HostRiskLease,
+    ) -> Result<(), SessionMachineError> {
+        self.require_state("register host-risk lease", &[SessionStateKind::Idle])?;
+        self.require_session(lease.session_id())?;
+        if self.host_risk_leases.contains_key(lease.id()) {
+            return Err(SessionMachineError::DuplicateAuthorizationLease);
+        }
+        if self.host_risk_leases.len() >= MAX_REGISTERED_AUTHORIZATION_LEASES {
+            return Err(SessionMachineError::TooManyAuthorizationLeases);
+        }
+        self.host_risk_leases
+            .insert(lease.id().clone(), Some(lease));
+        Ok(())
+    }
+
+    /// Registers one provider-authenticated process-ownership grant. The
+    /// binding is local-only and cannot be supplied by a command envelope.
+    pub fn register_sandbox_ownership_lease(
+        &mut self,
+        lease: SandboxOwnershipLease,
+    ) -> Result<(), SessionMachineError> {
+        self.require_state(
+            "register sandbox-ownership lease",
+            &[SessionStateKind::Idle],
+        )?;
+        self.require_session(lease.binding().session_id())?;
+        if lease.binding().provisioning_epoch() != &self.provisioning_epoch {
+            return Err(SessionMachineError::ProvisioningEpochMismatch);
+        }
+        if self.sandbox_ownership_leases.contains_key(lease.id()) {
+            return Err(SessionMachineError::DuplicateAuthorizationLease);
+        }
+        if self.sandbox_ownership_leases.len() >= MAX_REGISTERED_AUTHORIZATION_LEASES {
+            return Err(SessionMachineError::TooManyAuthorizationLeases);
+        }
+        self.sandbox_ownership_leases
+            .insert(lease.id().clone(), Some(lease));
+        Ok(())
     }
 
     /// Accepts one externally correlated command and advances state when the
@@ -342,7 +415,7 @@ impl SessionMachine {
     }
 
     fn accept_open(&mut self, target: DebugTargetRequest) -> Result<(), SessionMachineError> {
-        let (mut sandbox, gate) = match &target {
+        let (mut sandbox, gate, inherited_sandbox) = match &target {
             DebugTargetRequest::Launch(target) => match &target.environment {
                 crate::protocol::LaunchEnvironment::Sandboxed { policy } => {
                     self.require_session(policy.session_id)?;
@@ -350,41 +423,61 @@ impl SessionMachine {
                         target.binary_id.clone(),
                         policy,
                         self.helper_build.clone(),
+                        self.provisioning_epoch.clone(),
                     )?;
                     let mut sandbox = SandboxMachine::new(expected)?;
                     sandbox.begin_provisioning()?;
-                    (Some(sandbox), ExecutionGate::SandboxPending)
+                    (Some(sandbox), ExecutionGate::SandboxPending, None)
                 }
-                crate::protocol::LaunchEnvironment::Host {
-                    risk_acknowledgement,
-                } => {
-                    self.require_acknowledgement(risk_acknowledgement)?;
-                    (None, ExecutionGate::HostRiskAccepted)
+                crate::protocol::LaunchEnvironment::Host { risk_lease } => {
+                    self.consume_host_risk_lease(
+                        risk_lease,
+                        &HostRiskOperation::Launch {
+                            binary_id: target.binary_id.clone(),
+                        },
+                    )?;
+                    (None, ExecutionGate::HostRiskAccepted, None)
                 }
             },
             DebugTargetRequest::Attach(target) => match &target.scope {
                 AttachScope::Host {
-                    risk_acknowledgement,
-                    ..
+                    process,
+                    risk_lease,
                 } => {
-                    self.require_acknowledgement(risk_acknowledgement)?;
-                    (None, ExecutionGate::HostRiskAccepted)
+                    self.consume_host_risk_lease(
+                        risk_lease,
+                        &HostRiskOperation::Attach {
+                            process: process.clone(),
+                            mode: target.mode,
+                        },
+                    )?;
+                    (None, ExecutionGate::HostRiskAccepted, None)
                 }
                 AttachScope::OwnedSandbox {
-                    owner_session_id, ..
+                    process,
+                    ownership_lease,
                 } => {
-                    self.require_session(*owner_session_id)?;
-                    (None, ExecutionGate::InheritedSandbox)
+                    let binding = self.consume_sandbox_ownership_lease(
+                        ownership_lease,
+                        process,
+                        target.mode,
+                    )?;
+                    (None, ExecutionGate::InheritedSandbox, Some(binding))
                 }
             },
             DebugTargetRequest::Dump(_) | DebugTargetRequest::Offline(_) => {
-                (None, ExecutionGate::NotApplicable)
+                (None, ExecutionGate::NotApplicable, None)
             }
         };
         let next = self.next_state_token()?;
         self.execution_gate = gate;
         self.sandbox = sandbox.take();
+        self.inherited_sandbox = inherited_sandbox;
         self.target = Some(target.clone());
+        // One target consumes the session. Drop every unused authority so no
+        // later transition or accidental API reuse can resurrect it.
+        self.host_risk_leases.clear();
+        self.sandbox_ownership_leases.clear();
         self.transition_to(SessionState::Opening {
             token: next,
             target,
@@ -449,11 +542,42 @@ impl SessionMachine {
         }
     }
 
-    fn require_acknowledgement(
-        &self,
-        acknowledgement: &RiskAcknowledgementId,
+    fn consume_host_risk_lease(
+        &mut self,
+        id: &HostRiskLeaseId,
+        expected: &HostRiskOperation,
     ) -> Result<(), SessionMachineError> {
-        self.require_session(acknowledgement.session_id())
+        let lease = self
+            .host_risk_leases
+            .get_mut(id)
+            .and_then(Option::take)
+            .ok_or(SessionMachineError::HostRiskLeaseUnavailable)?;
+        if lease.session_id() != self.session_id || lease.operation() != expected {
+            return Err(SessionMachineError::HostRiskLeaseMismatch);
+        }
+        Ok(())
+    }
+
+    fn consume_sandbox_ownership_lease(
+        &mut self,
+        id: &SandboxOwnershipLeaseId,
+        process: &crate::protocol::ProcessIdentity,
+        mode: AttachMode,
+    ) -> Result<SandboxOwnershipBinding, SessionMachineError> {
+        let lease = self
+            .sandbox_ownership_leases
+            .get_mut(id)
+            .and_then(Option::take)
+            .ok_or(SessionMachineError::SandboxOwnershipLeaseUnavailable)?;
+        let binding = lease.binding();
+        if binding.session_id() != self.session_id
+            || binding.provisioning_epoch() != &self.provisioning_epoch
+            || binding.process() != process
+            || binding.mode() != mode
+        {
+            return Err(SessionMachineError::SandboxOwnershipLeaseMismatch);
+        }
+        Ok(lease.into_binding())
     }
 
     fn require_open_target(
@@ -544,8 +668,22 @@ pub enum SessionMachineError {
         from: SessionStateKind,
         action: &'static str,
     },
-    #[error("sandbox policy, acknowledgement, or inherited owner uses another session")]
+    #[error("sandbox policy or trusted authorization lease uses another session")]
     SessionBindingMismatch,
+    #[error("authorization lease id is already registered")]
+    DuplicateAuthorizationLease,
+    #[error("session has reached its registered authorization lease limit")]
+    TooManyAuthorizationLeases,
+    #[error("authorization lease belongs to another provisioning epoch")]
+    ProvisioningEpochMismatch,
+    #[error("host-risk lease is unknown, unregistered, or already consumed")]
+    HostRiskLeaseUnavailable,
+    #[error("host-risk lease does not authorize this exact operation and target")]
+    HostRiskLeaseMismatch,
+    #[error("sandbox-ownership lease is unknown, unregistered, or already consumed")]
+    SandboxOwnershipLeaseUnavailable,
+    #[error("sandbox-ownership lease does not bind this exact process and provisioning instance")]
+    SandboxOwnershipLeaseMismatch,
     #[error("sandbox target is not awaiting creation-time attestation")]
     SandboxNotPending,
     #[error("sandbox attestation has not been accepted")]
@@ -573,12 +711,13 @@ mod tests {
 
     use super::*;
     use crate::protocol::{
-        DebugTargetRequest, LaunchEnvironment, LaunchTarget, MemoryAddress, ProtocolVersion,
+        AttachTarget, DebugTargetRequest, LaunchEnvironment, LaunchTarget, MemoryAddress,
+        ProcessIdentity, ProcessStartKey, ProtocolVersion,
     };
     use crate::sandbox::{
         ChildProcessProfile, CleanupOutcome, CleanupReceiptId, DynamicCodeProfile,
-        IsolationBoundary, PolicyDigest, ProcessMitigationProfile, RiskAcknowledgementId,
-        SandboxGuarantee, SandboxNetworkMode, SandboxPolicy, SandboxProviderSelection,
+        IsolationBoundary, PolicyDigest, ProcessMitigationProfile, SandboxGuarantee,
+        SandboxNetworkMode, SandboxPolicy, SandboxPolicyApprovalId, SandboxProviderSelection,
         SandboxResourceLimits, Win32kProfile,
     };
 
@@ -590,8 +729,12 @@ mod tests {
         HelperBuildId::new("debugger-host-1.0.0+test").expect("helper build")
     }
 
+    fn provisioning_epoch() -> ProvisioningEpoch {
+        ProvisioningEpoch::new("a".repeat(64)).expect("provisioning epoch")
+    }
+
     fn machine() -> SessionMachine {
-        SessionMachine::new(session_id(), helper_build())
+        SessionMachine::new(session_id(), provisioning_epoch(), helper_build())
     }
 
     fn local_guarantees() -> BTreeSet<SandboxGuarantee> {
@@ -613,7 +756,7 @@ mod tests {
         let session_id = session_id();
         SandboxPolicy {
             session_id,
-            risk_acknowledgement: RiskAcknowledgementId::new(session_id, "sandbox-ack")
+            policy_approval: SandboxPolicyApprovalId::new(session_id, "sandbox-ack")
                 .expect("acknowledgement"),
             provider: SandboxProviderSelection::LocalAppContainer,
             required_boundary: IsolationBoundary::UserMode,
@@ -648,17 +791,38 @@ mod tests {
         })
     }
 
-    fn host_target(binary_id: BinaryId) -> DebugTargetRequest {
+    fn host_risk_lease_id(fill: char) -> HostRiskLeaseId {
+        HostRiskLeaseId::new(fill.to_string().repeat(64)).expect("host-risk lease id")
+    }
+
+    fn ownership_lease_id(fill: char) -> SandboxOwnershipLeaseId {
+        SandboxOwnershipLeaseId::new(fill.to_string().repeat(64))
+            .expect("sandbox-ownership lease id")
+    }
+
+    fn process_identity(process_id: u32, start_key: u64, image: &[u8]) -> ProcessIdentity {
+        ProcessIdentity {
+            process_id: ProcessId::new(process_id).expect("process id"),
+            start_key: ProcessStartKey::new(start_key).expect("process start key"),
+            binary_id: BinaryId::digest(image),
+        }
+    }
+
+    fn host_target(binary_id: BinaryId, risk_lease: HostRiskLeaseId) -> DebugTargetRequest {
         DebugTargetRequest::Launch(LaunchTarget {
             binary_id,
             executable: PathBuf::from("sample.exe"),
             arguments: Vec::new(),
             working_directory: None,
-            environment: LaunchEnvironment::Host {
-                risk_acknowledgement: RiskAcknowledgementId::new(session_id(), "host-ack")
-                    .expect("acknowledgement"),
-            },
+            environment: LaunchEnvironment::Host { risk_lease },
             stop_before_entry: true,
+        })
+    }
+
+    fn attach_target(scope: AttachScope) -> DebugTargetRequest {
+        DebugTargetRequest::Attach(AttachTarget {
+            scope,
+            mode: AttachMode::Debug,
         })
     }
 
@@ -676,6 +840,7 @@ mod tests {
         SandboxAttestation {
             binary_id: expected.binary_id.clone(),
             session_id: expected.session_id,
+            provisioning_epoch: expected.provisioning_epoch.clone(),
             policy_digest: expected.policy_digest.clone(),
             provider: expected.provider.clone(),
             boundary: expected.boundary,
@@ -690,6 +855,7 @@ mod tests {
         SandboxCleanupReceipt {
             receipt_id: CleanupReceiptId::new("cleanup-11").expect("receipt id"),
             session_id: expected.session_id,
+            provisioning_epoch: expected.provisioning_epoch.clone(),
             provider: expected.provider.clone(),
             policy_digest: expected.policy_digest.clone(),
             outcome: CleanupOutcome::Complete,
@@ -959,15 +1125,25 @@ mod tests {
     }
 
     #[test]
-    fn host_risk_override_is_session_bound_but_needs_no_sandbox_attestation() {
+    fn exact_registered_host_risk_lease_allows_only_its_launch_target() {
         let binary = BinaryId::digest(b"host target");
         let mut machine = machine();
+        let risk_lease = host_risk_lease_id('b');
+        machine
+            .register_host_risk_lease(HostRiskLease::new(
+                risk_lease.clone(),
+                session_id(),
+                HostRiskOperation::Launch {
+                    binary_id: binary.clone(),
+                },
+            ))
+            .expect("register host-risk lease");
         let initial = machine.state().state_token();
         machine
             .accept_command(&command(
                 1,
                 initial,
-                DebugCommand::Open(host_target(binary.clone())),
+                DebugCommand::Open(host_target(binary.clone(), risk_lease)),
             ))
             .expect("host open");
         assert_eq!(machine.target_binary_id(), Some(&binary));
@@ -975,6 +1151,287 @@ mod tests {
         machine
             .mark_stopped(StopReason::Initial, ThreadId::new(7).expect("thread id"))
             .expect("host initial stop");
+    }
+
+    #[test]
+    fn cross_target_host_risk_attempt_consumes_the_one_use_lease() {
+        let approved = BinaryId::digest(b"approved host target");
+        let different = BinaryId::digest(b"different host target");
+        let lease_id = host_risk_lease_id('c');
+        let mut machine = machine();
+        machine
+            .register_host_risk_lease(HostRiskLease::new(
+                lease_id.clone(),
+                session_id(),
+                HostRiskOperation::Launch {
+                    binary_id: approved.clone(),
+                },
+            ))
+            .expect("register host-risk lease");
+
+        let initial = machine.state().state_token();
+        assert_eq!(
+            machine.accept_command(&command(
+                1,
+                initial,
+                DebugCommand::Open(host_target(different, lease_id.clone())),
+            )),
+            Err(SessionMachineError::HostRiskLeaseMismatch)
+        );
+        assert_eq!(machine.state().kind(), SessionStateKind::Idle);
+        assert_eq!(
+            machine.accept_command(&command(
+                2,
+                initial,
+                DebugCommand::Open(host_target(approved, lease_id)),
+            )),
+            Err(SessionMachineError::HostRiskLeaseUnavailable)
+        );
+        assert_eq!(
+            machine.register_host_risk_lease(HostRiskLease::new(
+                host_risk_lease_id('c'),
+                session_id(),
+                HostRiskOperation::Launch {
+                    binary_id: BinaryId::digest(b"approved host target"),
+                },
+            )),
+            Err(SessionMachineError::DuplicateAuthorizationLease)
+        );
+    }
+
+    #[test]
+    fn attach_risk_lease_binds_pid_start_key_image_identity_and_mode() {
+        let approved = process_identity(4242, 10, b"approved attach image");
+        let reused_pid = process_identity(4242, 11, b"approved attach image");
+        let lease_id = host_risk_lease_id('d');
+        let mut machine = machine();
+        machine
+            .register_host_risk_lease(HostRiskLease::new(
+                lease_id.clone(),
+                session_id(),
+                HostRiskOperation::Attach {
+                    process: approved.clone(),
+                    mode: AttachMode::Debug,
+                },
+            ))
+            .expect("register attach lease");
+        let initial = machine.state().state_token();
+        assert_eq!(
+            machine.accept_command(&command(
+                1,
+                initial,
+                DebugCommand::Open(attach_target(AttachScope::Host {
+                    process: reused_pid,
+                    risk_lease: lease_id.clone(),
+                })),
+            )),
+            Err(SessionMachineError::HostRiskLeaseMismatch)
+        );
+        assert_eq!(
+            machine.accept_command(&command(
+                2,
+                initial,
+                DebugCommand::Open(attach_target(AttachScope::Host {
+                    process: approved.clone(),
+                    risk_lease: lease_id,
+                })),
+            )),
+            Err(SessionMachineError::HostRiskLeaseUnavailable)
+        );
+
+        let mode_lease = host_risk_lease_id('4');
+        let mut mode_machine =
+            SessionMachine::new(session_id(), provisioning_epoch(), helper_build());
+        mode_machine
+            .register_host_risk_lease(HostRiskLease::new(
+                mode_lease.clone(),
+                session_id(),
+                HostRiskOperation::Attach {
+                    process: approved.clone(),
+                    mode: AttachMode::Debug,
+                },
+            ))
+            .expect("register mode-bound attach lease");
+        let initial = mode_machine.state().state_token();
+        assert_eq!(
+            mode_machine.accept_command(&command(
+                1,
+                initial,
+                DebugCommand::Open(DebugTargetRequest::Attach(AttachTarget {
+                    scope: AttachScope::Host {
+                        process: approved.clone(),
+                        risk_lease: mode_lease.clone(),
+                    },
+                    mode: AttachMode::ObserveReadOnly,
+                })),
+            )),
+            Err(SessionMachineError::HostRiskLeaseMismatch)
+        );
+        assert_eq!(
+            mode_machine.accept_command(&command(
+                2,
+                initial,
+                DebugCommand::Open(attach_target(AttachScope::Host {
+                    process: approved,
+                    risk_lease: mode_lease,
+                })),
+            )),
+            Err(SessionMachineError::HostRiskLeaseUnavailable)
+        );
+    }
+
+    #[test]
+    fn sandbox_ownership_requires_registered_exact_one_use_binding() {
+        let process = process_identity(5150, 22, b"owned sandbox image");
+        let reused_pid = process_identity(5150, 23, b"owned sandbox image");
+        let binding = SandboxOwnershipBinding::new(
+            session_id(),
+            process.clone(),
+            AttachMode::Debug,
+            SandboxProviderSelection::LocalAppContainer,
+            PolicyDigest::new("b".repeat(64)).expect("policy digest"),
+            provisioning_epoch(),
+        );
+        let first_id = ownership_lease_id('e');
+        let mut machine = machine();
+
+        let initial = machine.state().state_token();
+        assert_eq!(
+            machine.accept_command(&command(
+                1,
+                initial,
+                DebugCommand::Open(attach_target(AttachScope::OwnedSandbox {
+                    process: process.clone(),
+                    ownership_lease: ownership_lease_id('f'),
+                })),
+            )),
+            Err(SessionMachineError::SandboxOwnershipLeaseUnavailable)
+        );
+
+        machine
+            .register_sandbox_ownership_lease(SandboxOwnershipLease::new(
+                first_id.clone(),
+                binding.clone(),
+            ))
+            .expect("register ownership lease");
+        assert_eq!(
+            machine.accept_command(&command(
+                2,
+                initial,
+                DebugCommand::Open(attach_target(AttachScope::OwnedSandbox {
+                    process: reused_pid,
+                    ownership_lease: first_id.clone(),
+                })),
+            )),
+            Err(SessionMachineError::SandboxOwnershipLeaseMismatch)
+        );
+        assert_eq!(
+            machine.accept_command(&command(
+                3,
+                initial,
+                DebugCommand::Open(attach_target(AttachScope::OwnedSandbox {
+                    process: process.clone(),
+                    ownership_lease: first_id,
+                })),
+            )),
+            Err(SessionMachineError::SandboxOwnershipLeaseUnavailable)
+        );
+        assert_eq!(
+            machine.register_sandbox_ownership_lease(SandboxOwnershipLease::new(
+                ownership_lease_id('e'),
+                binding.clone(),
+            )),
+            Err(SessionMachineError::DuplicateAuthorizationLease)
+        );
+
+        let mode_id = ownership_lease_id('5');
+        machine
+            .register_sandbox_ownership_lease(SandboxOwnershipLease::new(
+                mode_id.clone(),
+                binding.clone(),
+            ))
+            .expect("register mode-bound ownership lease");
+        assert_eq!(
+            machine.accept_command(&command(
+                4,
+                initial,
+                DebugCommand::Open(DebugTargetRequest::Attach(AttachTarget {
+                    scope: AttachScope::OwnedSandbox {
+                        process: process.clone(),
+                        ownership_lease: mode_id.clone(),
+                    },
+                    mode: AttachMode::ObserveReadOnly,
+                })),
+            )),
+            Err(SessionMachineError::SandboxOwnershipLeaseMismatch)
+        );
+        assert_eq!(
+            machine.accept_command(&command(
+                5,
+                initial,
+                DebugCommand::Open(attach_target(AttachScope::OwnedSandbox {
+                    process: process.clone(),
+                    ownership_lease: mode_id,
+                })),
+            )),
+            Err(SessionMachineError::SandboxOwnershipLeaseUnavailable)
+        );
+
+        let exact_id = ownership_lease_id('1');
+        machine
+            .register_sandbox_ownership_lease(SandboxOwnershipLease::new(
+                exact_id.clone(),
+                binding.clone(),
+            ))
+            .expect("register replacement ownership lease");
+        machine
+            .accept_command(&command(
+                6,
+                initial,
+                DebugCommand::Open(attach_target(AttachScope::OwnedSandbox {
+                    process,
+                    ownership_lease: exact_id,
+                })),
+            ))
+            .expect("exact owned-sandbox attach");
+        assert_eq!(machine.inherited_sandbox(), Some(&binding));
+    }
+
+    #[test]
+    fn ownership_registration_rejects_wrong_session_or_provisioning_epoch() {
+        let process = process_identity(6000, 30, b"owned image");
+        let mut machine = machine();
+        let wrong_session = SandboxOwnershipBinding::new(
+            SessionId::new(99).expect("other session"),
+            process.clone(),
+            AttachMode::Debug,
+            SandboxProviderSelection::LocalAppContainer,
+            PolicyDigest::new("c".repeat(64)).expect("policy digest"),
+            provisioning_epoch(),
+        );
+        assert_eq!(
+            machine.register_sandbox_ownership_lease(SandboxOwnershipLease::new(
+                ownership_lease_id('2'),
+                wrong_session,
+            )),
+            Err(SessionMachineError::SessionBindingMismatch)
+        );
+
+        let wrong_epoch = SandboxOwnershipBinding::new(
+            session_id(),
+            process,
+            AttachMode::Debug,
+            SandboxProviderSelection::LocalAppContainer,
+            PolicyDigest::new("d".repeat(64)).expect("policy digest"),
+            ProvisioningEpoch::new("f".repeat(64)).expect("different epoch"),
+        );
+        assert_eq!(
+            machine.register_sandbox_ownership_lease(SandboxOwnershipLease::new(
+                ownership_lease_id('3'),
+                wrong_epoch,
+            )),
+            Err(SessionMachineError::ProvisioningEpochMismatch)
+        );
     }
 
     #[test]
@@ -988,8 +1445,8 @@ mod tests {
             unreachable!("sandbox launch")
         };
         policy.session_id = SessionId::new(99).expect("other session");
-        policy.risk_acknowledgement =
-            RiskAcknowledgementId::new(policy.session_id, "other-ack").expect("acknowledgement");
+        policy.policy_approval =
+            SandboxPolicyApprovalId::new(policy.session_id, "other-ack").expect("acknowledgement");
 
         let mut machine = machine();
         let initial = machine.state().state_token();
