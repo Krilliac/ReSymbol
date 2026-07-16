@@ -58,6 +58,10 @@ mod fixture {
             OsString::from("with space"),
             OsString::from("quote\"inside"),
             OsString::from(r"trailing\\"),
+            OsString::from("space trailing\\"),
+            OsString::from(r#"space trailing\\\\"#),
+            OsString::from(r#"slashes\\\"quote"#),
+            OsString::from(r#"left""right"#),
             OsString::from("Unicode-雪-λ"),
         ];
         if arguments != expected {

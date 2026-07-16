@@ -503,10 +503,14 @@ completes, a deadline expires, a stdout/stderr capture worker fails, or the runt
 This is a lifecycle boundary, not an authority boundary. Linux `waitid(WNOWAIT)` and a macOS kqueue
 `NOTE_EXIT` observer keep an exited group leader unreaped until the group is terminated, preventing
 process-group identifier reuse during normal cleanup. Windows creates the child atomically inside a
-preconfigured kill-on-close Job through a narrow `STARTUPINFOEX` native boundary, allows inheritance
-of only the exact standard-stream handles, verifies Job membership, and has no post-spawn assignment
-fallback. A hostile POSIX plugin/helper or descendant can deliberately leave its process group or
-session and escape later group termination.
+preconfigured Job through a narrow `STARTUPINFOEX` native boundary, explicitly terminates that Job
+during normal cleanup, retains kill-on-close as an abrupt-parent fallback when no out-of-scope
+process holds a duplicate, allows inheritance of only the exact standard-stream handles, verifies
+Job membership, and has no post-spawn assignment fallback. This does not defend against an active
+same-account process with sufficient process/handle rights: it can duplicate or remotely close
+ReSymbol's handles and terminate or tamper with the parent. That actor requires a separate OS
+authority boundary. A hostile POSIX plugin/helper or descendant can deliberately leave its process
+group or session and escape later group termination.
 
 Process separation contains ordinary crashes, not authority. External, native, and managed child
 code still has the ambient filesystem, network, credential, and process access of the account

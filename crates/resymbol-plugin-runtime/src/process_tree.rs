@@ -471,7 +471,9 @@ impl ContainedChild {
 
         #[cfg(windows)]
         let containment_result = {
-            // Closing the final job handle applies JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.
+            // Explicit Job termination is authoritative during ordinary cleanup;
+            // closing ReSymbol's handle retains KILL_ON_JOB_CLOSE as the crash
+            // fallback when no out-of-scope process holds a duplicate.
             self.child.terminate_tree()
         };
 
@@ -665,7 +667,7 @@ fn terminate_direct_child(child: &mut PlatformChild) -> io::Result<()> {
             ) || cfg!(windows) && error.kind() == io::ErrorKind::PermissionDenied =>
         {
             // Windows TerminateProcess reports access denied when the process
-            // has already finished; a child spawned through Command retains a
+            // has already finished; the CreateProcessW child retains a
             // terminate-capable handle for its lifetime.
             Ok(())
         }
