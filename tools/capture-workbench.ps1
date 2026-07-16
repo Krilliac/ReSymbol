@@ -2,10 +2,17 @@
 param(
     [string]$Binary,
     [string]$OutputDirectory,
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+    [ValidateRange(10, 600)]
+    [int]$CaptureTimeoutSeconds = 90
 )
 
 $ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+
+$captureWidth = 1440
+$captureHeight = 900
+$captureTabs = @('overview', 'functions', 'graph', 'address-space')
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 if (-not $Binary) {
@@ -36,31 +43,66 @@ try {
         throw "Screenshot executable does not exist: $executable"
     }
 
+    # Eframe/winit is DPI-aware. A non-100% desktop scale changes the physical framebuffer, so the
+    # exact dimension check below is the authoritative DPI gate instead of silently resampling.
+    Add-Type -AssemblyName System.Drawing
+    $captures = [Collections.Generic.List[object]]::new()
+    $manifestPath = Join-Path $OutputDirectory 'capture-manifest.json'
+    Remove-Item -LiteralPath $manifestPath -Force -ErrorAction SilentlyContinue
+
     $priorScreenshot = $env:EFRAME_SCREENSHOT_TO
     $priorTab = $env:RESYMBOL_WORKBENCH_SCREENSHOT_TAB
     $priorZoom = $env:RESYMBOL_WORKBENCH_SCREENSHOT_ZOOM
     try {
         $env:RESYMBOL_WORKBENCH_SCREENSHOT_ZOOM = '1'
-        foreach ($tab in @('overview', 'functions', 'graph', 'address-space')) {
+        foreach ($tab in $captureTabs) {
             $destination = Join-Path $OutputDirectory "workbench-$tab.png"
             Remove-Item -LiteralPath $destination -Force -ErrorAction SilentlyContinue
             $env:EFRAME_SCREENSHOT_TO = $destination
             $env:RESYMBOL_WORKBENCH_SCREENSHOT_TAB = $tab
 
-            & $executable $Binary
-            if ($LASTEXITCODE -ne 0) {
-                throw "Screenshot capture for '$tab' failed with exit code $LASTEXITCODE"
+            $quotedBinary = '"{0}"' -f $Binary
+            $startParameters = @{
+                FilePath = $executable
+                ArgumentList = $quotedBinary
+                WorkingDirectory = $repoRoot
+                PassThru = $true
+            }
+            $process = Start-Process @startParameters
+            try {
+                if (-not $process.WaitForExit($CaptureTimeoutSeconds * 1000)) {
+                    Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+                    throw "Screenshot capture for '$tab' exceeded ${CaptureTimeoutSeconds}s"
+                }
+                if ($process.ExitCode -ne 0) {
+                    throw "Screenshot capture for '$tab' failed with exit code $($process.ExitCode)"
+                }
+            }
+            finally {
+                $process.Dispose()
             }
             if (-not (Test-Path -LiteralPath $destination -PathType Leaf)) {
                 throw "Screenshot capture for '$tab' did not create $destination"
             }
 
-            Add-Type -AssemblyName System.Drawing
             $image = [Drawing.Image]::FromFile($destination)
             try {
-                if ($image.Width -ne 1440 -or $image.Height -ne 900) {
-                    throw "Screenshot '$tab' is $($image.Width)x$($image.Height), expected 1440x900"
+                if ($image.RawFormat.Guid -ne [Drawing.Imaging.ImageFormat]::Png.Guid) {
+                    throw "Screenshot '$tab' is not a PNG image"
                 }
+                if ($image.Width -ne $captureWidth -or $image.Height -ne $captureHeight) {
+                    throw "Screenshot '$tab' is $($image.Width)x$($image.Height), expected ${captureWidth}x${captureHeight}. Ensure the capture desktop uses 100% DPI scaling."
+                }
+
+                $file = Get-Item -LiteralPath $destination
+                $captures.Add([ordered]@{
+                    file = $file.Name
+                    view = $tab
+                    width = $image.Width
+                    height = $image.Height
+                    bytes = $file.Length
+                    sha256 = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant()
+                })
             }
             finally {
                 $image.Dispose()
@@ -73,6 +115,31 @@ try {
         $env:RESYMBOL_WORKBENCH_SCREENSHOT_TAB = $priorTab
         $env:RESYMBOL_WORKBENCH_SCREENSHOT_ZOOM = $priorZoom
     }
+
+    if ($captures.Count -ne $captureTabs.Count) {
+        throw "Captured $($captures.Count) views, expected $($captureTabs.Count)"
+    }
+
+    $manifest = [ordered]@{
+        schema_version = 1
+        fixture = [ordered]@{
+            file = [IO.Path]::GetFileName($Binary)
+            sha256 = (Get-FileHash -LiteralPath $Binary -Algorithm SHA256).Hash.ToLowerInvariant()
+        }
+        viewport = [ordered]@{
+            width = $captureWidth
+            height = $captureHeight
+            ui_zoom = 1
+        }
+        captures = $captures
+    }
+    $manifestJson = $manifest | ConvertTo-Json -Depth 5
+    [IO.File]::WriteAllText(
+        $manifestPath,
+        "$manifestJson`n",
+        [Text.UTF8Encoding]::new($false)
+    )
+    Write-Host "Wrote capture manifest $manifestPath"
 }
 finally {
     Pop-Location

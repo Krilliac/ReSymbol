@@ -1,0 +1,86 @@
+name: GUI visual captures
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/resymbol-analysis/**"
+      - "crates/resymbol-app/**"
+      - "crates/resymbol-core/**"
+      - "crates/resymbol-debugger/**"
+      - "crates/resymbol-export/**"
+      - "crates/resymbol-package/**"
+      - "crates/resymbol-workbench/**"
+      - "fixtures/pe-x64-msvc/**"
+      - "tools/capture-workbench.ps1"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/gui-visual.yml"
+  pull_request:
+    paths:
+      - "crates/resymbol-analysis/**"
+      - "crates/resymbol-app/**"
+      - "crates/resymbol-core/**"
+      - "crates/resymbol-debugger/**"
+      - "crates/resymbol-export/**"
+      - "crates/resymbol-package/**"
+      - "crates/resymbol-workbench/**"
+      - "fixtures/pe-x64-msvc/**"
+      - "tools/capture-workbench.ps1"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/gui-visual.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gui-visual-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  capture:
+    name: Deterministic Windows workbench views
+    runs-on: windows-2022
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Select pinned Rust toolchain
+        run: rustup show active-toolchain
+
+      - name: Build screenshot workbench
+        run: >-
+          cargo build --locked
+          -p resymbol-workbench
+          --features screenshot
+          --bin resymbol-workbench
+
+      - name: Capture and validate fixture views
+        shell: pwsh
+        run: >-
+          ./tools/capture-workbench.ps1
+          -SkipBuild
+          -OutputDirectory "${{ runner.temp }}/workbench-captures"
+
+      # These are review artifacts, not approved pixel baselines. The capture script validates PNG
+      # format, dimensions, and completeness but intentionally does not claim rendering equivalence.
+      - name: Upload workbench captures
+        uses: actions/upload-artifact@v4
+        with:
+          name: workbench-visual-captures-${{ github.sha }}
+          path: ${{ runner.temp }}/workbench-captures
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
