@@ -2137,11 +2137,21 @@ impl WorkbenchApp {
                                                 .color(colors.secondary_text),
                                         );
                                     }
-                                    _ if region.zero_fill_size() != 0 => {
-                                        ui.monospace(format!(
-                                            "0x{:X} zero-fill",
-                                            region.zero_fill_size()
-                                        ));
+                                    _ if region.zero_fill_size() != 0
+                                        || region.mapped_padding_size() != 0 =>
+                                    {
+                                        let zero_fill = region.zero_fill_size();
+                                        let mapped_padding = region.mapped_padding_size();
+                                        let detail = match (zero_fill, mapped_padding) {
+                                            (0, padding) => {
+                                                format!("0x{padding:X} mapped padding")
+                                            }
+                                            (zeroes, 0) => format!("0x{zeroes:X} zero-fill"),
+                                            (zeroes, padding) => format!(
+                                                "0x{zeroes:X} zero-fill + 0x{padding:X} padding"
+                                            ),
+                                        };
+                                        ui.monospace(detail);
                                     }
                                     _ => {
                                         ui.label(
