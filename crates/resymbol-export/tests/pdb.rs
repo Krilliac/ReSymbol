@@ -69,9 +69,9 @@ fn exact_rsds_pe() -> Vec<u8> {
 
     let rdata = SECTION_OFFSET + 40;
     bytes[rdata..rdata + 8].copy_from_slice(b".rdata\0\0");
-    // The global at offset 0x10 deliberately sits at VirtualSize's exclusive
-    // end but inside SizeOfRawData, exercising the canonical maximum extent.
-    put_u32(&mut bytes, rdata + 8, 0x10);
+    // The debug directory and complete RSDS record are initialized bytes inside
+    // VirtualSize. The remaining SizeOfRawData suffix is file-alignment padding.
+    put_u32(&mut bytes, rdata + 8, 0x1c0);
     put_u32(&mut bytes, rdata + 12, 0x2000);
     put_u32(&mut bytes, rdata + 16, 0x200);
     put_u32(&mut bytes, rdata + 20, 0x400);

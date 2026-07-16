@@ -1340,7 +1340,7 @@ fn legacy_range_is_backed_executable(analysis: &PeAnalysis, rva: u32, size: u32)
     };
     analysis.sections.iter().any(|section| {
         let start = u64::from(section.virtual_address);
-        let backed_end = start.saturating_add(u64::from(section.raw_data_size));
+        let backed_end = start.saturating_add(u64::from(section.file_backed_size()));
         section.characteristics & IMAGE_SCN_MEM_EXECUTE != 0
             && u64::from(rva) >= start
             && end <= backed_end
@@ -8346,6 +8346,23 @@ entrypoint = "Plugin.dll"
         analysis.sections[0].characteristics &= !IMAGE_SCN_MEM_EXECUTE;
 
         assert!(!legacy_initial_thunk_seeds(analysis).contains(&0x1040));
+    }
+
+    #[test]
+    fn legacy_backing_checks_exclude_raw_alignment_padding() {
+        let mut base_analysis =
+            analyze_bytes(&pe_code_recovery_fixture()).expect("analyze PE fixture");
+        let BinaryAnalysis::Pe(analysis) = &mut base_analysis else {
+            panic!("PE analysis expected");
+        };
+        analysis.sections[0].virtual_size = 0x20;
+
+        assert!(legacy_range_is_backed_executable(analysis, 0x101f, 1));
+        assert!(!legacy_range_is_backed_executable(analysis, 0x1020, 1));
+
+        analysis.sections[0].virtual_size = 0;
+        assert!(legacy_range_is_backed_executable(analysis, 0x15ff, 1));
+        assert!(!legacy_range_is_backed_executable(analysis, 0x1600, 1));
     }
 
     #[test]

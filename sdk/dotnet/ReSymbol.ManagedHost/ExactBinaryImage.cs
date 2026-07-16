@@ -77,7 +77,7 @@ internal sealed class ExactBinaryImage
         var section = image.Sections.FirstOrDefault(section =>
         {
             var start = (ulong)section.VirtualAddress;
-            var size = (ulong)Math.Max(section.VirtualSize, section.RawDataSize);
+            var size = (ulong)section.LoadedSize;
             return rva >= start && rva < start + size;
         });
         if (section is null)
@@ -85,12 +85,12 @@ internal sealed class ExactBinaryImage
             return ValueTask.FromResult(0);
         }
         var delta = rva - section.VirtualAddress;
-        if (delta >= section.RawDataSize)
+        if (delta >= section.FileBackedSize)
         {
             return ValueTask.FromResult(0);
         }
         var fileOffset = checked((int)((ulong)section.RawDataOffset + delta));
-        var available = checked((int)((ulong)section.RawDataSize - delta));
+        var available = checked((int)((ulong)section.FileBackedSize - delta));
         return ValueTask.FromResult(CopyAvailable(fileOffset, available, destination.Span));
     }
 

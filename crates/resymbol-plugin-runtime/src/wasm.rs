@@ -194,6 +194,25 @@ pub struct WasmPeImageSection {
     pub raw_data_size: u32,
 }
 
+impl WasmPeImageSection {
+    const fn loaded_size(&self) -> u32 {
+        if self.virtual_size == 0 {
+            self.raw_data_size
+        } else {
+            self.virtual_size
+        }
+    }
+
+    const fn file_backed_size(&self) -> u32 {
+        let loaded_size = self.loaded_size();
+        if self.raw_data_size < loaded_size {
+            self.raw_data_size
+        } else {
+            loaded_size
+        }
+    }
+}
+
 /// Immutable exact PE bytes and their validated file-to-image mapping.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WasmPeImage {
@@ -286,7 +305,7 @@ impl WasmPeImage {
 
         let Some(section) = self.sections.iter().find(|section| {
             let start = u64::from(section.virtual_address);
-            let size = u64::from(section.virtual_size.max(section.raw_data_size));
+            let size = u64::from(section.loaded_size());
             (start..start.saturating_add(size)).contains(&u64::from(rva))
         }) else {
             return Ok(Vec::new());
@@ -294,14 +313,15 @@ impl WasmPeImage {
         let delta = rva
             .checked_sub(section.virtual_address)
             .ok_or(BinaryReadFailure::OutsideImage)?;
-        if delta >= section.raw_data_size {
+        let file_backed_size = section.file_backed_size();
+        if delta >= file_backed_size {
             return Ok(Vec::new());
         }
         let start = u64::from(section.raw_data_offset)
             .checked_add(u64::from(delta))
             .and_then(|value| usize::try_from(value).ok())
             .ok_or(BinaryReadFailure::OutsideImage)?;
-        let available = usize::try_from(section.raw_data_size - delta)
+        let available = usize::try_from(file_backed_size - delta)
             .map_err(|_| BinaryReadFailure::OutsideImage)?;
         Ok(copy_available(&self.bytes, start, available, length))
     }
@@ -1536,7 +1556,7 @@ fn validate_parsed_section(
     index: usize,
     section: &WasmPeImageSection,
 ) -> Result<(), PluginRuntimeError> {
-    let virtual_size = section.virtual_size.max(section.raw_data_size);
+    let virtual_size = section.loaded_size();
     let virtual_end = section
         .virtual_address
         .checked_add(virtual_size)
@@ -1570,9 +1590,9 @@ fn validate_section_overlaps(sections: &[WasmPeImageSection]) -> Result<(), Plug
             let right = &sections[second];
             if ranges_overlap(
                 left.virtual_address,
-                left.virtual_size.max(left.raw_data_size),
+                left.loaded_size(),
                 right.virtual_address,
-                right.virtual_size.max(right.raw_data_size),
+                right.loaded_size(),
             )? {
                 return Err(invalid_context(format!(
                     "PE sections {first} and {second} overlap in virtual memory"
@@ -1656,4 +1676,66 @@ fn checked_mul(
 ) -> Result<usize, PluginRuntimeError> {
     left.checked_mul(right)
         .ok_or_else(|| invalid_context(format!("PE {field} overflows")))
+}
+
+#[cfg(test)]
+mod pe_image_tests {
+    use super::*;
+
+    fn section(
+        virtual_address: u32,
+        virtual_size: u32,
+        raw_data_offset: u32,
+    ) -> WasmPeImageSection {
+        WasmPeImageSection {
+            virtual_address,
+            virtual_size,
+            raw_data_offset,
+            raw_data_size: 0x200,
+        }
+    }
+
+    #[test]
+    fn rva_reads_exclude_raw_padding_and_keep_zero_virtual_size_fallback() {
+        let bytes = (0_u8..=255).cycle().take(0x800).collect::<Vec<_>>();
+        let mut image = WasmPeImage {
+            identity: BinaryIdentity {
+                id: BinaryId::digest(&bytes),
+                size: bytes.len() as u64,
+                format: BinaryFormat::Pe,
+                architecture: "x86_64".to_owned(),
+                image_base: 0x0001_4000_0000,
+            },
+            size_of_headers: 0x200,
+            size_of_image: 0x2000,
+            sections: vec![section(0x1000, 0x100, 0x200)],
+            bytes: Arc::from(bytes),
+        };
+
+        assert_eq!(image.read_rva(0x10ff, 2).unwrap().len(), 1);
+        assert!(image.read_rva(0x1100, 1).unwrap().is_empty());
+
+        image.sections[0].virtual_size = 0;
+        assert_eq!(image.read_rva(0x11ff, 2).unwrap().len(), 1);
+        assert!(image.read_rva(0x1200, 1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn overlap_validation_uses_the_loaded_extent() {
+        let mut sections = vec![
+            WasmPeImageSection {
+                raw_data_size: 0x1200,
+                ..section(0x1000, 0x100, 0x200)
+            },
+            WasmPeImageSection {
+                raw_data_size: 0x1200,
+                ..section(0x2000, 0x100, 0x1400)
+            },
+        ];
+        validate_section_overlaps(&sections)
+            .expect("raw alignment padding does not overlap loaded sections");
+
+        sections[0].virtual_size = 0;
+        assert!(validate_section_overlaps(&sections).is_err());
+    }
 }

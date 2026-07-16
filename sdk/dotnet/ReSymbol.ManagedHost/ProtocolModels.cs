@@ -61,7 +61,12 @@ internal sealed record PeImageSection(
     uint VirtualAddress,
     uint VirtualSize,
     uint RawDataOffset,
-    uint RawDataSize);
+    uint RawDataSize)
+{
+    internal uint LoadedSize => VirtualSize == 0 ? RawDataSize : VirtualSize;
+
+    internal uint FileBackedSize => Math.Min(RawDataSize, LoadedSize);
+}
 
 internal sealed record PeImageMap(
     uint SizeOfHeaders,

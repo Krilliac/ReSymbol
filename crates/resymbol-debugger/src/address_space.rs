@@ -385,11 +385,7 @@ fn validate_image_alignment(analysis: &PeAnalysis) -> Result<(), StaticAddressSp
     )?;
 
     for (index, section) in analysis.sections.iter().enumerate() {
-        let loaded_size = if section.virtual_size == 0 {
-            section.raw_data_size
-        } else {
-            section.virtual_size
-        };
+        let loaded_size = section.loaded_size();
         if loaded_size != 0 {
             require_section_aligned(
                 index,
