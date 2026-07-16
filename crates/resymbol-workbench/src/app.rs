@@ -1,11 +1,11 @@
 use std::{
     collections::BTreeMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
 #[cfg(feature = "screenshot")]
-use std::{fs::OpenOptions, io::BufWriter, path::Path};
+use std::{fs::OpenOptions, io::BufWriter};
 
 use eframe::egui::{self, Align, Key, Layout, RichText, ScrollArea, Sense, TextEdit};
 use egui_extras::{Column, TableBuilder};
@@ -222,6 +222,13 @@ enum ReviewUiAction {
     Load(PathBuf),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseDialogAction {
+    SaveNew,
+    DiscardAndClose,
+    Cancel,
+}
+
 impl ActivityLevel {
     const fn label(self) -> &'static str {
         match self {
@@ -281,6 +288,9 @@ pub struct WorkbenchApp {
     review_result: Option<Result<String, String>>,
     pending_review_rollback: Option<BoundReviewLedger>,
     review_orphaned_decisions: usize,
+    close_confirmation_open: bool,
+    close_after_review_save: bool,
+    allow_dirty_close: bool,
     readiness_choice: SandboxProviderChoice,
     readiness_outcome: Option<DebuggerReadinessOutcome>,
     readiness_error: Option<String>,
@@ -376,6 +386,9 @@ impl WorkbenchApp {
             review_result: None,
             pending_review_rollback: None,
             review_orphaned_decisions: 0,
+            close_confirmation_open: false,
+            close_after_review_save: false,
+            allow_dirty_close: false,
             readiness_choice: SandboxProviderChoice::default(),
             readiness_outcome: None,
             readiness_error: None,
@@ -517,6 +530,150 @@ impl WorkbenchApp {
         context.request_repaint();
     }
 
+    fn request_close(&mut self, context: &egui::Context) -> bool {
+        let review_is_dirty = self
+            .review
+            .as_ref()
+            .is_some_and(BoundReviewLedger::is_dirty);
+        if close_requires_confirmation(review_is_dirty, self.allow_dirty_close) {
+            if !self.close_confirmation_open {
+                self.log(
+                    ActivityLevel::Warning,
+                    "Close paused: save or explicitly discard unsaved review decisions",
+                );
+            }
+            self.close_confirmation_open = true;
+            return false;
+        }
+
+        self.allow_dirty_close = false;
+        context.send_viewport_cmd(egui::ViewportCommand::Close);
+        true
+    }
+
+    fn choose_new_review_sidecar(&self, title: &str) -> Option<PathBuf> {
+        let default = PathBuf::from(self.review_destination.trim());
+        let mut dialog = rfd::FileDialog::new()
+            .set_title(title)
+            .add_filter("ReSymbol review", &["json"]);
+        if let Some(parent) = default
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            dialog = dialog.set_directory(parent);
+        }
+        if let Some(name) = default.file_name().and_then(|name| name.to_str()) {
+            dialog = dialog.set_file_name(name);
+        } else {
+            dialog = dialog.set_file_name("project.review.json");
+        }
+        dialog.save_file()
+    }
+
+    fn show_close_confirmation(&mut self, context: &egui::Context) {
+        if !self.close_confirmation_open {
+            return;
+        }
+        if !self
+            .review
+            .as_ref()
+            .is_some_and(BoundReviewLedger::is_dirty)
+        {
+            self.close_confirmation_open = false;
+            self.close_after_review_save = false;
+            self.request_close(context);
+            return;
+        }
+
+        let review_busy = self.project_operation.is_pending()
+            || self.review_operation.is_pending()
+            || self.export_operation.is_pending();
+        let response = egui::Modal::new(egui::Id::new("dirty_review_close_confirmation")).show(
+            context,
+            |ui| {
+                ui.set_min_width(430.0);
+                ui.heading("Unsaved review decisions");
+                ui.label(
+                    "Closing now would discard the in-memory review history for this binary.",
+                );
+                ui.small(
+                    "Review sidecars are create-new: saving never overwrites a loaded or previously saved file.",
+                );
+                if self.close_after_review_save && self.review_operation.is_pending() {
+                    ui.separator();
+                    ui.label("Saving the exact current ledger snapshot before closing...");
+                }
+                if let Some(Err(error)) = &self.review_result {
+                    ui.separator();
+                    ui.colored_label(
+                        self.preferences
+                            .theme
+                            .semantic_colors()
+                            .destructive_quarantined,
+                        format!("[ERROR] {error}"),
+                    );
+                }
+                ui.separator();
+                let mut action = None;
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(!review_busy, egui::Button::new("Save New..."))
+                        .on_hover_text("Choose a new binary-bound review sidecar, then close only after that exact snapshot is durable")
+                        .clicked()
+                    {
+                        action = Some(CloseDialogAction::SaveNew);
+                    }
+                    if ui.button("Discard and Close").clicked() {
+                        action = Some(CloseDialogAction::DiscardAndClose);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        action = Some(CloseDialogAction::Cancel);
+                    }
+                });
+                action
+            },
+        );
+        let should_cancel = response.should_close();
+        let action = response
+            .inner
+            .or_else(|| should_cancel.then_some(CloseDialogAction::Cancel));
+
+        match action {
+            Some(CloseDialogAction::SaveNew) => {
+                if let Some(path) = self.choose_new_review_sidecar(
+                    "Save review decisions to a new sidecar before closing",
+                ) {
+                    match self.queue_review_save(path) {
+                        Ok(_) => {
+                            self.close_after_review_save = true;
+                            self.close_confirmation_open = true;
+                        }
+                        Err(error) => {
+                            self.close_after_review_save = false;
+                            self.review_result = Some(Err(error.clone()));
+                            self.log(
+                                ActivityLevel::Error,
+                                format!("Review save before close failed: {error}"),
+                            );
+                        }
+                    }
+                }
+            }
+            Some(CloseDialogAction::DiscardAndClose) => {
+                self.close_confirmation_open = false;
+                self.close_after_review_save = false;
+                self.allow_dirty_close = true;
+                context.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Some(CloseDialogAction::Cancel) => {
+                self.close_confirmation_open = false;
+                self.close_after_review_save = false;
+                self.allow_dirty_close = false;
+            }
+            None => {}
+        }
+    }
+
     fn set_console_enabled(&mut self, enabled: bool) {
         if enabled == self.console_host.is_enabled() {
             return;
@@ -606,9 +763,9 @@ impl WorkbenchApp {
     fn apply_console_line(&mut self, line: &str, context: &egui::Context) -> bool {
         match parse_command(line) {
             Ok(command) => {
-                let continue_processing = !matches!(command, ConsoleCommand::Quit);
+                let is_quit = matches!(command, ConsoleCommand::Quit);
                 self.apply_console_command(command, context);
-                continue_processing
+                !is_quit || self.close_confirmation_open
             }
             Err(error) => {
                 self.console_reply(false, error);
@@ -756,8 +913,14 @@ impl WorkbenchApp {
                 }
             }
             ConsoleCommand::Quit => {
-                self.console_reply(true, "closing workbench");
-                context.send_viewport_cmd(egui::ViewportCommand::Close);
+                if self.request_close(context) {
+                    self.console_reply(true, "closing workbench");
+                } else {
+                    self.console_reply(
+                        false,
+                        "close paused: save or explicitly discard unsaved review decisions in the workbench",
+                    );
+                }
             }
         }
     }
@@ -1138,7 +1301,7 @@ impl WorkbenchApp {
         }
     }
 
-    fn poll_service_worker(&mut self) {
+    fn poll_service_worker(&mut self, context: &egui::Context) {
         loop {
             let event = match self.service_worker.try_recv() {
                 Ok(Some(event)) => event,
@@ -1153,6 +1316,7 @@ impl WorkbenchApp {
                         if let Some(previous) = self.pending_review_rollback.take() {
                             self.review = Some(previous);
                         }
+                        self.close_after_review_save = false;
                         self.log(ActivityLevel::Error, error);
                     }
                     break;
@@ -1264,8 +1428,22 @@ impl WorkbenchApp {
                             self.review_destination = outcome.path.to_string_lossy().into_owned();
                             self.review_result = Some(Ok(message.clone()));
                             self.log(ActivityLevel::Success, message);
+                            if self.close_after_review_save {
+                                self.close_after_review_save = false;
+                                if current {
+                                    self.close_confirmation_open = false;
+                                    context.send_viewport_cmd(egui::ViewportCommand::Close);
+                                } else {
+                                    self.close_confirmation_open = true;
+                                }
+                            }
                         }
                         Err(error) => {
+                            let was_closing_after_save = self.close_after_review_save;
+                            self.close_after_review_save = false;
+                            if was_closing_after_save {
+                                self.close_confirmation_open = true;
+                            }
                             self.review_result = Some(Err(error.clone()));
                             self.log(ActivityLevel::Error, format!("Review save failed: {error}"));
                         }
@@ -1579,6 +1757,9 @@ impl WorkbenchApp {
     }
 
     fn handle_inputs(&mut self, context: &egui::Context) {
+        if self.close_confirmation_open {
+            return;
+        }
         let (open_shortcut, load_review_shortcut, save_review_shortcut, save_review_as_shortcut) =
             context.input(|input| {
                 let command = input.modifiers.command;
@@ -1592,17 +1773,20 @@ impl WorkbenchApp {
         if open_shortcut {
             self.choose_binary(context);
         }
-        if save_review_shortcut && self.review.is_some() {
-            self.apply_review_ui_action(ReviewUiAction::Save(PathBuf::from(
-                self.review_destination.trim(),
-            )));
-        } else if save_review_as_shortcut && self.review.is_some() {
-            if let Some(path) = rfd::FileDialog::new()
-                .set_title("Create a new ReSymbol review sidecar")
-                .add_filter("ReSymbol review", &["json"])
-                .set_file_name("project.review.json")
-                .save_file()
-            {
+        if (save_review_shortcut || save_review_as_shortcut) && self.review.is_some() {
+            let destination = PathBuf::from(self.review_destination.trim());
+            let persisted_path = self
+                .review
+                .as_ref()
+                .and_then(BoundReviewLedger::persisted_path);
+            let needs_dialog = save_review_as_shortcut
+                || review_save_requires_dialog(&destination, persisted_path);
+            let path = if needs_dialog {
+                self.choose_new_review_sidecar("Create a new ReSymbol review sidecar")
+            } else {
+                Some(destination)
+            };
+            if let Some(path) = path {
                 self.apply_review_ui_action(ReviewUiAction::Save(path));
             }
         } else if load_review_shortcut
@@ -4136,13 +4320,18 @@ impl eframe::App for WorkbenchApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.preferences.theme.apply(context);
         self.poll_console(context);
-        self.poll_service_worker();
+        self.poll_service_worker(context);
+        if context.input(|input| input.viewport().close_requested()) && !self.request_close(context)
+        {
+            context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
         self.handle_inputs(context);
         self.show_header(context);
         self.show_project_panel(context);
         self.show_inspector(context);
         self.show_activity_panel(context);
         self.show_central(context);
+        self.show_close_confirmation(context);
 
         #[cfg(feature = "screenshot")]
         self.advance_screenshot_capture(context);
@@ -5083,6 +5272,16 @@ fn is_package_path(path: &std::path::Path) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case("resym"))
 }
 
+const fn close_requires_confirmation(review_is_dirty: bool, allow_dirty_close: bool) -> bool {
+    review_is_dirty && !allow_dirty_close
+}
+
+fn review_save_requires_dialog(destination: &Path, persisted_path: Option<&Path>) -> bool {
+    destination.as_os_str().is_empty()
+        || persisted_path == Some(destination)
+        || destination.exists()
+}
+
 fn default_export_path(project: &LoadedProject, kind: ExportKind) -> PathBuf {
     let digest = project.identity.sha256.as_str();
     let stem = project
@@ -5142,4 +5341,33 @@ fn bounded_message(mut message: String) -> String {
     message.truncate(end);
     message.push_str("...");
     message
+}
+
+#[cfg(test)]
+mod close_safety_tests {
+    use super::{close_requires_confirmation, review_save_requires_dialog};
+    use std::path::Path;
+
+    #[test]
+    fn dirty_close_requires_an_explicit_discard() {
+        assert!(close_requires_confirmation(true, false));
+        assert!(!close_requires_confirmation(false, false));
+        assert!(!close_requires_confirmation(true, true));
+    }
+
+    #[test]
+    fn save_shortcut_uses_save_as_for_empty_persisted_or_existing_paths() {
+        assert!(review_save_requires_dialog(Path::new(""), None));
+        assert!(review_save_requires_dialog(
+            Path::new("project.review.json"),
+            Some(Path::new("project.review.json")),
+        ));
+
+        let directory = tempfile::tempdir().expect("create sidecar fixture directory");
+        let existing = tempfile::NamedTempFile::new_in(directory.path())
+            .expect("create existing sidecar fixture");
+        assert!(review_save_requires_dialog(existing.path(), None));
+        let new_path = directory.path().join("new-project.review.json");
+        assert!(!review_save_requires_dialog(&new_path, None,));
+    }
 }
