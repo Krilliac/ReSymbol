@@ -541,13 +541,22 @@ fn attribution_order(left: &GraphAttribution, right: &GraphAttribution) -> std::
 #[cfg(test)]
 mod tests {
     use super::*;
+    use resymbol_app::AppServices;
+    use std::io::Write as _;
+    use tempfile::NamedTempFile;
 
     const OPTIMIZED_FIXTURE: &[u8] =
         include_bytes!("../../../fixtures/pe-x64-msvc/artifacts/milestone2-stripped.exe");
 
     fn optimized_project() -> LoadedProject {
-        LoadedProject::from_bytes(OPTIMIZED_FIXTURE, "milestone2-stripped.exe")
-            .expect("optimized fixture should load")
+        let mut source = NamedTempFile::new().expect("temporary optimized PE");
+        source
+            .write_all(OPTIMIZED_FIXTURE)
+            .expect("write optimized fixture");
+        let snapshot = AppServices::default()
+            .analyze_binary(source.path())
+            .expect("service-backed optimized fixture analysis");
+        LoadedProject::from_snapshot(snapshot).expect("optimized fixture should load")
     }
 
     #[test]

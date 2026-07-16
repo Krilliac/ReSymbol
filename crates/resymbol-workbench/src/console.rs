@@ -42,7 +42,7 @@ Commands:
   theme <graphite|light|ida|classic>
   panel <left|right|bottom> <show|hide|toggle>
   reset-layout
-  export <resym|json|markdown|map> <path>
+  export <resym|json|markdown|map|pdb|ida-python|ghidra-java> <path>
   quit  (close the workbench)
 
 Paths containing spaces must be enclosed in double quotes. Backslashes in
@@ -196,10 +196,21 @@ pub enum ConsoleExportKind {
     Json,
     Markdown,
     Map,
+    Pdb,
+    IdaPython,
+    GhidraJava,
 }
 
 impl ConsoleExportKind {
-    pub const ALL: [Self; 4] = [Self::Resym, Self::Json, Self::Markdown, Self::Map];
+    pub const ALL: [Self; 7] = [
+        Self::Resym,
+        Self::Json,
+        Self::Markdown,
+        Self::Map,
+        Self::Pdb,
+        Self::IdaPython,
+        Self::GhidraJava,
+    ];
 
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -208,6 +219,9 @@ impl ConsoleExportKind {
             Self::Json => "json",
             Self::Markdown => "markdown",
             Self::Map => "map",
+            Self::Pdb => "pdb",
+            Self::IdaPython => "ida-python",
+            Self::GhidraJava => "ghidra-java",
         }
     }
 }
@@ -299,7 +313,11 @@ pub fn parse_command(input: &str) -> Result<ConsoleCommand, String> {
             Ok(ConsoleCommand::ResetLayout)
         }
         "export" => {
-            expect_arity(&tokens, 2, "export <resym|json|markdown|map> <path>")?;
+            expect_arity(
+                &tokens,
+                2,
+                "export <resym|json|markdown|map|pdb|ida-python|ghidra-java> <path>",
+            )?;
             Ok(ConsoleCommand::Export {
                 kind: parse_export_kind(&tokens[1])?,
                 path: parse_path(&tokens[2], "export")?,
@@ -595,8 +613,11 @@ fn parse_export_kind(value: &str) -> Result<ConsoleExportKind, String> {
         "json" => Ok(ConsoleExportKind::Json),
         "markdown" => Ok(ConsoleExportKind::Markdown),
         "map" => Ok(ConsoleExportKind::Map),
+        "pdb" => Ok(ConsoleExportKind::Pdb),
+        "ida" | "ida-python" => Ok(ConsoleExportKind::IdaPython),
+        "ghidra" | "ghidra-java" => Ok(ConsoleExportKind::GhidraJava),
         _ => Err(format!(
-            "invalid export kind `{value}`; expected resym, json, markdown, or map"
+            "invalid export kind `{value}`; expected resym, json, markdown, map, pdb, ida-python, or ghidra-java"
         )),
     }
 }
@@ -665,6 +686,27 @@ mod tests {
                 ConsoleCommand::Export {
                     kind: ConsoleExportKind::Markdown,
                     path: PathBuf::from("report.md"),
+                },
+            ),
+            (
+                "export pdb symbols.pdb",
+                ConsoleCommand::Export {
+                    kind: ConsoleExportKind::Pdb,
+                    path: PathBuf::from("symbols.pdb"),
+                },
+            ),
+            (
+                "export ida-python import.py",
+                ConsoleCommand::Export {
+                    kind: ConsoleExportKind::IdaPython,
+                    path: PathBuf::from("import.py"),
+                },
+            ),
+            (
+                "export ghidra-java ReSymbolImport_deadbeefcafe.java",
+                ConsoleCommand::Export {
+                    kind: ConsoleExportKind::GhidraJava,
+                    path: PathBuf::from("ReSymbolImport_deadbeefcafe.java"),
                 },
             ),
             ("quit", ConsoleCommand::Quit),
