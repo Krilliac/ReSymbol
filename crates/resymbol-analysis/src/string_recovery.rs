@@ -118,16 +118,17 @@ fn recover_strings_with_limits(
 }
 
 fn eligible_section_bytes<'a>(bytes: &'a [u8], section: &PeSection) -> Option<&'a [u8]> {
-    if section.raw_data_size == 0
+    let file_backed_size = section.layout().file_backed_size;
+    if file_backed_size == 0
         || section.characteristics & IMAGE_SCN_CNT_INITIALIZED_DATA == 0
         || section.characteristics & IMAGE_SCN_MEM_READ == 0
         || section.characteristics & IMAGE_SCN_MEM_EXECUTE != 0
     {
         return None;
     }
-    section.virtual_address.checked_add(section.raw_data_size)?;
+    section.virtual_address.checked_add(file_backed_size)?;
     let start = usize::try_from(section.raw_data_offset).ok()?;
-    let size = usize::try_from(section.raw_data_size).ok()?;
+    let size = usize::try_from(file_backed_size).ok()?;
     let end = start.checked_add(size)?;
     bytes.get(start..end)
 }
@@ -282,8 +283,9 @@ fn eligible_section_contains(sections: &[PeSection], rva: u32, size: u32) -> boo
     let range_end = range_start + u64::from(size);
     sections.iter().any(|section| {
         let section_start = u64::from(section.virtual_address);
-        let section_end = section_start + u64::from(section.raw_data_size);
-        section.raw_data_size != 0
+        let file_backed_size = section.layout().file_backed_size;
+        let section_end = section_start + u64::from(file_backed_size);
+        file_backed_size != 0
             && section.characteristics & IMAGE_SCN_CNT_INITIALIZED_DATA != 0
             && section.characteristics & IMAGE_SCN_MEM_READ != 0
             && section.characteristics & IMAGE_SCN_MEM_EXECUTE == 0

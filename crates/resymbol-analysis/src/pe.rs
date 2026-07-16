@@ -1,5 +1,4 @@
 use std::{
-    cmp,
     collections::{BTreeMap, BTreeSet},
     str,
 };
@@ -797,7 +796,7 @@ pub(crate) fn validate_pe_analysis(analysis: &PeAnalysis) -> Result<(), Analysis
                 format!("section {index} does not match its exact raw name bytes"),
             );
         }
-        let virtual_span = cmp::max(section.virtual_size, section.raw_data_size);
+        let virtual_span = section.layout().loaded_size;
         let virtual_end = u64::from(section.virtual_address)
             .checked_add(u64::from(virtual_span))
             .ok_or(AnalysisError::ArithmeticOverflow("section virtual range"))?;
@@ -2475,7 +2474,7 @@ fn model_rva_is_backed(analysis: &PeAnalysis, rva: u32, size: u32) -> bool {
     }
     analysis.sections.iter().any(|section| {
         let start = u64::from(section.virtual_address);
-        let backed_end = start.saturating_add(u64::from(section.raw_data_size));
+        let backed_end = start.saturating_add(u64::from(section.layout().file_backed_size));
         u64::from(rva) >= start && end <= backed_end
     })
 }
@@ -2677,7 +2676,16 @@ fn parse_headers(reader: &Reader<'_>) -> Result<ParsedHeaders, AnalysisError> {
         let raw_data_offset = reader.u32(offset + 20, "section raw-data offset")?;
         let characteristics = reader.u32(offset + 36, "section characteristics")?;
 
-        let virtual_span = cmp::max(virtual_size, raw_data_size);
+        let section = PeSection {
+            name: display_section_name(&raw_name),
+            raw_name,
+            virtual_address,
+            virtual_size,
+            raw_data_offset,
+            raw_data_size,
+            characteristics,
+        };
+        let virtual_span = section.layout().loaded_size;
         let virtual_end =
             virtual_address
                 .checked_add(virtual_span)
@@ -2710,15 +2718,7 @@ fn parse_headers(reader: &Reader<'_>) -> Result<ParsedHeaders, AnalysisError> {
             }
         }
 
-        sections.push(PeSection {
-            name: display_section_name(&raw_name),
-            raw_name,
-            virtual_address,
-            virtual_size,
-            raw_data_offset,
-            raw_data_size,
-            characteristics,
-        });
+        sections.push(section);
     }
     validate_section_overlaps(&sections)?;
 
@@ -5489,7 +5489,7 @@ fn file_backed_executable_section_for_rva<'a>(
         return None;
     }
     let delta = rva.checked_sub(section.virtual_address)?;
-    if delta >= section.raw_data_size {
+    if delta >= section.layout().file_backed_size {
         return None;
     }
     let file_offset = u64::from(section.raw_data_offset).checked_add(u64::from(delta))?;
@@ -5499,7 +5499,7 @@ fn file_backed_executable_section_for_rva<'a>(
 pub(crate) fn section_for_rva(rva: u32, sections: &[PeSection]) -> Option<(usize, &PeSection)> {
     sections.iter().enumerate().find(|(_, section)| {
         let start = u64::from(section.virtual_address);
-        let size = u64::from(cmp::max(section.virtual_size, section.raw_data_size));
+        let size = u64::from(section.layout().loaded_size);
         let end = start.saturating_add(size);
         (start..end).contains(&u64::from(rva))
     })
@@ -5517,7 +5517,7 @@ fn section_for_rva_range(
     let end = start.checked_add(u64::from(size))?;
     sections.iter().enumerate().find(|(_, section)| {
         let section_start = u64::from(section.virtual_address);
-        let section_size = u64::from(cmp::max(section.virtual_size, section.raw_data_size));
+        let section_size = u64::from(section.layout().loaded_size);
         let section_end = section_start.saturating_add(section_size);
         start >= section_start && end <= section_end
     })
@@ -5554,7 +5554,7 @@ impl<'a> RvaMap<'a> {
         for section in self.sections {
             let section_start = u64::from(section.virtual_address);
             let backed_end = section_start
-                .checked_add(u64::from(section.raw_data_size))
+                .checked_add(u64::from(section.layout().file_backed_size))
                 .ok_or(AnalysisError::ArithmeticOverflow(
                     "section-backed RVA range",
                 ))?;
@@ -5627,7 +5627,8 @@ impl<'a> RvaMap<'a> {
         }
         for section in self.sections {
             let start = u64::from(section.virtual_address);
-            let end = start.checked_add(u64::from(section.raw_data_size)).ok_or(
+            let file_backed_size = section.layout().file_backed_size;
+            let end = start.checked_add(u64::from(file_backed_size)).ok_or(
                 AnalysisError::ArithmeticOverflow("section-backed RVA range"),
             )?;
             if u64::from(rva) >= start && u64::from(rva) < end {
@@ -5636,7 +5637,7 @@ impl<'a> RvaMap<'a> {
                     .checked_add(delta)
                     .ok_or(AnalysisError::ArithmeticOverflow("string file offset"))?;
                 let raw_end = u64::from(section.raw_data_offset)
-                    .checked_add(u64::from(section.raw_data_size))
+                    .checked_add(u64::from(file_backed_size))
                     .ok_or(AnalysisError::ArithmeticOverflow("section raw range"))?;
                 let offset = usize::try_from(offset)
                     .map_err(|_| AnalysisError::IntegerConversion("string file offset"))?;
@@ -5821,8 +5822,8 @@ fn validate_section_overlaps(sections: &[PeSection]) -> Result<(), AnalysisError
         for second in first + 1..sections.len() {
             let left = &sections[first];
             let right = &sections[second];
-            let left_virtual_size = cmp::max(left.virtual_size, left.raw_data_size);
-            let right_virtual_size = cmp::max(right.virtual_size, right.raw_data_size);
+            let left_virtual_size = left.layout().loaded_size;
+            let right_virtual_size = right.layout().loaded_size;
             if ranges_overlap(
                 u64::from(left.virtual_address),
                 u64::from(left_virtual_size),
@@ -5903,4 +5904,110 @@ fn push_hex_byte(output: &mut String, byte: u8) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     output.push(char::from(HEX[usize::from(byte >> 4)]));
     output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+}
+
+#[cfg(test)]
+mod section_layout_tests {
+    use super::*;
+
+    fn section(
+        virtual_address: u32,
+        virtual_size: u32,
+        raw_data_offset: u32,
+        raw_data_size: u32,
+    ) -> PeSection {
+        PeSection {
+            name: ".test".to_owned(),
+            raw_name: *b".test\0\0\0",
+            virtual_address,
+            virtual_size,
+            raw_data_offset,
+            raw_data_size,
+            characteristics: IMAGE_SCN_MEM_EXECUTE,
+        }
+    }
+
+    #[test]
+    fn raw_alignment_padding_is_neither_loaded_nor_file_backed() {
+        let sections = [section(0x1000, 0x801, 0x200, 0xa00)];
+        let layout = sections[0].layout();
+        assert_eq!(layout.loaded_size, 0x801);
+        assert_eq!(layout.file_backed_size, 0x801);
+
+        assert!(section_for_rva(0x1800, &sections).is_some());
+        assert!(section_for_rva(0x1801, &sections).is_none());
+        assert!(section_for_rva_range(0x1800, 1, &sections).is_some());
+        assert!(section_for_rva_range(0x1801, 1, &sections).is_none());
+
+        let bytes = vec![0_u8; 0xc00];
+        let mapper = RvaMap::new(&bytes, 0x200, &sections);
+        assert!(mapper.is_backed(0x1800, 1));
+        assert!(!mapper.is_backed(0x1801, 1));
+        assert_eq!(
+            mapper
+                .contiguous_bytes(0x1800, "last initialized byte")
+                .expect("last loaded byte is initialized")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn zero_virtual_size_falls_back_to_the_raw_size() {
+        let sections = [section(0x1000, 0, 0x200, 0xa00)];
+        let layout = sections[0].layout();
+        assert_eq!(layout.loaded_size, 0xa00);
+        assert_eq!(layout.file_backed_size, 0xa00);
+
+        assert!(section_for_rva(0x19ff, &sections).is_some());
+        assert!(section_for_rva(0x1a00, &sections).is_none());
+        let bytes = vec![0_u8; 0xc00];
+        let mapper = RvaMap::new(&bytes, 0x200, &sections);
+        assert!(mapper.is_backed(0x19ff, 1));
+        assert!(!mapper.is_backed(0x1a00, 1));
+    }
+
+    #[test]
+    fn virtual_zero_fill_is_loaded_but_not_file_backed() {
+        let sections = [section(0x1000, 0xa00, 0x200, 0x801)];
+        let layout = sections[0].layout();
+        assert_eq!(layout.loaded_size, 0xa00);
+        assert_eq!(layout.file_backed_size, 0x801);
+
+        assert!(section_for_rva(0x1900, &sections).is_some());
+        let bytes = vec![0_u8; 0xa01];
+        let mapper = RvaMap::new(&bytes, 0x200, &sections);
+        assert!(!mapper.is_backed(0x1900, 1));
+    }
+
+    #[test]
+    fn overlap_checks_use_loaded_spans_not_raw_padding() {
+        let mut sections = [
+            section(0x1000, 0x801, 0x200, 0xa00),
+            section(0x1801, 0x100, 0xc00, 0x100),
+        ];
+        validate_section_overlaps(&sections)
+            .expect("raw alignment padding does not overlap in virtual memory");
+
+        sections[1].virtual_address = 0x1800;
+        assert!(matches!(
+            validate_section_overlaps(&sections),
+            Err(AnalysisError::OverlappingSections {
+                first: 0,
+                second: 1,
+                space: "virtual"
+            })
+        ));
+
+        sections[0].virtual_size = 0;
+        sections[1].virtual_address = 0x1900;
+        assert!(matches!(
+            validate_section_overlaps(&sections),
+            Err(AnalysisError::OverlappingSections {
+                first: 0,
+                second: 1,
+                space: "virtual"
+            })
+        ));
+    }
 }

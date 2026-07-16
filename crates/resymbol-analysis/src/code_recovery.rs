@@ -1375,7 +1375,7 @@ pub(crate) fn model_range_is_backed_executable(analysis: &PeAnalysis, rva: u32, 
     };
     analysis.sections.iter().any(|section| {
         let start = u64::from(section.virtual_address);
-        let backed_end = start.saturating_add(u64::from(section.raw_data_size));
+        let backed_end = start.saturating_add(u64::from(section.layout().file_backed_size));
         section.characteristics & IMAGE_SCN_MEM_EXECUTE != 0
             && u64::from(rva) >= start
             && end <= backed_end
@@ -1420,7 +1420,7 @@ fn section_has_file_backed_range(section: &PeSection, rva: u32, size: u32) -> bo
         return false;
     }
     let start = u64::from(section.virtual_address);
-    let backed_end = start.saturating_add(u64::from(section.raw_data_size));
+    let backed_end = start.saturating_add(u64::from(section.layout().file_backed_size));
     let rva = u64::from(rva);
     rva >= start
         && rva

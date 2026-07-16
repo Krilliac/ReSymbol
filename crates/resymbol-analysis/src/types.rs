@@ -383,6 +383,37 @@ pub struct PeSection {
     pub characteristics: u32,
 }
 
+/// Canonical image-loader view of one PE section.
+///
+/// This stays crate-private so the serialized section-header model remains the
+/// public API while every analysis path agrees on which bytes are loaded and
+/// which loaded bytes are initialized from the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PeSectionLayout {
+    pub(crate) loaded_size: u32,
+    pub(crate) file_backed_size: u32,
+}
+
+impl PeSection {
+    /// Derive the section spans used by the PE loader and RVA-to-file mapping.
+    pub(crate) const fn layout(&self) -> PeSectionLayout {
+        let loaded_size = if self.virtual_size == 0 {
+            self.raw_data_size
+        } else {
+            self.virtual_size
+        };
+        let file_backed_size = if self.raw_data_size < loaded_size {
+            self.raw_data_size
+        } else {
+            loaded_size
+        };
+        PeSectionLayout {
+            loaded_size,
+            file_backed_size,
+        }
+    }
+}
+
 /// One imported library and its null-terminated thunk table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeImportLibrary {
