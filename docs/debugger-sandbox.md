@@ -4,8 +4,8 @@
 
 ReSymbol currently implements the non-executing foundation for debugger and sandbox work:
 
-- a complete preferred-image partition for supported PE32+ inputs, including headers, sections,
-  zero-filled tails, and explicit gaps;
+- a complete preferred-image partition for supported PE32+ inputs that validates file/section
+  alignment and distinguishes exact file backing, virtual zero-fill, loader padding, and image gaps;
 - exact-binary-bound protection findings for entry-point layout, TLS-before-entry behavior,
   anti-debug imports, common packer section names, high-entropy samples, and writable/executable
   sections;

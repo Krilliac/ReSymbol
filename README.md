@@ -30,7 +30,7 @@ The current alpha implements and tests an end-to-end, deliberately narrow analys
   conventional imports, modern RVA-form delay imports, exports, forwarded exports, x64
   exception-directory (`RUNTIME_FUNCTION`) records, ordered TLS-directory callback entries, and
   load-config GuardCF function, address-taken IAT, long-jump, and EH-continuation tables, plus
-  checked security-cookie, GuardCF, XFG, and CastGuard storage anchors;
+  checked security-cookie, GuardCF, XFG, CastGuard, and GuardMemcpy storage anchors;
 - bounded discovery of modern MSVC x64 Rev1 RTTI and vftables from file-backed compiler metadata,
   including both legacy 24-byte and `BCD_HASPCHD` 28-byte base-class descriptors, validated
   class/type names, and contiguous executable slot candidates;
@@ -51,7 +51,7 @@ The current alpha implements and tests an end-to-end, deliberately narrow analys
   fixtures cover read-only pointer control flow, dual RTTI descriptor layouts, transitive thunk
   chains, bounded TLS callback discovery, modern delay-load imports, GuardCF function tables, and
   modern Guard address-taken IAT, long-jump, and EH-continuation inventories and load-config
-  security/XFG/CastGuard anchors without changing the
+  security/XFG/CastGuard/GuardMemcpy anchors without changing the
   four corpus binaries, their hashes, or their oracle; these repository/source fixtures are analyzer
   test data and are not bundled in portable runtime archives;
 - conservative symbol-graph generation from exact export names, metadata-backed function

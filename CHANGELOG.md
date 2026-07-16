@@ -21,6 +21,11 @@ prereleases; breaking changes remain explicit.
   The loader-managed slot is inventory only: it does not create a function, thunk, graph edge,
   claim, or control-flow seed. Malformed, overlapping, cross-section, header, and unbacked layouts
   fail before publication, and schema relabeling is rejected.
+- Aligned the static PE address-space model with loader layout rules. It validates
+  `FileAlignment`/`SectionAlignment`, rounds header and section mappings without overlap or image
+  overflow, treats `VirtualSize == 0` as the checked raw-size fallback, and distinguishes exact
+  file-backed bytes, virtual zero-fill, mapped alignment padding, and unowned image gaps in both the
+  debugger model and workbench table.
 - Added the backend-neutral `resymbol-debugger` foundation without enabling target execution. The
   crate provides an exact-identity static PE address-space partition, bounded protection indicators,
   capability- and token-carrying debugger commands/events, compare-before-write contracts, a

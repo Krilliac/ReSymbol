@@ -117,11 +117,12 @@ control-flow graphing remains later work.
 ### Static address space and protection assessment
 
 The implemented **Address Space** tab is a non-executing preferred-image view for supported PE32+
-inputs. It partitions `SizeOfImage` into headers, declared sections and zero-filled tails, and
-explicit gaps; shows preferred virtual addresses, file backing, and declared read/write/execute
-attributes; and stays bound to the same exact SHA-256 identity as the analysis package. It is not a
-live process map and must not imply that ASLR, runtime allocations, loaded modules, guard pages, or
-changed page protections have been observed.
+inputs. It validates `FileAlignment` and `SectionAlignment`, models loader-aligned headers and
+section extents, and distinguishes exact file-backed bytes, virtual zero-fill, mapped alignment
+padding, and explicit image gaps. The table shows preferred virtual addresses, exact file ranges,
+tail ownership, and declared read/write/execute attributes while staying bound to the same SHA-256
+identity as the analysis package. It is not a live process map and must not imply that ASLR, runtime
+allocations, loaded modules, guard pages, or changed page protections have been observed.
 
 Protection assessment shows bounded artifact evidence for entry-point placement and backing,
 TLS-before-entry behavior, anti-debug imports, common packer section names, high-entropy samples, and
