@@ -53,6 +53,16 @@ pub struct NativePeImageSection {
     pub raw_data_size: u32,
 }
 
+impl NativePeImageSection {
+    const fn loaded_size(&self) -> u32 {
+        if self.virtual_size == 0 {
+            self.raw_data_size
+        } else {
+            self.virtual_size
+        }
+    }
+}
+
 /// Exact binary identity and PE file-to-image mapping required by `binary.read`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativePeImage {
@@ -114,7 +124,7 @@ impl NativePeImage {
         let mut raw_ranges = Vec::with_capacity(self.sections.len());
         for (index, section) in self.sections.iter().enumerate() {
             let virtual_start = u64::from(section.virtual_address);
-            let virtual_size = u64::from(section.virtual_size.max(section.raw_data_size));
+            let virtual_size = u64::from(section.loaded_size());
             let virtual_end = virtual_start.checked_add(virtual_size).ok_or_else(|| {
                 invalid_context(format!("PE section {index} virtual range overflows"))
             })?;
@@ -956,6 +966,35 @@ mod tests {
             vec![section(0x1000, 0x100), section(0x1100, 0x300)],
         )
         .unwrap_err();
+        assert!(error.to_string().contains("overlapping virtual"));
+    }
+
+    #[test]
+    fn image_map_ignores_raw_padding_but_preserves_zero_virtual_size_fallback() {
+        let bytes = vec![0_u8; 0x3000];
+        let identity = BinaryIdentity {
+            id: BinaryId::digest(&bytes),
+            size: bytes.len() as u64,
+            format: BinaryFormat::Pe,
+            architecture: "x86_64".to_owned(),
+            image_base: 0x0001_4000_0000,
+        };
+        let section = |virtual_address, virtual_size, raw_data_offset| NativePeImageSection {
+            virtual_address,
+            virtual_size,
+            raw_data_offset,
+            raw_data_size: 0x1200,
+        };
+        let sections = vec![
+            section(0x1000, 0x100, 0x200),
+            section(0x2000, 0x100, 0x1400),
+        ];
+        NativePeImage::new(identity.clone(), 0x200, 0x3000, sections.clone())
+            .expect("raw alignment padding does not overlap loaded sections");
+
+        let mut fallback = sections;
+        fallback[0].virtual_size = 0;
+        let error = NativePeImage::new(identity, 0x200, 0x3000, fallback).unwrap_err();
         assert!(error.to_string().contains("overlapping virtual"));
     }
 

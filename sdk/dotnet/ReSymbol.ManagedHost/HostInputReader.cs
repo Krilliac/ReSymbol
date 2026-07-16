@@ -331,7 +331,7 @@ internal static partial class HostInputReader
         var fileRanges = new List<(ulong Start, ulong End)>();
         foreach (var section in image.Sections)
         {
-            var virtualSize = Math.Max(section.VirtualSize, section.RawDataSize);
+            var virtualSize = section.LoadedSize;
             var virtualEnd = checked((ulong)section.VirtualAddress + virtualSize);
             var rawEnd = checked((ulong)section.RawDataOffset + section.RawDataSize);
             if (virtualEnd > image.SizeOfImage || rawEnd > binarySize)

@@ -6,8 +6,6 @@
 //! from one unambiguous `RSDS` record in the original PE so ordinary Windows
 //! symbol matching can reject the wrong binary.
 
-use std::cmp;
-
 use resymbol_analysis::{
     AnalysisSession, BinaryAnalysis, PeAnalysis, PeCodeViewInspection, PeSection,
     inspect_pe_codeview,
@@ -329,7 +327,7 @@ fn collect_symbols(
 fn section_address(rva: u64, sections: &[PeSection]) -> Option<SectionAddress> {
     sections.iter().enumerate().find_map(|(index, section)| {
         let start = u64::from(section.virtual_address);
-        let length = u64::from(cmp::max(section.virtual_size, section.raw_data_size));
+        let length = u64::from(section.loaded_size());
         let end = start.checked_add(length)?;
         if !(start..end).contains(&rva) {
             return None;
@@ -378,14 +376,14 @@ mod tests {
     }
 
     #[test]
-    fn section_mapping_uses_the_validated_maximum_virtual_extent() {
+    fn section_mapping_excludes_raw_alignment_padding() {
         let section = section();
         assert_eq!(
-            section_address(0x11ff, std::slice::from_ref(&section))
-                .expect("last byte in maximum section extent")
+            section_address(0x10ff, std::slice::from_ref(&section))
+                .expect("last byte in the loaded section extent")
                 .offset,
-            0x1ff
+            0xff
         );
-        assert!(section_address(0x1200, std::slice::from_ref(&section)).is_none());
+        assert!(section_address(0x1100, std::slice::from_ref(&section)).is_none());
     }
 }

@@ -31,6 +31,7 @@ var tests = new (string Name, Func<Task> Run)[]
     ("host service failures retain protocol codes", HostServiceFailuresRetainCodesAsync),
     ("artifact fingerprint matches portable v1", ArtifactFingerprintMatchesPortableV1Async),
     ("verified snapshots share one memory budget", VerifiedSnapshotsShareMemoryBudgetAsync),
+    ("PE section extents exclude raw alignment padding", CanonicalPeSectionExtentsAsync),
 };
 
 foreach (var test in tests)
@@ -126,6 +127,27 @@ static Task ManagedSdkIdentityIsExactAsync()
     ExpectThrows<FileLoadException>(() => PluginLoadContext.ValidateSdkReference(mismatched));
     PluginLoadContext.ValidateSdkReference(
         typeof(ReSymbol.PluginSdk.IReSymbolPlugin).Assembly.GetName());
+    return Task.CompletedTask;
+}
+
+static Task CanonicalPeSectionExtentsAsync()
+{
+    var rawPadding = new PeImageSection(0x1000, 0x101, 0x200, 0x200);
+    Assert(rawPadding.LoadedSize == 0x101,
+        "nonzero VirtualSize must define the loaded extent");
+    Assert(rawPadding.FileBackedSize == 0x101,
+        "raw FileAlignment padding must not be exposed through binary.read");
+
+    var zeroFill = new PeImageSection(0x1000, 0x200, 0x200, 0x101);
+    Assert(zeroFill.LoadedSize == 0x200, "VirtualSize includes the zero-filled tail");
+    Assert(zeroFill.FileBackedSize == 0x101,
+        "the zero-filled tail must not claim initializing file bytes");
+
+    var zeroVirtualSize = new PeImageSection(0x1000, 0, 0x200, 0x200);
+    Assert(zeroVirtualSize.LoadedSize == 0x200,
+        "zero VirtualSize must use the loader-compatible raw-size fallback");
+    Assert(zeroVirtualSize.FileBackedSize == 0x200,
+        "the zero-VirtualSize fallback remains fully file-backed");
     return Task.CompletedTask;
 }
 

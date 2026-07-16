@@ -112,6 +112,25 @@ pub(crate) struct PeImageSection {
     pub(crate) raw_data_size: u32,
 }
 
+impl PeImageSection {
+    pub(crate) const fn loaded_size(&self) -> u32 {
+        if self.virtual_size == 0 {
+            self.raw_data_size
+        } else {
+            self.virtual_size
+        }
+    }
+
+    pub(crate) const fn file_backed_size(&self) -> u32 {
+        let loaded_size = self.loaded_size();
+        if self.raw_data_size < loaded_size {
+            self.raw_data_size
+        } else {
+            loaded_size
+        }
+    }
+}
+
 impl PeImageMap {
     fn validate(&self, identity: &BinaryIdentity) -> Result<(), HostError> {
         if self.size_of_headers == 0 || self.size_of_image == 0 {
@@ -135,7 +154,7 @@ impl PeImageMap {
         let mut virtual_ranges = Vec::with_capacity(self.sections.len());
         for section in &self.sections {
             let virtual_start = u64::from(section.virtual_address);
-            let virtual_size = u64::from(section.virtual_size.max(section.raw_data_size));
+            let virtual_size = u64::from(section.loaded_size());
             let virtual_end = virtual_start.checked_add(virtual_size).ok_or_else(|| {
                 HostError::Bootstrap("PE section virtual range overflows".to_owned())
             })?;
@@ -505,6 +524,39 @@ mod tests {
             sections: vec![section(0x1000), section(0x1100)],
         };
         assert!(map.validate(&identity).is_err());
+    }
+
+    #[test]
+    fn image_map_excludes_raw_padding_but_keeps_zero_virtual_size_fallback() {
+        let identity = BinaryIdentity {
+            id: resymbol_core::BinaryId::digest(&vec![0_u8; 0x3000]),
+            size: 0x3000,
+            format: BinaryFormat::Pe,
+            architecture: "x86_64".to_owned(),
+            image_base: 0x0001_4000_0000,
+        };
+        let section = |virtual_address, virtual_size, raw_data_offset| PeImageSection {
+            virtual_address,
+            virtual_size,
+            raw_data_offset,
+            raw_data_size: 0x1200,
+        };
+        let mut map = PeImageMap {
+            size_of_headers: 0x100,
+            size_of_image: 0x3000,
+            sections: vec![
+                section(0x1000, 0x100, 0x200),
+                section(0x2000, 0x100, 0x1400),
+            ],
+        };
+        map.validate(&identity)
+            .expect("raw file padding does not overlap loaded sections");
+
+        map.sections[0].virtual_size = 0;
+        assert!(
+            map.validate(&identity).is_err(),
+            "zero VirtualSize falls back to the raw size and overlaps"
+        );
     }
 
     #[test]

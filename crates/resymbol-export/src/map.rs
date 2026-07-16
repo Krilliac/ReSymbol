@@ -1,4 +1,4 @@
-use std::{cmp, fmt::Write as _};
+use std::fmt::Write as _;
 
 use resymbol_analysis::{AnalysisSession, BinaryAnalysis, PeAnalysis, PeSection};
 use thiserror::Error;
@@ -198,7 +198,7 @@ pub fn render_map(
     )?;
     for (zero_based_index, section) in analysis.sections.iter().enumerate() {
         let one_based_index = zero_based_index + 1;
-        let length = cmp::max(section.virtual_size, section.raw_data_size);
+        let length = section.loaded_size();
         let name = escaped_section_name(&section.raw_name);
         let class = section_class(section);
         push_format(
@@ -323,7 +323,7 @@ fn collect_symbols(projection: &ExportProjection) -> Vec<MapSymbol<'_>> {
 fn section_address(rva: u64, sections: &[PeSection]) -> Option<SectionAddress> {
     sections.iter().enumerate().find_map(|(index, section)| {
         let start = u64::from(section.virtual_address);
-        let length = u64::from(cmp::max(section.virtual_size, section.raw_data_size));
+        let length = u64::from(section.loaded_size());
         let end = start.checked_add(length)?;
         if !(start..end).contains(&rva) {
             return None;
@@ -400,7 +400,7 @@ mod tests {
     }
 
     #[test]
-    fn section_mapping_uses_the_validated_maximum_virtual_extent() {
+    fn section_mapping_uses_the_canonical_loaded_extent() {
         let section = |virtual_size, raw_data_size| PeSection {
             name: ".test".to_owned(),
             raw_name: *b".test\0\0\0",
@@ -411,15 +411,31 @@ mod tests {
             characteristics: IMAGE_SCN_MEM_READ,
         };
 
-        for value in [section(0x100, 0x200), section(0x200, 0x100)] {
-            assert_eq!(
-                section_address(0x11ff, std::slice::from_ref(&value))
-                    .expect("last byte in max extent")
-                    .offset,
-                0x1ff
-            );
-            assert!(section_address(0x1200, std::slice::from_ref(&value)).is_none());
-        }
+        let raw_padding = section(0x100, 0x200);
+        assert_eq!(
+            section_address(0x10ff, std::slice::from_ref(&raw_padding))
+                .expect("last byte declared by VirtualSize")
+                .offset,
+            0xff
+        );
+        assert!(section_address(0x1100, std::slice::from_ref(&raw_padding)).is_none());
+
+        let zero_fill = section(0x200, 0x100);
+        assert_eq!(
+            section_address(0x11ff, std::slice::from_ref(&zero_fill))
+                .expect("last byte declared by VirtualSize")
+                .offset,
+            0x1ff
+        );
+        assert!(section_address(0x1200, std::slice::from_ref(&zero_fill)).is_none());
+
+        let zero_virtual_size = section(0, 0x200);
+        assert_eq!(
+            section_address(0x11ff, std::slice::from_ref(&zero_virtual_size))
+                .expect("zero VirtualSize falls back to SizeOfRawData")
+                .offset,
+            0x1ff
+        );
     }
 
     #[test]

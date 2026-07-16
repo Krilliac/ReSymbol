@@ -131,7 +131,7 @@ impl ExactBinaryImage {
 
         let Some(section) = self.sections.iter().find(|section| {
             let start = u64::from(section.virtual_address);
-            let size = u64::from(section.virtual_size.max(section.raw_data_size));
+            let size = u64::from(section.loaded_size());
             (start..start.saturating_add(size)).contains(&u64::from(rva))
         }) else {
             return Ok(0);
@@ -139,15 +139,16 @@ impl ExactBinaryImage {
         let delta = rva
             .checked_sub(section.virtual_address)
             .ok_or(ImageReadError::OutsideImage)?;
-        if delta >= section.raw_data_size {
+        let file_backed_size = section.file_backed_size();
+        if delta >= file_backed_size {
             return Ok(0);
         }
         let start = u64::from(section.raw_data_offset)
             .checked_add(u64::from(delta))
             .and_then(|offset| usize::try_from(offset).ok())
             .ok_or(ImageReadError::OutsideImage)?;
-        let available = usize::try_from(section.raw_data_size - delta)
-            .map_err(|_| ImageReadError::OutsideImage)?;
+        let available =
+            usize::try_from(file_backed_size - delta).map_err(|_| ImageReadError::OutsideImage)?;
         copy_available(&self.bytes, start, available, destination)
     }
 }
@@ -303,7 +304,7 @@ fn validate_parsed_section(
     index: usize,
     section: &PeImageSection,
 ) -> Result<(), HostError> {
-    let virtual_size = section.virtual_size.max(section.raw_data_size);
+    let virtual_size = section.loaded_size();
     let virtual_end = section
         .virtual_address
         .checked_add(virtual_size)
@@ -333,9 +334,9 @@ fn validate_section_overlaps(sections: &[PeImageSection]) -> Result<(), HostErro
             let right = &sections[second];
             if ranges_overlap(
                 left.virtual_address,
-                left.virtual_size.max(left.raw_data_size),
+                left.loaded_size(),
                 right.virtual_address,
-                right.virtual_size.max(right.raw_data_size),
+                right.loaded_size(),
             )? {
                 return invalid_binary(format!(
                     "PE sections {first} and {second} overlap in virtual memory"
@@ -522,6 +523,14 @@ mod tests {
             image.read_rva(0x3000, &mut destination),
             Err(ImageReadError::OutsideImage)
         ));
+
+        let mut raw_padding = image();
+        raw_padding.sections[0].virtual_size = 0x100;
+        assert_eq!(raw_padding.read_rva(0x10f8, &mut destination).unwrap(), 8);
+        assert_eq!(raw_padding.read_rva(0x1100, &mut destination).unwrap(), 0);
+
+        raw_padding.sections[0].virtual_size = 0;
+        assert_eq!(raw_padding.read_rva(0x11f8, &mut destination).unwrap(), 8);
     }
 
     #[test]
