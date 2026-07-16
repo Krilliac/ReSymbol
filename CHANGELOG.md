@@ -8,6 +8,13 @@ prereleases; breaking changes remain explicit.
 
 ### Added
 
+- Added durable exact-claim review to the desktop workbench. Function name proposals retain their
+  complete-claim fingerprint and provenance, while Accept Primary, Keep as Alias, Reject, optional
+  rationale annotations, undo, and redo update a binary-bound ledger. Strict sidecar load,
+  create-new save, orphan reporting, and reviewed-projection rebuilds run on the bounded worker;
+  operation identifiers, ledger snapshots, and exact binary identity reject stale results. All six
+  review-aware symbol exports consume the active ledger, while canonical `.resym` packages keep
+  review history in the separate sidecar.
 - Added checked PE32+ `GuardMemcpyFunctionPointer` storage-anchor recovery from the versioned load
   configuration. Package schema 13 records the optional checked slot RVA behind an always-present
   marker, while schemas 1 through 12 remain explicitly readable and report the field as unavailable.
@@ -29,12 +36,12 @@ prereleases; breaking changes remain explicit.
   selections stay synchronized; edges come only from retained direct-call, thunk, and import
   relationships, and large binaries receive an explicitly bounded rendering instead of a fabricated
   complete call graph. The workbench uses shared package/export models and renderers with a
-  consistent create-new policy for `.resym`, neutral JSON, Markdown, and MAP artifacts. Windows
+  consistent create-new policy for `.resym`, neutral JSON, Markdown, MAP, public-symbol PDB, IDA
+  Python, and Ghidra Java artifacts. Windows
   release archives package the static-CRT workbench beside `resymbol.exe`. An off-by-default
   companion console can be enabled or disabled from the running workbench to mirror workbench
   activity and accept typed status, navigation, layout, export, and lifecycle commands without
-  giving its I/O thread direct ownership of GUI state. Plugin execution, existing-package opening,
-  and durable review actions remain future work.
+  giving its I/O thread direct ownership of GUI state. GUI plugin execution remains future work.
 - Added the first sandboxed WebAssembly Component Model analysis host for PE32+ x86-64 sessions.
   Components run in an in-process Wasmtime store that links only the checked-in ReSymbol WIT
   imports and no WASI interfaces, receive permission- and phase-gated `binary.read` and claim

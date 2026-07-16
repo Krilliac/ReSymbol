@@ -81,7 +81,7 @@ impl OperationGate {
     }
 }
 
-/// Export jobs available to the current workbench without a review editor.
+/// Export jobs available to the current workbench.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkerExportKind {
     Package,
@@ -102,6 +102,29 @@ impl WorkerExportKind {
 pub struct ExportOutcome {
     pub kind: WorkerExportKind,
     pub path: PathBuf,
+}
+
+/// Exact ledger snapshot and destination completed by one save operation.
+#[derive(Debug)]
+pub struct ReviewSaveOutcome {
+    pub ledger: ReviewLedger,
+    pub path: PathBuf,
+}
+
+/// A strictly loaded ledger and the reviewed model derived from that same
+/// immutable project snapshot on the service worker.
+#[derive(Debug)]
+pub struct ReviewLoadOutcome {
+    pub ledger: ReviewLedger,
+    pub path: PathBuf,
+    pub project: LoadedProject,
+    pub orphaned_decisions: usize,
+}
+
+#[derive(Debug)]
+pub struct ReviewApplyOutcome {
+    pub project: LoadedProject,
+    pub orphaned_decisions: usize,
 }
 
 /// Long-running application-service work never runs on egui's render thread.
@@ -189,12 +212,29 @@ pub enum WorkerCommand {
     VerifySource {
         operation: OperationId,
         project: Arc<ProjectSnapshot>,
+        reviews: ReviewLedger,
         path: PathBuf,
     },
     Export {
         operation: OperationId,
         project: Arc<ProjectSnapshot>,
+        reviews: ReviewLedger,
         kind: WorkerExportKind,
+        path: PathBuf,
+    },
+    SaveReview {
+        operation: OperationId,
+        ledger: ReviewLedger,
+        path: PathBuf,
+    },
+    ApplyReview {
+        operation: OperationId,
+        project: Arc<ProjectSnapshot>,
+        ledger: ReviewLedger,
+    },
+    LoadReview {
+        operation: OperationId,
+        project: Arc<ProjectSnapshot>,
         path: PathBuf,
     },
     Shutdown,
@@ -213,6 +253,19 @@ pub enum WorkerEvent {
         operation: OperationId,
         result: Result<ExportOutcome, String>,
     },
+    ReviewSaved {
+        operation: OperationId,
+        result: Result<ReviewSaveOutcome, String>,
+    },
+    ReviewApplied {
+        operation: OperationId,
+        ledger: ReviewLedger,
+        result: Result<ReviewApplyOutcome, String>,
+    },
+    ReviewLoaded {
+        operation: OperationId,
+        result: Result<ReviewLoadOutcome, String>,
+    },
 }
 
 fn worker_loop(
@@ -230,67 +283,8 @@ fn worker_loop(
             break;
         }
 
-        let event = match command {
-            WorkerCommand::Analyze { operation, path } => WorkerEvent::ProjectOpened {
-                operation,
-                result: services
-                    .analyze_binary(&path)
-                    .map_err(|error| error.to_string())
-                    .and_then(|snapshot| {
-                        LoadedProject::from_snapshot(snapshot).map_err(|error| error.to_string())
-                    }),
-            },
-            WorkerCommand::OpenPackage { operation, path } => WorkerEvent::ProjectOpened {
-                operation,
-                result: services
-                    .open_package(&path)
-                    .map_err(|error| error.to_string())
-                    .and_then(|snapshot| {
-                        LoadedProject::from_snapshot(snapshot).map_err(|error| error.to_string())
-                    }),
-            },
-            WorkerCommand::VerifySource {
-                operation,
-                project,
-                path,
-            } => WorkerEvent::SourceVerified {
-                operation,
-                result: services
-                    .verify_source_binary(&project, &path)
-                    .map_err(|error| error.to_string())
-                    .and_then(|snapshot| {
-                        LoadedProject::from_snapshot(snapshot).map_err(|error| error.to_string())
-                    }),
-            },
-            WorkerCommand::Export {
-                operation,
-                project,
-                kind,
-                path,
-            } => {
-                let result = match kind {
-                    WorkerExportKind::Package => services
-                        .save_package_new(&project, &path)
-                        .map_err(|error| error.to_string()),
-                    WorkerExportKind::Service(format) => {
-                        ReviewLedger::for_session(project.session())
-                            .map_err(|error| error.to_string())
-                            .and_then(|reviews| {
-                                services
-                                    .prepare_export(&project, &reviews, format)
-                                    .map_err(|error| error.to_string())
-                            })
-                            .and_then(|prepared| {
-                                services
-                                    .publish_export_new(&prepared, &path)
-                                    .map_err(|error| error.to_string())
-                            })
-                    }
-                }
-                .map(|()| ExportOutcome { kind, path });
-                WorkerEvent::ExportCompleted { operation, result }
-            }
-            WorkerCommand::Shutdown => break,
+        let Some(event) = process_command(&services, command) else {
+            break;
         };
         if events.send(event).is_err() {
             break;
@@ -299,9 +293,152 @@ fn worker_loop(
     }
 }
 
+fn process_command(services: &AppServices, command: WorkerCommand) -> Option<WorkerEvent> {
+    let event = match command {
+        WorkerCommand::Analyze { operation, path } => WorkerEvent::ProjectOpened {
+            operation,
+            result: services
+                .analyze_binary(&path)
+                .map_err(|error| error.to_string())
+                .and_then(|snapshot| {
+                    LoadedProject::from_snapshot(snapshot).map_err(|error| error.to_string())
+                }),
+        },
+        WorkerCommand::OpenPackage { operation, path } => WorkerEvent::ProjectOpened {
+            operation,
+            result: services
+                .open_package(&path)
+                .map_err(|error| error.to_string())
+                .and_then(|snapshot| {
+                    LoadedProject::from_snapshot(snapshot).map_err(|error| error.to_string())
+                }),
+        },
+        WorkerCommand::VerifySource {
+            operation,
+            project,
+            reviews,
+            path,
+        } => WorkerEvent::SourceVerified {
+            operation,
+            result: services
+                .verify_source_binary(&project, &path)
+                .map_err(|error| error.to_string())
+                .and_then(|snapshot| {
+                    let projection = snapshot
+                        .reviewed_projection(&reviews)
+                        .map_err(|error| error.to_string())?;
+                    LoadedProject::from_snapshot_with_projection(snapshot, projection)
+                        .map_err(|error| error.to_string())
+                }),
+        },
+        WorkerCommand::Export {
+            operation,
+            project,
+            reviews,
+            kind,
+            path,
+        } => {
+            let result = match kind {
+                WorkerExportKind::Package => services
+                    .save_package_new(&project, &path)
+                    .map_err(|error| error.to_string()),
+                WorkerExportKind::Service(format) => services
+                    .prepare_export(&project, &reviews, format)
+                    .map_err(|error| error.to_string())
+                    .and_then(|prepared| {
+                        services
+                            .publish_export_new(&prepared, &path)
+                            .map_err(|error| error.to_string())
+                    }),
+            }
+            .map(|()| ExportOutcome { kind, path });
+            WorkerEvent::ExportCompleted { operation, result }
+        }
+        WorkerCommand::SaveReview {
+            operation,
+            ledger,
+            path,
+        } => WorkerEvent::ReviewSaved {
+            operation,
+            result: ledger
+                .save_new(&path)
+                .map_err(|error| error.to_string())
+                .map(|()| ReviewSaveOutcome { ledger, path }),
+        },
+        WorkerCommand::ApplyReview {
+            operation,
+            project,
+            ledger,
+        } => {
+            let result = apply_reviews(project, &ledger);
+            WorkerEvent::ReviewApplied {
+                operation,
+                ledger,
+                result,
+            }
+        }
+        WorkerCommand::LoadReview {
+            operation,
+            project,
+            path,
+        } => WorkerEvent::ReviewLoaded {
+            operation,
+            result: ReviewLedger::load_for_session(&path, project.session())
+                .map_err(|error| error.to_string())
+                .and_then(|ledger| {
+                    let reviewed = apply_reviews(project, &ledger)?;
+                    Ok(ReviewLoadOutcome {
+                        ledger,
+                        path,
+                        project: reviewed.project,
+                        orphaned_decisions: reviewed.orphaned_decisions,
+                    })
+                }),
+        },
+        WorkerCommand::Shutdown => return None,
+    };
+    Some(event)
+}
+
+fn apply_reviews(
+    project: Arc<ProjectSnapshot>,
+    ledger: &ReviewLedger,
+) -> Result<ReviewApplyOutcome, String> {
+    let orphaned_decisions = ledger
+        .orphaned_decision_count(project.session())
+        .map_err(|error| error.to_string())?;
+    let projection = project
+        .reviewed_projection(ledger)
+        .map_err(|error| error.to_string())?;
+    let project = LoadedProject::from_snapshot_with_projection(project, projection)
+        .map_err(|error| error.to_string())?;
+    Ok(ReviewApplyOutcome {
+        project,
+        orphaned_decisions,
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    use std::io::Write as _;
+
+    use resymbol_core::{BinaryFormat, BinaryId, BinaryIdentity};
+    use tempfile::{NamedTempFile, tempdir};
+
     use super::*;
+
+    const STRIPPED_FIXTURE: &[u8] =
+        include_bytes!("../../../fixtures/pe-x64-msvc/artifacts/milestone2-stripped.exe");
+
+    fn project_snapshot() -> Arc<ProjectSnapshot> {
+        let mut source = NamedTempFile::new().expect("temporary PE");
+        source
+            .write_all(STRIPPED_FIXTURE)
+            .expect("write fixture PE");
+        AppServices::default()
+            .analyze_binary(source.path())
+            .expect("analyze worker fixture")
+    }
 
     #[test]
     fn operation_gate_rejects_stale_results_without_clearing_the_current_request() {
@@ -327,5 +464,94 @@ mod tests {
 
         assert_ne!(first.get(), 0);
         assert!(second > first);
+    }
+
+    #[test]
+    fn worker_review_save_preserves_operation_id_and_refuses_clobber() {
+        let identity = BinaryIdentity {
+            id: BinaryId::digest(b"review-worker-fixture"),
+            size: 21,
+            format: BinaryFormat::Pe,
+            architecture: "x86_64".to_owned(),
+            image_base: 0x1400_0000_0,
+        };
+        let ledger = ReviewLedger::new(&identity);
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("review.json");
+        let mut sequence = OperationSequence::default();
+        let first = sequence.issue();
+
+        let event = process_command(
+            &AppServices::default(),
+            WorkerCommand::SaveReview {
+                operation: first,
+                ledger: ledger.clone(),
+                path: path.clone(),
+            },
+        )
+        .expect("save event");
+        match event {
+            WorkerEvent::ReviewSaved {
+                operation,
+                result: Ok(outcome),
+            } => {
+                assert_eq!(operation, first);
+                assert_eq!(outcome.ledger, ledger);
+                assert_eq!(outcome.path, path);
+            }
+            _ => panic!("unexpected worker event"),
+        }
+
+        let second = sequence.issue();
+        let event = process_command(
+            &AppServices::default(),
+            WorkerCommand::SaveReview {
+                operation: second,
+                ledger,
+                path,
+            },
+        )
+        .expect("second save event");
+        assert!(matches!(
+            event,
+            WorkerEvent::ReviewSaved {
+                operation,
+                result: Err(_),
+            } if operation == second
+        ));
+    }
+
+    #[test]
+    fn worker_loads_and_projects_a_binary_bound_review_with_its_operation_id() {
+        let project = project_snapshot();
+        let ledger = ReviewLedger::for_session(project.session()).expect("bound review ledger");
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("review.json");
+        ledger.save_new(&path).expect("save review fixture");
+        let operation = OperationSequence::default().issue();
+
+        let event = process_command(
+            &AppServices::default(),
+            WorkerCommand::LoadReview {
+                operation,
+                project: Arc::clone(&project),
+                path: path.clone(),
+            },
+        )
+        .expect("load event");
+        match event {
+            WorkerEvent::ReviewLoaded {
+                operation: actual,
+                result: Ok(outcome),
+            } => {
+                assert_eq!(actual, operation);
+                assert_eq!(outcome.path, path);
+                assert_eq!(outcome.ledger, ledger);
+                assert_eq!(outcome.orphaned_decisions, 0);
+                assert_eq!(outcome.project.snapshot.session(), project.session());
+                assert_eq!(outcome.project.projection, project.projection_arc());
+            }
+            _ => panic!("unexpected worker event"),
+        }
     }
 }

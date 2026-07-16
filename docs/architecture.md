@@ -550,11 +550,14 @@ address proximity or layout guesses. A fixed node/tier window keeps large binari
 a visible bounded/truncation cue whenever the reachable view exceeds that rendering budget.
 
 GUI exports use the same shared models and create-new policy to write canonical `.resym`, neutral
-JSON, bounded Markdown, and PE MAP files. The first slice does not execute plugins, open legacy
-packages, or persist review decisions, and **Accept**, **Keep as Alias**, and **Reject** are not
-active operations. PDB, IDAPython, and Ghidra Java GUI export, arbitrary docking, synchronized
-disassembly/pseudocode views, editable or exhaustive control-flow graphs, and an interactive
-debugger bridge remain planned.
+JSON, bounded Markdown, PE MAP, public-symbol PDB, IDA Python, and Ghidra Java files. The workbench
+opens current packages, verifies an exact source binary when byte-dependent views require it, and
+owns one binary-bound review ledger. **Accept Primary**, **Keep as Alias**, **Reject**, annotations,
+undo, and redo apply only to fingerprinted name claims; non-name claims remain read-only. Sidecar
+I/O and reviewed projection rebuilds run on the bounded worker, while operation identifiers and
+exact ledger/project binding reject stale results. GUI plugin execution, arbitrary docking,
+synchronized disassembly/pseudocode views, editable or exhaustive control-flow graphs, and an
+interactive debugger bridge remain planned.
 
 The companion console is an opt-in process rather than a second state owner. The GUI spawns the
 packaged console helper only after the user enables it and uses private redirected standard-I/O

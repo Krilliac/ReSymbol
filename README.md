@@ -280,9 +280,10 @@ ReSymbol is growing from the working PE/package foundation toward:
 - conservative standalone import-script exporters for IDA and Ghidra, deterministic
   Microsoft-linker-style MAP output, and exact-RSDS public-symbol PDB output, followed by richer
   bridges, richer PDB records, DWARF, and other debugging formats;
-- an initial Windows-first desktop workbench for background core analysis, evidence and provenance
-  review, read-only plugin health, and constrained create-new exports, followed by GUI plugin
-  execution, legacy-package opening, durable review decisions, and richer tool bridges;
+- a Windows-first desktop workbench for background core analysis, current-package opening, exact
+  claim review with durable binary-bound decisions, read-only plugin health, reconstruction and
+  address-space views, and constrained create-new exports, followed by GUI plugin execution and
+  richer debugger/tool bridges;
 - drop-in plugin discovery from a local `plugins/` directory;
 - WASM, native C/C++, managed/.NET, external-process, and debugger-hosted plugin families from the
   initial architecture, with WASM, external-process, native C/C++, and managed/.NET execution

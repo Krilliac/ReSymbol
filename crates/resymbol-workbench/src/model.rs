@@ -15,7 +15,7 @@ use std::{
 };
 
 use resymbol_analysis::{AnalysisSession, BinaryAnalysis, SessionValidationError};
-use resymbol_app::{AppError, AppServices, ProjectSnapshot};
+use resymbol_app::{AppError, AppServices, ProjectSnapshot, ReviewSubject, ReviewValidationError};
 use resymbol_core::{
     BinaryId, ClaimProducer, ControlFlowTarget, SymbolAssertion, SymbolClaim, SymbolSubject,
 };
@@ -25,7 +25,7 @@ use resymbol_debugger::{
 };
 use resymbol_export::{
     AttributedText, ExportAttribution, ExportBinaryFormat, ExportFunction, ExportProducer,
-    ExportProjection,
+    ExportProjection, ProjectionValidationError,
 };
 use thiserror::Error;
 
@@ -155,6 +155,16 @@ pub struct FunctionClaimDetail {
     pub method: String,
     pub run_id: Option<String>,
     pub evidence: Vec<EvidenceDetail>,
+    review_subject: Option<ReviewSubject>,
+}
+
+impl FunctionClaimDetail {
+    /// Exact, fingerprinted review key for name claims. Other claim kinds are
+    /// deliberately read-only until their own durable decision semantics exist.
+    #[must_use]
+    pub const fn review_subject(&self) -> Option<&ReviewSubject> {
+        self.review_subject.as_ref()
+    }
 }
 
 /// Inspector data for one canonical projection row.
@@ -276,8 +286,29 @@ impl LoadedProject {
 
     /// Build presentation indexes around one immutable application snapshot.
     pub fn from_snapshot(snapshot: Arc<ProjectSnapshot>) -> Result<Self, ModelError> {
+        let projection = snapshot.projection_arc();
+        Self::from_snapshot_with_projection(snapshot, projection)
+    }
+
+    /// Build presentation indexes around a reviewed projection of the same
+    /// immutable project. Exact identity is rechecked before any UI state is
+    /// constructed, so a stale or foreign worker result cannot be displayed.
+    pub fn from_snapshot_with_projection(
+        snapshot: Arc<ProjectSnapshot>,
+        projection: Arc<ExportProjection>,
+    ) -> Result<Self, ModelError> {
         snapshot.session().validate()?;
+        projection.validate()?;
         let base_analysis = snapshot.session().base_analysis();
+        let expected = base_analysis.identity();
+        if projection.binary.id != expected.id || projection.binary.file_size != expected.size {
+            return Err(ModelError::ProjectionIdentityMismatch {
+                expected_sha256: expected.id.clone(),
+                expected_size: expected.size,
+                found_sha256: projection.binary.id.clone(),
+                found_size: projection.binary.file_size,
+            });
+        }
         let static_address_space = StaticAddressSpace::from_analysis(base_analysis)?;
         let protection_assessment = match (base_analysis, snapshot.verified_source_bytes()) {
             (BinaryAnalysis::Pe(analysis), Some(bytes)) => {
@@ -287,9 +318,8 @@ impl LoadedProject {
             (_, _) => ProtectionAssessment::UnsupportedFormat,
         };
         let combined_graph = snapshot.session().combined_symbol_graph()?;
-        let projection = snapshot.projection_arc();
         let (functions, function_details) =
-            build_function_inventory(&projection.functions, combined_graph.claims());
+            build_function_inventory(&projection.functions, combined_graph.claims())?;
         let binary = &projection.binary;
         let path = snapshot.origin_path().to_path_buf();
         let display_name = path
@@ -422,7 +452,7 @@ fn compare_optional_f64(left: Option<f64>, right: Option<f64>) -> Ordering {
 fn build_function_inventory(
     projected_functions: &[ExportFunction],
     claims: &[SymbolClaim],
-) -> (Vec<FunctionRow>, Vec<FunctionDetail>) {
+) -> Result<(Vec<FunctionRow>, Vec<FunctionDetail>), ReviewValidationError> {
     let mut claims_by_rva = BTreeMap::<u64, Vec<FunctionClaimDetail>>::new();
     for claim in claims {
         let SymbolSubject::Function { rva, size, .. } = claim.subject() else {
@@ -431,7 +461,7 @@ fn build_function_inventory(
         claims_by_rva
             .entry(*rva)
             .or_default()
-            .push(claim_detail(claim, *size));
+            .push(claim_detail(claim, *size)?);
     }
 
     let mut rows = Vec::with_capacity(projected_functions.len());
@@ -476,7 +506,7 @@ fn build_function_inventory(
             claims,
         });
     }
-    (rows, details)
+    Ok((rows, details))
 }
 
 fn primary_attribution(function: &ExportFunction) -> Option<&ExportAttribution> {
@@ -498,9 +528,15 @@ fn name_candidate(value: &AttributedText) -> FunctionNameCandidate {
     }
 }
 
-fn claim_detail(claim: &SymbolClaim, subject_size: Option<u64>) -> FunctionClaimDetail {
+fn claim_detail(
+    claim: &SymbolClaim,
+    subject_size: Option<u64>,
+) -> Result<FunctionClaimDetail, ReviewValidationError> {
     let (kind, value) = assertion_detail(claim.assertion());
-    FunctionClaimDetail {
+    let review_subject = matches!(claim.assertion(), SymbolAssertion::Name { .. })
+        .then(|| ReviewSubject::from_name_claim(claim))
+        .transpose()?;
+    Ok(FunctionClaimDetail {
         kind,
         value,
         subject_size,
@@ -518,7 +554,8 @@ fn claim_detail(claim: &SymbolClaim, subject_size: Option<u64>) -> FunctionClaim
                 artifacts: evidence.artifacts.clone(),
             })
             .collect(),
-    }
+        review_subject,
+    })
 }
 
 fn assertion_detail(assertion: &SymbolAssertion) -> (FunctionClaimKind, String) {
@@ -578,6 +615,14 @@ fn derive_function_status(
     function: &ExportFunction,
     claims: &[FunctionClaimDetail],
 ) -> FunctionStatus {
+    if function.selected_name.as_ref().is_some_and(|name| {
+        matches!(
+            &name.source.attribution.provenance.producer,
+            ExportProducer::User { .. }
+        )
+    }) {
+        return FunctionStatus::Reviewed;
+    }
     if !function.alternate_names.is_empty() {
         return FunctionStatus::Conflict;
     }
@@ -673,6 +718,19 @@ pub enum ModelError {
     StaticAddressSpace(#[from] StaticAddressSpaceError),
     #[error("protection assessment failed: {0}")]
     Protection(#[from] ProtectionScanError),
+    #[error("review subject construction failed: {0}")]
+    Review(#[from] ReviewValidationError),
+    #[error("reviewed export projection is invalid: {0}")]
+    Projection(#[from] ProjectionValidationError),
+    #[error(
+        "reviewed projection identity mismatch: expected {expected_sha256}/{expected_size} bytes, found {found_sha256}/{found_size} bytes"
+    )]
+    ProjectionIdentityMismatch {
+        expected_sha256: BinaryId,
+        expected_size: u64,
+        found_sha256: BinaryId,
+        found_size: u64,
+    },
 }
 
 #[cfg(test)]
@@ -783,6 +841,7 @@ mod tests {
                 confidence: Some(confidence),
                 artifacts: BTreeMap::new(),
             }],
+            review_subject: None,
         }
     }
 
@@ -818,7 +877,29 @@ mod tests {
                 project.function_detail(index).map(|detail| detail.rva),
                 Some(row.rva)
             );
+            if let Some(detail) = project.function_detail(index) {
+                for claim in &detail.claims {
+                    assert_eq!(
+                        claim.review_subject().is_some(),
+                        claim.kind == FunctionClaimKind::Name,
+                        "only exact name claims should expose review subjects"
+                    );
+                }
+            }
         }
+    }
+
+    #[test]
+    fn reviewed_model_rejects_a_foreign_projection_identity() {
+        let project = loaded_fixture(STRIPPED_FIXTURE);
+        let snapshot = Arc::clone(&project.snapshot);
+        let mut projection = project.projection.as_ref().clone();
+        projection.binary.id = BinaryId::digest(b"foreign-reviewed-projection");
+
+        assert!(matches!(
+            LoadedProject::from_snapshot_with_projection(snapshot, Arc::new(projection)),
+            Err(ModelError::ProjectionIdentityMismatch { .. })
+        ));
     }
 
     #[test]
