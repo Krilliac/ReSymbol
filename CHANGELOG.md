@@ -36,6 +36,10 @@ prereleases; breaking changes remain explicit.
   findings. No process-executing debugger helper, Windows AppContainer provider, Hyper-V guest, attach
   path, or live memory mutation is implemented yet; the test host and readiness reports must not be
   represented as an operating-system security boundary.
+- Added a production, strictly non-executing `OfflineImageDebugHost`. It freezes one exact
+  identity-verified image snapshot, exposes only bounded canonical file-backed RVA reads, reports a
+  complete capability matrix with only `OfflineAnalysis` available, and rejects every live,
+  mutating, execution, attach, launch, and sandbox operation without emitting security evidence.
 - Added the first Windows-first `resymbol-workbench.exe` desktop slice. It runs bounded core-only PE
   analysis away from the UI thread and presents exact identity, evidence- and provenance-first
   function review, read-only plugin health, and a visual Reconstruction Graph rooted at the PE entry
