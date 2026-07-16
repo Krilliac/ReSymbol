@@ -115,10 +115,12 @@ The process runner places each external plugin or native/managed helper and its 
 owned POSIX process group or Windows Job Object. It terminates the whole owned tree when the direct
 child completes, a deadline expires, a stdout/stderr capture worker fails, or the runtime guard
 drops. This is lifecycle containment only: it does not restrict filesystem, network, credentials,
-process APIs, or any other ambient authority. Windows uses a safe Rust wrapper to assign the child
-to its Job Object immediately after spawn, but a narrow pre-assignment escape race remains. On
-POSIX a hostile plugin/helper or descendant can deliberately leave its process group or session
-and escape later group termination.
+process APIs, or any other ambient authority. Linux keeps an exited group leader waitable with
+`waitid(WNOWAIT)`, while macOS observes `NOTE_EXIT` through a kqueue registered at spawn; both defer
+reaping until group termination so the process-group identifier cannot be recycled during normal
+cleanup. Windows uses a safe Rust wrapper to assign the child to its Job Object immediately after
+spawn, but a narrow pre-assignment escape race remains. On POSIX a hostile plugin/helper or
+descendant can deliberately leave its process group or session and escape later group termination.
 
 External-process, native, and managed plugins require approval bound to the complete plugin-directory
 fingerprint. This binds a decision to exact local bytes but does not authenticate a publisher, and
