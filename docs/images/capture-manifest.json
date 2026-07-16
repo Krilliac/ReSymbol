@@ -43,8 +43,8 @@
                          "view":  "address-space",
                          "width":  1440,
                          "height":  900,
-                         "bytes":  257464,
-                         "sha256":  "2f43d3aafa1cd64e542e453226a38c5dc69528487170626b04d8269b47ad042c"
+                         "bytes":  254942,
+                         "sha256":  "a06eea7f7bf233cd58977b92bea3d058b60854ecadbaef8db55636420fe97d17"
                      },
                      {
                          "file":  "workbench-debugger-sandbox.png",
