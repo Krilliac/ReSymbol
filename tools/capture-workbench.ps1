@@ -13,6 +13,25 @@ Set-StrictMode -Version Latest
 $captureWidth = 1440
 $captureHeight = 900
 $captureTabs = @('overview', 'functions', 'graph', 'address-space', 'debugger-sandbox')
+$maxCapturedProcessLogChars = 16 * 1024
+$captureTerminationTimeoutMilliseconds = 5 * 1000
+
+function Write-BoundedCaptureProcessLog {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Label,
+        [AllowEmptyString()]
+        [string]$Value
+    )
+
+    if (-not $Value) {
+        return
+    }
+    if ($Value.Length -gt $maxCapturedProcessLogChars) {
+        $Value = $Value.Substring(0, $maxCapturedProcessLogChars) + "`n[output truncated]"
+    }
+    Write-Host "$Label`n$Value"
+}
 
 if (-not ('ReSymbol.WorkbenchCaptureDpi' -as [type])) {
     Add-Type -TypeDefinition @'
@@ -110,23 +129,51 @@ try {
             $env:RESYMBOL_WORKBENCH_SCREENSHOT_TAB = $tab
 
             $quotedBinary = '"{0}"' -f $Binary
-            $startParameters = @{
-                FilePath = $executable
-                ArgumentList = $quotedBinary
-                WorkingDirectory = $repoRoot
-                PassThru = $true
-            }
+            $startInfo = [Diagnostics.ProcessStartInfo]::new()
+            $startInfo.FileName = $executable
+            $startInfo.Arguments = $quotedBinary
+            $startInfo.WorkingDirectory = $repoRoot
+            $startInfo.UseShellExecute = $false
+            $startInfo.RedirectStandardOutput = $true
+            $startInfo.RedirectStandardError = $true
+            $startInfo.CreateNoWindow = $false
             # Keep the native window visible while the OpenGL framebuffer is sampled. A hidden or
             # minimized WGL surface can return partially cleared frames on Windows, even though the
             # application has completed all egui passes. The capture closes itself immediately.
-            $process = Start-Process @startParameters
+            $process = [Diagnostics.Process]::new()
+            $process.StartInfo = $startInfo
+            if (-not $process.Start()) {
+                $process.Dispose()
+                throw "Screenshot capture for '$tab' could not start"
+            }
+            $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+            $stderrTask = $process.StandardError.ReadToEndAsync()
             try {
-                if (-not $process.WaitForExit($CaptureTimeoutSeconds * 1000)) {
-                    Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+                $timedOut = -not $process.WaitForExit($CaptureTimeoutSeconds * 1000)
+                if ($timedOut) {
+                    try {
+                        $process.Kill()
+                    }
+                    catch {
+                        # The process can exit between the timed wait and Kill. The bounded wait
+                        # below is authoritative and also prevents a failed Kill from hanging CI.
+                    }
+                    if (-not $process.WaitForExit($captureTerminationTimeoutMilliseconds)) {
+                        throw "Screenshot capture for '$tab' exceeded ${CaptureTimeoutSeconds}s and could not be terminated within $($captureTerminationTimeoutMilliseconds / 1000)s"
+                    }
+                }
+                $capturedStdout = $stdoutTask.GetAwaiter().GetResult()
+                $capturedStderr = $stderrTask.GetAwaiter().GetResult()
+                if ($timedOut) {
+                    Write-BoundedCaptureProcessLog "Screenshot process stdout for '$tab':" $capturedStdout
+                    Write-BoundedCaptureProcessLog "Screenshot process stderr for '$tab':" $capturedStderr
                     throw "Screenshot capture for '$tab' exceeded ${CaptureTimeoutSeconds}s"
                 }
-                if ($process.ExitCode -ne 0) {
-                    throw "Screenshot capture for '$tab' failed with exit code $($process.ExitCode)"
+                $exitCode = $process.ExitCode
+                if ($exitCode -ne 0) {
+                    Write-BoundedCaptureProcessLog "Screenshot process stdout for '$tab':" $capturedStdout
+                    Write-BoundedCaptureProcessLog "Screenshot process stderr for '$tab':" $capturedStderr
+                    throw "Screenshot capture for '$tab' failed with exit code $exitCode"
                 }
             }
             finally {

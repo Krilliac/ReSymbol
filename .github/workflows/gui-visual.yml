@@ -67,8 +67,50 @@ jobs:
           --features screenshot
           --bin resymbol-workbench
 
+      - name: Provision pinned software OpenGL for capture
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = "26.0.3"
+          $expectedSha256 = "de1ec45c906164de2c046288a8969e83cf2d51d031dc8dfd1f9371bb31cd6755"
+          $archive = Join-Path $env:RUNNER_TEMP "mesa3d-$version-release-msvc.7z"
+          $stage = Join-Path $env:RUNNER_TEMP "mesa3d-$version"
+          $url = "https://github.com/pal1000/mesa-dist-win/releases/download/$version/mesa3d-$version-release-msvc.7z"
+
+          Invoke-WebRequest -Uri $url -OutFile $archive
+          $actualSha256 = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualSha256 -ne $expectedSha256) {
+            throw "Mesa archive SHA-256 mismatch: expected $expectedSha256, got $actualSha256"
+          }
+
+          $sevenZip = Join-Path $env:ProgramFiles "7-Zip\7z.exe"
+          if (-not (Test-Path -LiteralPath $sevenZip -PathType Leaf)) {
+            throw "7-Zip was not found at '$sevenZip'"
+          }
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          & $sevenZip e -y "-o$stage" $archive "x64\opengl32.dll" "x64\libgallium_wgl.dll"
+          if ($LASTEXITCODE -ne 0) {
+            throw "7-Zip failed to extract the Mesa runtime (exit code $LASTEXITCODE)"
+          }
+
+          $binaryDirectory = (Resolve-Path -LiteralPath "target\debug").Path
+          foreach ($library in @("opengl32.dll", "libgallium_wgl.dll")) {
+            $source = Join-Path $stage $library
+            if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+              throw "Mesa archive did not contain x64/$library"
+            }
+            Copy-Item -LiteralPath $source -Destination (Join-Path $binaryDirectory $library)
+          }
+          [IO.File]::WriteAllText(
+            (Join-Path $binaryDirectory "resymbol-workbench.exe.local"),
+            ""
+          )
+
       - name: Capture and validate review views
         shell: pwsh
+        env:
+          GALLIUM_DRIVER: llvmpipe
+          LIBGL_ALWAYS_SOFTWARE: "1"
         run: >-
           ./tools/capture-workbench.ps1
           -SkipBuild

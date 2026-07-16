@@ -41,3 +41,8 @@ format, exact dimensions, completeness, and manifest metadata, and uploads the f
 with PNG recompression disabled. CI deliberately does not compare those pixels with `docs/images`,
 so a passing job proves capture integrity—not rendering equivalence. The generated artifact remains
 available for human comparison with the checked-in references.
+
+GitHub's hosted Windows runner uses a SHA-256-pinned Mesa llvmpipe build placed beside the capture
+binary for that job only. This supplies a deterministic software OpenGL implementation without a
+system install. It is a CI startup dependency, not a claim that software-rendered pixels match the
+native Glow captures reviewed and checked in from a local Windows desktop.

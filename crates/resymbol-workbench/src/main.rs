@@ -1,4 +1,7 @@
-#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+#![cfg_attr(
+    all(target_os = "windows", not(feature = "screenshot")),
+    windows_subsystem = "windows"
+)]
 
 use eframe::egui;
 use resymbol_workbench::WorkbenchApp;
