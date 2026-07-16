@@ -14,7 +14,7 @@ pub const MAX_BUILD_ID_BYTES: usize = 256;
 
 const PREFIX_BYTES: usize = 4;
 const FIXED_CONTROL_BYTES: usize = 32;
-const HELLO_FIXED_BYTES: usize = 18;
+const HELLO_FIXED_BYTES: usize = 20;
 const MAGIC: [u8; 4] = *b"RSYM";
 const ADDRESS_FLAG: u8 = 1;
 
@@ -84,17 +84,82 @@ impl TryFrom<u8> for MessageKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum EndpointRole {
+    Controller = 1,
+    Host = 2,
+}
+
+impl EndpointRole {
+    #[must_use]
+    pub const fn peer(self) -> Self {
+        match self {
+            Self::Controller => Self::Host,
+            Self::Host => Self::Controller,
+        }
+    }
+
+    #[must_use]
+    pub const fn outbound_direction(self) -> MessageDirection {
+        match self {
+            Self::Controller => MessageDirection::ControllerToHost,
+            Self::Host => MessageDirection::HostToController,
+        }
+    }
+}
+
+impl TryFrom<u8> for EndpointRole {
+    type Error = WireError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::Controller),
+            2 => Ok(Self::Host),
+            _ => Err(WireError::UnknownEndpointRole { value }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum MessageDirection {
+    ControllerToHost = 1,
+    HostToController = 2,
+}
+
+impl TryFrom<u8> for MessageDirection {
+    type Error = WireError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::ControllerToHost),
+            2 => Ok(Self::HostToController),
+            _ => Err(WireError::UnknownMessageDirection { value }),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HelloIdentity {
     pub nonce: [u8; 16],
+    pub role: EndpointRole,
+    pub direction: MessageDirection,
     pub build_identity: String,
 }
 
 impl HelloIdentity {
-    pub fn new(nonce: [u8; 16], build_identity: impl Into<String>) -> Result<Self, WireError> {
+    pub fn new(
+        nonce: [u8; 16],
+        role: EndpointRole,
+        direction: MessageDirection,
+        build_identity: impl Into<String>,
+    ) -> Result<Self, WireError> {
         let build_identity = build_identity.into();
         let hello = Self {
             nonce,
+            role,
+            direction,
             build_identity,
         };
         hello.validate()?;
@@ -105,16 +170,271 @@ impl HelloIdentity {
         if self.nonce.iter().all(|byte| *byte == 0) {
             return Err(WireError::ZeroHelloNonce);
         }
-        if self.build_identity.is_empty() || self.build_identity.as_bytes().contains(&0) {
-            return Err(WireError::InvalidBuildIdentity);
+        if self.direction != self.role.outbound_direction() {
+            return Err(WireError::RoleDirectionMismatch);
         }
-        if self.build_identity.len() > MAX_BUILD_ID_BYTES {
-            return Err(WireError::BuildIdentityTooLong {
-                actual: self.build_identity.len(),
-                maximum: MAX_BUILD_ID_BYTES,
-            });
+        validate_build_identity(&self.build_identity)?;
+        Ok(())
+    }
+}
+
+fn validate_build_identity(build_identity: &str) -> Result<(), WireError> {
+    if build_identity.is_empty() || build_identity.chars().any(char::is_control) {
+        return Err(WireError::InvalidBuildIdentity);
+    }
+    if build_identity.len() > MAX_BUILD_ID_BYTES {
+        return Err(WireError::BuildIdentityTooLong {
+            actual: build_identity.len(),
+            maximum: MAX_BUILD_ID_BYTES,
+        });
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandshakeState {
+    Ready,
+    AwaitingHello,
+    AwaitingAcknowledgement,
+    Established,
+    Failed,
+}
+
+/// Directional challenge/response authentication for one frame exchange.
+///
+/// The machine deliberately owns no transport. Each side has an independent
+/// frame sequence, so the initial `Hello` and `HelloAck` are both sequence one.
+/// Any validation failure is terminal: callers must discard the channel rather
+/// than attempting to recover on bytes whose identity is no longer trusted.
+#[derive(Debug)]
+pub struct HandshakeMachine {
+    role: EndpointRole,
+    local_build_identity: String,
+    expected_peer_build_identity: String,
+    offered_version: ProtocolVersion,
+    negotiated_version: Option<ProtocolVersion>,
+    nonce: Option<[u8; 16]>,
+    state: HandshakeState,
+}
+
+impl HandshakeMachine {
+    pub fn initiator(
+        role: EndpointRole,
+        nonce: [u8; 16],
+        local_build_identity: impl Into<String>,
+        expected_peer_build_identity: impl Into<String>,
+    ) -> Result<Self, HandshakeError> {
+        Self::initiator_for_version(
+            role,
+            nonce,
+            local_build_identity,
+            expected_peer_build_identity,
+            ProtocolVersion::CURRENT,
+        )
+    }
+
+    /// Offers one explicitly supported protocol version. The responder either
+    /// acknowledges that exact version or fails the channel; there is no
+    /// ambiguous downgrade or silent fallback.
+    pub fn initiator_for_version(
+        role: EndpointRole,
+        nonce: [u8; 16],
+        local_build_identity: impl Into<String>,
+        expected_peer_build_identity: impl Into<String>,
+        offered_version: ProtocolVersion,
+    ) -> Result<Self, HandshakeError> {
+        if nonce.iter().all(|byte| *byte == 0) {
+            return Err(WireError::ZeroHelloNonce.into());
+        }
+        offered_version.validate()?;
+        Self::new(
+            role,
+            local_build_identity.into(),
+            expected_peer_build_identity.into(),
+            offered_version,
+            Some(nonce),
+            HandshakeState::Ready,
+        )
+    }
+
+    pub fn responder(
+        role: EndpointRole,
+        local_build_identity: impl Into<String>,
+        expected_peer_build_identity: impl Into<String>,
+    ) -> Result<Self, HandshakeError> {
+        Self::new(
+            role,
+            local_build_identity.into(),
+            expected_peer_build_identity.into(),
+            ProtocolVersion::CURRENT,
+            None,
+            HandshakeState::AwaitingHello,
+        )
+    }
+
+    fn new(
+        role: EndpointRole,
+        local_build_identity: String,
+        expected_peer_build_identity: String,
+        offered_version: ProtocolVersion,
+        nonce: Option<[u8; 16]>,
+        state: HandshakeState,
+    ) -> Result<Self, HandshakeError> {
+        validate_build_identity(&local_build_identity)?;
+        validate_build_identity(&expected_peer_build_identity)?;
+        Ok(Self {
+            role,
+            local_build_identity,
+            expected_peer_build_identity,
+            offered_version,
+            negotiated_version: None,
+            nonce,
+            state,
+        })
+    }
+
+    #[must_use]
+    pub const fn state(&self) -> HandshakeState {
+        self.state
+    }
+
+    #[must_use]
+    pub const fn negotiated_version(&self) -> Option<ProtocolVersion> {
+        self.negotiated_version
+    }
+
+    pub fn begin(&mut self, sequence: FrameSequence) -> Result<FrameHeader, HandshakeError> {
+        let result = self.begin_inner(sequence);
+        if result.is_err() {
+            self.state = HandshakeState::Failed;
+        }
+        result
+    }
+
+    fn begin_inner(&mut self, sequence: FrameSequence) -> Result<FrameHeader, HandshakeError> {
+        match self.state {
+            HandshakeState::Ready => {}
+            HandshakeState::AwaitingAcknowledgement | HandshakeState::Established => {
+                return Err(HandshakeError::ReplayOrDuplicate);
+            }
+            HandshakeState::AwaitingHello => return Err(HandshakeError::WrongHandshakeSide),
+            HandshakeState::Failed => return Err(HandshakeError::Terminal),
+        }
+        require_handshake_sequence(sequence)?;
+        let nonce = self.nonce.ok_or(HandshakeError::WrongHandshakeSide)?;
+        let mut frame = FrameHeader::new(
+            sequence,
+            MessageKind::Hello,
+            0,
+            None,
+            ControlBody::Hello(HelloIdentity::new(
+                nonce,
+                self.role,
+                self.role.outbound_direction(),
+                self.local_build_identity.clone(),
+            )?),
+        )?;
+        frame.version = self.offered_version;
+        frame.validate()?;
+        self.state = HandshakeState::AwaitingAcknowledgement;
+        Ok(frame)
+    }
+
+    /// Accepts the peer handshake frame. A responder returns the acknowledgement
+    /// it must send; an initiator returns `None` after validating that response.
+    pub fn accept(&mut self, frame: &FrameHeader) -> Result<Option<FrameHeader>, HandshakeError> {
+        let result = self.accept_inner(frame);
+        if result.is_err() {
+            self.state = HandshakeState::Failed;
+        }
+        result
+    }
+
+    fn accept_inner(&mut self, frame: &FrameHeader) -> Result<Option<FrameHeader>, HandshakeError> {
+        if matches!(self.state, HandshakeState::Established) {
+            return Err(HandshakeError::ReplayOrDuplicate);
+        }
+        if matches!(self.state, HandshakeState::Failed) {
+            return Err(HandshakeError::Terminal);
+        }
+        frame.validate()?;
+        require_handshake_sequence(frame.sequence)?;
+        let hello = match &frame.body {
+            ControlBody::Hello(hello) => hello,
+            ControlBody::Bytes(_) => return Err(HandshakeError::MissingHelloIdentity),
+        };
+        match self.state {
+            HandshakeState::AwaitingHello => {
+                require_kind(frame.kind, MessageKind::Hello)?;
+                self.validate_peer(hello)?;
+                let mut acknowledgement = FrameHeader::new(
+                    FrameSequence::new(1)?,
+                    MessageKind::HelloAck,
+                    0,
+                    None,
+                    ControlBody::Hello(HelloIdentity::new(
+                        hello.nonce,
+                        self.role,
+                        self.role.outbound_direction(),
+                        self.local_build_identity.clone(),
+                    )?),
+                )?;
+                acknowledgement.version = frame.version;
+                acknowledgement.validate()?;
+                self.nonce = Some(hello.nonce);
+                self.negotiated_version = Some(frame.version);
+                self.state = HandshakeState::Established;
+                Ok(Some(acknowledgement))
+            }
+            HandshakeState::AwaitingAcknowledgement => {
+                require_kind(frame.kind, MessageKind::HelloAck)?;
+                self.validate_peer(hello)?;
+                if frame.version != self.offered_version {
+                    return Err(HandshakeError::ProtocolVersionMismatch);
+                }
+                if self.nonce != Some(hello.nonce) {
+                    return Err(HandshakeError::NonceMismatch);
+                }
+                self.negotiated_version = Some(frame.version);
+                self.state = HandshakeState::Established;
+                Ok(None)
+            }
+            HandshakeState::Ready => Err(HandshakeError::HandshakeNotStarted),
+            HandshakeState::Established => Err(HandshakeError::ReplayOrDuplicate),
+            HandshakeState::Failed => Err(HandshakeError::Terminal),
+        }
+    }
+
+    fn validate_peer(&self, hello: &HelloIdentity) -> Result<(), HandshakeError> {
+        if hello.role != self.role.peer() {
+            return Err(HandshakeError::PeerRoleMismatch);
+        }
+        if hello.direction != hello.role.outbound_direction() {
+            return Err(HandshakeError::PeerDirectionMismatch);
+        }
+        if hello.build_identity != self.expected_peer_build_identity {
+            return Err(HandshakeError::PeerBuildIdentityMismatch);
         }
         Ok(())
+    }
+}
+
+fn require_handshake_sequence(sequence: FrameSequence) -> Result<(), HandshakeError> {
+    if sequence.get() == 1 {
+        Ok(())
+    } else {
+        Err(HandshakeError::UnexpectedSequence {
+            expected: 1,
+            actual: sequence.get(),
+        })
+    }
+}
+
+fn require_kind(actual: MessageKind, expected: MessageKind) -> Result<(), HandshakeError> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(HandshakeError::UnexpectedMessageKind { expected, actual })
     }
 }
 
@@ -235,6 +555,8 @@ pub fn encode_control(header: &FrameHeader) -> Result<Vec<u8>, WireError> {
     match &header.body {
         ControlBody::Hello(hello) => {
             out.extend_from_slice(&hello.nonce);
+            out.push(hello.role as u8);
+            out.push(hello.direction as u8);
             let length =
                 u16::try_from(hello.build_identity.len()).map_err(|_| WireError::LengthOverflow)?;
             out.extend_from_slice(&length.to_le_bytes());
@@ -281,7 +603,9 @@ pub fn decode_control(control: &[u8]) -> Result<FrameHeader, WireError> {
             return Err(WireError::Malformed("truncated hello"));
         }
         let nonce = array::<16>(bytes, 0)?;
-        let build_len = usize::from(u16::from_le_bytes(array(bytes, 16)?));
+        let role = EndpointRole::try_from(bytes[16])?;
+        let direction = MessageDirection::try_from(bytes[17])?;
+        let build_len = usize::from(u16::from_le_bytes(array(bytes, 18)?));
         let expected = HELLO_FIXED_BYTES
             .checked_add(build_len)
             .ok_or(WireError::LengthOverflow)?;
@@ -290,7 +614,7 @@ pub fn decode_control(control: &[u8]) -> Result<FrameHeader, WireError> {
         }
         let build = std::str::from_utf8(&bytes[HELLO_FIXED_BYTES..])
             .map_err(|_| WireError::InvalidBuildIdentity)?;
-        ControlBody::Hello(HelloIdentity::new(nonce, build)?)
+        ControlBody::Hello(HelloIdentity::new(nonce, role, direction, build)?)
     } else {
         ControlBody::Bytes(bytes.to_vec())
     };
@@ -471,6 +795,12 @@ pub enum WireError {
     ZeroHelloNonce,
     #[error("invalid build identity")]
     InvalidBuildIdentity,
+    #[error("unknown endpoint role {value}")]
+    UnknownEndpointRole { value: u8 },
+    #[error("unknown message direction {value}")]
+    UnknownMessageDirection { value: u8 },
+    #[error("hello endpoint role and direction disagree")]
+    RoleDirectionMismatch,
     #[error("build identity has {actual} bytes; maximum is {maximum}")]
     BuildIdentityTooLong { actual: usize, maximum: usize },
     #[error("control length cannot be zero")]
@@ -501,6 +831,39 @@ pub enum WireError {
     DecoderComplete,
 }
 
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum HandshakeError {
+    #[error(transparent)]
+    Wire(#[from] WireError),
+    #[error("handshake frame sequence {actual} does not equal required sequence {expected}")]
+    UnexpectedSequence { expected: u64, actual: u64 },
+    #[error("expected {expected:?} during handshake, received {actual:?}")]
+    UnexpectedMessageKind {
+        expected: MessageKind,
+        actual: MessageKind,
+    },
+    #[error("handshake frame did not contain a hello identity")]
+    MissingHelloIdentity,
+    #[error("handshake protocol version does not exactly match")]
+    ProtocolVersionMismatch,
+    #[error("handshake peer role does not match the opposite endpoint")]
+    PeerRoleMismatch,
+    #[error("handshake peer direction does not match its endpoint role")]
+    PeerDirectionMismatch,
+    #[error("handshake peer build identity does not match the pinned identity")]
+    PeerBuildIdentityMismatch,
+    #[error("handshake acknowledgement nonce does not match the challenge")]
+    NonceMismatch,
+    #[error("handshake has not been started")]
+    HandshakeNotStarted,
+    #[error("this endpoint cannot initiate the configured handshake")]
+    WrongHandshakeSide,
+    #[error("handshake frame is a replay or duplicate")]
+    ReplayOrDuplicate,
+    #[error("handshake is terminal after a validation failure")]
+    Terminal,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -511,7 +874,15 @@ mod tests {
             MessageKind::Hello,
             0,
             None,
-            ControlBody::Hello(HelloIdentity::new([0x5a; 16], "host/test").unwrap()),
+            ControlBody::Hello(
+                HelloIdentity::new(
+                    [0x5a; 16],
+                    EndpointRole::Controller,
+                    MessageDirection::ControllerToHost,
+                    "controller/test",
+                )
+                .unwrap(),
+            ),
         )
         .unwrap()
     }
@@ -618,5 +989,148 @@ mod tests {
         assert_eq!(decoded.header, header);
         assert_eq!(decoded.raw, &[1, 2, 3]);
         assert_eq!(decoded.consumed, frame.len());
+    }
+
+    #[test]
+    fn handshake_binds_nonce_roles_directions_builds_and_sequences() {
+        let nonce = [0x91; 16];
+        let mut controller = HandshakeMachine::initiator(
+            EndpointRole::Controller,
+            nonce,
+            "controller/build-7",
+            "host/build-4",
+        )
+        .unwrap();
+        let mut host =
+            HandshakeMachine::responder(EndpointRole::Host, "host/build-4", "controller/build-7")
+                .unwrap();
+
+        let hello = controller.begin(FrameSequence::new(1).unwrap()).unwrap();
+        let acknowledgement = host.accept(&hello).unwrap().unwrap();
+        assert_eq!(host.state(), HandshakeState::Established);
+        assert_eq!(host.negotiated_version(), Some(ProtocolVersion::CURRENT));
+        assert_eq!(controller.accept(&acknowledgement).unwrap(), None);
+        assert_eq!(controller.state(), HandshakeState::Established);
+        assert_eq!(
+            controller.negotiated_version(),
+            Some(ProtocolVersion::CURRENT)
+        );
+        assert!(matches!(
+            controller.accept(&acknowledgement),
+            Err(HandshakeError::ReplayOrDuplicate)
+        ));
+        assert_eq!(controller.state(), HandshakeState::Failed);
+    }
+
+    #[test]
+    fn handshake_rejects_reflection_and_becomes_terminal() {
+        let mut controller = HandshakeMachine::initiator(
+            EndpointRole::Controller,
+            [0x71; 16],
+            "controller/build",
+            "host/build",
+        )
+        .unwrap();
+        let reflected = controller.begin(FrameSequence::new(1).unwrap()).unwrap();
+        assert!(matches!(
+            controller.accept(&reflected),
+            Err(HandshakeError::UnexpectedMessageKind {
+                expected: MessageKind::HelloAck,
+                actual: MessageKind::Hello
+            })
+        ));
+        assert_eq!(controller.state(), HandshakeState::Failed);
+        assert_eq!(controller.accept(&reflected), Err(HandshakeError::Terminal));
+    }
+
+    #[test]
+    fn handshake_rejects_nonce_build_and_order_mismatches() {
+        let mut out_of_order = HandshakeMachine::initiator(
+            EndpointRole::Controller,
+            [0x31; 16],
+            "controller/build",
+            "host/build",
+        )
+        .unwrap();
+        assert_eq!(
+            out_of_order.begin(FrameSequence::new(2).unwrap()),
+            Err(HandshakeError::UnexpectedSequence {
+                expected: 1,
+                actual: 2
+            })
+        );
+
+        let mut controller = HandshakeMachine::initiator(
+            EndpointRole::Controller,
+            [0x31; 16],
+            "controller/build",
+            "host/build",
+        )
+        .unwrap();
+        controller.begin(FrameSequence::new(1).unwrap()).unwrap();
+        let wrong_nonce = FrameHeader::new(
+            FrameSequence::new(1).unwrap(),
+            MessageKind::HelloAck,
+            0,
+            None,
+            ControlBody::Hello(
+                HelloIdentity::new(
+                    [0x32; 16],
+                    EndpointRole::Host,
+                    MessageDirection::HostToController,
+                    "host/build",
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            controller.accept(&wrong_nonce),
+            Err(HandshakeError::NonceMismatch)
+        );
+
+        let mut host =
+            HandshakeMachine::responder(EndpointRole::Host, "host/build", "controller/expected")
+                .unwrap();
+        assert_eq!(
+            host.accept(&hello(1)),
+            Err(HandshakeError::PeerBuildIdentityMismatch)
+        );
+    }
+
+    #[test]
+    fn handshake_rejects_an_unsupported_offered_version_before_exchange() {
+        assert!(matches!(
+            HandshakeMachine::initiator_for_version(
+                EndpointRole::Controller,
+                [0x41; 16],
+                "controller/build",
+                "host/build",
+                ProtocolVersion {
+                    major: PROTOCOL_MAJOR + 1,
+                    minor: 0,
+                },
+            ),
+            Err(HandshakeError::Wire(WireError::UnsupportedVersion { .. }))
+        ));
+    }
+
+    #[test]
+    fn hello_codec_rejects_unknown_or_inconsistent_direction_bytes() {
+        let encoded = encode_control(&hello(1)).unwrap();
+        let control = &encoded[PREFIX_BYTES..];
+        let mut unknown_role = control.to_vec();
+        unknown_role[FIXED_CONTROL_BYTES + 16] = 9;
+        assert_eq!(
+            decode_control(&unknown_role),
+            Err(WireError::UnknownEndpointRole { value: 9 })
+        );
+
+        let mut reflected_direction = control.to_vec();
+        reflected_direction[FIXED_CONTROL_BYTES + 17] = MessageDirection::HostToController as u8;
+        assert_eq!(
+            decode_control(&reflected_direction),
+            Err(WireError::RoleDirectionMismatch)
+        );
     }
 }

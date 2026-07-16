@@ -5,6 +5,8 @@
 //! exchanges only the bounded commands and events defined here.
 
 mod address_space;
+mod host_client;
+mod host_codec;
 pub mod host_wire;
 mod identity;
 mod protection;
@@ -15,6 +17,15 @@ mod session_machine;
 pub use address_space::{
     AddressRange, FileBacking, MemoryAccess, RelativeAddress, StaticAddressSpace,
     StaticAddressSpaceError, StaticRegion, StaticRegionKind,
+};
+pub use host_client::{
+    ClientConnectionState, CommandReceipt, DebugHostClient, DebugHostClientError,
+    HostFrameExchange, HostTransportError, InMemoryDebugHost, MAX_PENDING_COMMANDS,
+    MAX_RESPONSE_FRAMES,
+};
+pub use host_codec::{
+    HostCodecError, HostFrame, decode_command_frame, decode_event_frame, encode_command_frame,
+    encode_event_frame,
 };
 pub use identity::SessionIdError;
 pub use protection::{
