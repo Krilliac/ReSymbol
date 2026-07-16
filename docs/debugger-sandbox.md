@@ -12,7 +12,8 @@ ReSymbol currently implements the non-executing foundation for debugger and sand
 - backend-neutral target, capability, command, event, state-token, breakpoint, memory-read, and
   compare-before-write memory-mutation contracts;
 - a bounded control/raw-byte frame format, direction- and identity-checked handshake, exact protocol
-  version binding, strict typed command/event codec, and single-owner host-client seam;
+  version binding, strict typed command/event codec, cumulative response-allocation budget, and
+  single-owner host-client seam;
 - a deterministic in-memory host that drives the real session and sandbox reducers for integration
   tests without reading an artifact, opening a process, or executing target code; and
 - sandbox policy, attestation, failure, lifecycle, resource-limit, and cleanup-receipt data models.
@@ -126,6 +127,15 @@ The current seam is intentionally narrow:
   cryptographic authentication; a future platform transport must authenticate the helper channel;
 - malformed, reflected, duplicate, replayed, stale, cross-session, overlong, and unknown-field inputs
   fail closed;
+- the connection owner supplies immutable response limits to the transport: at most 256 frames,
+  one typed frame no larger than the 64 KiB control ceiling plus the 1 MiB memory-read ceiling and
+  framing, and at most 8 MiB of encoded response data in total. A transport must reject the
+  peer-declared count before allocating the batch and preflight each decoded header before reading
+  its raw payload;
+- the returned batch has private invariants, but the client does not trust them: it independently
+  recomputes every encoded frame length and the cumulative byte count with checked arithmetic before
+  handshake or event decoding. Count, per-frame, total, or arithmetic failures disconnect and poison
+  the connection;
 - command IDs and event IDs are independent monotonic domains, while each synchronous response batch
   must contain exactly one command result and only events correlated to that command;
 - session generations and stop/run identifiers must advance exactly through a legal reducer

@@ -7,6 +7,7 @@
 mod address_space;
 mod host_client;
 mod host_codec;
+mod host_response;
 pub mod host_wire;
 mod identity;
 mod protection;
@@ -22,11 +23,15 @@ pub use address_space::{
 pub use host_client::{
     ClientConnectionState, CommandReceipt, DebugHostClient, DebugHostClientError,
     HostFrameExchange, HostTransportError, InMemoryDebugHost, MAX_PENDING_COMMANDS,
-    MAX_RESPONSE_FRAMES,
 };
 pub use host_codec::{
     HostCodecError, HostFrame, decode_command_frame, decode_event_frame, encode_command_frame,
     encode_event_frame,
+};
+pub use host_response::{
+    DEFAULT_HOST_RESPONSE_LIMITS, HostResponseBatch, HostResponseBatchBuilder,
+    HostResponseBudgetError, HostResponseFramePermit, HostResponseLimits, MAX_RESPONSE_BYTES,
+    MAX_RESPONSE_FRAME_BYTES, MAX_RESPONSE_FRAMES,
 };
 pub use identity::SessionIdError;
 pub use protection::{

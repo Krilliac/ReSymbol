@@ -11,6 +11,10 @@ use crate::host_codec::{
     HostCodecError, HostFrame, decode_command_frame, decode_event_frame, encode_command_frame,
     encode_event_frame,
 };
+use crate::host_response::{
+    DEFAULT_HOST_RESPONSE_LIMITS, HostResponseBatch, HostResponseBudgetError, HostResponseLimits,
+    MAX_RESPONSE_FRAMES,
+};
 use crate::host_wire::{
     EndpointRole, FrameSequence, HandshakeError, HandshakeMachine, HandshakeState,
     ProtocolVersion as WireProtocolVersion, WireError,
@@ -29,17 +33,22 @@ use crate::sandbox::{
 };
 use crate::{SessionMachine, SessionMachineError};
 
-pub const MAX_RESPONSE_FRAMES: usize = 256;
 pub const MAX_PENDING_COMMANDS: usize = 1;
 
 /// A synchronous frame exchange owned by one connection worker.
 ///
 /// Implementations may own a helper process or an I/O thread, but must not
 /// expose either handle. `exchange` runs on the connection owner thread and
-/// returns only complete, bounded frames. It must fail instead of silently
+/// returns only complete, bounded frames. The transport must apply `limits` to
+/// the peer-declared frame count before batch allocation and to every decoded
+/// header before allocating its raw payload. It must fail instead of silently
 /// reconnecting or changing the requested provider boundary.
 pub trait HostFrameExchange {
-    fn exchange(&mut self, request: HostFrame) -> Result<Vec<HostFrame>, HostTransportError>;
+    fn exchange(
+        &mut self,
+        request: HostFrame,
+        limits: HostResponseLimits,
+    ) -> Result<HostResponseBatch, HostTransportError>;
 
     fn disconnect(&mut self) -> Result<(), HostTransportError>;
 }
@@ -103,20 +112,27 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
             expected_host_build,
         )?;
         let hello = handshake.begin(FrameSequence::new(1)?)?;
-        let responses = match transport.exchange(HostFrame::new(hello, Vec::new())?) {
+        let responses = match transport.exchange(
+            HostFrame::new(hello, Vec::new())?,
+            DEFAULT_HOST_RESPONSE_LIMITS,
+        ) {
             Ok(responses) => responses,
             Err(error) => {
                 let _ = transport.disconnect();
                 return Err(error.into());
             }
         };
+        if let Err(error) = responses.validate(DEFAULT_HOST_RESPONSE_LIMITS) {
+            let _ = transport.disconnect();
+            return Err(error.into());
+        }
         if responses.len() != 1 {
             let _ = transport.disconnect();
             return Err(DebugHostClientError::UnexpectedHandshakeResponseCount {
                 actual: responses.len(),
             });
         }
-        let acknowledgement = &responses[0];
+        let acknowledgement = &responses.as_slice()[0];
         if !acknowledgement.raw().is_empty() {
             let _ = transport.disconnect();
             return Err(DebugHostClientError::HandshakeCarriedRawPayload);
@@ -197,7 +213,10 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
             .next_command_id
             .checked_add(1)
             .ok_or(DebugHostClientError::CommandIdOverflow)?;
-        let responses = match self.transport.exchange(request) {
+        let responses = match self
+            .transport
+            .exchange(request, DEFAULT_HOST_RESPONSE_LIMITS)
+        {
             Ok(responses) => responses,
             Err(error) => {
                 self.connection_state = if error.is_disconnected() {
@@ -282,7 +301,10 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
             .next_command_id
             .checked_add(1)
             .ok_or(DebugHostClientError::CommandIdOverflow)?;
-        let responses = match self.transport.exchange(request) {
+        let responses = match self
+            .transport
+            .exchange(request, DEFAULT_HOST_RESPONSE_LIMITS)
+        {
             Ok(responses) => responses,
             Err(error) => {
                 self.connection_state = if error.is_disconnected() {
@@ -357,7 +379,7 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
     fn accept_response_batch(
         &mut self,
         command_id: CommandId,
-        responses: Vec<HostFrame>,
+        responses: HostResponseBatch,
     ) -> Result<CommandReceipt, DebugHostClientError> {
         let result = self.accept_response_batch_inner(command_id, responses);
         if result.is_err() {
@@ -370,8 +392,9 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
     fn accept_capability_batch(
         &mut self,
         command_id: CommandId,
-        responses: Vec<HostFrame>,
+        responses: HostResponseBatch,
     ) -> Result<CapabilityReport, DebugHostClientError> {
+        responses.validate(DEFAULT_HOST_RESPONSE_LIMITS)?;
         if responses.is_empty() {
             return Err(DebugHostClientError::MissingCommandResult { command_id });
         }
@@ -383,7 +406,7 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
         }
         let mut report = None;
         let mut outcome = None;
-        for frame in responses {
+        for frame in responses.into_frames() {
             self.require_negotiated_frame_version(&frame)?;
             if frame.header().sequence.get() != self.next_inbound_frame_sequence {
                 return Err(DebugHostClientError::UnexpectedFrameSequence {
@@ -440,8 +463,9 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
     fn accept_response_batch_inner(
         &mut self,
         command_id: CommandId,
-        responses: Vec<HostFrame>,
+        responses: HostResponseBatch,
     ) -> Result<CommandReceipt, DebugHostClientError> {
+        responses.validate(DEFAULT_HOST_RESPONSE_LIMITS)?;
         if responses.is_empty() {
             self.connection_state = ClientConnectionState::Failed;
             return Err(DebugHostClientError::MissingCommandResult { command_id });
@@ -462,7 +486,7 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
         let mut events = Vec::with_capacity(responses.len());
         let mut outcome = None;
 
-        for frame in responses {
+        for frame in responses.into_frames() {
             self.require_negotiated_frame_version(&frame)?;
             if frame.header().sequence.get() != self.next_inbound_frame_sequence {
                 return self.fail(DebugHostClientError::UnexpectedFrameSequence {
@@ -637,6 +661,8 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
 pub enum HostTransportError {
     #[error("debugger host disconnected")]
     Disconnected,
+    #[error(transparent)]
+    ResponseBudget(#[from] HostResponseBudgetError),
     #[error("debugger host protocol failure: {detail:?}")]
     Protocol { detail: DiagnosticText },
     #[error("debugger host backend failure: {detail:?}")]
@@ -674,6 +700,8 @@ fn bounded_transport_detail(detail: impl Into<String>) -> DiagnosticText {
 pub enum DebugHostClientError {
     #[error(transparent)]
     Transport(#[from] HostTransportError),
+    #[error(transparent)]
+    ResponseBudget(#[from] HostResponseBudgetError),
     #[error(transparent)]
     Codec(#[from] HostCodecError),
     #[error(transparent)]
@@ -1296,8 +1324,19 @@ impl InMemoryDebugHost {
 }
 
 impl HostFrameExchange for InMemoryDebugHost {
-    fn exchange(&mut self, request: HostFrame) -> Result<Vec<HostFrame>, HostTransportError> {
-        self.exchange_inner(request)
+    fn exchange(
+        &mut self,
+        request: HostFrame,
+        limits: HostResponseLimits,
+    ) -> Result<HostResponseBatch, HostTransportError> {
+        let frames = self.exchange_inner(request)?;
+        match HostResponseBatch::try_from_frames(frames, limits) {
+            Ok(batch) => Ok(batch),
+            Err(error) => {
+                self.disconnected = true;
+                Err(error.into())
+            }
+        }
     }
 
     fn disconnect(&mut self) -> Result<(), HostTransportError> {
@@ -1371,8 +1410,11 @@ mod tests {
     use resymbol_core::BinaryId;
 
     use super::*;
+    use crate::host_response::{MAX_RESPONSE_BYTES, MAX_RESPONSE_FRAME_BYTES};
+    use crate::host_wire::{ControlBody, FrameHeader, MessageKind};
     use crate::protocol::{
-        LaunchEnvironment, LaunchTarget, MemoryAddress, OfflineTarget, ReadViewToken,
+        LaunchEnvironment, LaunchTarget, MAX_MEMORY_READ_BYTES, MemoryAddress, OfflineTarget,
+        ReadViewToken,
     };
     use crate::sandbox::{
         ChildProcessProfile, DynamicCodeProfile, ProcessMitigationProfile, RiskAcknowledgementId,
@@ -1410,6 +1452,20 @@ mod tests {
         inner: InMemoryDebugHost,
         mutation: ResponseMutation,
         exchanges: usize,
+    }
+
+    struct OverBudgetHost {
+        inner: InMemoryDebugHost,
+        exchanges: usize,
+    }
+
+    impl OverBudgetHost {
+        fn new() -> Self {
+            Self {
+                inner: host(),
+                exchanges: 0,
+            }
+        }
     }
 
     impl MutatingHost {
@@ -1506,15 +1562,71 @@ mod tests {
     }
 
     impl HostFrameExchange for MutatingHost {
-        fn exchange(&mut self, request: HostFrame) -> Result<Vec<HostFrame>, HostTransportError> {
-            let responses = self.inner.exchange(request)?;
+        fn exchange(
+            &mut self,
+            request: HostFrame,
+            limits: HostResponseLimits,
+        ) -> Result<HostResponseBatch, HostTransportError> {
+            let responses = self.inner.exchange(request, limits)?;
             let handshake = self.exchanges == 0;
             self.exchanges += 1;
             if handshake {
                 Ok(responses)
             } else {
-                Ok(self.mutate(responses))
+                HostResponseBatch::try_from_frames(self.mutate(responses.into_frames()), limits)
+                    .map_err(HostTransportError::from)
             }
+        }
+
+        fn disconnect(&mut self) -> Result<(), HostTransportError> {
+            self.inner.disconnect()
+        }
+    }
+
+    impl HostFrameExchange for OverBudgetHost {
+        fn exchange(
+            &mut self,
+            request: HostFrame,
+            limits: HostResponseLimits,
+        ) -> Result<HostResponseBatch, HostTransportError> {
+            let responses = self.inner.exchange(request, limits)?;
+            let handshake = self.exchanges == 0;
+            self.exchanges += 1;
+            if handshake {
+                return Ok(responses);
+            }
+
+            // Model a hostile transport that ignores the caller's cumulative
+            // limit and constructs a batch under a private, larger limit. Each
+            // individual frame remains below the caller's per-frame ceiling.
+            let mut total_bytes = responses.total_bytes();
+            let mut frames = responses.into_frames();
+            let mut sequence = frames
+                .last()
+                .map(|frame| frame.header().sequence.get() + 1)
+                .unwrap_or(2);
+            while total_bytes <= MAX_RESPONSE_BYTES {
+                let raw = vec![0u8; MAX_MEMORY_READ_BYTES as usize];
+                let header = FrameHeader::new(
+                    FrameSequence::new(sequence).unwrap(),
+                    MessageKind::Event,
+                    MAX_MEMORY_READ_BYTES,
+                    None,
+                    ControlBody::Bytes(vec![0]),
+                )
+                .unwrap();
+                let frame = HostFrame::new(header, raw).unwrap();
+                total_bytes += frame.header().frame_len().unwrap();
+                frames.push(frame);
+                sequence += 1;
+            }
+            let permissive = HostResponseLimits::new(
+                MAX_RESPONSE_FRAMES,
+                MAX_RESPONSE_FRAME_BYTES,
+                MAX_RESPONSE_BYTES * 2,
+            )
+            .unwrap();
+            HostResponseBatch::try_from_frames(frames, permissive).map_err(HostTransportError::from)
         }
 
         fn disconnect(&mut self) -> Result<(), HostTransportError> {
@@ -1568,6 +1680,79 @@ mod tests {
             rollback_on_close: true,
             vm_identity: None,
         }
+    }
+
+    #[test]
+    fn response_builder_rejects_cumulative_bytes() {
+        let frame = HostFrame::new(
+            FrameHeader::new(
+                FrameSequence::new(2).unwrap(),
+                MessageKind::Event,
+                32,
+                None,
+                ControlBody::Bytes(vec![0; 32]),
+            )
+            .unwrap(),
+            vec![0; 32],
+        )
+        .unwrap();
+        let frame_bytes = frame.header().frame_len().unwrap();
+        let limits = HostResponseLimits::new(2, frame_bytes, frame_bytes * 2 - 1).unwrap();
+        assert_eq!(
+            HostResponseBatch::try_from_frames(vec![frame.clone(), frame], limits),
+            Err(HostResponseBudgetError::TotalBytesExceeded {
+                actual: frame_bytes * 2,
+                maximum: frame_bytes * 2 - 1,
+            })
+        );
+    }
+
+    #[test]
+    fn in_memory_transport_enforces_supplied_limits_and_disconnects() {
+        let mut initiator = HandshakeMachine::initiator(
+            EndpointRole::Controller,
+            [0x6d; 16],
+            "controller/build-7",
+            "host/build-4",
+        )
+        .unwrap();
+        let hello = initiator.begin(FrameSequence::new(1).unwrap()).unwrap();
+        let request = HostFrame::new(hello, Vec::new()).unwrap();
+        let limits = HostResponseLimits::new(1, 1, 1).unwrap();
+        let mut transport = host();
+        assert!(matches!(
+            transport.exchange(request.clone(), limits),
+            Err(HostTransportError::ResponseBudget(
+                HostResponseBudgetError::FrameTooLarge { .. }
+            ))
+        ));
+        assert_eq!(
+            transport.exchange(request, DEFAULT_HOST_RESPONSE_LIMITS),
+            Err(HostTransportError::Disconnected)
+        );
+    }
+
+    #[test]
+    fn client_revalidates_cumulative_bytes_and_poisons_connection() {
+        let mut client = DebugHostClient::connect(
+            OverBudgetHost::new(),
+            [0x6d; 16],
+            "controller/build-7",
+            "host/build-4",
+        )
+        .unwrap();
+        client.begin_session(session_id()).unwrap();
+        assert!(matches!(
+            client.submit(DebugCommand::Open(DebugTargetRequest::Offline(
+                OfflineTarget {
+                    path: PathBuf::from("sample.exe"),
+                },
+            ))),
+            Err(DebugHostClientError::ResponseBudget(
+                HostResponseBudgetError::TotalBytesExceeded { .. }
+            ))
+        ));
+        assert_eq!(client.connection_state(), ClientConnectionState::Failed);
     }
 
     #[test]
@@ -1721,22 +1906,27 @@ mod tests {
             command: DebugCommand::Close { state: initial },
         };
         let frame = encode_command_frame(FrameSequence::new(3).unwrap(), &stale).unwrap();
-        let rejected = client.transport.exchange(frame.clone()).unwrap();
+        let rejected = client
+            .transport
+            .exchange(frame.clone(), DEFAULT_HOST_RESPONSE_LIMITS)
+            .unwrap();
         assert_eq!(rejected.len(), 1);
         assert!(matches!(
-            decode_event_frame(&rejected[0]).unwrap().event,
+            decode_event_frame(&rejected.as_slice()[0]).unwrap().event,
             DebugEvent::CommandResult {
                 command_id,
                 outcome: CommandOutcome::Rejected { .. },
             } if command_id == stale_id
         ));
-        assert!(rejected.iter().all(|frame| !matches!(
+        assert!(rejected.as_slice().iter().all(|frame| !matches!(
             decode_event_frame(frame).unwrap().event,
             DebugEvent::StateChanged(_)
         )));
 
         assert!(matches!(
-            client.transport.exchange(frame),
+            client
+                .transport
+                .exchange(frame, DEFAULT_HOST_RESPONSE_LIMITS),
             Err(HostTransportError::Protocol { .. })
         ));
     }
