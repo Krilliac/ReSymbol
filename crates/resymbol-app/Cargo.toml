@@ -1,0 +1,24 @@
+[package]
+name = "resymbol-app"
+description = "Shared application workflows for ReSymbol frontends"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+resymbol-analysis = { path = "../resymbol-analysis" }
+resymbol-core = { path = "../resymbol-core" }
+resymbol-export = { path = "../resymbol-export" }
+resymbol-package = { path = "../resymbol-package" }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+tempfile = "3.20.0"
+thiserror = "2.0.12"
+
+[dev-dependencies]
+
+[lints]
+workspace = true

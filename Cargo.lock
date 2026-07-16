@@ -2934,6 +2934,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "resymbol-app"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "resymbol-analysis",
+ "resymbol-core",
+ "resymbol-export",
+ "resymbol-package",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "resymbol-cli"
 version = "0.1.0-alpha.1"
 dependencies = [

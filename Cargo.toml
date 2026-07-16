@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/resymbol-analysis",
+    "crates/resymbol-app",
     "crates/resymbol-cli",
     "crates/resymbol-core",
     "crates/resymbol-export",
