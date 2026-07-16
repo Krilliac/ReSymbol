@@ -1211,6 +1211,7 @@ pub(crate) fn validate_pe_analysis(analysis: &PeAnalysis) -> Result<(), Analysis
             );
         }
     }
+    validate_runtime_function_order(&analysis.runtime_functions)?;
 
     validate_tls_callbacks(analysis)?;
     validate_load_config_metadata(analysis, &import_iat_rvas)?;
@@ -4623,7 +4624,35 @@ fn parse_runtime_functions(
             table_index: index,
         });
     }
+    validate_runtime_function_order(&functions)?;
     Ok(functions)
+}
+
+fn validate_runtime_function_order(functions: &[RuntimeFunction]) -> Result<(), AnalysisError> {
+    for (previous_index, pair) in functions.windows(2).enumerate() {
+        let previous = &pair[0];
+        let current = &pair[1];
+        let current_index = previous_index + 1;
+        if current.begin_rva <= previous.begin_rva {
+            return invalid_field(
+                "runtime-function table order",
+                format!(
+                    "entry {current_index} begins at {:#x}, which is not strictly after entry {previous_index} at {:#x}",
+                    current.begin_rva, previous.begin_rva
+                ),
+            );
+        }
+        if current.begin_rva < previous.end_rva {
+            return invalid_field(
+                "runtime-function overlap",
+                format!(
+                    "entry {current_index} begins at {:#x} before entry {previous_index} ends at {:#x}",
+                    current.begin_rva, previous.end_rva
+                ),
+            );
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn build_symbol_graph(

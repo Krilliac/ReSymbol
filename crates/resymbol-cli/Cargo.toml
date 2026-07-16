@@ -16,6 +16,7 @@ path = "src/main.rs"
 anyhow = "1.0.98"
 clap = { version = "4.5.40", features = ["derive"] }
 resymbol-analysis = { path = "../resymbol-analysis" }
+resymbol-app = { path = "../resymbol-app" }
 resymbol-core = { path = "../resymbol-core" }
 resymbol-export = { path = "../resymbol-export" }
 resymbol-package = { path = "../resymbol-package" }

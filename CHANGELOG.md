@@ -251,6 +251,15 @@ prereleases; breaking changes remain explicit.
 - Debugger capability probes must now report every protocol capability exactly once. Unsupported
   capabilities remain explicit typed `Unavailable` entries instead of becoming ambiguous through
   omission; duplicate and partial reports fail protocol validation.
+- Hardened x64 exception metadata ingestion and validated package deserialization. ReSymbol now
+  preserves `.pdata` source order only when `RUNTIME_FUNCTION` begin RVAs are strictly increasing
+  and half-open ranges do not overlap; adjacency remains valid and the table is never silently
+  sorted. Legacy packages containing duplicate, decreasing, partial-overlap, or contained ranges
+  can now fail validation instead of retaining ambiguous function-boundary evidence.
+- Routed CLI analysis and PDB source input through the application service's regular-file,
+  exact-length binary reader. Its 1 GiB default gate checks size before fallible allocation, probes
+  one byte beyond the declared length, and hashes the same retained snapshot used for identity-bound
+  PDB rendering.
 - Bumped the debugger wire and typed-command protocol to 1.2. Sandbox failures now bind the exact
   session, provisioning epoch, policy digest, provider, and launch binary/helper or inherited
   process/mode context. The controller validates an exact command-stage-kind-phase matrix before

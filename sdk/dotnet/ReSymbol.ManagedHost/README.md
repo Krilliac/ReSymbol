@@ -70,12 +70,14 @@ and re-fingerprints the complete package after the helper exits. Same-account re
 links, and file-identity races between checks remain platform-hardening concerns even though
 in-memory snapshots close the ordinary managed-load window.
 
-The parent currently terminates and reaps this direct helper only; it does not place the helper in a
-contained Unix process group or Windows Job Object. A managed plugin can therefore leave descendant
-processes running after a timeout. If a descendant inherits stdout or stderr, the parent returns
-after its bounded 50 ms result drain, but the corresponding capture reader remains blocked until the
-descendant closes the inherited handle. Process-tree containment and inherited-handle hardening are
-future work.
+The parent owns the helper and its ordinary descendants through a fresh POSIX process group or a
+Windows Job Object. The shared runner terminates that owned tree when the direct helper completes,
+the deadline expires, stdout/stderr capture fails, or the runtime guard drops, so ordinary
+descendants cannot retain capture pipes after their parent exits. Linux `waitid(WNOWAIT)` and a
+macOS `kqueue` exit observer keep the group leader stable until group termination; Windows assigns
+the helper to its Job Object immediately after spawn. This is lifecycle containment, not an
+authority sandbox. Windows retains a narrow pre-assignment escape race, and a hostile POSIX helper,
+plugin, or descendant can deliberately leave its process group or session before cleanup.
 
 The no-NuGet test executable builds x64 fixture plugins and exercises, among other cases, a
 successful transaction, lifecycle/managed-exception rollback, permission and phase enforcement,

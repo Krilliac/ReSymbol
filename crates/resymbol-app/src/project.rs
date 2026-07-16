@@ -8,7 +8,7 @@ use std::{
 };
 
 use resymbol_analysis::{AnalysisSession, analyze_bytes};
-use resymbol_core::BinaryId;
+use resymbol_core::{BinaryId, BinaryIdentity};
 use resymbol_export::ExportProjection;
 use resymbol_package::{ResymPackage, read_file_bound, write_file_new_bound};
 
@@ -55,22 +55,20 @@ impl AppServices {
 
     /// Read and analyze one exact binary without loading or executing it.
     pub fn analyze_binary(&self, path: impl AsRef<Path>) -> Result<Arc<ProjectSnapshot>, AppError> {
-        let (canonical, bytes) = self.read_binary(path.as_ref(), None)?;
-        let analysis = analyze_bytes(bytes.as_ref())?;
+        let exact_source = self.read_binary_exact(path, None)?;
+        let analysis = analyze_bytes(exact_source.bytes())?;
         let session = AnalysisSession::new(analysis, Vec::new(), Vec::new())?;
         let package = ResymPackage::from_bound_payload(&self.generator_version, session)?;
         let projection = ExportProjection::from_session(package.payload())?;
+        let canonical = exact_source.path().to_path_buf();
 
         Ok(Arc::new(ProjectSnapshot {
             origin_path: canonical.clone(),
-            binary_path: Some(canonical.clone()),
+            binary_path: Some(canonical),
             package_path: None,
             package: Arc::new(package),
             projection: Arc::new(projection),
-            exact_source: Some(VerifiedSourceBinary {
-                path: canonical,
-                bytes,
-            }),
+            exact_source: Some(exact_source),
         }))
     }
 
@@ -122,31 +120,27 @@ impl AppServices {
         path: impl AsRef<Path>,
     ) -> Result<Arc<ProjectSnapshot>, AppError> {
         let identity = project.session().base_analysis().identity();
-        let (canonical, bytes) = self.read_binary(path.as_ref(), Some(identity.size))?;
-        let actual = BinaryId::digest(bytes.as_ref());
-        if actual != identity.id {
-            return Err(AppError::SourceIdentityMismatch {
-                path: canonical,
-                expected: identity.id.to_string(),
-                actual: actual.to_string(),
-            });
-        }
-        project.package.ensure_bound_to(&actual)?;
+        let exact_source = self.read_binary_exact(path, Some(identity))?;
+        project.package.ensure_bound_to(&identity.id)?;
 
         let mut verified = ProjectSnapshot::clone(project);
-        verified.binary_path = Some(canonical.clone());
-        verified.exact_source = Some(VerifiedSourceBinary {
-            path: canonical,
-            bytes,
-        });
+        verified.binary_path = Some(exact_source.path().to_path_buf());
+        verified.exact_source = Some(exact_source);
         Ok(Arc::new(verified))
     }
 
-    fn read_binary(
+    /// Read one regular file into an exact, bounded immutable snapshot.
+    ///
+    /// The open handle's declared length is checked before allocation, the read
+    /// probes one byte beyond that length, and the retained length must match
+    /// exactly. When `expected_identity` is present, both its size and SHA-256
+    /// must match the retained bytes before this method returns them.
+    pub fn read_binary_exact(
         &self,
-        requested: &Path,
-        expected_size: Option<u64>,
-    ) -> Result<(PathBuf, Arc<[u8]>), AppError> {
+        requested: impl AsRef<Path>,
+        expected_identity: Option<&BinaryIdentity>,
+    ) -> Result<ExactBinary, AppError> {
+        let requested = requested.as_ref();
         let canonical = fs::canonicalize(requested)
             .map_err(|source| AppError::io("resolve binary path", requested, source))?;
         let file = File::open(&canonical)
@@ -158,11 +152,11 @@ impl AppServices {
             return Err(AppError::NotRegularFile { path: canonical });
         }
         let declared_size = metadata.len();
-        if let Some(expected) = expected_size {
-            if declared_size != expected {
+        if let Some(expected) = expected_identity {
+            if declared_size != expected.size {
                 return Err(AppError::SourceSizeMismatch {
                     path: canonical,
-                    expected,
+                    expected: expected.size,
                     actual: declared_size,
                 });
             }
@@ -199,7 +193,21 @@ impl AppServices {
                 actual: actual_size,
             });
         }
-        Ok((canonical, Arc::from(bytes)))
+        let bytes = Arc::<[u8]>::from(bytes);
+        if let Some(expected) = expected_identity {
+            let actual = BinaryId::digest(bytes.as_ref());
+            if actual != expected.id {
+                return Err(AppError::SourceIdentityMismatch {
+                    path: canonical,
+                    expected: expected.id.to_string(),
+                    actual: actual.to_string(),
+                });
+            }
+        }
+        Ok(ExactBinary {
+            path: canonical,
+            bytes,
+        })
     }
 }
 
@@ -217,7 +225,7 @@ pub struct ProjectSnapshot {
     package_path: Option<PathBuf>,
     package: Arc<ResymPackage<AnalysisSession>>,
     projection: Arc<ExportProjection>,
-    exact_source: Option<VerifiedSourceBinary>,
+    exact_source: Option<ExactBinary>,
 }
 
 impl ProjectSnapshot {
@@ -325,8 +333,35 @@ impl ProjectSnapshot {
     }
 }
 
+/// Canonical path and immutable bytes from one completed bounded file read.
 #[derive(Debug, Clone)]
-struct VerifiedSourceBinary {
+pub struct ExactBinary {
     path: PathBuf,
     bytes: Arc<[u8]>,
+}
+
+impl ExactBinary {
+    /// Canonical path resolved before the file handle was opened.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Exact immutable bytes retained by the bounded read and optional identity gate.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        self.bytes.as_ref()
+    }
+
+    /// Clone shared ownership of the retained allocation without copying it.
+    #[must_use]
+    pub fn bytes_arc(&self) -> Arc<[u8]> {
+        Arc::clone(&self.bytes)
+    }
+
+    /// Consume this snapshot into its canonical path and shared retained bytes.
+    #[must_use]
+    pub fn into_parts(self) -> (PathBuf, Arc<[u8]>) {
+        (self.path, self.bytes)
+    }
 }

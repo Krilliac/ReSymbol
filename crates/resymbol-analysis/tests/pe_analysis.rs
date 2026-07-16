@@ -7306,35 +7306,118 @@ fn validated_deserialization_rejects_inconsistent_export_metadata() {
     assert!(error.to_string().contains("export forwarder"));
 }
 
-#[test]
-fn preserves_duplicate_and_overlapping_runtime_metadata() {
+fn runtime_function_pair_fixture(first: (u32, u32), second: (u32, u32)) -> Vec<u8> {
     let mut bytes = fixture();
-    set_directory(&mut bytes, 3, 0x1300, 36);
+    set_directory(&mut bytes, 3, 0x1300, 24);
     let table = file_offset(0x1300);
-    put_u32(&mut bytes, table + 12, 0x1000);
-    put_u32(&mut bytes, table + 16, 0x1020);
-    put_u32(&mut bytes, table + 20, 0x1350);
-    put_u32(&mut bytes, table + 24, 0x1010);
-    put_u32(&mut bytes, table + 28, 0x1030);
-    put_u32(&mut bytes, table + 32, 0x1360);
+    put_u32(&mut bytes, table, first.0);
+    put_u32(&mut bytes, table + 4, first.1);
+    put_u32(&mut bytes, table + 8, 0x1350);
+    put_u32(&mut bytes, table + 12, second.0);
+    put_u32(&mut bytes, table + 16, second.1);
+    put_u32(&mut bytes, table + 20, 0x1360);
+    bytes
+}
 
-    let analysis = analyze_pe(&bytes).expect("overlap is evidence, not parser ambiguity");
-    assert_eq!(analysis.runtime_functions.len(), 3);
-    assert_eq!(
-        analysis.runtime_functions[0].begin_rva,
-        analysis.runtime_functions[1].begin_rva
-    );
-    assert_eq!(
-        analysis.runtime_functions[0].end_rva,
-        analysis.runtime_functions[1].end_rva
-    );
-    assert_eq!(
-        analysis.runtime_functions[0].unwind_info_rva,
-        analysis.runtime_functions[1].unwind_info_rva
-    );
+#[test]
+fn raw_runtime_function_table_rejects_duplicate_decreasing_and_overlapping_ranges() {
+    let cases = [
+        (
+            "duplicate",
+            (0x1000, 0x1020),
+            (0x1000, 0x1020),
+            "table order",
+        ),
+        (
+            "decreasing",
+            (0x1020, 0x1030),
+            (0x1000, 0x1010),
+            "table order",
+        ),
+        (
+            "partial overlap",
+            (0x1000, 0x1020),
+            (0x1010, 0x1030),
+            "overlap",
+        ),
+        ("contained", (0x1000, 0x1040), (0x1010, 0x1020), "overlap"),
+    ];
+
+    for (label, first, second, expected) in cases {
+        let error = match analyze_pe(&runtime_function_pair_fixture(first, second)) {
+            Ok(_) => panic!("{label} runtime-function ranges must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains(expected),
+            "{label}: unexpected error: {error}"
+        );
+    }
+}
+
+#[test]
+fn deserialized_runtime_function_table_rejects_duplicate_decreasing_and_overlapping_ranges() {
+    let adjacent = analyze_pe(&runtime_function_pair_fixture(
+        (0x1000, 0x1020),
+        (0x1020, 0x1040),
+    ))
+    .expect("adjacent source table is valid");
+    let cases = [
+        (
+            "duplicate",
+            (0x1000, 0x1020),
+            (0x1000, 0x1020),
+            "table order",
+        ),
+        (
+            "decreasing",
+            (0x1020, 0x1030),
+            (0x1000, 0x1010),
+            "table order",
+        ),
+        (
+            "partial overlap",
+            (0x1000, 0x1020),
+            (0x1010, 0x1030),
+            "overlap",
+        ),
+        ("contained", (0x1000, 0x1040), (0x1010, 0x1020), "overlap"),
+    ];
+
+    for (label, first, second, expected) in cases {
+        let mut value = serde_json::to_value(&adjacent).expect("serialize adjacent analysis");
+        value["runtime_functions"][0]["begin_rva"] = serde_json::json!(first.0);
+        value["runtime_functions"][0]["end_rva"] = serde_json::json!(first.1);
+        value["runtime_functions"][1]["begin_rva"] = serde_json::json!(second.0);
+        value["runtime_functions"][1]["end_rva"] = serde_json::json!(second.1);
+        let error = match serde_json::from_value::<resymbol_analysis::PeAnalysis>(value) {
+            Ok(_) => panic!("{label} runtime-function ranges must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains(expected),
+            "{label}: unexpected error: {error}"
+        );
+    }
+}
+
+#[test]
+fn raw_and_deserialized_runtime_function_tables_accept_adjacent_ranges_in_source_order() {
+    let analysis = analyze_pe(&runtime_function_pair_fixture(
+        (0x1000, 0x1020),
+        (0x1020, 0x1040),
+    ))
+    .expect("adjacent runtime-function ranges are valid");
+    assert_eq!(analysis.runtime_functions.len(), 2);
     assert_eq!(analysis.runtime_functions[0].table_index, 0);
     assert_eq!(analysis.runtime_functions[1].table_index, 1);
-    assert_eq!(analysis.symbol_graph.claims().len(), 7);
+    assert_eq!(analysis.runtime_functions[1].begin_rva, 0x1020);
+
+    let decoded = serde_json::from_value::<resymbol_analysis::PeAnalysis>(
+        serde_json::to_value(&analysis).expect("serialize adjacent analysis"),
+    )
+    .expect("deserialize adjacent analysis");
+    assert_eq!(decoded.runtime_functions, analysis.runtime_functions);
 }
 
 #[test]
@@ -7366,6 +7449,7 @@ fn classifies_export_names_against_all_runtime_function_starts() {
     put_u16(&mut bytes, file_offset(0x1152), 1);
     set_directory(&mut bytes, 3, 0x1300, 24);
     let table = file_offset(0x1300);
+    put_u32(&mut bytes, table + 4, 0x1010);
     put_u32(&mut bytes, table + 12, 0x1010);
     put_u32(&mut bytes, table + 16, 0x1030);
     put_u32(&mut bytes, table + 20, 0x1360);

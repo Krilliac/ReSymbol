@@ -1,8 +1,11 @@
 #![forbid(unsafe_code)]
 
-use std::{fs, sync::Arc};
+use std::{
+    fs::{self, File},
+    sync::Arc,
+};
 
-use resymbol_app::{AppError, AppServices, ExportFormat, ReviewLedger};
+use resymbol_app::{AppError, AppServices, DEFAULT_MAX_BINARY_BYTES, ExportFormat, ReviewLedger};
 use resymbol_package::{CURRENT_SCHEMA_VERSION, PackageError};
 use tempfile::TempDir;
 
@@ -237,6 +240,71 @@ fn package_schema_and_binary_size_policies_are_explicit() {
     assert!(matches!(
         services.open_package(&old),
         Err(AppError::Package(PackageError::UnsupportedSchema { .. }))
+    ));
+}
+
+#[test]
+fn exact_binary_reader_enforces_limits_lengths_and_optional_identity() {
+    let temp = TempDir::new().expect("create temp directory");
+    let binary = write_source(&temp, "fixture.exe", EXACT_RSDS_PE);
+    assert_eq!(DEFAULT_MAX_BINARY_BYTES, 1024 * 1024 * 1024);
+
+    let exact_limit = AppServices::default()
+        .with_binary_size_limit(EXACT_RSDS_PE.len() as u64)
+        .expect("fixture-sized limit is valid");
+    let exact = exact_limit
+        .read_binary_exact(&binary, None)
+        .expect("a file exactly at the configured limit is accepted");
+    assert_eq!(exact.bytes(), EXACT_RSDS_PE);
+    assert_eq!(
+        exact.path(),
+        fs::canonicalize(&binary)
+            .expect("canonicalize exact source")
+            .as_path()
+    );
+
+    let project = exact_limit
+        .analyze_binary(&binary)
+        .expect("analyze identity fixture");
+    let identity = project.session().base_analysis().identity().clone();
+    exact_limit
+        .read_binary_exact(&binary, Some(&identity))
+        .expect("size and SHA-256 identity match");
+
+    let mut mutated = EXACT_RSDS_PE.to_vec();
+    *mutated.last_mut().expect("fixture is not empty") ^= 0x5a;
+    let mutated_path = write_source(&temp, "mutated.exe", &mutated);
+    assert!(matches!(
+        exact_limit.read_binary_exact(&mutated_path, Some(&identity)),
+        Err(AppError::SourceIdentityMismatch { .. })
+    ));
+
+    let short_path = write_source(
+        &temp,
+        "short.exe",
+        &EXACT_RSDS_PE[..EXACT_RSDS_PE.len() - 1],
+    );
+    assert!(matches!(
+        exact_limit.read_binary_exact(&short_path, Some(&identity)),
+        Err(AppError::SourceSizeMismatch { .. })
+    ));
+
+    let sparse_path = temp.path().join("oversized-sparse.exe");
+    let sparse = File::create(&sparse_path).expect("create sparse-size fixture");
+    sparse
+        .set_len(4_097)
+        .expect("set sparse-size fixture length");
+    drop(sparse);
+    let small_limit = AppServices::default()
+        .with_binary_size_limit(4_096)
+        .expect("small nonzero limit is valid");
+    assert!(matches!(
+        small_limit.read_binary_exact(&sparse_path, None),
+        Err(AppError::BinaryTooLarge {
+            actual: 4_097,
+            maximum: 4_096,
+            ..
+        })
     ));
 }
 

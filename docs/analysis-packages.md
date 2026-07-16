@@ -56,6 +56,13 @@ Package reads are size-bounded and reject malformed binary identities, unsupport
 invalid payloads, and files that exceed the configured limit. Writes use create-new semantics: an
 existing destination is never silently replaced.
 
+Binary ingestion for `resymbol analyze`, the workbench, and PDB `--binary` export shares one
+application-service reader. It accepts only regular files, defaults to a 1 GiB ceiling, checks the
+open handle's declared length before a fallible exact-capacity reservation, reads through a
+`declared length + 1` bound, and rejects any retained length change. When an expected package
+identity is available, its exact size is checked before allocation and its SHA-256 is computed from
+the same immutable retained bytes passed to the PDB renderer.
+
 `resymbol inspect PACKAGE --binary EXACT_ORIGINAL_BINARY` optionally verifies the package against
 the bytes it names. ReSymbol fully validates the package, canonicalizes and reads the supplied file,
 and requires its exact size and SHA-256 to match before emitting inspection output to stdout.
@@ -176,7 +183,9 @@ The base analysis includes:
   attributes value, name/HMOD/IAT/INT base RVAs, optional BIAT/UIAT base RVAs, per-entry lookup/IAT
   RVAs and hints/names or ordinals, and the timestamp, but not raw array contents; schemas 8 through 13
   always serialize this inventory, including an empty array, as an explicit compatibility marker;
-- x64 `RUNTIME_FUNCTION` entries as evidence-backed candidate function boundaries;
+- x64 `RUNTIME_FUNCTION` entries as evidence-backed candidate function boundaries, retained in
+  source-table order with contiguous `table_index` values, strictly increasing begin RVAs, and
+  non-overlapping half-open ranges (adjacent ranges are valid);
 - up to 4,096 ordered PE32+ TLS callback entries with duplicates preserved, their callback-table
   RVA, and an independent partial-scan flag;
 - PE32+ load-config state as `directories.load_config {rva,size}`, optional `load_config_size`,
@@ -494,10 +503,11 @@ relationship family retains its deterministic traversal prefix when its record c
 `data_reference_scan_truncated` preserve the applicable partial state. A pointer call is retained
 only when its paired slot data reference is retained, so exhausting the data-reference cap also
 makes the pointer-call result incomplete rather than publishing a call without its provenance.
-Exhausting the shared
-decode or block-discovery budget makes both instruction-derived sets partial. Overlapping
-`RUNTIME_FUNCTION` ranges are preserved and traversed separately, with each decode charged to the
-shared budgets, so adversarial overlap metadata can make the scan partial earlier.
+Exhausting the shared decode or block-discovery budget makes both instruction-derived sets partial.
+The source `.pdata` table is never sorted or normalized: duplicate or decreasing begin RVAs and
+partial or contained overlaps fail analysis, while adjacent ranges remain valid. The same invariant
+is enforced during validated deserialization. This hardening can reject legacy packages that
+previously preserved ambiguous overlapping exception metadata.
 
 The guided sweep is intentionally a heuristic-confidence source. It suppresses unreachable bytes
 after terminal control flow and can reach a valid block after jump-over data, but reachable embedded

@@ -2974,6 +2974,7 @@ dependencies = [
  "anyhow",
  "clap",
  "resymbol-analysis",
+ "resymbol-app",
  "resymbol-core",
  "resymbol-export",
  "resymbol-package",

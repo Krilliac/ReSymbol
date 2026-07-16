@@ -70,6 +70,12 @@ The ingestion layer is responsible for:
 - linking optional related evidence such as another build, an existing symbol file, or a user
   annotation set.
 
+CLI analysis, workbench analysis and source verification, and PDB source ingestion share an
+application-owned exact-binary snapshot reader. The default 1 GiB gate accepts only regular files,
+checks the open handle's size before fallible allocation, probes one byte beyond that declaration,
+and retains only an exact-length immutable snapshot. Identity-bound callers hash those same retained
+bytes before downstream use.
+
 All downstream records use canonical address concepts rather than assuming that file offsets,
 virtual addresses, and relative virtual addresses are interchangeable.
 
@@ -85,7 +91,8 @@ unrelated signature index, and removing a plugin's results should not require re
 have no dependency on that plugin.
 
 The implemented slice extracts PE image/section metadata, conventional and delay imports, exports,
-forwarded exports, x64 `RUNTIME_FUNCTION` records, ordered TLS callbacks, load-config GuardCF
+forwarded exports, source-ordered x64 `RUNTIME_FUNCTION` records with strictly increasing starts and
+non-overlapping half-open ranges, ordered TLS callbacks, load-config GuardCF
 function, address-taken IAT, long-jump, and EH-continuation records, bounded exact strings,
 supported RIP-relative
 data references, bounded direct calls and thunks, and a bounded modern MSVC x64 RTTI/vftable subset
