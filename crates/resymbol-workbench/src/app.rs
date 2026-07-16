@@ -2362,7 +2362,9 @@ impl WorkbenchApp {
                                 } else {
                                     ui.label(format!("{:?}: {}", claim.kind, claim.value));
                                 }
-                                ui.collapsing("Evidence details", |ui| {
+                                egui::CollapsingHeader::new("Evidence details")
+                                    .id_salt(("claim-evidence", row.rva, claim_index))
+                                    .show(ui, |ui| {
                                     ui.label(format!(
                                         "Confidence: {:.1}%",
                                         claim.confidence * 100.0
@@ -2402,7 +2404,7 @@ impl WorkbenchApp {
                                         claim_index + 1,
                                         detail.claims.len()
                                     ));
-                                });
+                                    });
                             });
                         ui.add_space(5.0);
                     }
