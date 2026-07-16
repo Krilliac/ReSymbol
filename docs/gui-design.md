@@ -114,6 +114,25 @@ The layout can later host synchronized disassembly, pseudocode, hex, and cross-r
 without changing the surrounding navigation and inspector model. Editable and exhaustive
 control-flow graphing remains later work.
 
+### Static address space and protection assessment
+
+The implemented **Address Space** tab is a non-executing preferred-image view for supported PE32+
+inputs. It partitions `SizeOfImage` into headers, declared sections and zero-filled tails, and
+explicit gaps; shows preferred virtual addresses, file backing, and declared read/write/execute
+attributes; and stays bound to the same exact SHA-256 identity as the analysis package. It is not a
+live process map and must not imply that ASLR, runtime allocations, loaded modules, guard pages, or
+changed page protections have been observed.
+
+Protection assessment shows bounded artifact evidence for entry-point placement and backing,
+TLS-before-entry behavior, anti-debug imports, common packer section names, high-entropy samples, and
+writable/executable sections. These are review cues, not malware verdicts. Offline opening keeps the
+evidence visible without granting permission to run the target. A future live launch or attach must
+use a separate blocking acknowledgement bound to the exact binary, operation, provider, and sandbox
+policy; dismissing an offline finding can never authorize execution.
+
+Static and future live mappings remain distinct views. See
+[Debugger and sandbox architecture](debugger-sandbox.md) for the ownership and containment gates.
+
 ### Contextual inspector
 
 Selecting a function opens the implemented evidence inspector on the right. It shows the selected
@@ -291,6 +310,7 @@ later validation task.
 The current slice has no GUI plugin execution, legacy-package opening, durable review decisions,
 **Accept**/**Keep as Alias**/**Reject** behavior, PDB or IDA/Ghidra GUI export, docking,
 disassembly/pseudocode views, editable or exhaustive control-flow graphing, live debugger bridge,
-multi-binary workspace, or remote collaboration. Future choices in those areas must still be
-evaluated against startup size, portability, accessibility, crash isolation, exact identity, and
-the one-download product principle.
+debugger-host process, verified AppContainer/VM provider, multi-binary workspace, or remote
+collaboration. The backend-neutral debugger and sandbox contracts are foundations for those later
+features, not proof that they exist. Future choices must still be evaluated against startup size,
+portability, accessibility, crash isolation, exact identity, and the one-download product principle.
