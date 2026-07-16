@@ -16,9 +16,10 @@ native C/C++, and managed/.NET analysis runtimes. It also includes a validated, 
 export projection, deterministic Microsoft-linker-style MAP output, an exact-RSDS public-symbol PDB
 writer, and conservative standalone import-script generators
 for IDA and Ghidra. A first Windows-first workbench slice now provides background core analysis,
-evidence review, and a constrained shared-model export path. Broader disassembly-assisted
-discovery, matching, semantic inference, interactive debugger bridges, richer PDB and DWARF output,
-and the complete workbench review model remain design work.
+durable exact-name review, bounded graph navigation, static address/protection inspection,
+non-executing debugger/sandbox readiness, and a constrained shared-model export path. Broader
+disassembly-assisted discovery, matching, semantic inference, live debugger bridges, richer PDB and
+DWARF output, bulk review, and the rest of the workbench design remain future work.
 
 ## Goals
 
@@ -527,6 +528,30 @@ make the planned interactive tool-host boundary complete.
 
 See [plugin-system.md](plugin-system.md) for discovery, health states, and contracts.
 
+## Debugger and sandbox foundation
+
+`crates/resymbol-debugger` implements a backend-neutral, non-executing foundation: bounded control
+and raw-byte framing, strict typed commands and events, a command-specific session reducer, one-use
+host-risk and sandbox-ownership authority, exact attestation/cleanup evidence models, and a
+single-owner host-client seam. Its provider-readiness service performs only read-only discovery and
+reports whether provisioning may be attempted for the exact requested provider, boundary, and
+guarantees. It cannot provision a sandbox, launch or attach to a target, or attest that containment
+exists.
+
+The feature-gated `SyntheticDebugHost` exercises offline open/close protocol mechanics for tests and
+explicit test-support builds. It reports no platform capability and fabricates no target,
+attestation, or cleanup evidence. The build-claim handshake binds roles, versions, sequences, and a
+nonce strongly enough to detect protocol reflection, replay, downgrade, and accidental build
+mismatch, but its echoed nonce and self-reported strings are plaintext correlation—not peer or
+process authentication. A production transport must independently authenticate the helper channel
+and process identity.
+
+No Windows debugger-host process, live transport, AppContainer or Hyper-V provider, guest agent,
+live launch/attach, breakpoint engine, register service, or process-memory service is implemented.
+The current contracts and readiness UI are therefore not a working malware sandbox or live
+debugger. [debugger-sandbox.md](debugger-sandbox.md) records the exact ownership, authorization,
+containment, cleanup, and verification gates that future providers must satisfy.
+
 ## Workbench GUI
 
 `crates/resymbol-workbench` implements the first Windows-first desktop slice with pinned
@@ -538,9 +563,10 @@ export crates. The workbench does not fork reconciliation or identity rules from
 
 The initial shell implements the approved four-region structure: persistent, resizable and
 collapsible project/plugin navigation, a virtualized sortable/filterable function table, a bounded
-Reconstruction Graph, an evidence inspector, and a progress/warning/log area. It displays exact
-SHA-256 binary identity and read-only plugin health. Graphite, Light, IDA-inspired, and Classic
-Debugger are persisted theme presets; arbitrary docking is not implemented.
+Reconstruction Graph, a static Address Space/protection view, a non-executing Debugger / Sandbox
+readiness view, an evidence inspector, and a progress/warning/log area. It displays exact SHA-256
+binary identity and read-only plugin health. Graphite, Light, IDA-inspired, and Classic Debugger are
+persisted theme presets; arbitrary docking is not implemented.
 
 The Reconstruction Graph is a read-only projection of retained analysis, not a second analyzer or a
 claim of complete call-graph recovery. It roots at the PE entry point when that point is available as
@@ -555,11 +581,16 @@ GUI exports use the same shared models and create-new policy to write canonical 
 JSON, bounded Markdown, PE MAP, public-symbol PDB, IDA Python, and Ghidra Java files. The workbench
 opens current packages, verifies an exact source binary when byte-dependent views require it, and
 owns one binary-bound review ledger. **Accept Primary**, **Keep as Alias**, **Reject**, annotations,
-undo, and redo apply only to fingerprinted name claims; non-name claims remain read-only. Sidecar
-I/O and reviewed projection rebuilds run on the bounded worker, while operation identifiers and
-exact ledger/project binding reject stale results. GUI plugin execution, arbitrary docking,
-synchronized disassembly/pseudocode views, editable or exhaustive control-flow graphs, and an
-interactive debugger bridge remain planned.
+undo, and redo apply only to versioned semantic fingerprints of exact name claims; non-name claims
+remain read-only. **Keep as Alias** retains an alternate without silently promoting it to primary,
+and a disposition plus optional rationale is one indivisible undo/redo transaction. Current schema-2
+sidecars strictly migrate supported schema-1 data, stay bound to the exact binary, and use
+create-new durable writes. Sidecar I/O and reviewed projection rebuilds run on the bounded worker,
+while operation identifiers and exact ledger/project binding reject stale results. A native close
+request or companion-console `quit` with unsaved review changes pauses for **Save New...**,
+**Discard and Close**, or **Cancel**; save-and-close waits for the exact queued ledger snapshot to
+be durable. GUI plugin execution, arbitrary docking, synchronized disassembly/pseudocode views,
+editable or exhaustive control-flow graphs, and a live debugger bridge remain planned.
 
 The companion console is an opt-in process rather than a second state owner. The GUI spawns the
 packaged console helper only after the user enables it and uses private redirected standard-I/O
@@ -613,6 +644,9 @@ Developer toolchains are a contributor concern, not an end-user installation ste
    cannot directly create trusted facts.
 7. **Tool bridges are separate trust domains.** A bridge must validate the binary identity and
    address mapping before applying an analysis inside another program.
+8. **Debugger readiness is not containment.** A read-only readiness result authorizes neither
+   provisioning nor execution. The current plaintext build-claim exchange does not authenticate a
+   helper, and no process-executing debugger provider exists in the current implementation.
 
 The core should retain enough structured diagnostics to explain which boundary failed without
 logging binary contents, source material, or secrets by default.

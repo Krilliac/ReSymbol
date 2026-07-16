@@ -43,16 +43,19 @@ portable `.resym` package bound to the input's SHA-256 identity.
 
 On Windows x64, `resymbol-workbench.exe` opens a supported PE or current `.resym` package, runs the
 same core analysis away from the UI thread, and presents exact identity, evidence, durable
-exact-claim review, a bounded Reconstruction Graph, and discovered plugin health. The graph roots at
-the PE entry point or a clearly labeled deterministic lowest-RVA navigation fallback, synchronizes
+exact-claim review, a bounded Reconstruction Graph, a static Address Space/protection assessment,
+read-only debugger/sandbox provider readiness, and discovered plugin health. The graph roots at the
+PE entry point or a clearly labeled deterministic lowest-RVA navigation fallback, synchronizes
 function selection with the inspector, and draws only retained direct-call, thunk, and import
 relationships. Its visible bounded state makes large binary truncation explicit instead of
-suggesting complete call-graph recovery. Plugin health is read-only and the GUI does not execute
-plugins or migrate legacy packages. It creates new `.resym`, neutral JSON, Markdown, MAP,
-public-symbol PDB, IDA Python, and Ghidra Java artifacts, stores review decisions in a separate
-binary-bound create-new sidecar, and refuses to replace an existing destination. Its companion
-console is off by default; enable **View -> Companion console** to spawn live logs and typed
-workbench controls, then clear the same checkbox to close only that console session.
+suggesting complete call-graph recovery. Address Space is a preferred-image model rather than a live
+process map, and readiness is only a non-mutating provisioning preflight; neither executes the input
+or proves containment. Plugin health is read-only and the GUI does not execute plugins or migrate
+legacy packages. It creates new `.resym`, neutral JSON, Markdown, MAP, public-symbol PDB, IDA Python,
+and Ghidra Java artifacts, stores review decisions in a separate binary-bound create-new sidecar,
+and refuses to replace an existing destination. Its companion console is off by default; enable
+**View -> Companion console** to spawn live logs and typed workbench controls, then clear the same
+checkbox to close only that console session.
 
 This is not yet a general disassembler or a full symbol-recovery pipeline. It does not infer names
 erased by compilation, reconstruct general C++ layouts, recover register-indirect control flow, or
@@ -203,20 +206,23 @@ the file picker:
 ```
 
 The workbench performs background core-only analysis and provides evidence, provenance, durable
-exact-claim review, plugin-health, and bounded Reconstruction Graph views. The graph's root and
-synchronized selection controls let you move between the entry point or deterministic lowest-RVA
-fallback and individual functions; only retained direct-call, thunk, and import edges are drawn. A
-**BOUNDED** cue identifies large views that exceed the rendering budget. The workbench opens current
-`.resym` packages, can verify them against an exact source binary, saves review history to a separate
-create-new sidecar, and publishes create-new `.resym`, neutral JSON, Markdown, MAP, public-symbol PDB,
-IDA Python, or Ghidra Java artifacts. It never overwrites an existing destination. Plugin execution
-and legacy package migration remain CLI workflows; live launch, attach, and memory mutation are not
+exact-claim review, plugin health, a bounded Reconstruction Graph, a static Address Space/protection
+assessment, and read-only debugger/sandbox readiness. The graph's root and synchronized selection
+controls let you move between the entry point or deterministic lowest-RVA fallback and individual
+functions; only retained direct-call, thunk, and import edges are drawn. A **BOUNDED** cue identifies
+large views that exceed the rendering budget. The static and readiness views do not execute the
+input, create a sandbox, or prove containment. The workbench opens current `.resym` packages, can
+verify them against an exact source binary, saves review history to a separate create-new sidecar,
+and publishes create-new `.resym`, neutral JSON, Markdown, MAP, public-symbol PDB, IDA Python, or
+Ghidra Java artifacts. It never overwrites an existing destination. Plugin execution and legacy
+package migration remain CLI workflows; live launch, attach, and memory mutation are not
 implemented.
 
 The **View -> Companion console** checkbox spawns the packaged console helper when you want live
 timestamped activity or command control. Enter `help` there for the bounded command set. The helper
 is not a standalone analyzer, starts disabled on every launch, and can be closed without ending the
-GUI.
+GUI. Its `quit` command and the native window close button both pause on unsaved review changes so
+you can save a new sidecar, explicitly discard, or cancel before exiting.
 
 On Linux or macOS, use `./resymbol` instead of `resymbol` unless the extracted directory is on
 `PATH`. By default, `analyze` replaces the input extension with `.resym`. Select another destination

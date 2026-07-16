@@ -1,11 +1,11 @@
 # Workbench visual captures
 
-ReSymbol's deterministic capture workflow covers five review views for the checked-in symbolized MSVC fixture:
-**Overview**, **Functions**, **Reconstruction Graph**, **Address Space**, and the non-executing
-**Debugger / Sandbox Readiness** surface. The capture path builds
-the workbench with its opt-in `screenshot` feature, disables persisted window state and animation,
-sets a fixed native viewport and UI zoom, waits for the workbench panels to settle, and then
-uses egui's next-frame screenshot event. Every PNG must be exactly 1440x900 pixels.
+ReSymbol's deterministic capture workflow covers five review views for the checked-in symbolized
+MSVC fixture: **Overview**, **Functions**, **Reconstruction Graph**, **Address Space**, and the
+non-executing **Debugger / Sandbox Readiness** surface. The capture path builds the workbench with
+its opt-in `screenshot` feature, disables persisted window state and animation, clears interactive
+pointer state, sets a fixed native viewport and UI zoom, waits for the workbench panels to settle,
+and then uses egui's next-frame screenshot event. Every PNG must be exactly 1440x900 pixels.
 
 On Windows, regenerate the views with:
 
@@ -25,7 +25,19 @@ captures egui's returned native framebuffer without resizing it. This keeps both
 logical layout stable at supported desktop scales; any mismatch still fails loudly. Each view also
 has a bounded process timeout so a failed GUI startup cannot occupy a CI runner indefinitely.
 
-The Windows visual-capture workflow runs for relevant crate, fixture, capture-tool, and Rust
-dependency changes. It uploads the validated files for three days with PNG recompression disabled.
-These artifacts are for human review: ReSymbol does not compare their pixels until a reviewed,
-checked-in baseline and an explicit update policy exist.
+The five PNGs and `capture-manifest.json` under `docs/images` are the current checked-in,
+human-reviewed reference captures. They document the accepted appearance and make visual changes
+reviewable in source control, but they are not automated pixel-equivalence thresholds.
+
+When intentionally updating the references, run the script with its default output directory,
+inspect all five full-size images for layout, clipping, stale/duplicate-widget warnings, incorrect
+state, and accidental hover styling, then review the manifest hashes and commit the five PNGs plus
+the manifest as one set. An individual image or manifest-only update is not a complete reference
+refresh.
+
+The Windows visual-review workflow runs for relevant crate, fixture, capture-tool, and Rust
+dependency changes. It regenerates the same five views into a temporary directory, validates PNG
+format, exact dimensions, completeness, and manifest metadata, and uploads the files for three days
+with PNG recompression disabled. CI deliberately does not compare those pixels with `docs/images`,
+so a passing job proves capture integrity—not rendering equivalence. The generated artifact remains
+available for human comparison with the checked-in references.

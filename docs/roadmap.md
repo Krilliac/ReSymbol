@@ -17,23 +17,36 @@ eframe/egui 0.32.3 dependencies so the workspace can retain Rust 1.86. It runs *
 background core-only Analyze -> Review -> Export**, preserves exact SHA-256 identity, and presents
 read-only plugin health in a persistent four-theme, four-region shell. The shell includes a
 virtualized sortable/filterable function table, synchronized evidence inspector,
-progress/warning/log surface, and evidence-first Reconstruction Graph. That graph roots at the PE
+progress/warning/log surface, evidence-first Reconstruction Graph, non-executing static Address
+Space/protection view, and read-only Debugger / Sandbox readiness view. That graph roots at the PE
 entry point or a clearly labeled deterministic lowest-RVA navigation fallback, shares selection with
 the function review surfaces, and displays only retained direct-call, thunk, and import
 relationships. Explicit node/tier bounds keep large binaries responsive and visible as truncated
 rather than implying complete call-graph recovery. Through the existing shared package, review, and
-export models the workbench can open current `.resym` packages, persist binary-bound exact-claim
-review sidecars with undo/redo, and create new `.resym`, neutral JSON, bounded Markdown, MAP,
-public-symbol PDB, IDA Python, and Ghidra Java files without replacing an existing destination.
+export models the workbench can open current `.resym` packages, persist binary-bound schema-2
+exact-claim review sidecars with transaction-level undo/redo, and create new `.resym`, neutral JSON,
+bounded Markdown, MAP, public-symbol PDB, IDA Python, and Ghidra Java files without replacing an
+existing destination. **Keep as Alias** remains an alternate rather than an implicit primary;
+disposition and rationale are one undo/redo unit. A dirty native close or companion-console `quit`
+requires an explicit create-new save, discard, or cancel decision, and save-and-close waits for the
+exact queued ledger snapshot to become durable.
 
 An off-by-default companion console can be spawned from the running workbench. It mirrors bounded
 timestamped activity and routes status, navigation, layout, export, and lifecycle commands back to
 the GUI event loop through private process pipes; it never becomes a second owner of analysis state.
 
-This is a foundation, not the completed workbench. GUI plugin execution, legacy-package migration,
-bulk review, docking, disassembly views, and an interactive debugger bridge remain planned. A
-portable Windows archive is the initial GUI packaging target; broader desktop packaging remains
-future validation.
+The backend-neutral debugger foundation now includes strict bounded framing, typed commands/events,
+command-specific reducers, one-use authorization leases, exact attestation/cleanup evidence models,
+a single-owner host-client seam, and a read-only provider-readiness service. The feature-gated
+synthetic host supports only test/offline open-close mechanics and reports no platform capability.
+Its plaintext build-claim exchange detects protocol mismatch and replay but does not authenticate a
+peer or process. No live Windows host transport, AppContainer/Hyper-V provider, target execution,
+attach, breakpoint, register, or process-memory service is implemented.
+
+This is a foundation, not the completed workbench or a working sandbox. GUI plugin execution,
+legacy-package migration, bulk review, docking, disassembly views, and an interactive debugger
+bridge remain planned. A portable Windows archive is the initial GUI packaging target; broader
+desktop packaging remains future validation.
 
 The CLI writes package schema 13 and can inspect or export schemas 1 through 12 through explicit
 compatibility paths. Schema 1 is migrated in memory by revalidating persisted metadata and
@@ -339,8 +352,10 @@ Implemented in the current alpha.
 
 This milestone establishes extensibility before analysis behavior becomes difficult to decouple.
 Core graph types, plugin discovery/health policy, initial multi-runtime contracts, and the first
-WASM, external-process, native C/C++, and managed/.NET execution hosts are implemented. Package
-installation and debugger-hosted runtimes are still outstanding.
+WASM, external-process, native C/C++, and managed/.NET execution hosts are implemented. The
+backend-neutral debugger protocol, reducer, host-client, authorization/evidence contracts, and
+read-only readiness service are implemented; package installation and process-executing
+debugger-hosted runtimes are still outstanding.
 
 - Binary identity and canonical address primitives
 - Versioned entities for functions, ranges, names, types, claims, evidence, and plugin runs
@@ -361,6 +376,9 @@ installation and debugger-hosted runtimes are still outstanding.
   callbacks and full-batch validation
 - App-local self-contained managed/.NET analysis helper with a host-supplied SDK, verified private
   DLL and exact-binary snapshots, phase-bounded services, and transactional lifecycle
+- Backend-neutral debugger framing, typed reducer/client seam, one-use authorization, exact
+  attestation/cleanup evidence models, test-only synthetic mechanics, and read-only provider
+  readiness without a live target or claimed sandbox
 - Transactional plugin claims and failure-tolerant `AnalysisSession` packaging
 - Initial contracts and example packages for:
   - WebAssembly plugins with a source-backed, release-staged component
@@ -453,10 +471,11 @@ Semantic inference remains optional and never converts a hypothesis into an extr
 
 - Desktop workbench GUI for project navigation, evidence review, claim comparison, plugin health,
   bounded retained-relationship graphing, and export preview (initial Windows-first core-only shell,
-  synchronized Reconstruction Graph, evidence inspector, current-package opening, six create-new
-  exports, and durable exact-claim review with sidecars and undo/redo implemented; bulk review,
-  plugin execution, docking/disassembly, editable or exhaustive graphing, debugger bridges, and the
-  remaining [approved design](gui-design.md) are planned)
+  synchronized Reconstruction Graph, static Address Space/protection assessment, non-executing
+  debugger/sandbox readiness, evidence inspector, current-package opening, six create-new exports,
+  and transaction-safe exact-claim review with versioned sidecars, dirty-close protection, and
+  undo/redo implemented; bulk review, plugin execution, docking/disassembly, editable or exhaustive
+  graphing, live debugger bridges, and the remaining [approved design](gui-design.md) are planned)
 - Signed or verifiable plugin packages and registry metadata
 - Hash-addressed community symbol packs without bundled application binaries
 - Mergeable annotations and review decisions
