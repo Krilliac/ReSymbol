@@ -1,7 +1,8 @@
 use resymbol_analysis::{
     AnalysisError, AnalysisSession, BinaryAnalysis, ImportTarget, PeControlFlowTarget,
-    PeDataReference, PeDirectCall, PeRecoveredString, PeStringEncoding, PeThunk, PeTlsCallback,
-    PluginRunRecord, PluginRunStatus, SessionValidationError, analyze_bytes, analyze_pe,
+    PeDataReference, PeDirectCall, PeGuardCfFunction, PeRecoveredString, PeStringEncoding, PeThunk,
+    PeTlsCallback, PluginRunRecord, PluginRunStatus, SessionValidationError, analyze_bytes,
+    analyze_pe,
 };
 use resymbol_core::{
     BinaryId, ClaimProducer, ClaimProvenance, Confidence, ControlFlowTarget, Evidence,
@@ -19,6 +20,11 @@ const IMAGE_BASE: u64 = 0x0000_0001_4000_0000;
 const TLS_DIRECTORY_RVA: u32 = 0x1380;
 const TLS_CALLBACK_TABLE_RVA: u32 = 0x13c0;
 const TLS_CALLBACK_LIMIT: usize = 4_096;
+const LOAD_CONFIG_DIRECTORY_RVA: u32 = 0x1380;
+const LOAD_CONFIG_GUARD_FIELDS_SIZE: u32 = 148;
+const GUARD_CF_FUNCTION_TABLE_RVA: u32 = 0x1480;
+const GUARD_CF_FUNCTION_LIMIT: u64 = 262_144;
+const IMAGE_GUARD_CF_FUNCTION_TABLE_PRESENT: u32 = 0x0000_0400;
 const DELAY_IMPORT_DIRECTORY_RVA: u32 = 0x1400;
 const DELAY_IMPORT_NAME_RVA: u32 = 0x1440;
 const DELAY_IMPORT_MODULE_HANDLE_RVA: u32 = 0x1450;
@@ -404,6 +410,58 @@ fn combined_import_name_budget_fixture() -> Vec<u8> {
     );
     put_u16(&mut bytes, file_offset(DELAY_HINT_NAME_RVA), 1);
     put_c_string(&mut bytes, file_offset(DELAY_HINT_NAME_RVA + 2), "X");
+    bytes
+}
+
+fn set_guard_cf_load_config(
+    bytes: &mut [u8],
+    directory_size: u32,
+    load_config_size: u32,
+    table_va: u64,
+    function_count: u64,
+    guard_flags: u32,
+) {
+    set_directory(bytes, 10, LOAD_CONFIG_DIRECTORY_RVA, directory_size);
+    let load_config = file_offset(LOAD_CONFIG_DIRECTORY_RVA);
+    put_u32(bytes, load_config, load_config_size);
+    put_u64(bytes, load_config + 128, table_va);
+    put_u64(bytes, load_config + 136, function_count);
+    put_u32(bytes, load_config + 144, guard_flags);
+}
+
+fn write_guard_cf_records<const N: usize>(
+    bytes: &mut [u8],
+    table_rva: u32,
+    entries: &[(u32, [u8; N])],
+) {
+    assert!(N <= 15, "GuardFlags can encode at most 15 metadata bytes");
+    let record_size = 4 + N;
+    for (index, (rva, metadata)) in entries.iter().enumerate() {
+        let record = file_offset(table_rva) + index * record_size;
+        put_u32(bytes, record, *rva);
+        bytes[record + 4..record + record_size].copy_from_slice(metadata);
+    }
+}
+
+fn guard_cf_fixture<const N: usize>(entries: &[(u32, [u8; N])]) -> Vec<u8> {
+    assert!(N <= 15, "GuardFlags can encode at most 15 metadata bytes");
+    let mut bytes = fixture();
+    let metadata_size = u32::try_from(N).expect("GuardCF metadata size fits u32");
+    let guard_flags = IMAGE_GUARD_CF_FUNCTION_TABLE_PRESENT | (metadata_size << 28);
+    let table_va = if entries.is_empty() {
+        0
+    } else {
+        IMAGE_BASE + u64::from(GUARD_CF_FUNCTION_TABLE_RVA)
+    };
+    set_guard_cf_load_config(
+        &mut bytes,
+        LOAD_CONFIG_GUARD_FIELDS_SIZE,
+        LOAD_CONFIG_GUARD_FIELDS_SIZE,
+        table_va,
+        u64::try_from(entries.len()).expect("GuardCF fixture count fits u64"),
+        guard_flags,
+    );
+    write_guard_cf_records(&mut bytes, GUARD_CF_FUNCTION_TABLE_RVA, entries);
     bytes
 }
 
@@ -1242,6 +1300,11 @@ fn analyzes_minimal_pe_with_imports_exports_and_runtime_functions() {
     assert_eq!(analysis.runtime_functions.len(), 1);
     assert_eq!(analysis.runtime_functions[0].begin_rva, 0x1000);
     assert_eq!(analysis.runtime_functions[0].end_rva, 0x1020);
+    assert_eq!(analysis.directories.load_config, None);
+    assert_eq!(analysis.load_config_size, None);
+    assert_eq!(analysis.guard_flags, None);
+    assert_eq!(analysis.guard_cf_function_table_rva, None);
+    assert!(analysis.guard_cf_functions.is_empty());
     assert_eq!(analysis.symbol_graph.binaries().len(), 1);
     assert_eq!(analysis.symbol_graph.claims().len(), 5);
     assert!(matches!(
@@ -1299,6 +1362,69 @@ fn parses_modern_delay_imports_alongside_normal_imports() {
         library.entries[1].target,
         ImportTarget::Ordinal { ordinal: 77 }
     );
+}
+
+#[test]
+fn accepts_delay_import_module_handle_storage_in_a_zero_filled_virtual_tail() {
+    const VIRTUAL_MODULE_HANDLE_RVA: u32 = 0x1600;
+
+    let mut bytes = delay_import_fixture();
+    put_u32(&mut bytes, SECTION_OFFSET + 8, 0x608);
+    put_u32(
+        &mut bytes,
+        file_offset(DELAY_IMPORT_DIRECTORY_RVA) + 8,
+        VIRTUAL_MODULE_HANDLE_RVA,
+    );
+
+    let analysis = analyze_pe(&bytes)
+        .expect("an eight-byte HMOD range wholly inside a mapped virtual tail is valid");
+    assert_eq!(
+        analysis.delay_imports[0].module_handle_rva,
+        VIRTUAL_MODULE_HANDLE_RVA
+    );
+    let section = &analysis.sections[0];
+    let raw_end_rva = section
+        .virtual_address
+        .checked_add(section.raw_data_size)
+        .expect("fixture raw end RVA");
+    let virtual_end_rva = section
+        .virtual_address
+        .checked_add(section.virtual_size)
+        .expect("fixture virtual end RVA");
+    assert_eq!(raw_end_rva, VIRTUAL_MODULE_HANDLE_RVA);
+    assert_eq!(virtual_end_rva, VIRTUAL_MODULE_HANDLE_RVA + 8);
+
+    let encoded = serde_json::to_value(&analysis).expect("serialize virtual-tail HMOD analysis");
+    assert_eq!(
+        serde_json::from_value::<resymbol_analysis::PeAnalysis>(encoded)
+            .expect("validated deserialization accepts the mapped virtual-tail HMOD range"),
+        analysis
+    );
+}
+
+#[test]
+fn rejects_delay_import_module_handle_ranges_crossing_or_outside_the_section_virtual_span() {
+    const VIRTUAL_MODULE_HANDLE_RVA: u32 = 0x1600;
+
+    for (label, virtual_size) in [
+        ("crosses the virtual end", 0x607_u32),
+        ("starts at the virtual end", 0x600),
+    ] {
+        let mut bytes = delay_import_fixture();
+        put_u32(&mut bytes, SECTION_OFFSET + 8, virtual_size);
+        put_u32(
+            &mut bytes,
+            file_offset(DELAY_IMPORT_DIRECTORY_RVA) + 8,
+            VIRTUAL_MODULE_HANDLE_RVA,
+        );
+
+        let error = analyze_pe(&bytes)
+            .expect_err("the complete eight-byte HMOD range must stay in one mapped section");
+        assert!(
+            error.to_string().contains("module-handle storage"),
+            "{label}: {error}"
+        );
+    }
 }
 
 #[test]
@@ -1740,6 +1866,808 @@ fn validated_deserialization_rejects_tampered_delay_import_state() {
         .expect_err("data-directory entry 13 requires at least 224 optional-header bytes");
     assert!(error.to_string().contains("optional header"));
     assert!(error.to_string().contains("224"));
+}
+
+#[test]
+fn recovers_guard_cf_functions_with_exact_metadata_suppression_and_graph_evidence() {
+    let entries = [
+        (0x1040, [0x00, 0xa0]),
+        (0x1060, [0x01, 0xa1]),
+        (0x1080, [0x02, 0xa2]),
+        (0x10a0, [0x03, 0xa3]),
+        (0x10c0, [0x80, 0xa4]),
+    ];
+    let analysis = analyze_pe(&guard_cf_fixture(&entries)).expect("valid sorted GuardCF table");
+
+    assert_eq!(
+        analysis.directories.load_config,
+        Some(resymbol_analysis::DataDirectory {
+            rva: LOAD_CONFIG_DIRECTORY_RVA,
+            size: LOAD_CONFIG_GUARD_FIELDS_SIZE,
+        })
+    );
+    assert_eq!(
+        analysis.load_config_size,
+        Some(LOAD_CONFIG_GUARD_FIELDS_SIZE)
+    );
+    assert_eq!(analysis.guard_flags, Some(0x2000_0400));
+    assert_eq!(
+        analysis.guard_cf_function_table_rva,
+        Some(GUARD_CF_FUNCTION_TABLE_RVA)
+    );
+    assert_eq!(
+        analysis.guard_cf_functions,
+        [
+            PeGuardCfFunction {
+                table_index: 0,
+                rva: 0x1040,
+                metadata: vec![0x00, 0xa0],
+            },
+            PeGuardCfFunction {
+                table_index: 1,
+                rva: 0x1060,
+                metadata: vec![0x01, 0xa1],
+            },
+            PeGuardCfFunction {
+                table_index: 2,
+                rva: 0x1080,
+                metadata: vec![0x02, 0xa2],
+            },
+            PeGuardCfFunction {
+                table_index: 3,
+                rva: 0x10a0,
+                metadata: vec![0x03, 0xa3],
+            },
+            PeGuardCfFunction {
+                table_index: 4,
+                rva: 0x10c0,
+                metadata: vec![0x80, 0xa4],
+            },
+        ]
+    );
+    assert_eq!(
+        analysis
+            .guard_cf_functions
+            .iter()
+            .map(PeGuardCfFunction::is_fid_suppressed)
+            .collect::<Vec<_>>(),
+        [false, true, false, true, false]
+    );
+    assert_eq!(
+        analysis
+            .guard_cf_functions
+            .iter()
+            .map(PeGuardCfFunction::is_export_suppressed)
+            .collect::<Vec<_>>(),
+        [false, false, true, true, false]
+    );
+
+    let claims = analysis
+        .symbol_graph
+        .claims()
+        .iter()
+        .filter(|claim| claim.provenance().method == "pe-guard-cf-function")
+        .collect::<Vec<_>>();
+    assert_eq!(claims.len(), 5);
+    assert_eq!(
+        claims
+            .iter()
+            .map(|claim| match claim.subject() {
+                SymbolSubject::Function { rva, .. } => *rva,
+                other => panic!("unexpected GuardCF claim subject {other:?}"),
+            })
+            .collect::<Vec<_>>(),
+        [0x1040, 0x1060, 0x1080, 0x10a0, 0x10c0]
+    );
+    let export_suppressed = claims
+        .iter()
+        .copied()
+        .find(|claim| matches!(claim.subject(), SymbolSubject::Function { rva: 0x1080, .. }))
+        .expect("export suppression alone retains a function candidate");
+    assert!(matches!(
+        export_suppressed.assertion(),
+        SymbolAssertion::FunctionEntry
+    ));
+    assert_eq!(export_suppressed.confidence().get(), 0.99);
+    assert_eq!(
+        export_suppressed.evidence()[0].summary,
+        "exact executable function target from the sorted PE GuardCF function table"
+    );
+    assert_eq!(
+        export_suppressed.evidence()[0]
+            .confidence
+            .expect("exact GuardCF evidence")
+            .get(),
+        1.0
+    );
+    assert_eq!(
+        export_suppressed.evidence()[0].artifacts["load_config_rva"],
+        "0x1380"
+    );
+    assert_eq!(
+        export_suppressed.evidence()[0].artifacts["function_table_rva"],
+        "0x1480"
+    );
+    assert_eq!(
+        export_suppressed.evidence()[0].artifacts["guard_flags"],
+        "0x20000400"
+    );
+    assert_eq!(
+        export_suppressed.evidence()[0].artifacts["table_index"],
+        "2"
+    );
+    assert_eq!(
+        export_suppressed.evidence()[0].artifacts["target_rva"],
+        "0x1080"
+    );
+    assert_eq!(
+        export_suppressed.evidence()[0].artifacts["metadata"],
+        "02 a2"
+    );
+    assert_eq!(
+        export_suppressed.evidence()[0].artifacts["fid_suppressed"],
+        "false"
+    );
+    assert_eq!(
+        export_suppressed.evidence()[0].artifacts["export_suppressed"],
+        "true"
+    );
+    assert_eq!(
+        export_suppressed.evidence()[0].artifacts["section_index"],
+        "0"
+    );
+    assert_eq!(
+        export_suppressed.evidence()[0].artifacts["section_name"],
+        ".all"
+    );
+    assert!(matches!(
+        &export_suppressed.provenance().producer,
+        ClaimProducer::Core { component, version }
+            if component == "resymbol-analysis" && !version.is_empty()
+    ));
+    let fid_suppressed = claims
+        .iter()
+        .copied()
+        .find(|claim| matches!(claim.subject(), SymbolSubject::Function { rva: 0x1060, .. }))
+        .expect("FID suppression retains the exact GuardCF function claim");
+    assert_eq!(
+        fid_suppressed.evidence()[0].artifacts["fid_suppressed"],
+        "true"
+    );
+    assert_eq!(
+        fid_suppressed.evidence()[0].artifacts["export_suppressed"],
+        "false"
+    );
+    let both_suppressed = claims
+        .iter()
+        .copied()
+        .find(|claim| matches!(claim.subject(), SymbolSubject::Function { rva: 0x10a0, .. }))
+        .expect("combined suppression retains the exact GuardCF function claim");
+    assert_eq!(
+        both_suppressed.evidence()[0].artifacts["fid_suppressed"],
+        "true"
+    );
+    assert_eq!(
+        both_suppressed.evidence()[0].artifacts["export_suppressed"],
+        "true"
+    );
+    assert_eq!(
+        analysis
+            .rebuild_symbol_graph()
+            .expect("rebuild GuardCF graph"),
+        analysis.symbol_graph
+    );
+
+    let encoded = serde_json::to_string(&analysis).expect("serialize GuardCF analysis");
+    let decoded = serde_json::from_str::<resymbol_analysis::PeAnalysis>(&encoded)
+        .expect("deserialize GuardCF analysis");
+    assert_eq!(decoded, analysis);
+    let session = AnalysisSession::new(BinaryAnalysis::Pe(decoded), Vec::new(), Vec::new())
+        .expect("GuardCF analysis remains a valid session base");
+    assert_eq!(
+        serde_json::from_str::<AnalysisSession>(
+            &serde_json::to_string(&session).expect("serialize GuardCF session")
+        )
+        .expect("deserialize GuardCF session"),
+        session
+    );
+}
+
+#[test]
+fn guard_cf_stride_extremes_preserve_exact_record_boundaries() {
+    let no_metadata = analyze_pe(&guard_cf_fixture(&[(0x1040, []), (0x1080, [])]))
+        .expect("zero-byte GuardCF metadata stride");
+    assert_eq!(
+        no_metadata.guard_flags,
+        Some(IMAGE_GUARD_CF_FUNCTION_TABLE_PRESENT)
+    );
+    assert_eq!(
+        no_metadata.guard_cf_functions,
+        [
+            PeGuardCfFunction {
+                table_index: 0,
+                rva: 0x1040,
+                metadata: Vec::new(),
+            },
+            PeGuardCfFunction {
+                table_index: 1,
+                rva: 0x1080,
+                metadata: Vec::new(),
+            },
+        ]
+    );
+
+    let one_byte = analyze_pe(&guard_cf_fixture(&[(0x1040, [0x00]), (0x1080, [0x02])]))
+        .expect("one-byte GuardCF metadata stride");
+    assert_eq!(one_byte.guard_flags, Some(0x1000_0400));
+    assert_eq!(one_byte.guard_cf_functions[1].table_index, 1);
+    assert_eq!(one_byte.guard_cf_functions[1].rva, 0x1080);
+    assert_eq!(one_byte.guard_cf_functions[1].metadata, [0x02]);
+
+    let maximum_metadata = analyze_pe(&guard_cf_fixture(&[
+        (0x1040, [0x10; 15]),
+        (0x1080, [0x22; 15]),
+    ]))
+    .expect("maximum fifteen-byte GuardCF metadata stride");
+    assert_eq!(maximum_metadata.guard_flags, Some(0xf000_0400));
+    assert_eq!(maximum_metadata.guard_cf_functions[1].table_index, 1);
+    assert_eq!(maximum_metadata.guard_cf_functions[1].rva, 0x1080);
+    assert_eq!(maximum_metadata.guard_cf_functions[1].metadata, [0x22; 15]);
+}
+
+#[test]
+fn rejects_misaligned_export_suppressed_guard_cf_targets() {
+    let error = analyze_pe(&guard_cf_fixture(&[(0x1041, [0x02])]))
+        .expect_err("export-suppressed GFIDS entries must be sixteen-byte aligned");
+    assert!(matches!(
+        error,
+        AnalysisError::InvalidField {
+            field: "GuardCF function target",
+            reason,
+        } if reason.contains("export-suppressed") && reason.contains("16-byte aligned")
+    ));
+
+    let fid_suppressed = analyze_pe(&guard_cf_fixture(&[(0x1041, [0x01])]))
+        .expect("FID suppression alone does not impose export-suppression alignment");
+    assert!(fid_suppressed.guard_cf_functions[0].is_fid_suppressed());
+    assert!(!fid_suppressed.guard_cf_functions[0].is_export_suppressed());
+}
+
+#[test]
+fn rejects_unsorted_and_duplicate_guard_cf_function_rvas() {
+    for (label, entries) in [
+        ("descending", [(0x1080, []), (0x1040, [])]),
+        ("duplicate", [(0x1040, []), (0x1040, [])]),
+    ] {
+        let error = analyze_pe(&guard_cf_fixture(&entries))
+            .expect_err("GuardCF function RVAs must be strictly increasing and unique");
+        assert!(
+            matches!(
+                &error,
+                AnalysisError::InvalidField {
+                    field: "GuardCF function table",
+                    reason,
+                } if reason.contains("strictly increasing and unique")
+            ),
+            "{label}: {error}"
+        );
+    }
+}
+
+#[test]
+fn handles_versioned_empty_and_malformed_load_config_structures() {
+    let mut short_version = fixture();
+    set_guard_cf_load_config(
+        &mut short_version,
+        LOAD_CONFIG_GUARD_FIELDS_SIZE,
+        LOAD_CONFIG_GUARD_FIELDS_SIZE - 1,
+        IMAGE_BASE + u64::from(GUARD_CF_FUNCTION_TABLE_RVA),
+        1,
+        IMAGE_GUARD_CF_FUNCTION_TABLE_PRESENT,
+    );
+    let short_version = analyze_pe(&short_version)
+        .expect("a versioned load config shorter than the GuardCF prefix is retained opaquely");
+    assert_eq!(
+        short_version.load_config_size,
+        Some(LOAD_CONFIG_GUARD_FIELDS_SIZE - 1)
+    );
+    assert_eq!(short_version.guard_flags, None);
+    assert_eq!(short_version.guard_cf_function_table_rva, None);
+    assert!(short_version.guard_cf_functions.is_empty());
+
+    let mut empty = fixture();
+    set_guard_cf_load_config(
+        &mut empty,
+        LOAD_CONFIG_GUARD_FIELDS_SIZE,
+        LOAD_CONFIG_GUARD_FIELDS_SIZE,
+        0,
+        0,
+        0xf000_0400,
+    );
+    let empty = analyze_pe(&empty)
+        .expect("zero table and count are a valid empty inventory even with table-present set");
+    assert_eq!(empty.guard_flags, Some(0xf000_0400));
+    assert_eq!(empty.guard_cf_function_table_rva, None);
+    assert!(empty.guard_cf_functions.is_empty());
+
+    let mut too_short_directory = fixture();
+    set_guard_cf_load_config(&mut too_short_directory, 3, 3, 0, 0, 0);
+    let error = analyze_pe(&too_short_directory)
+        .expect_err("the directory must back the four-byte structure-size field");
+    assert!(matches!(
+        error,
+        AnalysisError::InvalidField {
+            field: "load-config directory size",
+            ..
+        }
+    ));
+
+    let mut too_small_structure = fixture();
+    set_guard_cf_load_config(
+        &mut too_small_structure,
+        LOAD_CONFIG_GUARD_FIELDS_SIZE,
+        3,
+        0,
+        0,
+        0,
+    );
+    let error = analyze_pe(&too_small_structure)
+        .expect_err("a present load-config structure declares at least its size field");
+    assert!(matches!(
+        error,
+        AnalysisError::InvalidField {
+            field: "load-config size",
+            ..
+        }
+    ));
+
+    let mut structure_exceeds_directory = fixture();
+    set_guard_cf_load_config(
+        &mut structure_exceeds_directory,
+        LOAD_CONFIG_GUARD_FIELDS_SIZE,
+        LOAD_CONFIG_GUARD_FIELDS_SIZE + 1,
+        0,
+        0,
+        0,
+    );
+    let error = analyze_pe(&structure_exceeds_directory)
+        .expect_err("the internal size cannot exceed the directory range");
+    assert!(matches!(
+        error,
+        AnalysisError::InvalidField {
+            field: "load-config size",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn rejects_inconsistent_overlapping_and_unbacked_guard_cf_tables() {
+    for (label, table_va, count, guard_flags) in [
+        (
+            "count without table",
+            0,
+            1,
+            IMAGE_GUARD_CF_FUNCTION_TABLE_PRESENT,
+        ),
+        (
+            "table without count",
+            IMAGE_BASE + u64::from(GUARD_CF_FUNCTION_TABLE_RVA),
+            0,
+            IMAGE_GUARD_CF_FUNCTION_TABLE_PRESENT,
+        ),
+        (
+            "table without presence flag",
+            IMAGE_BASE + u64::from(GUARD_CF_FUNCTION_TABLE_RVA),
+            1,
+            0,
+        ),
+    ] {
+        let mut bytes = fixture();
+        set_guard_cf_load_config(
+            &mut bytes,
+            LOAD_CONFIG_GUARD_FIELDS_SIZE,
+            LOAD_CONFIG_GUARD_FIELDS_SIZE,
+            table_va,
+            count,
+            guard_flags,
+        );
+        let error = analyze_pe(&bytes).expect_err("GuardCF table fields must be self-consistent");
+        assert!(
+            matches!(
+                &error,
+                AnalysisError::InvalidField {
+                    field: "GuardCF function table",
+                    ..
+                }
+            ),
+            "{label}: {error}"
+        );
+    }
+
+    for (label, table_va, expected_reason) in [
+        (
+            "below image base",
+            IMAGE_BASE - 1,
+            "below preferred image base",
+        ),
+        (
+            "outside image",
+            IMAGE_BASE + 0x2000,
+            "outside the declared image",
+        ),
+        (
+            "wider than an RVA",
+            IMAGE_BASE + u64::from(u32::MAX) + 1,
+            "does not fit a 32-bit image RVA",
+        ),
+    ] {
+        let mut bytes = fixture();
+        set_guard_cf_load_config(
+            &mut bytes,
+            LOAD_CONFIG_GUARD_FIELDS_SIZE,
+            LOAD_CONFIG_GUARD_FIELDS_SIZE,
+            table_va,
+            1,
+            IMAGE_GUARD_CF_FUNCTION_TABLE_PRESENT,
+        );
+        let error = analyze_pe(&bytes).expect_err("GuardCFFunctionTable stores an image VA");
+        assert!(
+            matches!(
+                &error,
+                AnalysisError::InvalidField {
+                    field: "GuardCFFunctionTable",
+                    reason,
+                } if reason.contains(expected_reason)
+            ),
+            "{label}: {error}"
+        );
+    }
+
+    let mut overlapping = fixture();
+    set_guard_cf_load_config(
+        &mut overlapping,
+        LOAD_CONFIG_GUARD_FIELDS_SIZE,
+        LOAD_CONFIG_GUARD_FIELDS_SIZE,
+        IMAGE_BASE + u64::from(LOAD_CONFIG_DIRECTORY_RVA),
+        1,
+        IMAGE_GUARD_CF_FUNCTION_TABLE_PRESENT,
+    );
+    let error = analyze_pe(&overlapping)
+        .expect_err("the function table cannot alias its load-config structure");
+    assert!(matches!(
+        error,
+        AnalysisError::InvalidField {
+            field: "GuardCF function table",
+            reason,
+        } if reason.contains("overlaps")
+    ));
+
+    let mut unbacked_directory = fixture();
+    set_directory(&mut unbacked_directory, 10, 0x15f0, 148);
+    let error = analyze_pe(&unbacked_directory)
+        .expect_err("the complete load-config directory range must be file-backed");
+    assert!(matches!(
+        error,
+        AnalysisError::UnmappedRva {
+            context: "load-config directory",
+            rva: 0x15f0,
+            size: 148,
+        }
+    ));
+
+    let mut one_byte_short = fixture();
+    set_guard_cf_load_config(
+        &mut one_byte_short,
+        LOAD_CONFIG_GUARD_FIELDS_SIZE,
+        LOAD_CONFIG_GUARD_FIELDS_SIZE,
+        IMAGE_BASE + 0x15ee,
+        1,
+        0xf000_0400,
+    );
+    let error = analyze_pe(&one_byte_short)
+        .expect_err("the final metadata byte of each GuardCF record must be file-backed");
+    assert!(matches!(
+        error,
+        AnalysisError::UnmappedRva {
+            context: "GuardCF function table",
+            rva: 0x15ee,
+            size: 19,
+        }
+    ));
+
+    let mut exact_tail = fixture();
+    set_guard_cf_load_config(
+        &mut exact_tail,
+        LOAD_CONFIG_GUARD_FIELDS_SIZE,
+        LOAD_CONFIG_GUARD_FIELDS_SIZE,
+        IMAGE_BASE + 0x15ed,
+        1,
+        0xf000_0400,
+    );
+    write_guard_cf_records(&mut exact_tail, 0x15ed, &[(0x1040, [0x22; 15])]);
+    let exact_tail = analyze_pe(&exact_tail)
+        .expect("the final nineteen fully backed bytes may hold one maximum-stride record");
+    assert_eq!(exact_tail.guard_cf_function_table_rva, Some(0x15ed));
+    assert_eq!(exact_tail.guard_cf_functions[0].rva, 0x1040);
+    assert_eq!(exact_tail.guard_cf_functions[0].metadata, [0x22; 15]);
+}
+
+#[test]
+fn rejects_non_executable_unbacked_and_suppressed_invalid_guard_cf_targets() {
+    let mut non_executable = guard_cf_fixture(&[(0x2000, [])]);
+    non_executable.resize(0xa00, 0);
+    put_u16(&mut non_executable, COFF_OFFSET + 2, 2);
+    put_u32(&mut non_executable, OPTIONAL_OFFSET + 56, 0x3000);
+    let data_section = SECTION_OFFSET + 40;
+    non_executable[data_section..data_section + 6].copy_from_slice(b".data\0");
+    put_u32(&mut non_executable, data_section + 8, 0x200);
+    put_u32(&mut non_executable, data_section + 12, 0x2000);
+    put_u32(&mut non_executable, data_section + 16, 0x200);
+    put_u32(&mut non_executable, data_section + 20, 0x800);
+    put_u32(&mut non_executable, data_section + 36, 0x4000_0040);
+
+    let mut virtual_tail = guard_cf_fixture(&[(0x1600, [])]);
+    put_u32(&mut virtual_tail, SECTION_OFFSET + 8, 0x700);
+
+    let cases = [
+        ("non-executable section", non_executable),
+        ("executable virtual tail", virtual_tail),
+        ("outside image", guard_cf_fixture(&[(0x2000, [])])),
+        (
+            "FID-suppressed invalid target",
+            guard_cf_fixture(&[(0x0100, [0x01])]),
+        ),
+    ];
+    for (label, bytes) in cases {
+        let error = analyze_pe(&bytes)
+            .expect_err("every GFIDS record remains a backed executable RVA structurally");
+        assert!(
+            matches!(
+                &error,
+                AnalysisError::InvalidField {
+                    field: "GuardCF function target",
+                    ..
+                }
+            ),
+            "{label}: {error}"
+        );
+    }
+}
+
+#[test]
+fn enforces_guard_cf_function_count_before_mapping_or_allocating_the_table() {
+    let mut bytes = fixture();
+    set_guard_cf_load_config(
+        &mut bytes,
+        LOAD_CONFIG_GUARD_FIELDS_SIZE,
+        LOAD_CONFIG_GUARD_FIELDS_SIZE,
+        IMAGE_BASE + u64::from(GUARD_CF_FUNCTION_TABLE_RVA),
+        GUARD_CF_FUNCTION_LIMIT + 1,
+        0xf000_0400,
+    );
+    let error = analyze_pe(&bytes)
+        .expect_err("the declared GuardCF count cap is checked before the table is mapped");
+    assert!(matches!(
+        error,
+        AnalysisError::LimitExceeded {
+            kind: "GuardCF function",
+            count: 262_145,
+            limit: 262_144,
+        }
+    ));
+}
+
+#[test]
+fn seeds_thunks_from_every_guard_cf_function_record() {
+    let mut bytes = guard_cf_fixture(&[(0x1040, [0x00]), (0x1080, [0x02]), (0x10c0, [0x01])]);
+    put_rel32_instruction(&mut bytes, 0x1040, 0xe9, 0x1060);
+    put_rel8_instruction(&mut bytes, 0x1060, 0xeb, 0x1070);
+    bytes[file_offset(0x1070)] = 0xc3;
+    put_rel32_instruction(&mut bytes, 0x1080, 0xe9, 0x10a0);
+    bytes[file_offset(0x10a0)] = 0xc3;
+    put_rel32_instruction(&mut bytes, 0x10c0, 0xe9, 0x10e0);
+    bytes[file_offset(0x10e0)] = 0xc3;
+
+    let analysis = analyze_pe(&bytes).expect("GuardCF candidates seed exact thunk recovery");
+    assert_eq!(
+        analysis.thunks,
+        [
+            PeThunk {
+                rva: 0x1040,
+                instruction_size: 5,
+                target: PeControlFlowTarget::Function { rva: 0x1060 },
+            },
+            PeThunk {
+                rva: 0x1060,
+                instruction_size: 2,
+                target: PeControlFlowTarget::Function { rva: 0x1070 },
+            },
+            PeThunk {
+                rva: 0x1080,
+                instruction_size: 5,
+                target: PeControlFlowTarget::Function { rva: 0x10a0 },
+            },
+            PeThunk {
+                rva: 0x10c0,
+                instruction_size: 5,
+                target: PeControlFlowTarget::Function { rva: 0x10e0 },
+            },
+        ]
+    );
+    assert_eq!(
+        analysis
+            .symbol_graph
+            .claims()
+            .iter()
+            .filter(|claim| claim.provenance().method == "pe-guard-cf-function")
+            .count(),
+        3
+    );
+    assert!(analysis.symbol_graph.claims().iter().any(|claim| {
+        claim.provenance().method == "pe-guard-cf-function"
+            && matches!(claim.subject(), SymbolSubject::Function { rva: 0x10c0, .. })
+    }));
+    assert!(analysis.symbol_graph.claims().iter().any(|claim| matches!(
+        (claim.subject(), claim.assertion()),
+        (
+            SymbolSubject::Function { rva: 0x1080, .. },
+            SymbolAssertion::ThunkTarget {
+                target: ControlFlowTarget::Function { rva: 0x10a0 },
+            },
+        )
+    )));
+    assert!(analysis.symbol_graph.claims().iter().any(|claim| matches!(
+        (claim.subject(), claim.assertion()),
+        (
+            SymbolSubject::Function { rva: 0x10c0, .. },
+            SymbolAssertion::ThunkTarget {
+                target: ControlFlowTarget::Function { rva: 0x10e0 },
+            },
+        )
+    )));
+}
+
+#[test]
+fn every_guard_cf_record_authorizes_a_runtime_interior_target() {
+    let mut bytes = guard_cf_fixture(&[(0x1080, [0x00])]);
+    put_u32(&mut bytes, file_offset(0x1300) + 4, 0x1100);
+    put_rel32_instruction(&mut bytes, 0x1000, 0xe9, 0x1080);
+    bytes[file_offset(0x1080)] = 0xc3;
+
+    let analysis = analyze_pe(&bytes)
+        .expect("GFIDS proves an alternate function start inside unwind-covered code");
+    assert!(analysis.thunks.iter().any(|thunk| {
+        thunk.rva == 0x1000 && thunk.target == PeControlFlowTarget::Function { rva: 0x1080 }
+    }));
+
+    let mut suppressed = guard_cf_fixture(&[(0x1080, [0x01])]);
+    put_u32(&mut suppressed, file_offset(0x1300) + 4, 0x1100);
+    put_rel32_instruction(&mut suppressed, 0x1000, 0xe9, 0x1080);
+    suppressed[file_offset(0x1080)] = 0xc3;
+
+    let suppressed = analyze_pe(&suppressed)
+        .expect("FID-suppressed GFIDS still proves an interior function start");
+    assert!(suppressed.thunks.iter().any(|thunk| {
+        thunk.rva == 0x1000 && thunk.target == PeControlFlowTarget::Function { rva: 0x1080 }
+    }));
+}
+
+#[test]
+fn validated_deserialization_rejects_tampered_guard_cf_state_and_graphs() {
+    let analysis = analyze_pe(&guard_cf_fixture(&[
+        (0x1040, [0x00, 0xa0]),
+        (0x1080, [0x01, 0xa1]),
+        (0x10c0, [0x02, 0xa2]),
+    ]))
+    .expect("valid GuardCF analysis");
+    let original = serde_json::to_value(analysis).expect("serialize GuardCF analysis");
+
+    let mut missing_directory = original.clone();
+    missing_directory["directories"]["load_config"] = serde_json::Value::Null;
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(missing_directory)
+        .expect_err("GuardCF state cannot outlive its load-config directory");
+    assert!(error.to_string().contains("load-config directory"));
+
+    let mut missing_size = original.clone();
+    missing_size["load_config_size"] = serde_json::Value::Null;
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(missing_size)
+        .expect_err("a load-config directory requires its internal size");
+    assert!(error.to_string().contains("load-config size"));
+
+    let mut missing_flags = original.clone();
+    missing_flags["guard_flags"] = serde_json::Value::Null;
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(missing_flags)
+        .expect_err("the GuardCF-capable prefix requires GuardFlags");
+    assert!(error.to_string().contains("GuardFlags"));
+
+    let mut missing_table = original.clone();
+    missing_table["guard_cf_function_table_rva"] = serde_json::Value::Null;
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(missing_table)
+        .expect_err("GuardCF records require their function-table RVA");
+    assert!(error.to_string().contains("without a table RVA"));
+
+    let mut empty_table = original.clone();
+    empty_table["guard_cf_functions"] = serde_json::json!([]);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(empty_table)
+        .expect_err("a persisted nonzero table RVA requires retained records");
+    assert!(error.to_string().contains("without any records"));
+
+    let mut table_flag_cleared = original.clone();
+    table_flag_cleared["guard_flags"] = serde_json::json!(0x2000_0000_u32);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(table_flag_cleared)
+        .expect_err("a persisted nonempty table requires the table-present flag");
+    assert!(
+        error
+            .to_string()
+            .contains("IMAGE_GUARD_CF_FUNCTION_TABLE_PRESENT is clear")
+    );
+
+    let mut short_guard_prefix = original.clone();
+    short_guard_prefix["load_config_size"] = serde_json::json!(LOAD_CONFIG_GUARD_FIELDS_SIZE - 1);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(short_guard_prefix)
+        .expect_err("GuardCF state cannot survive a shortened load-config prefix");
+    assert!(
+        error
+            .to_string()
+            .contains("too short to contain GuardCF fields")
+    );
+
+    let mut short_optional_header = original.clone();
+    short_optional_header["coff"]["optional_header_size"] = serde_json::json!(199);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(short_optional_header)
+        .expect_err("data-directory entry 10 requires at least 200 optional-header bytes");
+    assert!(error.to_string().contains("at least 200 bytes"));
+
+    let mut noncanonical_index = original.clone();
+    noncanonical_index["guard_cf_functions"][1]["table_index"] = serde_json::json!(7);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(noncanonical_index)
+        .expect_err("GuardCF table indices preserve exact source order");
+    assert!(error.to_string().contains("function-table index"));
+
+    let mut changed_stride = original.clone();
+    changed_stride["guard_flags"] = serde_json::json!(0x3000_0400_u32);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(changed_stride)
+        .expect_err("retained metadata lengths must match the GuardFlags high nibble");
+    assert!(error.to_string().contains("function metadata"));
+
+    let mut unsorted = original.clone();
+    unsorted["guard_cf_functions"][1]["rva"] = serde_json::json!(0x1030);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(unsorted)
+        .expect_err("persisted GFIDS RVAs remain strictly sorted");
+    assert!(error.to_string().contains("strictly increasing and unique"));
+
+    let mut invalid_target = original.clone();
+    invalid_target["guard_cf_functions"][0]["rva"] = serde_json::json!(0x100);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(invalid_target)
+        .expect_err("persisted GuardCF targets remain backed executable RVAs");
+    assert!(error.to_string().contains("GuardCF function target"));
+
+    let mut misaligned_export_suppressed = original.clone();
+    misaligned_export_suppressed["guard_cf_functions"][0]["rva"] = serde_json::json!(0x1041);
+    misaligned_export_suppressed["guard_cf_functions"][0]["metadata"][0] = serde_json::json!(0x02);
+    let error =
+        serde_json::from_value::<resymbol_analysis::PeAnalysis>(misaligned_export_suppressed)
+            .expect_err("persisted export-suppressed GFIDS entries retain alignment invariants");
+    assert!(error.to_string().contains("16-byte aligned"));
+
+    let mut changed_suppression = original.clone();
+    changed_suppression["guard_cf_functions"][0]["metadata"][0] = serde_json::json!(1);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(changed_suppression)
+        .expect_err("suppression changes must invalidate the deterministic base graph");
+    assert!(error.to_string().contains("symbol graph"));
+
+    let mut stale_evidence = original;
+    let guard_claim = stale_evidence["symbol_graph"]["claims"]
+        .as_array_mut()
+        .expect("claim array")
+        .iter_mut()
+        .find(|claim| claim["provenance"]["method"] == "pe-guard-cf-function")
+        .expect("GuardCF claim");
+    guard_claim["evidence"][0]["artifacts"]["metadata"] = serde_json::json!("ff ff");
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(stale_evidence)
+        .expect_err("persisted GuardCF evidence remains bound to exact metadata bytes");
+    assert!(error.to_string().contains("symbol graph"));
 }
 
 #[test]

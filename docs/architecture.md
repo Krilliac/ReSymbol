@@ -4,8 +4,9 @@ This document records the intended architecture and the invariants that new comp
 preserve. ReSymbol is in early development; sections marked as design describe the target system,
 not necessarily behavior implemented in the current checkout.
 
-The current implementation covers bounded PE32+ x86-64 ingestion, including ordered TLS callback
-and modern RVA-form delay-import discovery, a conservative metadata-derived symbol graph, modern
+The current implementation covers bounded PE32+ x86-64 ingestion, including ordered TLS callback,
+load-config GuardCF, and modern RVA-form delay-import discovery, a conservative metadata-derived
+symbol graph, modern
 MSVC x64 Rev1 RTTI/vftable
 discovery, canonical JSON `.resym` packages, plugin
 discovery/contracts, a no-WASI WebAssembly Component Model host, and trusted external-process,
@@ -80,11 +81,13 @@ unrelated signature index, and removing a plugin's results should not require re
 have no dependency on that plugin.
 
 The implemented slice extracts PE image/section metadata, conventional and delay imports, exports,
-forwarded exports, x64 `RUNTIME_FUNCTION` records, ordered TLS callbacks, bounded exact strings,
+forwarded exports, x64 `RUNTIME_FUNCTION` records, ordered TLS callbacks, load-config GuardCF
+records, bounded exact strings,
 supported RIP-relative
 data references, bounded direct calls and thunks, and a bounded modern MSVC x64 RTTI/vftable subset
 without loading or executing the input. Exact export names, corroborated metadata-backed
-boundaries, slot-attributed TLS callback entries, supported decoded function entries and relationships,
+boundaries, GuardCF and slot-attributed TLS callback entries, supported decoded function
+entries and relationships,
 validated string literals, RTTI type/vftable names, and function-to-class relationships from
 virtual slots become evidence-bearing graph claims. Broader candidate discovery and unsupported
 evidence sources remain planned.
@@ -124,14 +127,31 @@ provenance. The `callback_slot_rva` and `table_index` evidence artifacts keep cl
 target RVAs repeat.
 The four checked-in MSVC fixture binaries, semantic oracle, and recorded hashes remain unchanged.
 
+PE32+ load-config GuardCF discovery is also proven with focused synthetic fixtures. Optional-header
+data-directory entry 10 must be fully file-backed and contain an internal structure size from 4
+through the directory size; only an internal size of at least 148 bytes exposes the PE32+
+`GuardCFFunctionTable`, `GuardCFFunctionCount`, and `GuardFlags` fields. Counts above 262,144,
+oversized tables, structural inconsistencies, and malformed records are hard analysis errors; an
+accepted GFIDS table is fully retained, fully file-backed, disjoint from the load-config directory,
+and strictly sorted by unique executable target RVA. Disjointness is a ReSymbol hardening policy. Each record has
+stride `4 + n`, where `n` comes from the high `GuardFlags` nibble, and the `n` bytes are retained
+exactly and treated as opaque. Every structurally valid record, including one marked
+`IMAGE_GUARD_FLAG_FID_SUPPRESSED`, `IMAGE_GUARD_FLAG_EXPORT_SUPPRESSED`, or both, emits the existing
+`FunctionEntry` claim and joins initial one-instruction thunk seeding. FID suppression describes CFG
+eligibility rather than whether the target is a function; export-suppressed RVAs must be 16-byte
+aligned. Claims retain both suppression booleans as evidence. The corpus binaries and hashes remain
+unchanged.
+
 Modern PE32+ delay-import discovery is likewise proven with focused synthetic fixtures without
 regenerating that corpus. Optional-header data-directory entry 13 is a fully file-backed sequence of
 32-byte descriptors ending in an all-zero descriptor and then only all-zero declared tail padding.
 The parser accepts only the modern RVA form
 whose attributes value is exactly `dlattrRva` (`1`) and rejects the legacy VA form, zero, and
 unknown bits despite ambiguity in the generic PE table documentation. Each active descriptor has
-nonzero name, module-handle (HMOD), delay-IAT, and delay-INT RVAs; HMOD contents and permissions stay
-opaque. Its paired null-terminated 64-bit INT/IAT arrays and any nonzero optional bound-IAT (BIAT) or
+nonzero name, module-handle (HMOD), delay-IAT, and delay-INT RVAs. HMOD needs an eight-byte range
+wholly mapped inside one section but may occupy zero-filled virtual data rather than file-backed
+bytes; initial contents and permissions stay opaque. Its paired null-terminated 64-bit INT/IAT
+arrays and any nonzero optional bound-IAT (BIAT) or
 unload-IAT (UIAT) array must be fully file-backed and pairwise disjoint. Each present BIAT or UIAT
 must have a zero slot at the paired INT/IAT entry count. BIAT payload values before that required
 slot are otherwise opaque, including whether any is zero, while the complete UIAT must byte-match
@@ -161,17 +181,19 @@ membership wins before pointer interpretation. A non-IAT slot must be eight full
 readable, non-writable, non-executable data. Its little-endian preferred-image VA is resolved one
 hop to a file-backed executable endpoint, and the control-flow target retains both the slot and
 endpoint. A pointer call also retains a same-site data reference; a pointer thunk does not require
-or invent one. Deterministic metadata, export, call-target, TLS-callback, and RTTI thunk candidates
-are processed first in RVA order. A TLS callback endpoint is checked only as a one-instruction
-thunk seed, not swept as a callback body. Each retained internal thunk endpoint seeds the next
+or invent one. Deterministic metadata, export, call-target, GuardCF, TLS-callback, and RTTI
+thunk candidates are processed first in RVA order. A GuardCF or TLS callback endpoint is checked
+only as a one-instruction thunk seed, not swept as a function body. Each retained internal thunk
+endpoint seeds the next
 sorted layer until that causal closure is exhausted. The graph preserves each exact hop instead of
 rewriting a direct call
 or earlier thunk to a terminal endpoint. A global visited set decodes a candidate once, so connected
 cycles retain their exact non-self edges and terminate; persisted disconnected thunk cycles are
 invalid. Import-IAT targets stop the executable chain. This endpoint traversal does not follow
 pointer-to-pointer data: every non-IAT slot remains a single dereference under the read-only policy.
-Internal targets covered by known runtime-function metadata are suppressed unless
-their RVA matches a recorded runtime-function begin. Aggregate limits of 64 MiB, 1,000,000
+Internal targets covered by known runtime-function metadata are suppressed unless their RVA matches
+an authoritative metadata function start: a runtime-function begin or retained GuardCF function
+start. Aggregate limits of 64 MiB, 1,000,000
 instructions, 262,144 discovered block starts, 8,192 retained direct calls, 4,096 retained thunks,
 and 32,768 retained data references retain deterministic traversal prefixes when exhausted. The
 original thunk seeds have priority over later hop layers.
@@ -298,8 +320,9 @@ relationships rather than an invented terminal destination.
 TLS callbacks likewise require no new neutral projection shape: each slot-backed callback claim
 uses the existing attributed function-entry assertion. Delay-import descriptor and inventory data
 remain package-only, while calls and thunks through delay-IAT slots use the existing import-IAT
-target containing the slot RVA. Package schema 8 therefore leaves neutral projection schema 6
-unchanged.
+target containing the slot RVA. Load-config/GFIDS inventory and suppression evidence are also
+package-only; GuardCF claims and any supported seeded thunks reuse the existing attributed shapes. Package schema 9 therefore
+leaves neutral projection schema 6 unchanged.
 
 The first writers serialize the projection as JSON, render bounded Markdown or
 Microsoft-linker-style MAP text, emit an exact-RSDS public-symbol PDB, or generate self-contained
@@ -553,7 +576,7 @@ A plugin declares a supported API range. Unsupported plugins are marked incompat
 loaded optimistically. Schema migrations are explicit and must preserve provenance. Before 1.0,
 breaking changes are expected, but they still require version bumps and release notes.
 
-The current CLI writes analysis-package schema 8 and can inspect or export schemas 1 through 7
+The current CLI writes analysis-package schema 9 and can inspect or export schemas 1 through 8
 through explicit compatibility paths. It migrates schema 1 into a validated current session,
 rebuilds the base graph from persisted legacy metadata, and never rewrites the source package.
 Schema 2 already records direct calls and thunks but predates recovered strings and data references;
@@ -561,11 +584,13 @@ schema 3 includes string/data recovery but predates read-only function-pointer c
 resolution; schema 4 records pointer control flow but predates 24-byte RTTI base-class descriptor
 recovery; schema 5 records that RTTI form but predates transitive executable thunk-chain discovery;
 schema 6 records that closure but predates TLS callback discovery and callback-based thunk seeding;
-and schema 7 records TLS callbacks but predates modern delay-import recovery.
+schema 7 records TLS callbacks but predates modern delay-import recovery; and schema 8 records delay
+imports but predates load-config GuardCF recovery.
 Because a package omits the analyzed binary bytes, compatibility loading cannot recreate absent
 recovery results. Schemas 1 through 6 report TLS callbacks unavailable; obtaining every current
-result also requires treating delay imports as unavailable in schemas 1 through 7 and reanalyzing
-the exact original binary into schema 8.
+result also requires treating delay imports as unavailable in schemas 1 through 7 and GuardCF
+recovery as unavailable in schemas 1 through 8, then reanalyzing the exact original binary into
+schema 9.
 Schemas 2 and 3 are also semantically gated against relabeled schema-4 `function-pointer` targets.
 All schemas 1 through 4 are semantically gated against relabeled schema-5 base-class records whose
 `class_hierarchy_descriptor_rva` is missing or null. Schemas 1 through 5 reject a deterministic
@@ -573,15 +598,20 @@ base thunk source that is valid only under schema-6 transitive endpoint seeding.
 Schemas 1 through 6 reject schema-7 TLS fields, core `pe-tls-callback` claims, and callback-only
 base thunk seeds rather than accepting a relabeled package.
 Schemas 1 through 7 likewise reject the exact schema-8 base-analysis `delay_imports` inventory key
-and `directories.delay_imports` directory key. Current schema 8 always serializes the delay-import
-inventory, including an empty array, and rejects a payload missing that marker so relabeling alone
+and `directories.delay_imports` directory key. Schemas 8 and 9 always serialize the delay-import
+inventory, including an empty array, and reject a payload missing that marker so relabeling alone
 cannot upgrade a legacy package.
+Schemas 1 through 8 reject schema-9 `load_config_size`, `guard_flags`,
+`guard_cf_function_table_rva`, and `guard_cf_functions` fields, the `directories.load_config` key,
+and core `pe-guard-cf-function` claims. Current schema 9 always serializes the GuardCF inventory,
+including an empty array, and rejects a payload missing that marker.
 The independently versioned debugger-neutral projection is schema 6; its string-reference
 correlation and exact per-hop thunk relationships are derived from already validated claims and
-therefore do not require a projection-schema change or legacy package rewrite. Package schema 8 and
-neutral projection schema 6 remain independent compatibility domains. Package schema 8 also leaves
+therefore do not require a projection-schema change or legacy package rewrite. Package schema 9 and
+neutral projection schema 6 remain independent compatibility domains. Package schema 9 also leaves
 the plugin API and external wire protocol 1.0 unchanged. Plugins with `symbols.read` can observe the
-TLS and delay-import fields in detached base-analysis JSON; plugins without that permission receive
+TLS, delay-import, and load-config/GuardCF fields in detached base-analysis JSON; plugins without
+that permission receive
 no base analysis.
 
 ## Core invariants

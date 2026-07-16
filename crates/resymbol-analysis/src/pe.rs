@@ -13,8 +13,8 @@ use resymbol_core::{
 use crate::{
     AnalysisError, CoffHeader, DataDirectory, ImportTarget, MsvcRttiVftable, PeAnalysis,
     PeControlFlowTarget, PeDataDirectories, PeDataReference, PeDelayImportLibrary, PeDirectCall,
-    PeExport, PeExportName, PeImport, PeImportLibrary, PeRecoveredString, PeSection, PeThunk,
-    PeTlsCallback, RuntimeFunction,
+    PeExport, PeExportName, PeGuardCfFunction, PeImport, PeImportLibrary, PeRecoveredString,
+    PeSection, PeThunk, PeTlsCallback, RuntimeFunction,
     code_recovery::{
         CodeRecoveryInput, recover_code, validate_code_recovery, validate_data_references,
     },
@@ -40,11 +40,19 @@ const DELAY_IMPORT_DESCRIPTOR_SIZE_U32: u32 = 32;
 const RUNTIME_FUNCTION_SIZE: usize = 12;
 const RUNTIME_FUNCTION_SIZE_U32: u32 = 12;
 const TLS_DIRECTORY_SIZE_U32: u32 = 40;
+const LOAD_CONFIG_GUARD_FIELDS_SIZE_U32: u32 = 148;
+const LOAD_CONFIG_GUARD_CF_FUNCTION_TABLE_OFFSET: usize = 128;
+const LOAD_CONFIG_GUARD_CF_FUNCTION_COUNT_OFFSET: usize = 136;
+const LOAD_CONFIG_GUARD_FLAGS_OFFSET: usize = 144;
 
 const MACHINE_AMD64: u16 = 0x8664;
 const OPTIONAL_MAGIC_PE32_PLUS: u16 = 0x020b;
 const IMPORT_BY_ORDINAL_64: u64 = 1_u64 << 63;
 const DELAY_IMPORT_ATTRIBUTE_RVA: u32 = 1;
+const IMAGE_GUARD_CF_FUNCTION_TABLE_PRESENT: u32 = 0x0000_0400;
+const IMAGE_GUARD_CF_FUNCTION_TABLE_SIZE_MASK: u32 = 0xf000_0000;
+const IMAGE_GUARD_CF_FUNCTION_TABLE_SIZE_SHIFT: u32 = 28;
+const GUARD_CF_EXPORT_SUPPRESSED_ALIGNMENT: u32 = 16;
 const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 
 const MAX_PE_HEADER_OFFSET: u32 = 16 * 1024 * 1024;
@@ -59,6 +67,7 @@ const MAX_EXPORT_FUNCTIONS: u64 = 65_536;
 const MAX_EXPORT_NAMES: u64 = 65_536;
 const MAX_EXPORT_NAME_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_RUNTIME_FUNCTIONS: u64 = 262_144;
+const MAX_GUARD_CF_FUNCTIONS: u64 = 262_144;
 const MAX_TLS_CALLBACKS: u64 = 4_096;
 const MAX_DEBUG_DIRECTORY_ENTRIES: u64 = 4_096;
 const MAX_CODEVIEW_RECORD_BYTES: u64 = 64 * 1_024;
@@ -95,6 +104,7 @@ const IMPORT_DIRECTORY_INDEX: usize = 1;
 const EXCEPTION_DIRECTORY_INDEX: usize = 3;
 const DEBUG_DIRECTORY_INDEX: usize = 6;
 const TLS_DIRECTORY_INDEX: usize = 9;
+const LOAD_CONFIG_DIRECTORY_INDEX: usize = 10;
 const DELAY_IMPORT_DIRECTORY_INDEX: usize = 13;
 
 const IMAGE_DEBUG_TYPE_CODEVIEW: u32 = 2;
@@ -193,6 +203,13 @@ struct ParsedHeaders {
     sections: Vec<PeSection>,
 }
 
+struct ParsedGuardCfMetadata {
+    load_config_size: Option<u32>,
+    guard_flags: Option<u32>,
+    function_table_rva: Option<u32>,
+    functions: Vec<PeGuardCfFunction>,
+}
+
 #[derive(Default)]
 struct ImportBudget {
     libraries: u64,
@@ -207,6 +224,10 @@ pub(crate) struct SymbolGraphInput<'a> {
     pub sections: &'a [PeSection],
     pub exports: &'a [PeExport],
     pub runtime_functions: &'a [RuntimeFunction],
+    pub load_config_rva: Option<u32>,
+    pub guard_flags: Option<u32>,
+    pub guard_cf_function_table_rva: Option<u32>,
+    pub guard_cf_functions: &'a [PeGuardCfFunction],
     pub tls_directory_rva: Option<u32>,
     pub tls_callback_table_rva: Option<u32>,
     pub tls_callbacks: &'a [PeTlsCallback],
@@ -249,6 +270,19 @@ pub fn analyze_pe(bytes: &[u8]) -> Result<PeAnalysis, AnalysisError> {
         headers.directories.exceptions,
         headers.size_of_image,
     )?;
+    let ParsedGuardCfMetadata {
+        load_config_size,
+        guard_flags,
+        function_table_rva: guard_cf_function_table_rva,
+        functions: guard_cf_functions,
+    } = parse_guard_cf_functions(
+        &reader,
+        &mapper,
+        headers.directories.load_config,
+        headers.image_base,
+        headers.size_of_image,
+        &headers.sections,
+    )?;
     let (tls_callback_table_rva, tls_callbacks, tls_callback_scan_truncated) = parse_tls_callbacks(
         &reader,
         &mapper,
@@ -273,6 +307,7 @@ pub fn analyze_pe(bytes: &[u8]) -> Result<PeAnalysis, AnalysisError> {
         delay_imports: &delay_imports,
         exports: &exports,
         runtime_functions: &runtime_functions,
+        guard_cf_functions: &guard_cf_functions,
         tls_callbacks: &tls_callbacks,
         msvc_rtti_vftables: &msvc_rtti_vftables,
     });
@@ -284,6 +319,13 @@ pub fn analyze_pe(bytes: &[u8]) -> Result<PeAnalysis, AnalysisError> {
         sections: &headers.sections,
         exports: &exports,
         runtime_functions: &runtime_functions,
+        load_config_rva: headers
+            .directories
+            .load_config
+            .map(|directory| directory.rva),
+        guard_flags,
+        guard_cf_function_table_rva,
+        guard_cf_functions: &guard_cf_functions,
         tls_directory_rva: headers.directories.tls.map(|directory| directory.rva),
         tls_callback_table_rva,
         tls_callbacks: &tls_callbacks,
@@ -312,6 +354,10 @@ pub fn analyze_pe(bytes: &[u8]) -> Result<PeAnalysis, AnalysisError> {
         export_library_name,
         exports,
         runtime_functions,
+        load_config_size,
+        guard_flags,
+        guard_cf_function_table_rva,
+        guard_cf_functions,
         tls_callback_table_rva,
         tls_callback_scan_truncated,
         tls_callbacks,
@@ -602,6 +648,10 @@ pub(crate) fn validate_pe_analysis(analysis: &PeAnalysis) -> Result<(), Analysis
         (analysis.directories.exceptions, EXCEPTION_DIRECTORY_INDEX),
         (analysis.directories.tls, TLS_DIRECTORY_INDEX),
         (
+            analysis.directories.load_config,
+            LOAD_CONFIG_DIRECTORY_INDEX,
+        ),
+        (
             analysis.directories.delay_imports,
             DELAY_IMPORT_DIRECTORY_INDEX,
         ),
@@ -644,6 +694,7 @@ pub(crate) fn validate_pe_analysis(analysis: &PeAnalysis) -> Result<(), Analysis
         ("import directory", analysis.directories.imports),
         ("exception directory", analysis.directories.exceptions),
         ("TLS directory", analysis.directories.tls),
+        ("load-config directory", analysis.directories.load_config),
         ("delay-import directory", analysis.directories.delay_imports),
     ] {
         if let Some(directory) = directory {
@@ -707,6 +758,7 @@ pub(crate) fn validate_pe_analysis(analysis: &PeAnalysis) -> Result<(), Analysis
         ("import directory", analysis.directories.imports),
         ("exception directory", analysis.directories.exceptions),
         ("TLS directory", analysis.directories.tls),
+        ("load-config directory", analysis.directories.load_config),
         ("delay-import directory", analysis.directories.delay_imports),
     ] {
         if let Some(directory) = directory {
@@ -1075,6 +1127,7 @@ pub(crate) fn validate_pe_analysis(analysis: &PeAnalysis) -> Result<(), Analysis
     }
 
     validate_tls_callbacks(analysis)?;
+    validate_guard_cf_functions(analysis)?;
     validate_msvc_rtti(analysis)?;
     validate_code_recovery(analysis)?;
     validate_recovered_strings(
@@ -1091,6 +1144,13 @@ pub(crate) fn validate_pe_analysis(analysis: &PeAnalysis) -> Result<(), Analysis
         sections: &analysis.sections,
         exports: &analysis.exports,
         runtime_functions: &analysis.runtime_functions,
+        load_config_rva: analysis
+            .directories
+            .load_config
+            .map(|directory| directory.rva),
+        guard_flags: analysis.guard_flags,
+        guard_cf_function_table_rva: analysis.guard_cf_function_table_rva,
+        guard_cf_functions: &analysis.guard_cf_functions,
         tls_directory_rva: analysis.directories.tls.map(|directory| directory.rva),
         tls_callback_table_rva: analysis.tls_callback_table_rva,
         tls_callbacks: &analysis.tls_callbacks,
@@ -1215,12 +1275,16 @@ fn validate_delay_imports(
                 ))?;
         let name_size = u32::try_from(name_size)
             .map_err(|_| AnalysisError::IntegerConversion("delay-import DLL-name size"))?;
-        if !model_rva_is_backed(analysis, library.name_rva, name_size)
-            || !model_rva_is_backed(analysis, library.module_handle_rva, 8)
-        {
+        if !model_rva_is_backed(analysis, library.name_rva, name_size) {
             return invalid_field(
                 "delay-import descriptor",
-                "DLL-name or module-handle storage is not fully backed by file data",
+                "DLL name is not fully backed by file data",
+            );
+        }
+        if !model_rva_is_mapped_section_range(analysis, library.module_handle_rva, 8) {
+            return invalid_field(
+                "delay-import descriptor",
+                "module-handle storage is not wholly mapped inside one section",
             );
         }
 
@@ -1342,6 +1406,188 @@ fn validate_delay_imports(
                 }
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_guard_cf_functions(analysis: &PeAnalysis) -> Result<(), AnalysisError> {
+    let Some(directory) = analysis.directories.load_config else {
+        if analysis.load_config_size.is_some()
+            || analysis.guard_flags.is_some()
+            || analysis.guard_cf_function_table_rva.is_some()
+            || !analysis.guard_cf_functions.is_empty()
+        {
+            return invalid_field(
+                "GuardCF metadata",
+                "load-config state exists without a load-config directory",
+            );
+        }
+        return Ok(());
+    };
+
+    if directory.size < 4 {
+        return invalid_field(
+            "load-config directory size",
+            "must contain the four-byte structure-size field",
+        );
+    }
+    let load_config_size =
+        analysis
+            .load_config_size
+            .ok_or_else(|| AnalysisError::InvalidField {
+                field: "load-config size",
+                reason: "a load-config directory exists without its declared structure size"
+                    .to_owned(),
+            })?;
+    if load_config_size > directory.size {
+        return invalid_field(
+            "load-config size",
+            "the structure declares more bytes than its data-directory entry",
+        );
+    }
+    if load_config_size < 4 {
+        return invalid_field(
+            "load-config size",
+            "must be at least four bytes when a load-config directory is present",
+        );
+    }
+    if load_config_size < LOAD_CONFIG_GUARD_FIELDS_SIZE_U32 {
+        if analysis.guard_flags.is_some()
+            || analysis.guard_cf_function_table_rva.is_some()
+            || !analysis.guard_cf_functions.is_empty()
+        {
+            return invalid_field(
+                "GuardCF metadata",
+                "state exists in a load-config structure too short to contain GuardCF fields",
+            );
+        }
+        return Ok(());
+    }
+
+    let guard_flags = analysis
+        .guard_flags
+        .ok_or_else(|| AnalysisError::InvalidField {
+            field: "GuardFlags",
+            reason: "the load-config structure contains GuardCF fields but GuardFlags is absent"
+                .to_owned(),
+        })?;
+    let table_present = guard_flags & IMAGE_GUARD_CF_FUNCTION_TABLE_PRESENT != 0;
+    let metadata_size = usize::try_from(
+        (guard_flags & IMAGE_GUARD_CF_FUNCTION_TABLE_SIZE_MASK)
+            >> IMAGE_GUARD_CF_FUNCTION_TABLE_SIZE_SHIFT,
+    )
+    .map_err(|_| AnalysisError::IntegerConversion("GuardCF metadata size"))?;
+    let record_size =
+        4_usize
+            .checked_add(metadata_size)
+            .ok_or(AnalysisError::ArithmeticOverflow(
+                "GuardCF function-record size",
+            ))?;
+
+    let Some(table_rva) = analysis.guard_cf_function_table_rva else {
+        if !analysis.guard_cf_functions.is_empty() {
+            return invalid_field(
+                "GuardCF function table",
+                "entries exist without a table RVA",
+            );
+        }
+        return Ok(());
+    };
+    if !table_present {
+        return invalid_field(
+            "GuardCF function table",
+            "a table RVA exists while IMAGE_GUARD_CF_FUNCTION_TABLE_PRESENT is clear",
+        );
+    }
+    if analysis.guard_cf_functions.is_empty() {
+        return invalid_field(
+            "GuardCF function table",
+            "a nonzero table RVA exists without any records",
+        );
+    }
+
+    let function_count = u64::try_from(analysis.guard_cf_functions.len())
+        .map_err(|_| AnalysisError::IntegerConversion("GuardCF function count"))?;
+    enforce_limit("GuardCF function", function_count, MAX_GUARD_CF_FUNCTIONS)?;
+    let table_size = function_count
+        .checked_mul(
+            u64::try_from(record_size)
+                .map_err(|_| AnalysisError::IntegerConversion("GuardCF record size"))?,
+        )
+        .ok_or(AnalysisError::ArithmeticOverflow(
+            "GuardCF function-table byte size",
+        ))?;
+    enforce_limit(
+        "GuardCF function-table byte",
+        table_size,
+        MAX_DIRECTORY_BYTES,
+    )?;
+    let table_size_u32 = u32::try_from(table_size)
+        .map_err(|_| AnalysisError::IntegerConversion("GuardCF function-table byte size"))?;
+    if !model_rva_is_backed(analysis, table_rva, table_size_u32) {
+        return invalid_field("GuardCF function table", "is not fully backed by file data");
+    }
+    if ranges_overlap(
+        u64::from(directory.rva),
+        u64::from(directory.size),
+        u64::from(table_rva),
+        table_size,
+    )? {
+        return invalid_field(
+            "GuardCF function table",
+            "overlaps the declared load-config directory range",
+        );
+    }
+
+    let mut previous_rva = None;
+    for (index, function) in analysis.guard_cf_functions.iter().enumerate() {
+        let expected_index = u32::try_from(index)
+            .map_err(|_| AnalysisError::IntegerConversion("GuardCF function-table index"))?;
+        if function.table_index != expected_index {
+            return invalid_field(
+                "GuardCF function-table index",
+                "does not match source-table order",
+            );
+        }
+        if function.metadata.len() != metadata_size {
+            return invalid_field(
+                "GuardCF function metadata",
+                format!(
+                    "entry {index} retains {} bytes instead of the GuardFlags-selected {metadata_size}",
+                    function.metadata.len()
+                ),
+            );
+        }
+        if previous_rva.is_some_and(|previous| previous >= function.rva) {
+            return invalid_field(
+                "GuardCF function table",
+                "RVAs must be strictly increasing and unique",
+            );
+        }
+        let executable = section_for_rva(function.rva, &analysis.sections)
+            .is_some_and(|(_, section)| section.characteristics & IMAGE_SCN_MEM_EXECUTE != 0)
+            && model_rva_is_backed(analysis, function.rva, 1);
+        if !executable {
+            return invalid_field(
+                "GuardCF function target",
+                format!(
+                    "entry {index} has RVA {:#x}, which is not fully file-backed executable data",
+                    function.rva
+                ),
+            );
+        }
+        if function.is_export_suppressed()
+            && function.rva % GUARD_CF_EXPORT_SUPPRESSED_ALIGNMENT != 0
+        {
+            return invalid_field(
+                "GuardCF function target",
+                format!(
+                    "entry {index} has export-suppressed RVA {:#x}, which is not 16-byte aligned",
+                    function.rva
+                ),
+            );
+        }
+        previous_rva = Some(function.rva);
     }
     Ok(())
 }
@@ -1547,6 +1793,10 @@ fn model_rva_is_backed(analysis: &PeAnalysis, rva: u32, size: u32) -> bool {
     })
 }
 
+fn model_rva_is_mapped_section_range(analysis: &PeAnalysis, rva: u32, size: u32) -> bool {
+    section_for_rva_range(rva, size, &analysis.sections).is_some()
+}
+
 fn parse_headers(reader: &Reader<'_>) -> Result<ParsedHeaders, AnalysisError> {
     if reader.len() < 2 || reader.bytes(0, 2, "DOS signature")? != b"MZ" {
         let found = reader
@@ -1682,6 +1932,13 @@ fn parse_headers(reader: &Reader<'_>) -> Result<ParsedHeaders, AnalysisError> {
             directory_count,
             EXCEPTION_DIRECTORY_INDEX,
             "exception directory",
+        )?,
+        load_config: read_directory(
+            reader,
+            optional_offset,
+            directory_count,
+            LOAD_CONFIG_DIRECTORY_INDEX,
+            "load-config directory",
         )?,
         tls: read_directory(
             reader,
@@ -2041,7 +2298,14 @@ fn parse_delay_imports(
             "import-name byte",
             MAX_IMPORT_NAME_BYTES,
         )?;
-        let _ = mapper.offset(module_handle_rva, 8, "delay-import module-handle storage")?;
+        if section_for_rva_range(module_handle_rva, 8, mapper.sections).is_none() {
+            return invalid_field(
+                "delay-import module-handle storage",
+                format!(
+                    "descriptor {index} has an eight-byte range that is not wholly mapped inside one section"
+                ),
+            );
+        }
         let entries = parse_import_thunks(reader, mapper, int_rva, iat_rva, budget, true)?;
         let table_slots = entries
             .len()
@@ -2426,6 +2690,202 @@ fn parse_exports(
     Ok((export_library_name, exports))
 }
 
+fn parse_guard_cf_functions(
+    reader: &Reader<'_>,
+    mapper: &RvaMap<'_>,
+    directory: Option<DataDirectory>,
+    image_base: u64,
+    size_of_image: u32,
+    sections: &[PeSection],
+) -> Result<ParsedGuardCfMetadata, AnalysisError> {
+    let Some(directory) = directory else {
+        return Ok(ParsedGuardCfMetadata {
+            load_config_size: None,
+            guard_flags: None,
+            function_table_rva: None,
+            functions: Vec::new(),
+        });
+    };
+    enforce_directory_size("load-config-directory byte", directory.size)?;
+    if directory.size < 4 {
+        return invalid_field(
+            "load-config directory size",
+            "must contain the four-byte structure-size field",
+        );
+    }
+    let directory_size = usize::try_from(directory.size)
+        .map_err(|_| AnalysisError::IntegerConversion("load-config-directory size"))?;
+    let directory_offset = mapper.offset(directory.rva, directory_size, "load-config directory")?;
+    let load_config_size = reader.u32(directory_offset, "load-config structure size")?;
+    if load_config_size > directory.size {
+        return invalid_field(
+            "load-config size",
+            "the structure declares more bytes than its data-directory entry",
+        );
+    }
+    if load_config_size < 4 {
+        return invalid_field(
+            "load-config size",
+            "must be at least four bytes when a load-config directory is present",
+        );
+    }
+    if load_config_size < LOAD_CONFIG_GUARD_FIELDS_SIZE_U32 {
+        return Ok(ParsedGuardCfMetadata {
+            load_config_size: Some(load_config_size),
+            guard_flags: None,
+            function_table_rva: None,
+            functions: Vec::new(),
+        });
+    }
+
+    let table_va = reader.u64(
+        checked_add(
+            directory_offset,
+            LOAD_CONFIG_GUARD_CF_FUNCTION_TABLE_OFFSET,
+            "GuardCF function-table field offset",
+        )?,
+        "GuardCFFunctionTable",
+    )?;
+    let function_count = reader.u64(
+        checked_add(
+            directory_offset,
+            LOAD_CONFIG_GUARD_CF_FUNCTION_COUNT_OFFSET,
+            "GuardCF function-count field offset",
+        )?,
+        "GuardCFFunctionCount",
+    )?;
+    let guard_flags = reader.u32(
+        checked_add(
+            directory_offset,
+            LOAD_CONFIG_GUARD_FLAGS_OFFSET,
+            "GuardFlags field offset",
+        )?,
+        "GuardFlags",
+    )?;
+    let table_present = guard_flags & IMAGE_GUARD_CF_FUNCTION_TABLE_PRESENT != 0;
+
+    if table_va == 0 && function_count == 0 {
+        return Ok(ParsedGuardCfMetadata {
+            load_config_size: Some(load_config_size),
+            guard_flags: Some(guard_flags),
+            function_table_rva: None,
+            functions: Vec::new(),
+        });
+    }
+    if table_va == 0 || function_count == 0 {
+        return invalid_field(
+            "GuardCF function table",
+            "table VA and function count must either both be zero or both be nonzero",
+        );
+    }
+    if !table_present {
+        return invalid_field(
+            "GuardCF function table",
+            "table VA and count are nonzero while IMAGE_GUARD_CF_FUNCTION_TABLE_PRESENT is clear",
+        );
+    }
+
+    enforce_limit("GuardCF function", function_count, MAX_GUARD_CF_FUNCTIONS)?;
+    let metadata_size = usize::try_from(
+        (guard_flags & IMAGE_GUARD_CF_FUNCTION_TABLE_SIZE_MASK)
+            >> IMAGE_GUARD_CF_FUNCTION_TABLE_SIZE_SHIFT,
+    )
+    .map_err(|_| AnalysisError::IntegerConversion("GuardCF metadata size"))?;
+    let record_size =
+        4_usize
+            .checked_add(metadata_size)
+            .ok_or(AnalysisError::ArithmeticOverflow(
+                "GuardCF function-record size",
+            ))?;
+    let table_size = function_count
+        .checked_mul(
+            u64::try_from(record_size)
+                .map_err(|_| AnalysisError::IntegerConversion("GuardCF record size"))?,
+        )
+        .ok_or(AnalysisError::ArithmeticOverflow(
+            "GuardCF function-table byte size",
+        ))?;
+    enforce_limit(
+        "GuardCF function-table byte",
+        table_size,
+        MAX_DIRECTORY_BYTES,
+    )?;
+    let table_size_usize = usize::try_from(table_size)
+        .map_err(|_| AnalysisError::IntegerConversion("GuardCF function-table byte size"))?;
+    let table_rva = image_va_to_rva(table_va, image_base, size_of_image, "GuardCFFunctionTable")?;
+    let table_offset = mapper.offset(table_rva, table_size_usize, "GuardCF function table")?;
+    if ranges_overlap(
+        u64::from(directory.rva),
+        u64::from(directory.size),
+        u64::from(table_rva),
+        table_size,
+    )? {
+        return invalid_field(
+            "GuardCF function table",
+            "overlaps the declared load-config directory range",
+        );
+    }
+
+    let capacity = usize::try_from(function_count)
+        .map_err(|_| AnalysisError::IntegerConversion("GuardCF function count"))?;
+    let mut functions = Vec::with_capacity(capacity);
+    let mut previous_rva = None;
+    for index in 0..capacity {
+        let record_offset = checked_add(
+            table_offset,
+            checked_mul(index, record_size, "GuardCF function-record position")?,
+            "GuardCF function-record offset",
+        )?;
+        let rva = reader.u32(record_offset, "GuardCF function RVA")?;
+        if previous_rva.is_some_and(|previous| previous >= rva) {
+            return invalid_field(
+                "GuardCF function table",
+                "RVAs must be strictly increasing and unique",
+            );
+        }
+        let executable = section_for_rva(rva, sections)
+            .is_some_and(|(_, section)| section.characteristics & IMAGE_SCN_MEM_EXECUTE != 0)
+            && mapper.is_backed(rva, 1);
+        if !executable {
+            return invalid_field(
+                "GuardCF function target",
+                format!(
+                    "entry {index} has RVA {rva:#x}, which is not fully file-backed executable data"
+                ),
+            );
+        }
+        let metadata_offset = checked_add(record_offset, 4, "GuardCF metadata offset")?;
+        let metadata = reader
+            .bytes(metadata_offset, metadata_size, "GuardCF function metadata")?
+            .to_vec();
+        let function = PeGuardCfFunction {
+            table_index: u32::try_from(index)
+                .map_err(|_| AnalysisError::IntegerConversion("GuardCF function-table index"))?,
+            rva,
+            metadata,
+        };
+        if function.is_export_suppressed()
+            && function.rva % GUARD_CF_EXPORT_SUPPRESSED_ALIGNMENT != 0
+        {
+            return invalid_field(
+                "GuardCF function target",
+                format!(
+                    "entry {index} has export-suppressed RVA {rva:#x}, which is not 16-byte aligned"
+                ),
+            );
+        }
+        functions.push(function);
+        previous_rva = Some(rva);
+    }
+
+    Ok(ParsedGuardCfMetadata {
+        load_config_size: Some(load_config_size),
+        guard_flags: Some(guard_flags),
+        function_table_rva: Some(table_rva),
+        functions,
+    })
+}
+
 fn parse_tls_callbacks(
     reader: &Reader<'_>,
     mapper: &RvaMap<'_>,
@@ -2454,7 +2914,7 @@ fn parse_tls_callbacks(
     if callbacks_va == 0 {
         return Ok((None, Vec::new(), false));
     }
-    let callbacks_rva = tls_va_to_rva(
+    let callbacks_rva = image_va_to_rva(
         callbacks_va,
         image_base,
         size_of_image,
@@ -2485,7 +2945,7 @@ fn parse_tls_callbacks(
         }
 
         let callback_rva =
-            tls_va_to_rva(callback_va, image_base, size_of_image, "TLS callback VA")?;
+            image_va_to_rva(callback_va, image_base, size_of_image, "TLS callback VA")?;
         let executable = section_for_rva(callback_rva, sections)
             .is_some_and(|(_, section)| section.characteristics & IMAGE_SCN_MEM_EXECUTE != 0)
             && mapper.is_backed(callback_rva, 1);
@@ -2506,7 +2966,7 @@ fn parse_tls_callbacks(
     unreachable!("the bounded TLS callback loop always returns")
 }
 
-fn tls_va_to_rva(
+fn image_va_to_rva(
     va: u64,
     image_base: u64,
     size_of_image: u32,
@@ -2631,6 +3091,10 @@ pub(crate) fn build_symbol_graph(
         sections,
         exports,
         runtime_functions,
+        load_config_rva,
+        guard_flags,
+        guard_cf_function_table_rva,
+        guard_cf_functions,
         tls_directory_rva,
         tls_callback_table_rva,
         tls_callbacks,
@@ -2646,6 +3110,7 @@ pub(crate) fn build_symbol_graph(
     let export_subject_confidence = Confidence::new(0.99)?;
     let runtime_boundary_confidence = Confidence::new(0.99)?;
     let entry_point_confidence = Confidence::new(0.99)?;
+    let guard_cf_confidence = Confidence::new(0.99)?;
     let function_candidate_confidence = Confidence::new(0.95)?;
     let direct_call_confidence = Confidence::new(0.90)?;
     let recovered_string_confidence = Confidence::new(0.90)?;
@@ -2788,6 +3253,93 @@ pub(crate) fn build_symbol_graph(
                 entry_point_confidence,
                 vec![evidence],
                 provenance("pe-entry-point"),
+            )?)?;
+        }
+    }
+
+    if !guard_cf_functions.is_empty() {
+        let load_config_rva = load_config_rva.ok_or_else(|| AnalysisError::InvalidField {
+            field: "GuardCF metadata",
+            reason: "entries exist without a load-config directory".to_owned(),
+        })?;
+        let guard_flags = guard_flags.ok_or_else(|| AnalysisError::InvalidField {
+            field: "GuardFlags",
+            reason: "GuardCF entries exist without GuardFlags".to_owned(),
+        })?;
+        let function_table_rva =
+            guard_cf_function_table_rva.ok_or_else(|| AnalysisError::InvalidField {
+                field: "GuardCF function table",
+                reason: "entries exist without a table RVA".to_owned(),
+            })?;
+        for function in guard_cf_functions {
+            let (section_index, section) = file_backed_executable_section_for_rva(
+                identity,
+                function.rva,
+                sections,
+            )
+            .ok_or_else(|| AnalysisError::InvalidField {
+                field: "GuardCF function target",
+                reason: format!(
+                    "entry {} has RVA {:#x}, which is not fully file-backed executable data",
+                    function.table_index, function.rva
+                ),
+            })?;
+            let mut evidence = Evidence::new(
+                metadata_kind.clone(),
+                "exact executable function target from the sorted PE GuardCF function table",
+            )?;
+            evidence.confidence = Some(exact_metadata_confidence);
+            evidence.artifacts.insert(
+                "load_config_rva".to_owned(),
+                format!("{load_config_rva:#x}"),
+            );
+            evidence.artifacts.insert(
+                "function_table_rva".to_owned(),
+                format!("{function_table_rva:#x}"),
+            );
+            evidence
+                .artifacts
+                .insert("guard_flags".to_owned(), format!("{guard_flags:#010x}"));
+            evidence
+                .artifacts
+                .insert("table_index".to_owned(), function.table_index.to_string());
+            evidence
+                .artifacts
+                .insert("target_rva".to_owned(), format!("{:#x}", function.rva));
+            evidence.artifacts.insert(
+                "metadata".to_owned(),
+                if function.metadata.is_empty() {
+                    "none".to_owned()
+                } else {
+                    format_hex(&function.metadata)
+                },
+            );
+            evidence.artifacts.insert(
+                "fid_suppressed".to_owned(),
+                function.is_fid_suppressed().to_string(),
+            );
+            evidence.artifacts.insert(
+                "export_suppressed".to_owned(),
+                function.is_export_suppressed().to_string(),
+            );
+            evidence
+                .artifacts
+                .insert("section_index".to_owned(), section_index.to_string());
+            if !section.name.is_empty() {
+                evidence
+                    .artifacts
+                    .insert("section_name".to_owned(), section.name.clone());
+            }
+            graph.submit_claim(SymbolClaim::new(
+                SymbolSubject::Function {
+                    binary: identity.id.clone(),
+                    rva: u64::from(function.rva),
+                    size: None,
+                },
+                SymbolAssertion::FunctionEntry,
+                guard_cf_confidence,
+                vec![evidence],
+                provenance("pe-guard-cf-function"),
             )?)?;
         }
     }
@@ -3418,6 +3970,24 @@ pub(crate) fn section_for_rva(rva: u32, sections: &[PeSection]) -> Option<(usize
         let size = u64::from(cmp::max(section.virtual_size, section.raw_data_size));
         let end = start.saturating_add(size);
         (start..end).contains(&u64::from(rva))
+    })
+}
+
+fn section_for_rva_range(
+    rva: u32,
+    size: u32,
+    sections: &[PeSection],
+) -> Option<(usize, &PeSection)> {
+    if size == 0 {
+        return None;
+    }
+    let start = u64::from(rva);
+    let end = start.checked_add(u64::from(size))?;
+    sections.iter().enumerate().find(|(_, section)| {
+        let section_start = u64::from(section.virtual_address);
+        let section_size = u64::from(cmp::max(section.virtual_size, section.raw_data_size));
+        let section_end = section_start.saturating_add(section_size);
+        start >= section_start && end <= section_end
     })
 }
 

@@ -12,26 +12,32 @@ exception metadata, and derives conservative metadata-backed claims. Canonical `
 now carry an `AnalysisSession`: deterministic base analysis, an auditable plugin-run ledger, and
 separately validated plugin claims with a derived combined graph.
 
-The CLI writes package schema 8 and can inspect or export schemas 1 through 7 through explicit
+The CLI writes package schema 9 and can inspect or export schemas 1 through 8 through explicit
 compatibility paths. Schema 1 is migrated in memory by revalidating persisted metadata and
 rebuilding the base graph; schema 2 already contains direct-call and thunk recovery, and schema 3
 adds string/data recovery. Schema 4 adds read-only pointer control flow but predates legacy 24-byte
 RTTI base-class descriptor recovery. Schema 5 adds that RTTI form but predates transitive executable
 thunk-chain discovery. Schema 6 adds that closure but predates TLS callback discovery and
 callback-based thunk seeding; schema 7 adds TLS callbacks but predates modern delay-import
-recovery. Older packages do not embed executable bytes, so compatibility loading
+recovery; and schema 8 adds delay imports but predates load-config GuardCF recovery. Older packages
+do not embed executable bytes, so compatibility loading
 cannot reconstruct results that were never recorded. Reanalyzing the exact original binary is
 required for transitive thunk chains in schemas 1 through 5, 24-byte descriptors in schemas 1
 through 4, read-only function-pointer calls and thunks in schemas 2 and 3, strings/data references
-in schemas 1 and 2, TLS callbacks in schemas 1 through 6, delay imports in schemas 1 through 7, and
+in schemas 1 and 2, TLS callbacks in schemas 1 through 6, delay imports in schemas 1 through 7,
+GuardCF functions in schemas 1 through 8, and
 all code recovery when starting from
 schema 1. Relabeled schema-6-only
 transitive base-thunk sources are rejected under schema 1-through-5 envelopes; schemas 1 through 6
 also reject schema-7 TLS callback state and callback-only base thunk seeds. Schemas 1 through 7 also
 reject the exact schema-8 base-analysis `delay_imports` inventory key and
-`directories.delay_imports` directory key.
+`directories.delay_imports` directory key. Schemas 8 and 9 both require that explicit inventory,
+even when empty.
+Schemas 1 through 8 reject schema-9 load-config/GuardCF fields,
+`directories.load_config`, and core `pe-guard-cf-function` claims; schema 9 requires an explicit
+`guard_cf_functions` inventory even when empty.
 
-For every supported package schema, 1 through 8, `resymbol inspect` can optionally accept the exact
+For every supported package schema, 1 through 9, `resymbol inspect` can optionally accept the exact
 original binary and require its size and SHA-256 to match before inspection data reaches stdout;
 failures report on stderr. Human inspection reports the canonical source path and a matched identity
 gate, while JSON remains pure package data. This is an identity check only: it does not rerun
@@ -57,13 +63,29 @@ Each retained slot emits a `FunctionEntry` claim with `pe-tls-callback` provenan
 slot/index evidence, including duplicate target RVAs. Retained targets join the deterministic
 first-instruction thunk seeds without causing a callback-body sweep or executing the input.
 
+A bounded PE32+ load-config GuardCF slice is now implemented from optional-header data-directory
+entry 10. A present directory is fully file-backed and contains an internal structure size from 4
+through the directory size; at least 148 internal bytes are required before ReSymbol exposes
+`GuardCFFunctionTable`, `GuardCFFunctionCount`, and `GuardFlags`. Counts above 262,144, oversized
+tables, structural inconsistencies, and malformed records are hard errors; an accepted GFIDS table
+is retained in full with strictly increasing unique executable RVAs. Records have stride `4 + n`, where the
+high `GuardFlags` nibble selects `n`, and those metadata bytes are retained exactly and opaquely.
+The table must be fully backed and disjoint from the load-config directory; disjointness is a
+ReSymbol hardening policy. Every structurally valid record, including one marked
+`IMAGE_GUARD_FLAG_FID_SUPPRESSED`, `IMAGE_GUARD_FLAG_EXPORT_SUPPRESSED`, or both, emits its existing
+`FunctionEntry` claim and joins initial one-instruction thunk seeding. FID suppression describes CFG
+eligibility rather than whether the target is a function; export-suppressed RVAs must be 16-byte
+aligned. GFIDS does not cause a function-body sweep or name/extent inference.
+
 A bounded modern PE32+ delay-import slice is now implemented from optional-header data-directory
 entry 13. It accepts an ordered sequence of 32-byte descriptors followed by an all-zero terminator
 and only all-zero declared tail padding when the
 attributes value is exactly the modern RVA-form `dlattrRva` (`1`); the legacy VA form, zero, and
 unknown bits are rejected despite ambiguity in the generic PE table documentation. Each active
-descriptor has nonzero name, module-handle (HMOD), delay-IAT, and delay-INT RVAs; HMOD contents and
-permissions stay opaque. Paired null-terminated 64-bit INT/IAT arrays and optional bound-IAT (BIAT)
+descriptor has nonzero name, module-handle (HMOD), delay-IAT, and delay-INT RVAs. HMOD needs an
+eight-byte range wholly mapped inside one section but may occupy zero-filled virtual data rather
+than file-backed bytes; initial contents and permissions stay opaque. Paired null-terminated 64-bit
+INT/IAT arrays and optional bound-IAT (BIAT)
 and unload-IAT (UIAT) arrays must be fully backed and pairwise disjoint. Each present BIAT or UIAT
 must have a zero slot at the paired INT/IAT entry count. BIAT payload values before that required
 slot are otherwise opaque, including whether any is zero, while the complete UIAT must byte-match
@@ -92,8 +114,9 @@ traversal does not follow pointer-to-pointer slots: every non-IAT slot remains a
 dereference. It discovers at most 262,144 block starts and retains at most 8,192 direct calls,
 32,768 data references, and 4,096 thunks. Reaching the shared decode or relationship caps preserves
 the deterministic valid prefix and marks the applicable recovery state partial. Internal targets
-covered by known runtime-function metadata are suppressed unless their RVA
-matches a recorded runtime-function begin. A separate bounded pass recovers complete
+covered by known runtime-function metadata are allowed only when their RVA matches a recorded
+runtime-function begin or a retained GuardCF function start. Every other
+interior endpoint remains suppressed regardless of another seed source. A separate bounded pass recovers complete
 NUL-terminated ASCII and UTF-16LE literals from readable initialized non-executable file-backed
 data. These passes emit attributed claims without inventing names or extents and preserve
 independent partial-scan flags. The guided sweep suppresses unreachable post-terminal bytes and can
@@ -167,15 +190,16 @@ The first export checkpoint is implemented as a validated, debugger-neutral proj
 deterministic JSON output, a bounded human-readable Markdown report, PE-only
 Microsoft-linker-style MAP text, an exact-RSDS public-symbol PDB, and standalone IDAPython and
 Ghidra Java import scripts. Markdown is presentation-only rather than a stable interchange schema;
-JSON remains the machine-consumable artifact. New analyses write package schema 8, while export also
-accepts package schemas 1 through 7 through validated compatibility paths. The neutral projection is
+JSON remains the machine-consumable artifact. New analyses write package schema 9, while export also
+accepts package schemas 1 through 8 through validated compatibility paths. The neutral projection is
 independently schema 6; MAP and PDB add no schema fields, and no exporter rewrites its source
 package. Projection schema 5 correlates exact or valid content-interior data-reference targets with
 retained strings while excluding NUL terminators and misaligned UTF-16LE interiors; projection
 schema 6 preserves function-pointer slot and resolved-target RVAs. TLS callback endpoints reuse its
 existing function-entry and thunk shapes, so no TLS-specific projection field is added. Delay-load
 descriptor inventory remains package-only, while delay-IAT control flow reuses the existing import
-target with its slot RVA. The scripts
+target with its slot RVA. GuardCF claims and supported seeded thunks reuse the existing shapes, so
+load-config/GFIDS inventory and suppression evidence remain package-only and projection schema 6 is unchanged. The scripts
 bind to the exact loaded binary SHA-256, resolve addresses as loaded image base plus RVA, preserve
 user-authored names and existing function bodies, and continue past per-symbol application errors.
 They are deliberately narrower than the planned interactive debugger bridges: prototypes, types,
@@ -213,8 +237,8 @@ data references, and modern RTTI/vftables without executing the fixture binaries
 inputs are repository/source test data rather than portable runtime archive contents. Read-only
 function-pointer calls and thunks, plus all-legacy and mixed 24/28-byte RTTI descriptor
 hierarchies, are covered by focused synthetic PE fixtures. Exact transitive thunk chains, connected
-cycles, disconnected-cycle rejection, bounded TLS callback discovery, and modern delay-import
-recovery are also synthetic-only coverage.
+cycles, disconnected-cycle rejection, bounded TLS callback discovery, modern delay-import recovery,
+and load-config GuardCF recovery are also synthetic-only coverage.
 These focused slices do not change the four corpus binaries, their semantic oracle, or their
 recorded hashes.
 
@@ -286,9 +310,10 @@ The first intentionally narrow analysis target is native Windows x86-64 PE input
 adversarial obfuscation.
 
 - Format, section, import, export, and build-metadata extraction
-- Executable-range and candidate function discovery (exception ranges, exports, calls, and seeded
-  entries implemented)
-- Exception and unwind metadata ingestion
+- Executable-range and candidate function discovery (exception ranges, exports, calls, seeded
+  entries, and the narrow load-config/GFIDS source implemented)
+- Exception and unwind metadata ingestion (current x64 `RUNTIME_FUNCTION` boundary slice
+  implemented; broader unwind semantics remain planned)
 - Strings, constants, references, call relationships, and thunks (bounded exact strings, supported
   RIP-relative data references, direct calls, exact per-hop transitive one-instruction thunks, and
   exact/content-interior string-reference correlation implemented; broader constants remain
@@ -302,13 +327,16 @@ adversarial obfuscation.
   broader compilers remain planned)
 - Boundary, coverage, malformed-input, and resource-limit benchmarks
 
-The PE metadata, x64 exception ingestion, bounded string, data-reference, direct-call, and
-transitive-thunk recovery,
+The PE metadata, narrow load-config/GFIDS candidate source, x64 exception ingestion, bounded string,
+data-reference, direct-call, and transitive-thunk recovery,
 deterministic string-reference correlation, bounded dual-layout MSVC x64 RTTI/vftable slice,
 portable package, canonical package encoding, neutral JSON export projection, bounded Markdown
 report, initial MSVC fixture matrix, and related CLI
 portions are implemented. The unfinished parts of the bullets describe the remainder of this
-milestone.
+milestone. Broader load-config/security tables and semantics—including security cookies and
+check/dispatch pointers, address-taken-IAT, long-jump, EH-continuation, and SafeSEH metadata—remain
+planned, as do names/extents/body recovery beyond the current evidence, broader constants and
+compilers, and resource/coverage benchmarks.
 
 The MVP should be useful without AI, a network connection, Ghidra, or IDA.
 

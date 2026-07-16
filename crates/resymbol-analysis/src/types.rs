@@ -62,7 +62,7 @@ pub struct PeAnalysis {
     pub imports: Vec<PeImportLibrary>,
     /// Ordered modern RVA-form delay-load import descriptors.
     ///
-    /// Schema 8 serializes this field even when it is empty so the inventory is
+    /// Schemas 8 and later serialize this field even when it is empty so the inventory is
     /// an explicit compatibility marker rather than something an older package
     /// can acquire by changing only its envelope version.
     #[serde(default)]
@@ -70,6 +70,21 @@ pub struct PeAnalysis {
     pub export_library_name: Option<String>,
     pub exports: Vec<PeExport>,
     pub runtime_functions: Vec<RuntimeFunction>,
+    /// Size declared by the PE32+ load-configuration structure, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_config_size: Option<u32>,
+    /// Exact `GuardFlags` value when the load configuration is large enough to contain it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard_flags: Option<u32>,
+    /// RVA of the GuardCF function table after converting its preferred-image VA.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard_cf_function_table_rva: Option<u32>,
+    /// Ordered records from the PE GuardCF function table.
+    ///
+    /// Schema 9 serializes this inventory even when empty so a legacy package
+    /// cannot acquire GuardCF recovery semantics by changing only its envelope.
+    #[serde(default)]
+    pub guard_cf_functions: Vec<PeGuardCfFunction>,
     /// RVA of the callback pointer array named by the TLS directory, when nonzero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_callback_table_rva: Option<u32>,
@@ -131,6 +146,10 @@ impl PeAnalysis {
             sections: &self.sections,
             exports: &self.exports,
             runtime_functions: &self.runtime_functions,
+            load_config_rva: self.directories.load_config.map(|directory| directory.rva),
+            guard_flags: self.guard_flags,
+            guard_cf_function_table_rva: self.guard_cf_function_table_rva,
+            guard_cf_functions: &self.guard_cf_functions,
             tls_directory_rva: self.directories.tls.map(|directory| directory.rva),
             tls_callback_table_rva: self.tls_callback_table_rva,
             tls_callbacks: &self.tls_callbacks,
@@ -164,6 +183,14 @@ struct UncheckedPeAnalysis {
     export_library_name: Option<String>,
     exports: Vec<PeExport>,
     runtime_functions: Vec<RuntimeFunction>,
+    #[serde(default)]
+    load_config_size: Option<u32>,
+    #[serde(default)]
+    guard_flags: Option<u32>,
+    #[serde(default)]
+    guard_cf_function_table_rva: Option<u32>,
+    #[serde(default)]
+    guard_cf_functions: Vec<PeGuardCfFunction>,
     #[serde(default)]
     tls_callback_table_rva: Option<u32>,
     #[serde(default)]
@@ -213,6 +240,10 @@ impl TryFrom<UncheckedPeAnalysis> for PeAnalysis {
             export_library_name: value.export_library_name,
             exports: value.exports,
             runtime_functions: value.runtime_functions,
+            load_config_size: value.load_config_size,
+            guard_flags: value.guard_flags,
+            guard_cf_function_table_rva: value.guard_cf_function_table_rva,
+            guard_cf_functions: value.guard_cf_functions,
             tls_callback_table_rva: value.tls_callback_table_rva,
             tls_callback_scan_truncated: value.tls_callback_scan_truncated,
             tls_callbacks: value.tls_callbacks,
@@ -257,6 +288,9 @@ pub struct PeDataDirectories {
     pub exports: Option<DataDirectory>,
     pub imports: Option<DataDirectory>,
     pub exceptions: Option<DataDirectory>,
+    /// PE optional-header data-directory entry 10.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_config: Option<DataDirectory>,
     /// PE optional-header data-directory entry 9.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<DataDirectory>,
@@ -368,6 +402,32 @@ pub struct PeTlsCallback {
     pub table_index: u32,
     /// RVA obtained by subtracting the preferred image base from the slot's VA.
     pub callback_rva: u32,
+}
+
+/// One record from the PE Guard Control Flow function table (GFIDS).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeGuardCfFunction {
+    /// Zero-based position in the strictly sorted GFIDS table.
+    pub table_index: u32,
+    /// Exact four-byte RVA stored at the start of the record.
+    pub rva: u32,
+    /// Exact optional metadata bytes selected by the high nibble of `GuardFlags`.
+    pub metadata: Vec<u8>,
+}
+
+impl PeGuardCfFunction {
+    /// Whether the defined `IMAGE_GUARD_FLAG_FID_SUPPRESSED` bit is set.
+    #[must_use]
+    pub fn is_fid_suppressed(&self) -> bool {
+        self.metadata.first().is_some_and(|flags| flags & 0x01 != 0)
+    }
+
+    /// Whether the defined `IMAGE_GUARD_FLAG_EXPORT_SUPPRESSED` bit is set.
+    #[must_use]
+    pub fn is_export_suppressed(&self) -> bool {
+        self.metadata.first().is_some_and(|flags| flags & 0x02 != 0)
+    }
 }
 
 /// A statically resolved target used by the bounded PE control-flow model.

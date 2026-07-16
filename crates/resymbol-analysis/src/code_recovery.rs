@@ -7,8 +7,8 @@ use iced_x86::{Code, Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Reg
 
 use crate::{
     AnalysisError, MsvcRttiVftable, PeAnalysis, PeControlFlowTarget, PeDataReference,
-    PeDelayImportLibrary, PeDirectCall, PeExport, PeImportLibrary, PeSection, PeThunk,
-    PeTlsCallback, RuntimeFunction,
+    PeDelayImportLibrary, PeDirectCall, PeExport, PeGuardCfFunction, PeImportLibrary, PeSection,
+    PeThunk, PeTlsCallback, RuntimeFunction,
     pe::{RvaMap, section_for_rva},
 };
 
@@ -43,6 +43,7 @@ pub(crate) struct CodeRecoveryInput<'a, 'data> {
     pub delay_imports: &'a [PeDelayImportLibrary],
     pub exports: &'a [PeExport],
     pub runtime_functions: &'a [RuntimeFunction],
+    pub guard_cf_functions: &'a [PeGuardCfFunction],
     pub tls_callbacks: &'a [PeTlsCallback],
     pub msvc_rtti_vftables: &'a [MsvcRttiVftable],
 }
@@ -56,19 +57,23 @@ struct TargetContext<'a, 'data> {
     size_of_image: u32,
 }
 
-/// Runtime-function coverage used to reject interior labels without a linear
-/// scan through the exception table for every recovered edge.
+/// Runtime-function coverage used to reject unsubstantiated interior labels
+/// without a linear scan through the exception table for every recovered edge.
 struct RuntimeTargetPolicy {
-    begins: BTreeSet<u32>,
+    known_starts: BTreeSet<u32>,
     covered_intervals: Vec<(u32, u32)>,
 }
 
 impl RuntimeTargetPolicy {
-    fn new(runtime_functions: &[RuntimeFunction]) -> Self {
-        let begins = runtime_functions
+    fn new<I>(runtime_functions: &[RuntimeFunction], additional_starts: I) -> Self
+    where
+        I: IntoIterator<Item = u32>,
+    {
+        let mut known_starts: BTreeSet<u32> = runtime_functions
             .iter()
             .map(|function| function.begin_rva)
             .collect();
+        known_starts.extend(additional_starts);
         let mut ranges = runtime_functions
             .iter()
             .filter_map(|function| {
@@ -92,13 +97,13 @@ impl RuntimeTargetPolicy {
         }
 
         Self {
-            begins,
+            known_starts,
             covered_intervals,
         }
     }
 
     fn allows_function_target(&self, rva: u32) -> bool {
-        if self.begins.contains(&rva) {
+        if self.known_starts.contains(&rva) {
             return true;
         }
         let candidate = self
@@ -106,6 +111,12 @@ impl RuntimeTargetPolicy {
             .partition_point(|(begin_rva, _)| *begin_rva <= rva);
         candidate == 0 || rva >= self.covered_intervals[candidate - 1].1
     }
+}
+
+fn guard_cf_function_starts(
+    guard_cf_functions: &[PeGuardCfFunction],
+) -> impl Iterator<Item = u32> + '_ {
+    guard_cf_functions.iter().map(|function| function.rva)
 }
 
 #[derive(Default)]
@@ -519,7 +530,10 @@ fn scan_runtime_function(
 
 pub(crate) fn recover_code(input: CodeRecoveryInput<'_, '_>) -> CodeRecovery {
     let import_iat_rvas = import_iat_rvas(input.imports, input.delay_imports);
-    let runtime_targets = RuntimeTargetPolicy::new(input.runtime_functions);
+    let runtime_targets = RuntimeTargetPolicy::new(
+        input.runtime_functions,
+        guard_cf_function_starts(input.guard_cf_functions),
+    );
     let target_context = TargetContext {
         mapper: input.mapper,
         sections: input.sections,
@@ -898,6 +912,9 @@ fn thunk_seeds(input: &CodeRecoveryInput<'_, '_>, direct_calls: &[PeDirectCall])
     }) {
         insert_executable_seed(&mut seeds, input.mapper, input.sections, rva);
     }
+    for rva in input.guard_cf_functions.iter().map(|function| function.rva) {
+        insert_executable_seed(&mut seeds, input.mapper, input.sections, rva);
+    }
     for rva in input
         .tls_callbacks
         .iter()
@@ -930,7 +947,10 @@ pub(crate) fn validate_code_recovery(analysis: &PeAnalysis) -> Result<(), Analys
     }
 
     let import_iat_rvas = import_iat_rvas(&analysis.imports, &analysis.delay_imports);
-    let runtime_targets = RuntimeTargetPolicy::new(&analysis.runtime_functions);
+    let runtime_targets = RuntimeTargetPolicy::new(
+        &analysis.runtime_functions,
+        guard_cf_function_starts(&analysis.guard_cf_functions),
+    );
     let mut previous_call_site = None;
     for call in &analysis.direct_calls {
         let call_key = (call.caller_rva, call.call_site_rva);
@@ -1163,6 +1183,12 @@ fn model_thunk_seeds(analysis: &PeAnalysis) -> BTreeSet<u32> {
     );
     seeds.extend(
         analysis
+            .guard_cf_functions
+            .iter()
+            .map(|function| function.rva),
+    );
+    seeds.extend(
+        analysis
             .tls_callbacks
             .iter()
             .map(|callback| callback.callback_rva),
@@ -1211,7 +1237,7 @@ fn validate_target(
             if !runtime_targets.allows_function_target(rva) {
                 return invalid(
                     field,
-                    "internal endpoint lies inside runtime-function metadata but is not a runtime-function begin",
+                    "internal endpoint lies inside runtime-function metadata but is not an authoritative metadata function start",
                 );
             }
             if !model_range_is_backed_executable(analysis, rva, 1) {
@@ -1245,7 +1271,7 @@ fn validate_target(
             if !runtime_targets.allows_function_target(rva) {
                 return invalid(
                     field,
-                    "internal endpoint lies inside runtime-function metadata but is not a runtime-function begin",
+                    "internal endpoint lies inside runtime-function metadata but is not an authoritative metadata function start",
                 );
             }
             if !model_range_is_backed_executable(analysis, rva, 1) {
@@ -1794,7 +1820,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_target_policy_allows_starts_and_outside_addresses_only() {
+    fn runtime_target_policy_allows_authoritative_starts_and_outside_addresses_only() {
         let runtime_functions = [
             RuntimeFunction {
                 begin_rva: 0x1000,
@@ -1809,12 +1835,12 @@ mod tests {
                 table_index: 1,
             },
         ];
-        let policy = RuntimeTargetPolicy::new(&runtime_functions);
+        let policy = RuntimeTargetPolicy::new(&runtime_functions, [0x1100]);
 
         assert!(policy.allows_function_target(0x1000));
         assert!(policy.allows_function_target(0x1080));
         assert!(!policy.allows_function_target(0x107f));
-        assert!(!policy.allows_function_target(0x1100));
+        assert!(policy.allows_function_target(0x1100));
         assert!(policy.allows_function_target(0x1180));
     }
 

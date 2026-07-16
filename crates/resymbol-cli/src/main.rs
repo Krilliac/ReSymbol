@@ -48,6 +48,7 @@ const NO_PCHD_BASE_DESCRIPTOR_SCHEMA_VERSION: u32 = 5;
 const TRANSITIVE_THUNK_CHAIN_SCHEMA_VERSION: u32 = 6;
 const TLS_CALLBACK_SCHEMA_VERSION: u32 = 7;
 const DELAY_IMPORT_SCHEMA_VERSION: u32 = 8;
+const GUARD_CF_SCHEMA_VERSION: u32 = 9;
 const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 
 #[derive(Debug, Parser)]
@@ -288,15 +289,7 @@ fn analyze(args: AnalyzeArgs, safe_mode: bool, plugin_dir: PathBuf) -> Result<()
         .with_context(|| format!("cannot write package {}", output.display()))?;
 
     println!("binary: {}", binary.display());
-    print_session_summary(
-        package.payload(),
-        CodeRecoveryAvailability::Recorded,
-        TransitiveThunkRecoveryAvailability::Recorded,
-        StringDataRecoveryAvailability::Recorded,
-        RttiRecoveryAvailability::Recorded,
-        TlsCallbackAvailability::Recorded,
-        DelayImportAvailability::Recorded,
-    )?;
+    print_session_summary(package.payload(), AnalysisFeatureAvailability::RECORDED)?;
     println!("package: {}", output.display());
     println!("plugin directory: {}", plugin_dir.display());
     println!("safe mode: {safe_mode}");
@@ -356,12 +349,15 @@ fn inspect(args: InspectArgs) -> Result<()> {
     }
     print_session_summary(
         loaded.package.payload(),
-        loaded.code_recovery_availability,
-        loaded.transitive_thunk_recovery_availability,
-        loaded.string_data_recovery_availability,
-        loaded.rtti_recovery_availability,
-        loaded.tls_callback_availability,
-        loaded.delay_import_availability,
+        AnalysisFeatureAvailability {
+            code_recovery: loaded.code_recovery_availability,
+            transitive_thunk_recovery: loaded.transitive_thunk_recovery_availability,
+            string_data_recovery: loaded.string_data_recovery_availability,
+            rtti_recovery: loaded.rtti_recovery_availability,
+            tls_callbacks: loaded.tls_callback_availability,
+            delay_imports: loaded.delay_import_availability,
+            guard_cf: loaded.guard_cf_availability,
+        },
     )?;
 
     Ok(())
@@ -509,6 +505,46 @@ enum DelayImportAvailability {
     Unavailable(u32),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuardCfAvailability {
+    Recorded,
+    Unavailable(u32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AnalysisFeatureAvailability {
+    code_recovery: CodeRecoveryAvailability,
+    transitive_thunk_recovery: TransitiveThunkRecoveryAvailability,
+    string_data_recovery: StringDataRecoveryAvailability,
+    rtti_recovery: RttiRecoveryAvailability,
+    tls_callbacks: TlsCallbackAvailability,
+    delay_imports: DelayImportAvailability,
+    guard_cf: GuardCfAvailability,
+}
+
+impl AnalysisFeatureAvailability {
+    const RECORDED: Self = Self {
+        code_recovery: CodeRecoveryAvailability::Recorded,
+        transitive_thunk_recovery: TransitiveThunkRecoveryAvailability::Recorded,
+        string_data_recovery: StringDataRecoveryAvailability::Recorded,
+        rtti_recovery: RttiRecoveryAvailability::Recorded,
+        tls_callbacks: TlsCallbackAvailability::Recorded,
+        delay_imports: DelayImportAvailability::Recorded,
+        guard_cf: GuardCfAvailability::Recorded,
+    };
+}
+
+impl GuardCfAvailability {
+    fn export_summary_line(self) -> Option<String> {
+        match self {
+            Self::Recorded => None,
+            Self::Unavailable(schema_version) => Some(format!(
+                "GuardCF functions: unavailable (schema {schema_version} package predates PE GuardCF recovery; reanalyze the exact original binary)"
+            )),
+        }
+    }
+}
+
 impl DelayImportAvailability {
     fn export_summary_line(self) -> Option<String> {
         match self {
@@ -539,6 +575,7 @@ struct LoadedAnalysisPackage {
     rtti_recovery_availability: RttiRecoveryAvailability,
     tls_callback_availability: TlsCallbackAvailability,
     delay_import_availability: DelayImportAvailability,
+    guard_cf_availability: GuardCfAvailability,
     legacy_inspection_source: Option<ResymPackage<Value>>,
 }
 
@@ -564,7 +601,7 @@ fn read_analysis_package(
         1 => CodeRecoveryAvailability::UnavailableSchema1,
         2 => CodeRecoveryAvailability::RecordedWithoutReadOnlyPointerControlFlow(2),
         3 => CodeRecoveryAvailability::RecordedWithoutReadOnlyPointerControlFlow(3),
-        4..=8 => CodeRecoveryAvailability::Recorded,
+        4..=9 => CodeRecoveryAvailability::Recorded,
         _ => bail!("unsupported analysis package schema {schema_version}"),
     };
     let transitive_thunk_recovery_availability = match schema_version {
@@ -572,39 +609,49 @@ fn read_analysis_package(
         2..=5 => TransitiveThunkRecoveryAvailability::RecordedWithoutTransitiveThunkChains(
             schema_version,
         ),
-        6..=8 => TransitiveThunkRecoveryAvailability::Recorded,
+        6..=9 => TransitiveThunkRecoveryAvailability::Recorded,
         _ => bail!("unsupported analysis package schema {schema_version}"),
     };
     let string_data_recovery_availability = match schema_version {
         1 => StringDataRecoveryAvailability::UnavailableSchema1,
         2 => StringDataRecoveryAvailability::UnavailableSchema2,
-        3..=8 => StringDataRecoveryAvailability::Recorded,
+        3..=9 => StringDataRecoveryAvailability::Recorded,
         _ => bail!("unsupported analysis package schema {schema_version}"),
     };
     let rtti_recovery_availability = match schema_version {
         1..=4 => RttiRecoveryAvailability::RecordedWithoutNoPchdBaseDescriptors(schema_version),
-        5..=8 => RttiRecoveryAvailability::Recorded,
+        5..=9 => RttiRecoveryAvailability::Recorded,
         _ => bail!("unsupported analysis package schema {schema_version}"),
     };
     let tls_callback_availability = match schema_version {
         1..=6 => TlsCallbackAvailability::Unavailable(schema_version),
-        7..=8 => TlsCallbackAvailability::Recorded,
+        7..=9 => TlsCallbackAvailability::Recorded,
         _ => bail!("unsupported analysis package schema {schema_version}"),
     };
     let delay_import_availability = match schema_version {
         1..=7 => DelayImportAvailability::Unavailable(schema_version),
-        DELAY_IMPORT_SCHEMA_VERSION => DelayImportAvailability::Recorded,
+        DELAY_IMPORT_SCHEMA_VERSION..=GUARD_CF_SCHEMA_VERSION => DelayImportAvailability::Recorded,
+        _ => bail!("unsupported analysis package schema {schema_version}"),
+    };
+    let guard_cf_availability = match schema_version {
+        1..=8 => GuardCfAvailability::Unavailable(schema_version),
+        GUARD_CF_SCHEMA_VERSION => GuardCfAvailability::Recorded,
         _ => bail!("unsupported analysis package schema {schema_version}"),
     };
     let legacy_inspection_source = (preserve_legacy_inspection_source
         && schema_version < CURRENT_SCHEMA_VERSION)
         .then(|| package.clone());
-    match schema_version.cmp(&DELAY_IMPORT_SCHEMA_VERSION) {
-        std::cmp::Ordering::Equal => require_v8_delay_import_marker(package.payload())?,
+    match schema_version.cmp(&GUARD_CF_SCHEMA_VERSION) {
+        std::cmp::Ordering::Equal => require_v9_guard_cf_marker(package.payload())?,
         std::cmp::Ordering::Less => {
-            reject_pre_v8_delay_import_semantics(package.payload(), schema_version)?;
+            reject_pre_v9_guard_cf_semantics(package.payload(), schema_version)?;
         }
         std::cmp::Ordering::Greater => {}
+    }
+    if schema_version >= DELAY_IMPORT_SCHEMA_VERSION {
+        require_v8_delay_import_marker(package.payload(), schema_version)?;
+    } else {
+        reject_pre_v8_delay_import_semantics(package.payload(), schema_version)?;
     }
     if schema_version < TLS_CALLBACK_SCHEMA_VERSION {
         reject_pre_v7_tls_callback_semantics(package.payload(), schema_version)?;
@@ -625,7 +672,8 @@ fn read_analysis_package(
         5 => serde_json::from_value(payload).context("cannot decode schema-v5 analysis payload"),
         6 => serde_json::from_value(payload).context("cannot decode schema-v6 analysis payload"),
         7 => serde_json::from_value(payload).context("cannot decode schema-v7 analysis payload"),
-        8 => serde_json::from_value(payload).context("cannot decode current analysis payload"),
+        8 => serde_json::from_value(payload).context("cannot decode schema-v8 analysis payload"),
+        9 => serde_json::from_value(payload).context("cannot decode current analysis payload"),
         _ => bail!("unsupported analysis package schema {schema_version}"),
     })?;
     if (2..TRANSITIVE_THUNK_CHAIN_SCHEMA_VERSION).contains(&schema_version) {
@@ -642,11 +690,68 @@ fn read_analysis_package(
         rtti_recovery_availability,
         tls_callback_availability,
         delay_import_availability,
+        guard_cf_availability,
         legacy_inspection_source,
     })
 }
 
-fn require_v8_delay_import_marker(payload: &Value) -> Result<()> {
+fn require_v9_guard_cf_marker(payload: &Value) -> Result<()> {
+    let Some(analysis) = payload
+        .pointer("/base_analysis/analysis")
+        .and_then(Value::as_object)
+    else {
+        return Ok(());
+    };
+    if !analysis.contains_key("guard_cf_functions") {
+        bail!(
+            "package schema 9 requires an explicit guard_cf_functions inventory, even when empty; a legacy package without that marker cannot be migrated by changing only its envelope label, so reanalyze the exact original binary"
+        );
+    }
+    Ok(())
+}
+
+fn reject_pre_v9_guard_cf_semantics(payload: &Value, schema_version: u32) -> Result<()> {
+    debug_assert!((1..GUARD_CF_SCHEMA_VERSION).contains(&schema_version));
+    let Some(analysis) = payload.pointer("/base_analysis/analysis") else {
+        return Ok(());
+    };
+    let uses_guard_cf_shape = analysis.as_object().is_some_and(|analysis| {
+        [
+            "load_config_size",
+            "guard_flags",
+            "guard_cf_function_table_rva",
+            "guard_cf_functions",
+        ]
+        .iter()
+        .any(|key| analysis.contains_key(*key))
+            || analysis
+                .get("directories")
+                .and_then(Value::as_object)
+                .is_some_and(|directories| directories.contains_key("load_config"))
+    });
+    let base_graph_uses_guard_cf_claim = analysis
+        .pointer("/symbol_graph/claims")
+        .and_then(Value::as_array)
+        .is_some_and(|claims| {
+            claims.iter().any(|claim| {
+                claim.pointer("/provenance/method").and_then(Value::as_str)
+                    == Some("pe-guard-cf-function")
+                    && claim
+                        .pointer("/provenance/producer/kind")
+                        .and_then(Value::as_str)
+                        == Some("core")
+            })
+        });
+    if uses_guard_cf_shape || base_graph_uses_guard_cf_claim {
+        bail!(
+            "package schema {schema_version} predates PE GuardCF function recovery but its base analysis contains schema-9 GuardCF semantics; legacy envelopes cannot be relabeled, so reanalyze the exact original binary"
+        );
+    }
+    Ok(())
+}
+
+fn require_v8_delay_import_marker(payload: &Value, schema_version: u32) -> Result<()> {
+    debug_assert!(schema_version >= DELAY_IMPORT_SCHEMA_VERSION);
     let Some(analysis) = payload
         .pointer("/base_analysis/analysis")
         .and_then(Value::as_object)
@@ -655,7 +760,7 @@ fn require_v8_delay_import_marker(payload: &Value) -> Result<()> {
     };
     if !analysis.contains_key("delay_imports") {
         bail!(
-            "package schema 8 requires an explicit delay_imports inventory, even when empty; a legacy package without that marker cannot be migrated by changing only its envelope label, so reanalyze the exact original binary"
+            "package schema {schema_version} requires an explicit delay_imports inventory, even when empty; a legacy package without that marker cannot be migrated by changing only its envelope label, so reanalyze the exact original binary"
         );
     }
     Ok(())
@@ -1072,6 +1177,10 @@ impl SchemaV1PeAnalysis {
             export_library_name: self.export_library_name,
             exports: self.exports,
             runtime_functions: self.runtime_functions,
+            load_config_size: None,
+            guard_flags: None,
+            guard_cf_function_table_rva: None,
+            guard_cf_functions: Vec::new(),
             tls_callback_table_rva: None,
             tls_callback_scan_truncated: false,
             tls_callbacks: Vec::new(),
@@ -1214,6 +1323,9 @@ fn export(args: ExportArgs) -> Result<()> {
         println!("{line}");
     }
     if let Some(line) = package_data.delay_import_availability.export_summary_line() {
+        println!("{line}");
+    }
+    if let Some(line) = package_data.guard_cf_availability.export_summary_line() {
         println!("{line}");
     }
     println!(
@@ -2276,22 +2388,9 @@ fn default_package_path(binary: &Path) -> PathBuf {
 
 fn print_session_summary(
     session: &AnalysisSession,
-    code_recovery_availability: CodeRecoveryAvailability,
-    transitive_thunk_recovery_availability: TransitiveThunkRecoveryAvailability,
-    string_data_recovery_availability: StringDataRecoveryAvailability,
-    rtti_recovery_availability: RttiRecoveryAvailability,
-    tls_callback_availability: TlsCallbackAvailability,
-    delay_import_availability: DelayImportAvailability,
+    availability: AnalysisFeatureAvailability,
 ) -> Result<()> {
-    print_analysis_summary(
-        session.base_analysis(),
-        code_recovery_availability,
-        transitive_thunk_recovery_availability,
-        string_data_recovery_availability,
-        rtti_recovery_availability,
-        tls_callback_availability,
-        delay_import_availability,
-    );
+    print_analysis_summary(session.base_analysis(), availability);
     let succeeded = session
         .plugin_runs()
         .iter()
@@ -2329,15 +2428,16 @@ fn print_session_summary(
     Ok(())
 }
 
-fn print_analysis_summary(
-    analysis: &BinaryAnalysis,
-    code_recovery_availability: CodeRecoveryAvailability,
-    transitive_thunk_recovery_availability: TransitiveThunkRecoveryAvailability,
-    string_data_recovery_availability: StringDataRecoveryAvailability,
-    rtti_recovery_availability: RttiRecoveryAvailability,
-    tls_callback_availability: TlsCallbackAvailability,
-    delay_import_availability: DelayImportAvailability,
-) {
+fn print_analysis_summary(analysis: &BinaryAnalysis, availability: AnalysisFeatureAvailability) {
+    let AnalysisFeatureAvailability {
+        code_recovery: code_recovery_availability,
+        transitive_thunk_recovery: transitive_thunk_recovery_availability,
+        string_data_recovery: string_data_recovery_availability,
+        rtti_recovery: rtti_recovery_availability,
+        tls_callbacks: tls_callback_availability,
+        delay_imports: delay_import_availability,
+        guard_cf: guard_cf_availability,
+    } = availability;
     let identity = analysis.identity();
     println!("size: {} bytes", identity.size);
     println!("sha256: {}", identity.id);
@@ -2404,6 +2504,7 @@ fn print_analysis_summary(
                 forwarder_count
             );
             println!("runtime functions: {}", pe.runtime_functions.len());
+            println!("{}", guard_cf_summary_line(pe, guard_cf_availability));
             for line in tls_callback_summary_lines(pe, tls_callback_availability) {
                 println!("{line}");
             }
@@ -2474,6 +2575,35 @@ fn delay_import_summary_line(
         }
         DelayImportAvailability::Unavailable(schema_version) => format!(
             "delay imports: unavailable (not recorded by schema {schema_version}; reanalyze the exact original binary)"
+        ),
+    }
+}
+
+fn guard_cf_summary_line(
+    pe: &resymbol_analysis::PeAnalysis,
+    availability: GuardCfAvailability,
+) -> String {
+    match availability {
+        GuardCfAvailability::Recorded => {
+            let fid_suppressed = pe
+                .guard_cf_functions
+                .iter()
+                .filter(|function| function.is_fid_suppressed())
+                .count();
+            let export_suppressed = pe
+                .guard_cf_functions
+                .iter()
+                .filter(|function| function.is_export_suppressed())
+                .count();
+            let function_candidates = pe.guard_cf_functions.len();
+            format!(
+                "GuardCF functions: {} record(s), {} function candidate(s), {fid_suppressed} FID-suppressed for CFG, {export_suppressed} export-suppressed",
+                pe.guard_cf_functions.len(),
+                function_candidates
+            )
+        }
+        GuardCfAvailability::Unavailable(schema_version) => format!(
+            "GuardCF functions: unavailable (not recorded by schema {schema_version}; reanalyze the exact original binary)"
         ),
     }
 }
@@ -3317,6 +3447,43 @@ mod tests {
         bytes
     }
 
+    fn pe_guard_cf_fixture() -> Vec<u8> {
+        const IMAGE_BASE: u64 = 0x0000_0001_4000_0000;
+        const LOAD_CONFIG_RVA: u32 = 0x1380;
+        const FUNCTION_TABLE_RVA: u32 = 0x1480;
+        const GUARD_FLAGS: u32 = 0x1000_0400;
+
+        let mut bytes = pe_fixture();
+        set_directory(&mut bytes, 10, LOAD_CONFIG_RVA, 148);
+        let load_config = file_offset(LOAD_CONFIG_RVA);
+        put_u32(&mut bytes, load_config, 148);
+        put_u64(
+            &mut bytes,
+            load_config + 128,
+            IMAGE_BASE + u64::from(FUNCTION_TABLE_RVA),
+        );
+        put_u64(&mut bytes, load_config + 136, 3);
+        put_u32(&mut bytes, load_config + 144, GUARD_FLAGS);
+
+        let table = file_offset(FUNCTION_TABLE_RVA);
+        for (index, (rva, metadata)) in [(0x1040, 0x02), (0x1060, 0x01), (0x1080, 0x80)]
+            .into_iter()
+            .enumerate()
+        {
+            put_u32(&mut bytes, table + index * 5, rva);
+            bytes[table + index * 5 + 4] = metadata;
+        }
+
+        let thunk = file_offset(0x1040);
+        bytes[thunk] = 0xe9;
+        put_u32(&mut bytes, thunk + 1, 0x1050 - 0x1040 - 5);
+        let suppressed_thunk = file_offset(0x1060);
+        bytes[suppressed_thunk] = 0xe9;
+        put_u32(&mut bytes, suppressed_thunk + 1, 0x1070 - 0x1060 - 5);
+        bytes[file_offset(0x1080)] = 0xc3;
+        bytes
+    }
+
     fn create_plugin(root: &Path, id: &str) -> PathBuf {
         let plugin = root.join("example");
         fs::create_dir(&plugin).expect("create plugin directory");
@@ -3886,7 +4053,139 @@ entrypoint = "Plugin.dll"
     }
 
     #[test]
-    fn schema_v8_delay_imports_stay_additive_for_symbols_read_and_projection() {
+    fn guard_cf_summaries_distinguish_current_and_legacy_data() {
+        let analysis = analyze_bytes(&pe_guard_cf_fixture()).expect("analyze GuardCF fixture");
+        let BinaryAnalysis::Pe(pe) = &analysis else {
+            panic!("PE analysis expected");
+        };
+        assert_eq!(
+            guard_cf_summary_line(pe, GuardCfAvailability::Recorded),
+            "GuardCF functions: 3 record(s), 3 function candidate(s), 1 FID-suppressed for CFG, 1 export-suppressed"
+        );
+        assert_eq!(GuardCfAvailability::Recorded.export_summary_line(), None);
+
+        for schema_version in 1..GUARD_CF_SCHEMA_VERSION {
+            let availability = GuardCfAvailability::Unavailable(schema_version);
+            assert_eq!(
+                guard_cf_summary_line(pe, availability),
+                format!(
+                    "GuardCF functions: unavailable (not recorded by schema {schema_version}; reanalyze the exact original binary)"
+                )
+            );
+            assert_eq!(
+                availability.export_summary_line(),
+                Some(format!(
+                    "GuardCF functions: unavailable (schema {schema_version} package predates PE GuardCF recovery; reanalyze the exact original binary)"
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn schema_v9_guard_cf_stays_additive_for_symbols_read_and_projection() {
+        let base_analysis = analyze_bytes(&pe_guard_cf_fixture()).expect("analyze GuardCF fixture");
+        let BinaryAnalysis::Pe(pe) = &base_analysis else {
+            panic!("PE analysis expected");
+        };
+        assert_eq!(pe.load_config_size, Some(148));
+        assert_eq!(pe.guard_flags, Some(0x1000_0400));
+        assert_eq!(pe.guard_cf_function_table_rva, Some(0x1480));
+        assert_eq!(pe.guard_cf_functions.len(), 3);
+        assert_eq!(pe.guard_cf_functions[0].metadata, [0x02]);
+        assert!(pe.guard_cf_functions[1].is_fid_suppressed());
+        assert_eq!(
+            pe.symbol_graph
+                .claims()
+                .iter()
+                .filter(|claim| claim.provenance().method == "pe-guard-cf-function")
+                .count(),
+            3
+        );
+        assert!(pe.thunks.iter().any(|thunk| thunk.rva == 0x1040));
+        assert!(pe.thunks.iter().any(|thunk| thunk.rva == 0x1060));
+
+        let detached =
+            serde_json::to_value(&base_analysis).expect("serialize symbols.read base analysis");
+        assert_eq!(
+            detached["analysis"]["directories"]["load_config"],
+            serde_json::json!({"rva": 0x1380, "size": 148})
+        );
+        assert_eq!(detached["analysis"]["load_config_size"], 148);
+        assert_eq!(detached["analysis"]["guard_flags"], 0x1000_0400_u32);
+        assert_eq!(detached["analysis"]["guard_cf_function_table_rva"], 0x1480);
+        assert_eq!(
+            detached["analysis"]["guard_cf_functions"][2],
+            serde_json::json!({"table_index": 2, "rva": 0x1080, "metadata": [0x80]})
+        );
+
+        let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
+            .expect("create GuardCF analysis session");
+        let package = ResymPackage::from_bound_payload("0.1.0-schema9-test", session)
+            .expect("create GuardCF package");
+        assert_eq!(package.schema_version(), 9);
+        let projection = ExportProjection::from_session(package.payload())
+            .expect("project GuardCF session through neutral schema");
+        assert_eq!(projection.schema_version, 6);
+        let guard_function = projection
+            .functions
+            .iter()
+            .find(|function| function.rva == 0x1080)
+            .expect("GuardCF function remains a projected function entry");
+        let guard_attribution = guard_function
+            .entry_attribution
+            .as_ref()
+            .expect("GuardCF metadata establishes a function entry");
+        assert_eq!(guard_attribution.confidence, 0.99);
+        assert_eq!(guard_attribution.provenance.method, "pe-guard-cf-function");
+        assert!(matches!(
+            &guard_attribution.provenance.producer,
+            resymbol_export::ExportProducer::Core { component, .. }
+                if component == "resymbol-analysis"
+        ));
+        let fid_suppressed_function = projection
+            .functions
+            .iter()
+            .find(|function| function.rva == 0x1060)
+            .expect("FID-suppressed GuardCF record remains a projected function entry");
+        let fid_suppressed_attribution = fid_suppressed_function
+            .entry_attribution
+            .as_ref()
+            .expect("FID suppression does not erase GuardCF function evidence");
+        assert_eq!(
+            fid_suppressed_attribution.provenance.method,
+            "pe-guard-cf-function"
+        );
+        let thunk = projection
+            .thunks
+            .iter()
+            .find(|thunk| thunk.rva == 0x1040)
+            .expect("GuardCF-seeded thunk remains in the neutral projection");
+        assert!(matches!(
+            thunk.target,
+            resymbol_export::ExportControlFlowTarget::Function { rva: 0x1050 }
+        ));
+        assert_eq!(thunk.attribution.provenance.method, "pe-x64-jump-thunk");
+        let fid_suppressed_thunk = projection
+            .thunks
+            .iter()
+            .find(|thunk| thunk.rva == 0x1060)
+            .expect("FID-suppressed GuardCF record remains a thunk seed");
+        assert!(matches!(
+            fid_suppressed_thunk.target,
+            resymbol_export::ExportControlFlowTarget::Function { rva: 0x1070 }
+        ));
+        assert_eq!(
+            fid_suppressed_thunk.attribution.provenance.method,
+            "pe-x64-jump-thunk"
+        );
+        let projection_json =
+            serde_json::to_string(&projection).expect("serialize neutral projection");
+        assert!(!projection_json.contains("guard_cf"));
+        assert!(!projection_json.contains("load_config"));
+    }
+
+    #[test]
+    fn delay_imports_stay_additive_for_symbols_read_and_projection() {
         let base_analysis =
             analyze_bytes(&pe_delay_import_fixture()).expect("analyze delay-import fixture");
         let BinaryAnalysis::Pe(pe) = &base_analysis else {
@@ -3908,9 +4207,9 @@ entrypoint = "Plugin.dll"
 
         let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
             .expect("create delay-import analysis session");
-        let package = ResymPackage::from_bound_payload("0.1.0-schema8-test", session)
+        let package = ResymPackage::from_bound_payload("0.1.0-schema9-test", session)
             .expect("create delay-import package");
-        assert_eq!(package.schema_version(), 8);
+        assert_eq!(package.schema_version(), CURRENT_SCHEMA_VERSION);
         let projection = ExportProjection::from_session(package.payload())
             .expect("project delay-import session through neutral schema");
         assert_eq!(projection.schema_version, 6);
@@ -4363,7 +4662,7 @@ entrypoint = "Plugin.dll"
 
         let package: ResymPackage<AnalysisSession> =
             read_file_bound(&output).expect("read bound package");
-        assert_eq!(CURRENT_SCHEMA_VERSION, 8);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 9);
         assert_eq!(package.schema_version(), CURRENT_SCHEMA_VERSION);
         assert_eq!(
             package.binary_sha256(),
@@ -4426,7 +4725,41 @@ entrypoint = "Plugin.dll"
         .expect("JSON inspection serializes validated package");
     }
 
+    fn strip_schema_v9_guard_cf_semantics(value: &mut Value) {
+        let pe = value
+            .pointer_mut("/payload/base_analysis/analysis")
+            .and_then(Value::as_object_mut)
+            .expect("serialized PE analysis object");
+        for field in [
+            "load_config_size",
+            "guard_flags",
+            "guard_cf_function_table_rva",
+            "guard_cf_functions",
+        ] {
+            pe.remove(field);
+        }
+        pe.get_mut("directories")
+            .and_then(Value::as_object_mut)
+            .expect("serialized PE data directories")
+            .remove("load_config");
+        pe.get_mut("symbol_graph")
+            .and_then(|graph| graph.get_mut("claims"))
+            .and_then(Value::as_array_mut)
+            .expect("serialized base claims")
+            .retain(|claim| {
+                claim.pointer("/provenance/method").and_then(Value::as_str)
+                    != Some("pe-guard-cf-function")
+                    || claim
+                        .pointer("/provenance/producer/kind")
+                        .and_then(Value::as_str)
+                        != Some("core")
+            });
+    }
+
     fn strip_schema_v8_delay_import_semantics(value: &mut Value) {
+        // Every schema predating delay imports also predates GuardCF. Cascade
+        // the newer semantic strip so legacy fixture rewrites cannot retain it.
+        strip_schema_v9_guard_cf_semantics(value);
         let pe = value
             .pointer_mut("/payload/base_analysis/analysis")
             .and_then(Value::as_object_mut)
@@ -4625,6 +4958,7 @@ entrypoint = "Plugin.dll"
             loaded.delay_import_availability,
             DelayImportAvailability::Recorded
         );
+        assert_eq!(loaded.guard_cf_availability, GuardCfAvailability::Recorded);
 
         let verified = verify_inspection_binary(&loaded, &binary_path)
             .expect("exact current binary passes the inspection gate");
@@ -4964,11 +5298,20 @@ entrypoint = "Plugin.dll"
             decoded.delay_import_availability,
             DelayImportAvailability::Unavailable(1)
         );
+        assert_eq!(
+            decoded.guard_cf_availability,
+            GuardCfAvailability::Unavailable(1)
+        );
         let BinaryAnalysis::Pe(pe) = decoded.package.payload().base_analysis() else {
             panic!("PE analysis expected");
         };
         assert!(pe.directories.delay_imports.is_none());
         assert!(pe.delay_imports.is_empty());
+        assert!(pe.directories.load_config.is_none());
+        assert!(pe.load_config_size.is_none());
+        assert!(pe.guard_flags.is_none());
+        assert!(pe.guard_cf_function_table_rva.is_none());
+        assert!(pe.guard_cf_functions.is_empty());
         assert!(pe.directories.tls.is_none());
         assert!(pe.tls_callback_table_rva.is_none());
         assert!(!pe.tls_callback_scan_truncated);
@@ -5561,16 +5904,16 @@ entrypoint = "Plugin.dll"
     }
 
     #[test]
-    fn cli_rejects_schema_v9_before_decoding_the_analysis_payload() {
+    fn cli_rejects_schema_v10_before_decoding_the_analysis_payload() {
         let temp = tempfile::tempdir().expect("create temporary directory");
-        let path = temp.path().join("schema-v9.resym");
+        let path = temp.path().join("schema-v10.resym");
         let base_analysis = analyze_bytes(&pe_fixture()).expect("analyze PE fixture");
         let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
             .expect("create base-only session");
         let package = ResymPackage::from_bound_payload("0.1.0-future", session)
             .expect("create current package value");
         let mut value = serde_json::to_value(package).expect("serialize package value");
-        value["schema_version"] = serde_json::json!(9);
+        value["schema_version"] = serde_json::json!(10);
         value["payload"] = serde_json::json!("not an analysis session");
         fs::write(
             &path,
@@ -5579,35 +5922,35 @@ entrypoint = "Plugin.dll"
         .expect("write future package");
 
         let error = match read_analysis_package(&path, false) {
-            Ok(_) => panic!("schema 9 must be rejected"),
+            Ok(_) => panic!("schema 10 must be rejected"),
             Err(error) => error,
         };
         let diagnostic = format!("{error:#}");
-        assert!(diagnostic.contains("unsupported package schema 9"));
-        assert!(diagnostic.contains("schemas 1 through 8"));
+        assert!(diagnostic.contains("unsupported package schema 10"));
+        assert!(diagnostic.contains("schemas 1 through 9"));
         assert!(!diagnostic.contains("analysis payload"));
     }
 
     #[test]
-    fn schema_v8_requires_an_explicit_delay_import_inventory_marker() {
+    fn schema_v9_requires_an_explicit_guard_cf_inventory_marker() {
         let temp = tempfile::tempdir().expect("create temporary directory");
-        let path = temp.path().join("relabeled-schema-v7.resym");
+        let path = temp.path().join("schema-v9-without-guard-cf-marker.resym");
         let base_analysis = analyze_bytes(&pe_fixture()).expect("analyze PE fixture");
         let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
             .expect("create base-only session");
-        let package = ResymPackage::from_bound_payload("0.1.0-schema8", session)
+        let package = ResymPackage::from_bound_payload("0.1.0-schema9", session)
             .expect("create current package value");
         let mut value = serde_json::to_value(package).expect("serialize current package value");
         assert_eq!(
-            value.pointer("/payload/base_analysis/analysis/delay_imports"),
+            value.pointer("/payload/base_analysis/analysis/guard_cf_functions"),
             Some(&Value::Array(Vec::new())),
-            "schema 8 must serialize its inventory marker even when no delay imports exist"
+            "schema 9 must serialize its inventory marker even when no GuardCF table exists"
         );
         value
             .pointer_mut("/payload/base_analysis/analysis")
             .and_then(Value::as_object_mut)
             .expect("serialized PE analysis object")
-            .remove("delay_imports");
+            .remove("guard_cf_functions");
         fs::write(
             &path,
             serde_json::to_vec(&value).expect("encode relabeled package"),
@@ -5615,13 +5958,262 @@ entrypoint = "Plugin.dll"
         .expect("write relabeled package");
 
         let error = match read_analysis_package(&path, false) {
-            Ok(_) => panic!("schema 8 must require its explicit inventory marker"),
+            Ok(_) => panic!("schema 9 must require its explicit GuardCF inventory marker"),
             Err(error) => error,
         };
         let diagnostic = format!("{error:#}");
-        assert!(diagnostic.contains("schema 8 requires an explicit delay_imports inventory"));
+        assert!(diagnostic.contains("schema 9 requires an explicit guard_cf_functions inventory"));
         assert!(diagnostic.contains("cannot be migrated by changing only its envelope label"));
+        assert!(!diagnostic.contains("delay_imports inventory"));
         assert!(!diagnostic.contains("cannot decode current analysis payload"));
+    }
+
+    #[test]
+    fn pre_v9_guard_cf_gate_rejects_exact_base_shapes_and_core_provenance() {
+        let shapes = [
+            serde_json::json!({"load_config_size": 148}),
+            serde_json::json!({"guard_flags": 0}),
+            serde_json::json!({"guard_cf_function_table_rva": null}),
+            serde_json::json!({"guard_cf_functions": []}),
+            serde_json::json!({"directories": {"load_config": null}}),
+            serde_json::json!({
+                "symbol_graph": {"claims": [{
+                    "provenance": {
+                        "producer": {"kind": "core"},
+                        "method": "pe-guard-cf-function"
+                    }
+                }]}
+            }),
+        ];
+        for schema_version in 1..GUARD_CF_SCHEMA_VERSION {
+            for analysis in &shapes {
+                let payload = serde_json::json!({
+                    "base_analysis": {"analysis": analysis},
+                    "plugin_claims": []
+                });
+                let error = reject_pre_v9_guard_cf_semantics(&payload, schema_version)
+                    .expect_err("an exact schema-9 GuardCF shape must reject a legacy envelope");
+                let diagnostic = error.to_string();
+                assert!(diagnostic.contains(&format!("package schema {schema_version}")));
+                assert!(diagnostic.contains("schema-9 GuardCF semantics"));
+                assert!(diagnostic.contains("cannot be relabeled"));
+            }
+        }
+    }
+
+    #[test]
+    fn pre_v9_guard_cf_gate_ignores_plugin_and_nested_lookalikes() {
+        let allowed = [
+            serde_json::json!({
+                "base_analysis": {
+                    "analysis": {
+                        "extension": {
+                            "guard_cf_functions": [],
+                            "directories": {"load_config": null}
+                        },
+                        "symbol_graph": {"claims": []}
+                    }
+                },
+                "plugin_claims": [{
+                    "guard_cf_functions": [],
+                    "provenance": {
+                        "producer": {"kind": "core"},
+                        "method": "pe-guard-cf-function"
+                    }
+                }]
+            }),
+            serde_json::json!({
+                "base_analysis": {
+                    "analysis": {
+                        "symbol_graph": {"claims": [{
+                            "provenance": {
+                                "producer": {"kind": "plugin"},
+                                "method": "pe-guard-cf-function"
+                            }
+                        }]}
+                    }
+                },
+                "plugin_claims": []
+            }),
+            serde_json::json!({
+                "base_analysis": {
+                    "guard_cf_functions": [],
+                    "analysis": {
+                        "guard_cf_function": [],
+                        "directories": {"load_configuration": null},
+                        "symbol_graph": {"claims": [{
+                            "provenance": {
+                                "producer": {"kind": "core"},
+                                "method": "plugin-pe-guard-cf-function"
+                            }
+                        }]}
+                    }
+                },
+                "plugin_claims": []
+            }),
+        ];
+        for schema_version in 1..GUARD_CF_SCHEMA_VERSION {
+            for payload in &allowed {
+                reject_pre_v9_guard_cf_semantics(payload, schema_version)
+                    .expect("plugin claims, nested extensions, and lookalike names remain valid");
+            }
+        }
+    }
+
+    #[test]
+    fn cli_runs_the_pre_v9_guard_cf_gate_before_older_gates_and_decoding() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let base_analysis = analyze_bytes(&pe_fixture()).expect("analyze PE fixture");
+        let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
+            .expect("create base-only session");
+        let package = ResymPackage::from_bound_payload("0.1.0", session)
+            .expect("create current package value");
+        let current = serde_json::to_value(package).expect("serialize current package value");
+
+        for schema_version in 1..GUARD_CF_SCHEMA_VERSION {
+            let mut value = current.clone();
+            value["schema_version"] = serde_json::json!(schema_version);
+            let path = temp
+                .path()
+                .join(format!("relabeled-guard-cf-schema-{schema_version}.resym"));
+            fs::write(
+                &path,
+                serde_json::to_vec(&value).expect("encode relabeled package"),
+            )
+            .expect("write relabeled package");
+
+            let error = match read_analysis_package(&path, false) {
+                Ok(_) => panic!("schema {schema_version} must reject schema-9 GuardCF semantics"),
+                Err(error) => error,
+            };
+            let diagnostic = format!("{error:#}");
+            assert!(diagnostic.contains("schema-9 GuardCF semantics"));
+            assert!(!diagnostic.contains("schema-8 delay-import semantics"));
+            assert!(!diagnostic.contains("cannot decode schema"));
+        }
+    }
+
+    #[test]
+    fn schema_v8_keeps_delay_imports_but_reports_guard_cf_unavailable() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let path = temp.path().join("schema-v8.resym");
+        let output = temp.path().join("schema-v8.json");
+        let base_analysis =
+            analyze_bytes(&pe_delay_import_fixture()).expect("analyze delay-import PE fixture");
+        let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
+            .expect("create base-only session");
+        let package = ResymPackage::from_bound_payload("0.1.0-schema8", session)
+            .expect("create current package value");
+        let mut value = serde_json::to_value(package).expect("serialize current package value");
+        value["schema_version"] = serde_json::json!(8);
+        strip_schema_v9_guard_cf_semantics(&mut value);
+        fs::write(
+            &path,
+            serde_json::to_vec(&value).expect("encode schema-v8 package"),
+        )
+        .expect("write schema-v8 package");
+
+        let decoded = read_analysis_package(&path, true).expect("decode schema-v8 package");
+        assert_eq!(decoded.package.schema_version(), 8);
+        assert_eq!(
+            decoded.delay_import_availability,
+            DelayImportAvailability::Recorded
+        );
+        assert_eq!(
+            decoded.guard_cf_availability,
+            GuardCfAvailability::Unavailable(8)
+        );
+        assert!(decoded.legacy_inspection_source.is_some());
+        let BinaryAnalysis::Pe(pe) = decoded.package.payload().base_analysis() else {
+            panic!("PE analysis expected");
+        };
+        assert_eq!(pe.delay_imports.len(), 1);
+        assert_eq!(pe.delay_imports[0].name, "DELAYED.dll");
+        assert!(matches!(
+            &pe.delay_imports[0].entries[0].target,
+            resymbol_analysis::ImportTarget::Name { name, .. } if name == "Delayed"
+        ));
+        assert!(pe.directories.load_config.is_none());
+        assert!(pe.guard_cf_functions.is_empty());
+        assert_eq!(
+            serde_json::from_str::<Value>(
+                &decoded
+                    .to_pretty_inspection_json()
+                    .expect("serialize legacy inspection JSON")
+            )
+            .expect("inspection JSON is valid"),
+            value
+        );
+
+        inspect(InspectArgs {
+            package: path.clone(),
+            binary: None,
+            json: true,
+        })
+        .expect("JSON inspection accepts schema 8");
+        export(ExportArgs {
+            package: path,
+            format: ExportFormat::Json,
+            output: Some(output.clone()),
+            binary: None,
+        })
+        .expect("JSON export accepts schema 8");
+        let projection: Value =
+            serde_json::from_slice(&fs::read(output).expect("read schema-v8 projection"))
+                .expect("schema-v8 projection JSON is valid");
+        assert_eq!(projection["schema_version"], 6);
+        let projection_json = serde_json::to_string(&projection).expect("serialize projection");
+        assert!(!projection_json.contains("guard_cf"));
+        assert!(!projection_json.contains("load_config"));
+    }
+
+    #[test]
+    fn schemas_v8_and_v9_require_the_explicit_delay_import_inventory_marker() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let base_analysis = analyze_bytes(&pe_fixture()).expect("analyze PE fixture");
+        let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
+            .expect("create base-only session");
+        let package = ResymPackage::from_bound_payload("0.1.0-schema9", session)
+            .expect("create current package value");
+        let current = serde_json::to_value(package).expect("serialize current package value");
+        for schema_version in [8, 9] {
+            let mut value = current.clone();
+            value["schema_version"] = serde_json::json!(schema_version);
+            if schema_version == 8 {
+                strip_schema_v9_guard_cf_semantics(&mut value);
+            }
+            assert_eq!(
+                value.pointer("/payload/base_analysis/analysis/delay_imports"),
+                Some(&Value::Array(Vec::new())),
+                "schema {schema_version} must serialize its inventory marker even when no delay imports exist"
+            );
+            value
+                .pointer_mut("/payload/base_analysis/analysis")
+                .and_then(Value::as_object_mut)
+                .expect("serialized PE analysis object")
+                .remove("delay_imports");
+            let path = temp.path().join(format!(
+                "missing-delay-marker-schema-{schema_version}.resym"
+            ));
+            fs::write(
+                &path,
+                serde_json::to_vec(&value).expect("encode relabeled package"),
+            )
+            .expect("write relabeled package");
+
+            let error = match read_analysis_package(&path, false) {
+                Ok(_) => panic!(
+                    "schema {schema_version} must require its explicit delay-import inventory marker"
+                ),
+                Err(error) => error,
+            };
+            let diagnostic = format!("{error:#}");
+            assert!(diagnostic.contains(&format!(
+                "schema {schema_version} requires an explicit delay_imports inventory"
+            )));
+            assert!(diagnostic.contains("cannot be migrated by changing only its envelope label"));
+            assert!(!diagnostic.contains("cannot decode"));
+        }
     }
 
     #[test]
@@ -5697,6 +6289,7 @@ entrypoint = "Plugin.dll"
         for schema_version in 1..DELAY_IMPORT_SCHEMA_VERSION {
             let mut value = current.clone();
             value["schema_version"] = serde_json::json!(schema_version);
+            strip_schema_v9_guard_cf_semantics(&mut value);
             value["payload"]["base_analysis"]["analysis"]["delay_imports"] =
                 Value::Array(Vec::new());
             let path = temp.path().join(format!(

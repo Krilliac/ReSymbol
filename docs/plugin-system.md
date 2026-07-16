@@ -405,7 +405,15 @@ flag to that detached JSON object. Package schema 8 adds the separate ordered mo
 directory and inventory: the DLL name, descriptor RVA and exact attributes value,
 name/HMOD/IAT/INT base RVAs, optional BIAT/UIAT base RVAs, each entry's lookup/IAT RVAs and
 hint/name or ordinal, and the timestamp. Raw array contents are not serialized. Those fields are
-additive data, not a new managed SDK type or plugin assertion; the plugin API remains unchanged.
+additive data, not a new managed SDK type or plugin assertion. Package schema 9 similarly adds
+`directories.load_config`, `load_config_size`, `guard_flags`, `guard_cf_function_table_rva`, and the
+mandatory `guard_cf_functions[{table_index,rva,metadata}]` array. Its length is the retained count;
+raw GFIDS table bytes are not separately serialized. Every structurally valid record, including one
+marked `IMAGE_GUARD_FLAG_FID_SUPPRESSED`, `IMAGE_GUARD_FLAG_EXPORT_SUPPRESSED`, or both, emits core
+function-entry evidence and joins one-instruction thunk seeding. FID suppression describes CFG
+eligibility rather than whether the target is a function. The derived FID/export suppression
+booleans stay claim evidence rather than record fields. The plugin API remains unchanged, and only
+`symbols.read` recipients observe this detached base-analysis state.
 
 #### Managed plugin author quickstart
 
@@ -498,7 +506,10 @@ it adds no assertion or control-flow target shape. Plugins granted `symbols.read
 additive TLS directory and ordered callback fields in detached base-analysis JSON. Package schema
 8's delay-import inventory is another additive `symbols.read` field, while delay-IAT calls and
 thunks reuse the existing `import-IAT` target shape. The plugin API, WIT/ABI,
-`resymbol.plugin-wire` 1.0 handshake, and neutral projection schema 6 remain unchanged.
+`resymbol.plugin-wire` 1.0 handshake, and neutral projection schema 6 remain unchanged. Package
+schema 9's load-config/GuardCF inventory is likewise additive `symbols.read` state; GuardCF claims
+and supported seeded thunks reuse existing `function-entry` and exact `thunk-target` assertions, so the same API, WIT/ABI, wire
+1.0 handshake, and projection schema 6 remain unchanged.
 
 ### Tool-hosted bridges (planned host)
 

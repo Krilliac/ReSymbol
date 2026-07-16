@@ -28,7 +28,8 @@ The current alpha implements and tests an end-to-end, deliberately narrow analys
 
 - safe, bounded ingestion of PE32+ x86-64 binaries, including image metadata, sections,
   conventional imports, modern RVA-form delay imports, exports, forwarded exports, x64
-  exception-directory (`RUNTIME_FUNCTION`) records, and ordered TLS-directory callback entries;
+  exception-directory (`RUNTIME_FUNCTION`) records, ordered TLS-directory callback entries, and
+  load-config GuardCF function-table records;
 - bounded discovery of modern MSVC x64 Rev1 RTTI and vftables from file-backed compiler metadata,
   including both legacy 24-byte and `BCD_HASPCHD` 28-byte base-class descriptors, validated
   class/type names, and contiguous executable slot candidates;
@@ -47,11 +48,11 @@ The current alpha implements and tests an end-to-end, deliberately narrow analys
   profile-sensitive semantic oracle covering imports, exports, unwind functions, direct calls,
   internal/import thunks, strings, data references, and modern RTTI/vftables; focused synthetic PE
   fixtures cover read-only pointer control flow, dual RTTI descriptor layouts, transitive thunk
-  chains, bounded TLS callback discovery, and modern delay-load imports without changing the four
-  corpus binaries, their hashes, or their oracle; these repository/source
+  chains, bounded TLS callback discovery, modern delay-load imports, and GuardCF function tables
+  without changing the four corpus binaries, their hashes, or their oracle; these repository/source
   fixtures are analyzer test data and are not bundled in portable runtime archives;
 - conservative symbol-graph generation from exact export names, metadata-backed function
-  boundaries, entry-point and TLS-callback function-entry candidates, direct calls, thunks,
+  boundaries, entry-point, GuardCF, and TLS-callback function-entry candidates, direct calls, thunks,
   recovered strings, and data references, with SHA-256 binary identity, evidence, provenance,
   confidence, and claim validation;
 - canonical JSON `.resym` packages whose `AnalysisSession` payload keeps deterministic base
@@ -113,8 +114,9 @@ reference to the slot. Seeded `E9` and `EB` internal thunks remain supported. Ex
 conventional or delay IAT slot remains
 an import target, while any other accepted slot resolves one read-only pointer hop to executable
 code. A pointer thunk records its slot and endpoint without requiring a paired data reference. The
-built-in pass checks its original deterministic thunk seeds first, including each retained TLS
-callback endpoint, then follows internal endpoints of retained thunks in sorted hop layers. It
+built-in pass checks its original deterministic thunk seeds first, including every retained GuardCF
+function and retained TLS callback endpoint, then follows internal endpoints of retained thunks in
+sorted hop layers. It
 preserves each exact relationship (`A -> B`, `B -> C`)
 instead of rewriting the first thunk or a direct call to a terminal endpoint. A global visited set
 terminates connected cycles while retaining their exact edges; a disconnected persisted cycle is
@@ -125,8 +127,9 @@ starts and retains at most 8,192 direct calls, 32,768 supported RIP-relative dat
 and marks code recovery partial. These are heuristic-confidence findings:
 reachable embedded data can still decode as instructions, while an invalid encoding or unsupported
 branch can omit later relationships on that path. An internal target covered by known
-`RUNTIME_FUNCTION` metadata is suppressed unless its RVA matches a recorded runtime-function
-begin. The pass does not persist a basic-block graph, infer erased identifiers, invent names or
+`RUNTIME_FUNCTION` metadata is suppressed unless its RVA matches an authoritative metadata function
+start: a runtime-function begin or retained GuardCF function start. The pass does
+not persist a basic-block graph, infer erased identifiers, invent names or
 sizes, recover register-indirect
 control flow, or claim a complete call graph. A separate bounded pass retains exact, fully
 terminated printable ASCII and valid UTF-16LE strings from eligible data, with deterministic
@@ -144,13 +147,37 @@ and `callback_slot_rva` plus `table_index` evidence, so duplicate target RVAs re
 claims. Retained callback targets also join the deterministic one-instruction thunk seeds; this
 does not turn callback bodies into another instruction sweep. ReSymbol does not execute callbacks
 or infer their names or extents.
+
+GuardCF discovery reads PE32+ optional-header data-directory entry 10 as the load-config directory.
+A present directory must be fully file-backed and contain its four-byte internal structure-size
+field. That internal size must be between 4 and the data-directory size; only a size of at least
+148 bytes exposes the PE32+ `GuardCFFunctionTable`, `GuardCFFunctionCount`, and `GuardFlags` fields.
+The table VA and count must be both zero or both nonzero, and a nonzero pair requires
+`IMAGE_GUARD_CF_FUNCTION_TABLE_PRESENT`. ReSymbol converts the preferred-image table VA to a
+checked RVA. A count above 262,144, an oversized table, or any malformed record is a hard analysis
+error; accepted tables are retained in full rather than truncated to a prefix. Records are `4 + n`
+bytes, where `n` is selected by the high `GuardFlags` nibble.
+The table must be fully file-backed, disjoint from the load-config directory, and contain strictly
+increasing unique RVAs whose targets begin in file-backed executable data. The disjointness rule is
+a ReSymbol hardening policy rather than a requirement stated by the PE format. ReSymbol preserves
+each record's `n` metadata bytes exactly and opaquely. Every structurally valid record, including a
+record marked `IMAGE_GUARD_FLAG_FID_SUPPRESSED`, `IMAGE_GUARD_FLAG_EXPORT_SUPPRESSED`, or both,
+produces an exact `FunctionEntry` claim and joins the initial one-instruction thunk seeds. FID
+suppression describes CFG eligibility rather than whether the target is a function;
+export-suppressed targets must be 16-byte aligned. Claim evidence records both suppression booleans
+alongside the table index and raw metadata. ReSymbol does not sweep a GuardCF
+function body or infer a name or extent from GFIDS alone.
+
 Modern PE32+ delay-import discovery reads optional-header data-directory entry 13 as ordered
 32-byte descriptors followed by an all-zero descriptor; the rest of the declared range must be
 all-zero padding. ReSymbol accepts only the RVA-based
 `dlattrRva` form whose attributes value is exactly `1`; it deliberately rejects the legacy VA form,
 zero, and unknown attribute bits despite ambiguity in the generic PE table documentation. Every
-active descriptor must provide nonzero, fully file-backed name, module-handle (HMOD), delay-IAT,
-and delay-INT RVAs. HMOD bytes and section permissions remain opaque to this static-analysis slice.
+active descriptor must provide nonzero name, module-handle (HMOD), delay-IAT, and delay-INT RVAs.
+The name and import tables must be fully file-backed. The HMOD RVA instead needs an eight-byte
+storage range wholly mapped inside one section; that range may be zero-filled virtual data rather
+than file-backed. Its initial contents and section permissions remain opaque to this static-analysis
+slice.
 The paired 64-bit INT/IAT arrays must be fully backed and end together with null entries. INT, IAT,
 and each present bound-IAT (BIAT) or unload-IAT (UIAT) must be pairwise disjoint. Each present BIAT
 or UIAT must have a zero slot at the paired INT/IAT entry count. BIAT payload values before that
@@ -278,10 +305,10 @@ inspection data to stdout, ReSymbol validates the package and requires the suppl
 size and SHA-256 to match. Failures remain actionable on stderr. Human output then includes
 `source binary: <canonical-path>` and `identity gate: matched`.
 With `--json`, stdout remains the pure validated package JSON and does not gain those status lines.
-The gate works for every supported package schema, 1 through 8; it does not rerun analysis,
+The gate works for every supported package schema, 1 through 9; it does not rerun analysis,
 reconstruct missing legacy results, or rewrite either file.
 
-New analyses write package schema 8. `inspect` and `export` also accept schemas 1 through 7 through
+New analyses write package schema 9. `inspect` and `export` also accept schemas 1 through 8 through
 validated in-memory compatibility paths. Migration does not rewrite the source package or rerun
 analysis because `.resym` does not embed the executable bytes. Schema 1 therefore has no available
 recovered calls, thunks, strings, or data references. Schema 2 retains calls and thunks but predates
@@ -290,29 +317,38 @@ predate read-only function-pointer call and thunk resolution; schema 4 records t
 Schemas 1 through 4 all predate recovery of legacy 24-byte base-class descriptors; schema 5 records
 that RTTI form but predates transitive executable thunk-chain discovery. Schema 6 records that
 thunk closure but predates TLS callback discovery and callback-based thunk seeding. Schema 7
-records TLS callbacks but predates modern delay-import recovery. Schemas 2 through 7 keep their
+records TLS callbacks but predates modern delay-import recovery. Schema 8 records delay imports
+but predates load-config GuardCF recovery. Schemas 2 through 8 keep their
 already-recorded direct calls and thunks, but loading cannot synthesize a later result family. TLS
-callback recovery is unavailable for every schema 1-through-6 package, and delay-import recovery is
-unavailable for every schema 1-through-7 package. Reanalyze the exact original binary to produce
-schema 8 with all current recovery results. A schema 2 or 3 envelope containing a schema-4
+callback recovery is unavailable for every schema 1-through-6 package, delay-import recovery is
+unavailable for every schema 1-through-7 package, and GuardCF recovery is unavailable for every
+schema 1-through-8 package. Reanalyze the exact original binary to produce schema 9 with all
+current recovery results. A schema 2 or 3 envelope containing a schema-4
 `function-pointer` target, or any schema 1-through-4 envelope
 containing an RTTI base record whose `class_hierarchy_descriptor_rva` is missing or null, is
 rejected rather than treated as a relabeled legacy package. A schema 1-through-5 envelope likewise
 cannot contain a base thunk source that is valid only through schema-6 transitive endpoint seeding.
 Schemas 1 through 6 likewise cannot contain schema-7 TLS callback records or callback-only base
 thunk seeds. Schemas 1 through 7 cannot contain the exact schema-8 base-analysis `delay_imports`
-inventory key or `directories.delay_imports` directory key.
-Conversely, schema 8 always serializes its `delay_imports` inventory, including an empty array, and
-rejects a payload missing that marker so a schema-7 package cannot be upgraded by relabeling alone.
+inventory key or `directories.delay_imports` directory key. Schemas 8 and 9 always serialize the
+`delay_imports` inventory, including an empty array, and reject a payload missing that marker so a
+legacy package cannot be upgraded by relabeling alone.
+Schemas 1 through 8 cannot contain schema-9 `load_config_size`, `guard_flags`,
+`guard_cf_function_table_rva`, or `guard_cf_functions` fields, the
+`directories.load_config` directory key, or core `pe-guard-cf-function` claims. Conversely, schema
+9 always serializes its `guard_cf_functions` inventory, including an empty array, and rejects a
+payload missing that marker so a schema-8 package cannot be upgraded by relabeling alone.
 
 TLS callback fields were introduced in package schema 7's deterministic base analysis; package
-schema 8 adds the separate ordered delay-import directory and inventory. The independently
+schema 8 adds the separate ordered delay-import directory and inventory, and package schema 9 adds
+load-config and GuardCF state. The independently
 versioned neutral projection remains schema 6, and the plugin API and external wire handshake
-remain unchanged. A plugin granted `symbols.read` can observe both additive result families in its
+remain unchanged. A plugin granted `symbols.read` can observe these additive result families in its
 base-analysis JSON; a plugin without that permission still receives no base analysis.
 
 The `analyze` and `inspect` summaries report recovered strings, data references, direct calls,
-thunks, TLS callbacks, and delay-import libraries/symbols as well as discovered MSVC RTTI vftables,
+thunks, GuardCF record/function-candidate totals and FID-/export-suppressed counts, TLS callbacks, and delay-import
+libraries/symbols as well as discovered MSVC RTTI vftables,
 unique types, base-class
 records, and virtual slots. If a fixed string, data-reference, control-flow, TLS-callback, or RTTI
 discovery budget is reached, the corresponding summary prints a `partial` status; the valid
@@ -320,8 +356,8 @@ deterministic results remain available and the package records the truncation ex
 
 The Markdown output is a deterministic, bounded presentation report for people to review. It is
 not a stable interchange format; integrations should consume the neutral JSON projection instead.
-Without `--output`, it is written as `application.symbols.md` beside the package. Package schema 8
-is used by new analyses, export also accepts package schemas 1 through 7 through validated
+Without `--output`, it is written as `application.symbols.md` beside the package. Package schema 9
+is used by new analyses, export also accepts package schemas 1 through 8 through validated
 compatibility paths, and neutral projection schema 6 remains unchanged by this presentation-only
 format. Export does not rewrite the source package.
 
@@ -330,7 +366,7 @@ default for tools that support that format. It maps selected names to one-based 
 `section:offset` values and preferred-image-base-plus-RVA addresses. Its semicolon-prefixed exact
 SHA-256 and file-size comments are informational: a MAP file cannot check the binary loaded by a
 consumer, so compare the executable with the recorded identity before using the symbols. MAP adds
-no fields to package schema 8 or neutral projection schema 6, and it does not rewrite legacy source
+no fields to package schema 9 or neutral projection schema 6, and it does not rewrite legacy source
 packages accepted through compatibility paths. The header module name is the package filename stem;
 for a valid UTF-8 stem, unsupported/non-ASCII encoded bytes become `_` and the result is capped at
 255 bytes. A non-UTF-8 or otherwise unusable stem falls back to `resymbol_<sha12>`.

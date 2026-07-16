@@ -18,8 +18,8 @@ pub use session::{AnalysisSession, PluginRunRecord, PluginRunStatus, SessionVali
 pub use types::{
     BinaryAnalysis, CoffHeader, DataDirectory, ImportTarget, MsvcRttiBaseClass, MsvcRttiVftable,
     PeAnalysis, PeControlFlowTarget, PeDataDirectories, PeDataReference, PeDelayImportLibrary,
-    PeDirectCall, PeExport, PeExportName, PeImport, PeImportLibrary, PeRecoveredString, PeSection,
-    PeStringEncoding, PeThunk, PeTlsCallback, RuntimeFunction,
+    PeDirectCall, PeExport, PeExportName, PeGuardCfFunction, PeImport, PeImportLibrary,
+    PeRecoveredString, PeSection, PeStringEncoding, PeThunk, PeTlsCallback, RuntimeFunction,
 };
 
 /// Detect and analyze a supported binary container.

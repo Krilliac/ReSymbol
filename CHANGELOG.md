@@ -64,16 +64,32 @@ prereleases; breaking changes remain explicit.
   exactly `dlattrRva` (`1`), explicitly rejecting the legacy VA form and unknown bits despite the
   generic PE table's ambiguity. The ordered package inventory retains the DLL name, descriptor RVA
   and exact attributes value, name/HMOD/IAT/INT base RVAs, optional BIAT/UIAT base RVAs, per-entry
-  lookup/IAT RVAs and hints/names or ordinals, and the timestamp, but not raw array contents. HMOD
-  contents and permissions remain opaque. INT/IAT and optional BIAT/UIAT arrays must be pairwise
+  lookup/IAT RVAs and hints/names or ordinals, and the timestamp, but not raw array contents.
+  INT/IAT and optional BIAT/UIAT arrays must be pairwise
   disjoint. Each present BIAT or UIAT must have a zero slot at the paired INT/IAT entry count; BIAT
   payload values before that slot are otherwise opaque, including whether any is zero, while the
-  complete UIAT must byte-match the original delay IAT. Every consumed descriptor, table, slot,
-  and string must be fully file-backed. Conventional and delay imports share limits of 4,096 libraries,
+  complete UIAT must byte-match the original delay IAT. Every consumed descriptor, import table,
+  and string must be fully file-backed. The nonzero HMOD RVA instead must map an
+  eight-byte range wholly inside one section, but that storage may be zero-filled virtual data;
+  initial contents and section permissions remain opaque. Conventional and delay imports share
+  limits of 4,096 libraries,
   65,536 symbols, and 16 MiB of names; malformed input or any exhausted limit is a hard analysis
   error rather than a partial result. Delay-IAT slots join conventional IAT slots for existing
   `ImportIat` calls and thunks and take precedence over read-only function-pointer fallback, while
   the richer ordered inventory remains package-only.
+- Added bounded PE32+ load-config GuardCF recovery from optional-header data-directory entry 10. A
+  present load-config directory must be fully file-backed, expose an internal structure size from 4
+  through the directory size, and declare at least 148 bytes before ReSymbol consumes the PE32+
+  GuardCF fields. A count above 262,144, an oversized table, or any malformed record is a hard
+  analysis error; accepted GFIDS tables are retained in full, must be fully file-backed and
+  disjoint from the load-config directory, and must contain strictly increasing unique executable
+  RVAs. The disjointness requirement is an explicit ReSymbol hardening policy. Record stride is
+  `4 + n`, with `n` selected by the high `GuardFlags` nibble; all `n` metadata bytes are retained
+  exactly and otherwise treated as opaque. Every structurally valid record, including one marked
+  `IMAGE_GUARD_FLAG_FID_SUPPRESSED`, `IMAGE_GUARD_FLAG_EXPORT_SUPPRESSED`, or both, emits the
+  existing `FunctionEntry` claim and joins initial one-instruction thunk seeding. FID suppression
+  describes CFG eligibility rather than whether the target is a function; export-suppressed RVAs
+  must be 16-byte aligned. Claim evidence retains both suppression booleans.
 - Expanded the source-available, byte-reproducible MSVC x64 fixture corpus to four PE inputs:
   optimized and unoptimized builds, each with and without CodeView metadata. The existing optimized
   filenames remain stable, exact hashes bind every checked-in executable, and the semantic oracle
@@ -91,6 +107,9 @@ prereleases; breaking changes remain explicit.
   library/symbol/name budgets, package compatibility, and delay-IAT
   control flow without changing the four checked-in MSVC corpus binaries, semantic oracle, or
   hashes.
+- Added focused synthetic load-config/GuardCF fixtures covering structure-size bounds, table
+  presence and backing, strictly sorted unique GFIDS, record-stride metadata, suppression policy,
+  graph claims, and thunk seeds without changing the checked-in MSVC corpus or its hashes.
 - Added a pure-Rust x86-64 decoder that performs a bounded control-flow-guided block sweep of fully
   file-backed `RUNTIME_FUNCTION` ranges for supported direct calls and data references, and checks
   seeded executable candidates for one-instruction internal, import, or read-only function-pointer
@@ -152,7 +171,7 @@ prereleases; breaking changes remain explicit.
   extents, and types; ordinary generation requires no Visual Studio, DIA, LLVM, or compiler
   installation.
 - Added optional `resymbol inspect PACKAGE --binary EXACT_ORIGINAL_BINARY` verification for package
-  schemas 1 through 8. Inspection validates the package first, then requires the supplied file's
+  schemas 1 through 9. Inspection validates the package first, then requires the supplied file's
   exact size and SHA-256 to match before any inspection output reaches stdout. Failures report on
   stderr. Human summaries add
   `source binary: <canonical-path>` and `identity gate: matched`; `--json` remains pure package JSON.
@@ -175,7 +194,7 @@ prereleases; breaking changes remain explicit.
   and no longer quarantine the plugin artifact.
 - Raised the pinned Rust source-build toolchain and workspace MSRV to 1.86 for the Component Model
   host. Ordinary release users and users of the bundled WASM example still need no compiler.
-- New `.resym` analyses use package schema 8. Schema 4 introduced the `function-pointer`
+- New `.resym` analyses use package schema 9. Schema 4 introduced the `function-pointer`
   control-flow target, which persists both the read-only slot RVA and resolved function RVA and
   requires a paired same-site slot data reference for a direct call but not for a pointer thunk.
   Schema 5 preserves a legacy 24-byte RTTI base-class descriptor with a null
@@ -184,7 +203,8 @@ prereleases; breaking changes remain explicit.
   transitive thunk closure while retaining the same exact per-hop relationship shape. Schema 7
   adds TLS-directory identity, callback-table RVA, ordered callback records, and the independent
   callback-scan partial flag. Schema 8 adds the separate ordered modern delay-import directory and
-  inventory, which is serialized even when empty as an explicit anti-relabel compatibility marker.
+  inventory. Schema 9 adds load-config size and GuardFlags state plus the ordered GFIDS inventory;
+  both inventories are serialized even when empty as explicit anti-relabel compatibility markers.
 - The debugger-neutral JSON projection now uses schema 6. Schema 4 added attributed string and
   data-reference arrays to schema 3's entry attribution and control-flow relationships; schema 5
   added `referenced_string_rva` correlation; and schema 6 adds explicit `function-pointer` targets.
@@ -192,8 +212,8 @@ prereleases; breaking changes remain explicit.
   same-site data-reference reduction selects a conflicting noncompanion reference, the projection
   omits the pointer call with an `unsupported-assertion` warning instead of flattening it.
 - `resymbol analyze` and `resymbol inspect` report recovered string, data-reference, direct-call,
-  thunk, TLS-callback, and delay-import library/symbol counts plus applicable partial-recovery
-  status for result families that support partial output.
+  thunk, GuardCF record/function-candidate and FID-/export-suppressed, TLS-callback, and delay-import library/symbol
+  counts plus applicable partial-recovery status for result families that support partial output.
 - Address-kind collision diagnostics and both standalone debugger writers now share one
   mutation-aware rule: a same-RVA global is suppressed only when the writer actually emits a
   function record. Entry-only function evidence does not become a debugger mutation.
@@ -218,7 +238,7 @@ schema versions independently.
 
 ### Compatibility
 
-- The CLI can inspect and export package schemas 1 through 7 through explicit, validated in-memory
+- The CLI can inspect and export package schemas 1 through 8 through explicit, validated in-memory
   compatibility paths. It revalidates persisted metadata, plugin runs and claims, binary binding,
   and rebuilds the deterministic base graph; it does not rewrite a legacy package. `inspect --json`
   preserves the validated original representation instead of mislabeling migrated content.
@@ -235,9 +255,11 @@ schema versions independently.
   descriptor recovery. Schema 5 includes that RTTI recovery but predates transitive executable
   thunk-chain discovery. Schema 6 includes that closure but predates TLS callback discovery and
   callback-based thunk seeding. Schema 7 includes TLS callback discovery but predates modern
-  delay-import recovery. Schemas 1 through 6 report TLS callback recovery unavailable, and schemas
-  1 through 7 report delay-import recovery unavailable; neither result family can be synthesized
-  during loading. Reanalyze the exact original binary to create schema 8 with current recovery. The
+  delay-import recovery. Schema 8 includes delay imports but predates load-config GuardCF recovery.
+  Schemas 1 through 6 report TLS callback recovery unavailable, schemas 1 through 7 report
+  delay-import recovery unavailable, and schemas 1 through 8 report GuardCF recovery unavailable;
+  none can be synthesized during loading. Reanalyze the exact original binary to create schema 9
+  with current recovery. The
   reader rejects schema 2 or 3 envelopes containing schema-4
   function-pointer targets in base relationships,
   symbol graphs, or plugin claims. It also rejects a schema 1-through-4 payload containing an RTTI
@@ -246,17 +268,20 @@ schema versions independently.
   source that depends on schema-6 transitive endpoint seeding, and rejects schema 1-through-6
   envelopes containing schema-7 TLS callback state or callback-only base thunk seeds. It also
   rejects schema 1-through-7 envelopes containing the exact schema-8 base-analysis `delay_imports`
-  inventory key or `directories.delay_imports` directory key. Changing only the envelope label is
-  never migration.
-- Package schema 8 and neutral projection schema 6 are independent version domains. Generic
+  inventory key or `directories.delay_imports` directory key. Schemas 8 and 9 both require that
+  explicit inventory marker, even when empty. Changing only the envelope label is never migration.
+  Schemas 1 through 8 also reject schema-9 load-config/GuardCF fields,
+  `directories.load_config`, and core `pe-guard-cf-function` claims. Schema 9 requires the explicit
+  `guard_cf_functions` inventory even when empty.
+- Package schema 9 and neutral projection schema 6 are independent version domains. Generic
   package readers still require an explicit compatibility range and application-defined payload
   migration to accept an older schema.
 - Markdown export is presentation-only and does not change either version domain: new analyses
-  continue to use package schema 8 and the neutral projection continues to use schema 6.
+  continue to use package schema 9 and the neutral projection continues to use schema 6.
 - MAP export consumes the current validated session and neutral projection without adding fields to
-  package schema 8 or projection schema 6.
+  package schema 9 or projection schema 6.
 - PDB export consumes the same current session and projection plus a byte-backed inspection of the
-  exact original PE. It does not add fields to package schema 8 or projection schema 6.
+  exact original PE. It does not add fields to package schema 9 or projection schema 6.
 - The external plugin wire remains protocol 1.0. Dual-layout RTTI recovery changes deterministic
   base-analysis/package content but adds no plugin assertion or control-flow target shape.
   Transitive built-in thunk discovery likewise composes existing exact `thunk-target` claims and
@@ -265,7 +290,9 @@ schema versions independently.
   existing `function-entry` assertion and do not change the plugin API, plugin wire, or neutral
   projection schema. Schema 8 delay-import records are another additive `symbols.read` field;
   delay-IAT control flow reuses the existing `import-IAT` target, so the API, WIT/ABI, plugin wire
-  1.0 handshake, and projection schema 6 remain unchanged.
+  1.0 handshake, and projection schema 6 remain unchanged. Schema 9 load-config/GuardCF records are
+  likewise additive `symbols.read` state and reuse `function-entry`; they leave the plugin API,
+  WIT/ABI, plugin wire 1.0 handshake, and projection schema 6 unchanged.
 - Managed-plugin execution adds no package-schema field: successful runs and validated claims use
   the existing `AnalysisSession` plugin ledger and claim representation.
 - WASM-plugin execution likewise adds no package-schema field. It uses the existing plugin ledger,
@@ -297,10 +324,11 @@ schema versions independently.
 - Built-in string recovery scans at most 64 MiB, retains at most 16,384 literals and 4 MiB of UTF-8
   text in aggregate, and caps each exact value at 4 KiB UTF-8 and 4 KiB encoded data including its
   terminator. Reaching a limit never publishes a truncated prefix and records the scan as partial.
-- Internal targets covered by known runtime-function metadata are suppressed unless their RVA
-  matches a recorded runtime-function begin. A call to its own next instruction is not promoted to
-  a function target. Overlapping runtime-function ranges may be traversed and charged to decoder
-  budgets separately.
+- Internal targets covered by known runtime-function metadata are allowed only when their RVA
+  matches a recorded runtime-function begin or a retained GuardCF function
+  start; every other interior endpoint remains suppressed regardless of another seed source. A call
+  to its own next instruction is not promoted to a function target. Overlapping runtime-function
+  ranges may be traversed and charged to decoder budgets separately.
 - Read-only function-pointer calls and thunks are accepted only from exact supported RIP-relative
   encodings. Their non-IAT slot must be eight fully backed bytes of initialized, readable,
   non-writable, non-executable data, and its preferred-image VA must resolve in one hop to
