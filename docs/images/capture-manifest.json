@@ -19,8 +19,8 @@
                          "view":  "overview",
                          "width":  1440,
                          "height":  900,
-                         "bytes":  219180,
-                         "sha256":  "2b33764ba7e5159f90cf6254176c96c3aafe692ae38cefa2203bd6d9ae16876a"
+                         "bytes":  220893,
+                         "sha256":  "17d0b038f6268fe6f1cb4284c0a9f149b54a6262b26c602795a8cd0fb6c86484"
                      },
                      {
                          "file":  "workbench-functions.png",
@@ -43,8 +43,8 @@
                          "view":  "address-space",
                          "width":  1440,
                          "height":  900,
-                         "bytes":  233780,
-                         "sha256":  "cfdb97824a07aab0d867515971bba1a21e7d987da6603c66fc3be96afafe9ee0"
+                         "bytes":  236967,
+                         "sha256":  "31bd1e93dcec620da0cbc7584acdff7fb91f56f60a845d1b403a2b447951aeae"
                      }
                  ]
 }

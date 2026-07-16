@@ -115,8 +115,10 @@ try {
                 ArgumentList = $quotedBinary
                 WorkingDirectory = $repoRoot
                 PassThru = $true
-                WindowStyle = 'Hidden'
             }
+            # Keep the native window visible while the OpenGL framebuffer is sampled. A hidden or
+            # minimized WGL surface can return partially cleared frames on Windows, even though the
+            # application has completed all egui passes. The capture closes itself immediately.
             $process = Start-Process @startParameters
             try {
                 if (-not $process.WaitForExit($CaptureTimeoutSeconds * 1000)) {
