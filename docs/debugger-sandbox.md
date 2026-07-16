@@ -11,11 +11,11 @@ ReSymbol currently implements the non-executing foundation for debugger and sand
   sections;
 - backend-neutral target, capability, command, event, state-token, breakpoint, memory-read, and
   compare-before-write memory-mutation contracts;
-- a bounded control/raw-byte frame format, direction- and identity-checked handshake, exact protocol
-  version binding, strict typed command/event codec, cumulative response-allocation budget, and
-  single-owner host-client seam;
-- a deterministic in-memory host that drives the real session and sandbox reducers for integration
-  tests without reading an artifact, opening a process, or executing target code; and
+- a bounded control/raw-byte frame format, direction-checked plaintext build-claim correlation,
+  exact wire/typed protocol version binding, strict typed command/event codec, cumulative
+  response-allocation budget, and single-owner host-client seam;
+- a feature-gated synthetic host that models only offline open/close reducer mechanics, rejects
+  every unsupported operation, and never fabricates target, attestation, or cleanup evidence; and
 - sandbox policy, attestation, failure, lifecycle, resource-limit, and cleanup-receipt data models.
 
 The debugger crate also exposes a bounded provider-readiness service. It is discovery only: it
@@ -25,9 +25,9 @@ the suspended target still needs the exact policy/provider/build attestation des
 
 The Windows debugger host process, pipe transport, AppContainer provider, Hyper-V provider, guest
 agent, live process attach, breakpoint engine, register access, memory access, and instruction
-editing are not implemented. `InMemoryDebugHost` is a protocol test double, not a security boundary
-or a platform provider. The current types and UI must not be described as a working malware sandbox
-or live debugger.
+editing are not implemented. `SyntheticDebugHost` is available only to crate tests or the explicit
+`test-support` feature. It is not a security boundary or platform provider. The current types and UI
+must not be described as a working malware sandbox or live debugger.
 
 ## Ownership and thread affinity
 
@@ -134,8 +134,11 @@ tests:
 8. Cleanup receipts carry the same provisioning epoch as attestation, so evidence from an otherwise
    identical earlier provisioning instance is rejected. Helper loss never implies cleanup succeeded.
 
-The pure reducers, typed client, and in-memory host now exercise these ordering and binding rules. They
-remain requirements for a future process-executing provider, not evidence that such a provider exists.
+The pure reducers and typed client now exercise these ordering and binding rules. The client
+independently replays each command through its reducer and accepts only command-specific state and
+operation evidence, including exact attestation and cleanup bindings. The synthetic host covers only
+execution-neutral protocol mechanics. These remain requirements for a future process-executing
+provider, not evidence that such a provider exists.
 
 ## Implemented host seam
 
@@ -143,10 +146,12 @@ The current seam is intentionally narrow:
 
 - debugger wire and typed-command protocol 1.1 carries the lease identifiers and provisioning epoch;
 - a four-byte length prefix is validated before allocating a bounded control buffer;
-- controller and host roles, directions, nonzero challenge nonce, expected build identities, offered
-  protocol version, response kind, and independent frame sequences are verified before commands;
-- the wire handshake detects reflection, replay, downgrade, and accidental peer mismatch but is not
-  cryptographic authentication; a future platform transport must authenticate the helper channel;
+- controller and host roles, directions, nonzero challenge nonce, expected plaintext build claims,
+  offered protocol version, response kind, and independent frame sequences are correlated before
+  commands;
+- `BuildClaimHandshake` detects reflection, replay, downgrade, and accidental build mismatch, but
+  its echoed nonce and self-reported strings do not authenticate either peer. A future platform
+  transport must independently authenticate the helper channel and process identity;
 - malformed, reflected, duplicate, replayed, stale, cross-session, overlong, and unknown-field inputs
   fail closed;
 - the connection owner supplies immutable response limits to the transport: at most 256 frames,
@@ -160,11 +165,16 @@ The current seam is intentionally narrow:
   the connection;
 - command IDs and event IDs are independent monotonic domains, while each synchronous response batch
   must contain exactly one command result and only events correlated to that command;
-- session generations and stop/run identifiers must advance exactly through a legal reducer
-  transition, non-transition events must carry the exact current state token, and a rejected command
-  may not change client state;
-- connection-level capability probing is explicit; the in-memory host reports every platform
-  capability as unavailable and rejects target-data operations it cannot honestly model;
+- session generations and stop/run identifiers must advance exactly through the command-specific
+  reducer path; non-transition events carry the exact current state token, memory/breakpoint evidence
+  must match the request, and a rejected command may not claim any effect. Its command identifier and
+  any presented one-use authority remain consumed without cloning the reducer or lease;
+- attestation and cleanup events are bound both to the outer event session and to the reducer's exact
+  binary, policy, provider, build, provisioning epoch, and cleanup expectation before `Closed` can be
+  accepted or released;
+- connection-level capability probing is explicit; the synthetic host reports every platform
+  capability as unavailable, supports only offline open/close, and rejects every other operation
+  without producing security evidence;
 - host-risk and sandbox-ownership grant objects are host-local and non-serializable. Commands carry
   only strict 64-character lowercase-hex lease IDs; the reducer bounds registrations, consumes a
   presented lease even on mismatch, and drops every unused lease after a target opens;
@@ -172,7 +182,8 @@ The current seam is intentionally narrow:
   non-cloneable. Ownership moves into one session worker, while pure lease IDs, operation bindings,
   and retained sandbox evidence remain cloneable value data;
 - only `Closed` sessions can be released, and sandbox closure requires the exact cleanup receipt that
-  the reducer validates; and
+  the reducer validates. Active abandon, transport loss, and client drop perform deterministic
+  best-effort control-channel shutdown but never imply cleanup or synthesize `Closed`; and
 - the client and transport expose value types only. Future process, pipe, token, Job, VM, and provider
   handles stay opaque inside the owning host implementation.
 
@@ -242,8 +253,8 @@ No process-executing provider should merge until the project has evidence for:
 - legal session transitions, cross-target and replayed lease rejection, stale generation/stop
   rejection, provisioning-epoch-bound attestation and cleanup, attestation-gated resume,
   compare-write conflicts, sequence overflow, and terminal cleanup behavior;
-- strict wire decoding, Hello-first/once handshake, role/build/version/nonce agreement, bounded
-  allocation before payload reads, and crash recovery;
+- strict wire decoding, Hello-first/once build-claim exchange, role/build/version/nonce correlation,
+  independent transport authentication, bounded allocation before payload reads, and crash recovery;
 - benign Windows probes showing allowed staged reads and scratch writes while profile sentinels,
   network, unlisted handles, inherited secrets, and forbidden child creation fail;
 - target code not reaching a safe TLS/CRT marker before explicit resume;

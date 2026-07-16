@@ -1179,6 +1179,33 @@ impl EventEnvelope {
         if sandbox_event && (self.session_id.is_none() || self.state.is_none()) {
             return Err(ProtocolValidationError::MissingSessionContext);
         }
+        if sandbox_event {
+            let outer_session = self
+                .session_id
+                .expect("sandbox context presence was checked above");
+            let outer_state = self
+                .state
+                .expect("sandbox context presence was checked above");
+            if outer_state.session_id != outer_session {
+                return Err(ProtocolValidationError::StaleStateToken);
+            }
+            let inner_session = match &self.event {
+                DebugEvent::SandboxAttested(attestation) => attestation.session_id,
+                DebugEvent::SandboxLifecycle(lifecycle) => match lifecycle {
+                    SandboxLifecycleEvent::State { session_id, .. } => *session_id,
+                    SandboxLifecycleEvent::Attested(attestation) => attestation.session_id,
+                    SandboxLifecycleEvent::ProviderUnavailable(unavailable) => {
+                        unavailable.session_id
+                    }
+                    SandboxLifecycleEvent::Failed(failure) => failure.session_id,
+                    SandboxLifecycleEvent::Closed(receipt) => receipt.session_id,
+                },
+                _ => unreachable!("sandbox event was matched above"),
+            };
+            if inner_session != outer_session {
+                return Err(ProtocolValidationError::StaleSession);
+            }
+        }
         Ok(())
     }
 }
@@ -1573,6 +1600,32 @@ mod tests {
         assert_eq!(
             exhausted.observe(EventSequence::new(u64::MAX).unwrap()),
             Err(ProtocolValidationError::EventSequenceOverflow)
+        );
+    }
+
+    #[test]
+    fn sandbox_evidence_is_bound_to_the_outer_session_envelope() {
+        let envelope = EventEnvelope {
+            version: ProtocolVersion::current(),
+            sequence: EventSequence::new(1).unwrap(),
+            session_id: Some(session(1)),
+            state: Some(state(1, 2)),
+            caused_by: Some(CommandId::new(7).unwrap()),
+            event: DebugEvent::SandboxLifecycle(SandboxLifecycleEvent::State {
+                session_id: session(2),
+                state: crate::sandbox::SandboxLifecycleState::Provisioning,
+            }),
+        };
+        assert_eq!(
+            envelope.validate(),
+            Err(ProtocolValidationError::StaleSession)
+        );
+
+        let mut mismatched_state = envelope;
+        mismatched_state.session_id = Some(session(2));
+        assert_eq!(
+            mismatched_state.validate(),
+            Err(ProtocolValidationError::StaleStateToken)
         );
     }
 
