@@ -538,19 +538,26 @@ reports whether provisioning may be attempted for the exact requested provider, 
 guarantees. It cannot provision a sandbox, launch or attach to a target, or attest that containment
 exists.
 
-The feature-gated `SyntheticDebugHost` exercises offline open/close protocol mechanics for tests and
-explicit test-support builds. It reports no platform capability and fabricates no target,
-attestation, or cleanup evidence. The build-claim handshake binds roles, versions, sequences, and a
-nonce strongly enough to detect protocol reflection, replay, downgrade, and accidental build
-mismatch, but its echoed nonce and self-reported strings are plaintext correlation—not peer or
-process authentication. A production transport must independently authenticate the helper channel
-and process identity.
+`VerifiedOfflineImage` and `OfflineImageDebugHost` provide the first production host without target
+execution. They retain one exact identity-verified `Arc<[u8]>`, publish a complete capability matrix
+with only `OfflineAnalysis` available, and serve bounded canonical file-backed RVA spans from that
+frozen snapshot. Gaps, zero-fill, loader padding, raw tails, crossings, mutation, execution, launch,
+attach, and sandbox commands fail closed. This host is in-process and owns no helper process or
+operating-system sandbox.
+
+The feature-gated `SyntheticDebugHost` remains only for tests and explicit test-support builds. It
+reports no platform capability and fabricates no target, attestation, or cleanup evidence. The
+build-claim handshake binds roles, versions, sequences, and a nonce strongly enough to detect
+protocol reflection, replay, downgrade, and accidental build mismatch, but its echoed nonce and
+self-reported strings are plaintext correlation—not peer or process authentication. A production
+external transport must independently authenticate the helper channel and process identity.
 
 No Windows debugger-host process, live transport, AppContainer or Hyper-V provider, guest agent,
 live launch/attach, breakpoint engine, register service, or process-memory service is implemented.
-The current contracts and readiness UI are therefore not a working malware sandbox or live
-debugger. [debugger-sandbox.md](debugger-sandbox.md) records the exact ownership, authorization,
-containment, cleanup, and verification gates that future providers must satisfy.
+The production offline host does not change that boundary: the current contracts and readiness UI
+are not a working malware sandbox or live debugger. [debugger-sandbox.md](debugger-sandbox.md)
+records the exact ownership, authorization, containment, cleanup, and verification gates that future
+live providers must satisfy.
 
 ## Workbench GUI
 
@@ -563,10 +570,13 @@ export crates. The workbench does not fork reconciliation or identity rules from
 
 The initial shell implements the approved four-region structure: persistent, resizable and
 collapsible project/plugin navigation, a virtualized sortable/filterable function table, a bounded
-Reconstruction Graph, a static Address Space/protection view, a non-executing Debugger / Sandbox
-readiness view, an evidence inspector, and a progress/warning/log area. It displays exact SHA-256
-binary identity and read-only plugin health. Graphite, Light, IDA-inspired, and Classic Debugger are
-persisted theme presets; arbitrary docking is not implemented.
+Reconstruction Graph, a static Address Space/protection view with a worker-owned 256-byte exact-RVA
+reader, a non-executing Debugger / Sandbox readiness view, an evidence inspector, and a
+progress/warning/log area. The reader constructs and closes one in-process offline client per request
+and accepts a result only when its operation, full identity, canonical verified source, span, and
+lifecycle receipt still match. The shell displays exact SHA-256 binary identity and read-only plugin
+health. Graphite, Light, IDA-inspired, and Classic Debugger are persisted theme presets; arbitrary
+docking is not implemented.
 
 The Reconstruction Graph is a read-only projection of retained analysis, not a second analyzer or a
 claim of complete call-graph recovery. It roots at the PE entry point when that point is available as

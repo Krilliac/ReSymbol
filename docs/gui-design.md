@@ -125,6 +125,16 @@ tail ownership, and declared read/write/execute attributes while staying bound t
 identity as the analysis package. It is not a live process map and must not imply that ASLR, runtime
 allocations, loaded modules, guard pages, or changed page protections have been observed.
 
+When the active project retains an exact verified source snapshot, this tab also offers a bounded
+RVA byte reader. The application-service worker creates a one-shot in-process
+`OfflineImageDebugHost`, verifies its complete offline-only capability report, opens the exact
+canonical source, reads 16, 32, 64, 128, or 256 bytes, then closes, releases, and disconnects before
+publishing the result. The UI accepts it only when the monotonic operation, full binary identity,
+canonical source path, requested span, and completed lifecycle still match the current project.
+File gaps, zero-fill, loader padding, raw tails, and crossing spans are shown as typed unavailability;
+package-only projects remain **SOURCE REQUIRED**. This is a frozen-source hex preview, not
+disassembly, a process-memory view, or a sandbox operation.
+
 Protection assessment shows bounded artifact evidence for entry-point placement and backing,
 TLS-before-entry behavior, anti-debug imports, common packer section names, high-entropy samples, and
 writable/executable sections. These are review cues, not malware verdicts. Offline opening keeps the
@@ -343,8 +353,9 @@ docking, disassembly/pseudocode views, editable or exhaustive control-flow graph
 bridge, process-executing debugger host, verified AppContainer/VM provider, multi-binary workspace,
 or remote collaboration. Current-package opening, exact-claim Accept Primary/Keep as Alias/Reject,
 transaction-level undo/redo, binary-bound versioned review sidecars, dirty-close protection, static
-Address Space/protection assessment, read-only provider readiness, and all six symbol export formats
-are implemented. The backend-neutral debugger and sandbox contracts and readiness result are
-foundations for later live features, not proof that an operating-system boundary exists. Future
+Address Space/protection assessment with bounded verified-source RVA reads, read-only provider
+readiness, and all six symbol export formats are implemented. The backend-neutral debugger and
+sandbox contracts, offline host, and readiness result are foundations for later live features, not
+proof that an operating-system boundary exists. Future
 choices must still be evaluated against startup size, portability, accessibility, crash isolation,
 exact identity, and the one-download product principle.

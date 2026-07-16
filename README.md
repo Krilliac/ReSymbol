@@ -66,8 +66,8 @@ The current alpha implements and tests an end-to-end, deliberately narrow analys
 - a Windows-first `resymbol-workbench.exe` desktop application that opens a supported PE or current
   `.resym` package, runs core-only analysis in the background, and presents exact binary identity,
   durable provenance-first exact-claim review, a bounded Reconstruction Graph, a non-executing
-  static Address Space/protection view, read-only debugger/sandbox provider readiness, and read-only
-  plugin health.
+  static Address Space/protection view with a worker-owned exact-RVA byte reader for verified source
+  snapshots, read-only debugger/sandbox provider readiness, and read-only plugin health.
   The graph starts from the PE entry point or a clearly labeled deterministic lowest-RVA fallback,
   shares function selection with the table and inspector, and draws only retained direct-call,
   thunk, and import relationships. Accept Primary, Keep as Alias, Reject, rationale, undo, and redo
@@ -77,7 +77,9 @@ The current alpha implements and tests an end-to-end, deliberately narrow analys
   existing destination. Its separately spawned companion console is off by default; enable it from
   **View -> Companion console** when live activity and typed control are useful. Provider readiness
   is a non-mutating preflight only: it does not provision a sandbox, launch or attach to a target, or
-  attest containment. See [the debugger and sandbox architecture](docs/debugger-sandbox.md);
+  attest containment. The Address Space reader serves at most 256 bytes from the frozen exact source
+  through the in-process offline host; it does not open a process or claim a live mapping. See
+  [the debugger and sandbox architecture](docs/debugger-sandbox.md);
 - a deterministic, debugger-neutral export projection plus `resymbol export`, which writes the
   projection as JSON, renders a bounded human-readable Markdown report, emits deterministic
   Microsoft-linker-style MAP text for compatible tools, creates an exact-RSDS public-symbol PDB
@@ -354,8 +356,11 @@ provider readiness. Its Reconstruction Graph roots at the PE entry point when av
 at a clearly labeled deterministic lowest-RVA navigation fallback, synchronizes selection with the
 function inspector, and shows only relationships retained by analysis. Large graphs are rendered
 through an explicit bounded view rather than implying complete call-graph recovery. Address Space is
-a preferred-image model, not a live process map, and provider readiness means only that provisioning
-may be attempted; neither surface executes the input or proves containment. The workbench opens
+a preferred-image model, not a live process map. When an exact source snapshot is present, its reader
+can return a 16, 32, 64, 128, or 256-byte file-backed RVA span through the in-process offline host;
+gaps, zero-fill, padding, and crossing spans remain explicitly unavailable. Provider readiness means
+only that provisioning may be attempted; neither surface executes the input or proves containment.
+The workbench opens
 current `.resym` packages and creates new `.resym`, neutral JSON, Markdown, MAP, public-symbol PDB,
 IDA Python, or Ghidra Java artifacts. It does not execute plugins, migrate legacy packages, or
 overwrite an output or review-sidecar file.

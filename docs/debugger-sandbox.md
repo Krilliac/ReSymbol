@@ -38,19 +38,24 @@ The intended ownership chain is:
 
 ```text
 Workbench UI thread
-  -> one DebugHostClient (owns helper process and bounded pipes)
-    -> resymbol-debugger-host helper
-      -> one SessionWorker thread
-        -> one selected provider/backend
-          -> opaque platform RAII handles
+  -> bounded application-service worker queue
+    -> one thread-affine DebugHostClient
+      -> in-process OfflineImageDebugHost (offline image only; no process or sandbox)
+      OR
+      -> authenticated bounded transport (future live modes)
+        -> resymbol-debugger-host helper
+          -> one SessionWorker thread
+            -> one selected provider/backend
+              -> opaque platform RAII handles
 ```
 
 - The UI owns product state and never receives a platform handle.
 - `DebugHostClient` is deliberately `!Send` and `!Sync`. One connection worker constructs and owns
   it; UI code uses bounded queues. Its synchronous exchange calls are never made on the UI thread.
-- One client owns one connection and at most one session. Graceful release and disconnect require
-  reducer state `Closed`. Explicit abandon, transport failure, or client drop may sever only the
-  control channel while preserving the last non-`Closed` state; none supplies cleanup evidence.
+- One client owns one connection and at most one session. The offline client owns no helper or pipe;
+  a future live client owns its authenticated helper transport. Graceful release and disconnect
+  require reducer state `Closed`. Explicit abandon, transport failure, or client drop may sever only
+  the control channel while preserving the last non-`Closed` state; none supplies cleanup evidence.
 - One `SessionWorker` owns every debug event, target process/thread, Job, profile, staging directory,
   provider, and cleanup transition for a session.
 - Provider and debug-event methods are worker-thread-only and non-hot-reloadable until close and
@@ -140,10 +145,14 @@ open, bounded RVA reads, and close. Dump, snapshot, observe, attach, launch, exe
 register, breakpoint, terminate, and sandbox operations are rejected through the same
 public-but-opaque, host-owned remote-command transaction path. Rejections restore visible reducer
 state while retaining command and authority-consumption watermarks, and emit only a correlated
-rejected command result. This host
-never emits sandbox attestation, lifecycle, or cleanup evidence. Graceful shutdown and the mandatory
-non-panicking abort/drop paths close only the in-process control boundary; they do not claim target
-or sandbox cleanup.
+rejected command result. This host never emits sandbox attestation, lifecycle, or cleanup evidence.
+Graceful shutdown and the mandatory non-panicking abort/drop paths close only the in-process control
+boundary; they do not claim target or sandbox cleanup.
+
+The Workbench Address Space reader owns this client only on the bounded application-service worker.
+Each request is limited to 256 bytes, and the UI publishes bytes only after the full identity,
+canonical source path, operation, span, and close/release/disconnect receipt match the current
+project. A package without verified source bytes cannot queue a read.
 
 ## Session safety contract
 
@@ -308,6 +317,11 @@ The Address Space tab is a declared preferred-image model. It is not a live `Vir
 does not show ASLR, dynamically allocated pages, loaded modules, copy-on-write state, guard pages, or
 runtime protection changes. A future live view must show the preferred and actual mappings as
 separate address spaces.
+
+Its optional byte reader is a bounded view of the frozen verified source snapshot. It never reads a
+process, maps the image through the operating-system loader, provisions a sandbox, or treats virtual
+zero-fill and loader padding as file bytes. Typed range unavailability remains evidence, not a reason
+to guess or fall back to disk.
 
 Protection findings are bounded artifact evidence. They are neither malware signatures nor an
 authorization to execute. Offline opening should keep those findings reviewable without training the

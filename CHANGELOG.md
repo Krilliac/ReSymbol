@@ -40,6 +40,11 @@ prereleases; breaking changes remain explicit.
   identity-verified image snapshot, exposes only bounded canonical file-backed RVA reads, reports a
   complete capability matrix with only `OfflineAnalysis` available, and rejects every live,
   mutating, execution, attach, launch, and sandbox operation without emitting security evidence.
+- Added a worker-owned Address Space byte reader backed by that offline host. It accepts an exact RVA
+  and a 16/32/64/128/256-byte size, binds results to the full binary identity, canonical verified
+  source path, operation, and span, and displays bounded hex/ASCII rows only after close, release,
+  and disconnect complete. Package-only projects remain source-required, while gaps, zero-fill,
+  padding, and cross-region reads are typed nonfatal unavailability rather than guessed bytes.
 - Added the first Windows-first `resymbol-workbench.exe` desktop slice. It runs bounded core-only PE
   analysis away from the UI thread and presents exact identity, evidence- and provenance-first
   function review, read-only plugin health, and a visual Reconstruction Graph rooted at the PE entry

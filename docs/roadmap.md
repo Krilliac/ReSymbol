@@ -334,8 +334,9 @@ The remaining Milestone 2 work is deliberately substantial: broader disassembly-
 discovery, broader indirect control flow and richer call-graph analysis, persisted basic-block
 modeling, broader RTTI/ABI coverage, broader compiler fixtures,
 benchmarks, and continued malformed-input/resource-limit validation.
-The debugger-hosted execution paths remain future work; their contracts and architecture should not
-be mistaken for working hosts.
+The strictly non-executing offline image host and its bounded workbench byte reader are implemented.
+Process-executing debugger-hosted paths remain future work; neither the offline host nor the live
+contracts should be mistaken for a working live debugger or malware sandbox.
 
 ## Milestone 0: repository foundation
 
@@ -354,8 +355,8 @@ This milestone establishes extensibility before analysis behavior becomes diffic
 Core graph types, plugin discovery/health policy, initial multi-runtime contracts, and the first
 WASM, external-process, native C/C++, and managed/.NET execution hosts are implemented. The
 backend-neutral debugger protocol, reducer, host-client, authorization/evidence contracts, and
-read-only readiness service are implemented; package installation and process-executing
-debugger-hosted runtimes are still outstanding.
+read-only readiness service are implemented, as is the production in-process offline image host;
+package installation and process-executing debugger-hosted runtimes are still outstanding.
 
 - Binary identity and canonical address primitives
 - Versioned entities for functions, ranges, names, types, claims, evidence, and plugin runs
@@ -471,11 +472,12 @@ Semantic inference remains optional and never converts a hypothesis into an extr
 
 - Desktop workbench GUI for project navigation, evidence review, claim comparison, plugin health,
   bounded retained-relationship graphing, and export preview (initial Windows-first core-only shell,
-  synchronized Reconstruction Graph, static Address Space/protection assessment, non-executing
-  debugger/sandbox readiness, evidence inspector, current-package opening, six create-new exports,
-  and transaction-safe exact-claim review with versioned sidecars, dirty-close protection, and
-  undo/redo implemented; bulk review, plugin execution, docking/disassembly, editable or exhaustive
-  graphing, live debugger bridges, and the remaining [approved design](gui-design.md) are planned)
+  synchronized Reconstruction Graph, static Address Space/protection assessment, bounded exact-RVA
+  reads from verified source snapshots, non-executing debugger/sandbox readiness, evidence inspector,
+  current-package opening, six create-new exports, and transaction-safe exact-claim review with
+  versioned sidecars, dirty-close protection, and undo/redo implemented; bulk review, plugin
+  execution, docking/disassembly, editable or exhaustive graphing, live debugger bridges, and the
+  remaining [approved design](gui-design.md) are planned)
 - Signed or verifiable plugin packages and registry metadata
 - Hash-addressed community symbol packs without bundled application binaries
 - Mergeable annotations and review decisions
