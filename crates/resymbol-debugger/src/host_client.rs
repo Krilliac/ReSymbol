@@ -26,9 +26,9 @@ use crate::protocol::{
     ProtocolVersion, SessionId, SessionState, SessionStateKind, StateToken,
 };
 use crate::sandbox::{
-    AttestationMismatch, CleanupReceiptError, DiagnosticText, HelperBuildId, SandboxAttestation,
-    SandboxCleanupReceipt, SandboxFailureStage, SandboxLifecycleEvent, SandboxLifecycleState,
-    SandboxProviderSelection,
+    AttestationMismatch, CleanupAttemptFailureError, CleanupReceiptError, DiagnosticText,
+    HelperBuildId, SandboxAttestation, SandboxCleanupReceipt, SandboxFailureStage,
+    SandboxLifecycleEvent, SandboxLifecycleState, SandboxProviderSelection,
 };
 use crate::session_machine::RemoteCommandCheckpoint;
 use crate::{SessionMachine, SessionMachineError};
@@ -127,6 +127,7 @@ struct ResponseEvidence {
     command_state_observed: bool,
     attestation_accepted: bool,
     cleanup_receipt: Option<SandboxCleanupReceipt>,
+    incomplete_cleanup_receipt: Option<SandboxCleanupReceipt>,
     memory_read: bool,
     memory_written: bool,
     breakpoint_changed: bool,
@@ -139,6 +140,7 @@ impl ResponseEvidence {
         self.state_changed
             || self.attestation_accepted
             || self.cleanup_receipt.is_some()
+            || self.incomplete_cleanup_receipt.is_some()
             || self.memory_read
             || self.memory_written
             || self.breakpoint_changed
@@ -1086,14 +1088,41 @@ fn validate_sandbox_lifecycle(
                 },
             )?;
         }
+        SandboxLifecycleEvent::CleanupAttemptFailed(attempt) => {
+            attempt.validate()?;
+            require_sandbox_session(reducer, attempt.failure.session_id)?;
+            let expected_provider = expected_sandbox_provider(reducer)
+                .ok_or(DebugHostClientError::UnexpectedSandboxEvidence)?;
+            if &attempt.failure.provider != expected_provider {
+                return Err(DebugHostClientError::UnexpectedSandboxProvider);
+            }
+            if reducer.state().kind() != SessionStateKind::Closing {
+                return Err(DebugHostClientError::CleanupAttemptReceiptOutsideClose);
+            }
+            if evidence.cleanup_receipt.is_some() || evidence.incomplete_cleanup_receipt.is_some() {
+                return Err(DebugHostClientError::DuplicateCommandEvidence {
+                    evidence: "sandbox-cleanup-evidence",
+                });
+            }
+            reducer.validate_cleanup_attempt_receipt(&attempt.receipt)?;
+            observe_sandbox_rejection_diagnostic(
+                evidence,
+                SandboxRejectionDiagnostic::Failed {
+                    stage: attempt.failure.stage,
+                    detail: attempt.failure.detail.clone(),
+                },
+            )?;
+            evidence.incomplete_cleanup_receipt = Some(attempt.receipt.clone());
+            evidence.sandbox_event = true;
+        }
         SandboxLifecycleEvent::Closed(receipt) => {
             require_sandbox_session(reducer, receipt.session_id)?;
             if reducer.state().kind() != SessionStateKind::Closing {
                 return Err(DebugHostClientError::CleanupReceiptOutsideClose);
             }
-            if evidence.cleanup_receipt.is_some() {
+            if evidence.cleanup_receipt.is_some() || evidence.incomplete_cleanup_receipt.is_some() {
                 return Err(DebugHostClientError::DuplicateCommandEvidence {
-                    evidence: "sandbox-cleanup-receipt",
+                    evidence: "sandbox-cleanup-evidence",
                 });
             }
             if let Some(expected) = reducer.expected_attestation() {
@@ -1153,10 +1182,12 @@ fn command_allows_sandbox_lifecycle(
         SandboxLifecycleEvent::Attested(_) | SandboxLifecycleEvent::ProviderUnavailable(_) => {
             is_sandboxed_open(command)
         }
-        SandboxLifecycleEvent::Closed(_) => matches!(
-            command,
-            DebugCommand::Terminate { .. } | DebugCommand::Close { .. }
-        ),
+        SandboxLifecycleEvent::CleanupAttemptFailed(_) | SandboxLifecycleEvent::Closed(_) => {
+            matches!(
+                command,
+                DebugCommand::Terminate { .. } | DebugCommand::Close { .. }
+            )
+        }
         SandboxLifecycleEvent::State { .. } | SandboxLifecycleEvent::Failed(_) => matches!(
             command,
             DebugCommand::Open(DebugTargetRequest::Launch(crate::protocol::LaunchTarget {
@@ -1215,10 +1246,20 @@ fn classify_rejected_response(
                 == Some(SandboxLifecycleState::Cleanup)
                 || reducer.inherited_sandbox().is_some();
             let cleanup_required = reducer.requires_cleanup_receipt() && cleanup_state_preserved;
+            let incomplete_receipt_exact = if *stage == SandboxFailureStage::Cleanup {
+                evidence.incomplete_cleanup_receipt.is_some()
+                    && matches!(
+                        &envelope.command,
+                        DebugCommand::Terminate { .. } | DebugCommand::Close { .. }
+                    )
+            } else {
+                evidence.incomplete_cleanup_receipt.is_none()
+            };
             if evidence.state_changed
                 && exact_failed_state
                 && cleanup_required
                 && evidence.cleanup_receipt.is_none()
+                && incomplete_receipt_exact
                 && !evidence.memory_read
                 && !evidence.memory_written
                 && !evidence.breakpoint_changed
@@ -1404,6 +1445,8 @@ pub enum DebugHostClientError {
     Attestation(#[from] AttestationMismatch),
     #[error(transparent)]
     CleanupReceipt(#[from] CleanupReceiptError),
+    #[error(transparent)]
+    CleanupAttemptFailure(#[from] CleanupAttemptFailureError),
     #[error("handshake returned {actual} frames; exactly one is required")]
     UnexpectedHandshakeResponseCount { actual: usize },
     #[error("handshake acknowledgement carried a raw payload")]
@@ -1526,6 +1569,8 @@ pub enum DebugHostClientError {
     },
     #[error("sandbox cleanup receipt arrived outside a close operation")]
     CleanupReceiptOutsideClose,
+    #[error("incomplete sandbox cleanup-attempt receipt arrived outside a close operation")]
+    CleanupAttemptReceiptOutsideClose,
     #[error("sandbox cleanup was not independently verified before release")]
     SandboxCleanupNotVerified,
 }
@@ -1991,11 +2036,12 @@ mod tests {
         ProcessStartKey, ReadViewToken, RunId, RunToken, StateGeneration, StopReason, ThreadId,
     };
     use crate::sandbox::{
-        ChildProcessProfile, CleanupOutcome, CleanupReceiptId, DynamicCodeProfile,
-        ExpectedSandboxAttestation, IsolationBoundary, PolicyDigest, ProcessMitigationProfile,
-        ProviderUnavailable, ProviderUnavailableReason, SandboxFailure, SandboxFailureKind,
-        SandboxGuarantee, SandboxNetworkMode, SandboxPolicy, SandboxPolicyApprovalId,
-        SandboxProviderSelection, SandboxResourceLimits, Win32kProfile,
+        ChildProcessProfile, CleanupOutcome, CleanupReceiptId, CleanupResidual,
+        CleanupResidualKind, DynamicCodeProfile, ExpectedSandboxAttestation, IsolationBoundary,
+        PolicyDigest, ProcessMitigationProfile, ProviderUnavailable, ProviderUnavailableReason,
+        SandboxCleanupAttemptFailure, SandboxFailure, SandboxFailureKind, SandboxGuarantee,
+        SandboxNetworkMode, SandboxPolicy, SandboxPolicyApprovalId, SandboxProviderSelection,
+        SandboxResourceLimits, Win32kProfile,
     };
 
     const TEST_SANDBOX_FAILURE_DETAIL: &str = "sandbox helper failed with cleanup still required";
@@ -2267,6 +2313,11 @@ mod tests {
         FailureWithStateEffect,
         ProvisioningFailureThenCleanup,
         RuntimeFailureThenCleanup,
+        CleanupFailureWithoutReceipt,
+        CleanupFailureThenCleanup,
+        WrongCleanupFailureReceipt,
+        DuplicateCleanupFailureReceipt,
+        CleanupFailureReportedAsSuccess,
         InheritedCleanupFailure,
         WrongInheritedCleanupFailure,
         FailureReportedAsSuccess,
@@ -2478,6 +2529,11 @@ mod tests {
                         | ScriptedAttack::WrongInheritedCleanup
                         | ScriptedAttack::ProvisioningFailureThenCleanup
                         | ScriptedAttack::RuntimeFailureThenCleanup
+                        | ScriptedAttack::CleanupFailureWithoutReceipt
+                        | ScriptedAttack::CleanupFailureThenCleanup
+                        | ScriptedAttack::WrongCleanupFailureReceipt
+                        | ScriptedAttack::DuplicateCleanupFailureReceipt
+                        | ScriptedAttack::CleanupFailureReportedAsSuccess
                         | ScriptedAttack::InheritedCleanupFailure
                         | ScriptedAttack::WrongInheritedCleanupFailure => {
                             unreachable!("handled elsewhere")
@@ -2512,19 +2568,30 @@ mod tests {
                 }
                 ScriptedAttack::ProvisioningFailureThenCleanup
                 | ScriptedAttack::RuntimeFailureThenCleanup
+                | ScriptedAttack::CleanupFailureWithoutReceipt
+                | ScriptedAttack::CleanupFailureThenCleanup
+                | ScriptedAttack::WrongCleanupFailureReceipt
+                | ScriptedAttack::DuplicateCleanupFailureReceipt
+                | ScriptedAttack::CleanupFailureReportedAsSuccess
                 | ScriptedAttack::InheritedCleanupFailure
                 | ScriptedAttack::WrongInheritedCleanupFailure => {
-                    if matches!(
-                        self.attack,
-                        ScriptedAttack::InheritedCleanupFailure
-                            | ScriptedAttack::WrongInheritedCleanupFailure
-                    ) {
+                    if matches!(self.attack, ScriptedAttack::CleanupFailureWithoutReceipt) {
                         self.scripted_cleanup_required_failure(
                             &mut batch,
                             envelope,
                             session_id,
                             SandboxFailureStage::Cleanup,
                         )?;
+                    } else if matches!(
+                        self.attack,
+                        ScriptedAttack::CleanupFailureThenCleanup
+                            | ScriptedAttack::WrongCleanupFailureReceipt
+                            | ScriptedAttack::DuplicateCleanupFailureReceipt
+                            | ScriptedAttack::CleanupFailureReportedAsSuccess
+                            | ScriptedAttack::InheritedCleanupFailure
+                            | ScriptedAttack::WrongInheritedCleanupFailure
+                    ) {
+                        self.scripted_incomplete_cleanup_attempt(&mut batch, envelope, session_id)?;
                     } else if matches!(&envelope.command, DebugCommand::Close { .. }) {
                         self.scripted_exact_close(&mut batch, envelope, session_id)?;
                     } else {
@@ -2534,6 +2601,15 @@ mod tests {
                             }
                             ScriptedAttack::RuntimeFailureThenCleanup => {
                                 SandboxFailureStage::Runtime
+                            }
+                            ScriptedAttack::CleanupFailureWithoutReceipt => {
+                                unreachable!("receipt-free cleanup failure is handled above")
+                            }
+                            ScriptedAttack::CleanupFailureThenCleanup
+                            | ScriptedAttack::WrongCleanupFailureReceipt
+                            | ScriptedAttack::DuplicateCleanupFailureReceipt
+                            | ScriptedAttack::CleanupFailureReportedAsSuccess => {
+                                unreachable!("cleanup attempts are handled above")
                             }
                             ScriptedAttack::InheritedCleanupFailure => {
                                 unreachable!("handled as cleanup failure")
@@ -2633,6 +2709,113 @@ mod tests {
                         code: "sandbox-cleanup-required".into(),
                         message: "sandbox operation failed and requires cleanup".into(),
                     },
+                },
+            )
+        }
+
+        fn scripted_incomplete_cleanup_attempt(
+            &mut self,
+            batch: &mut Vec<HostFrame>,
+            envelope: &CommandEnvelope,
+            session_id: SessionId,
+        ) -> Result<(), HostTransportError> {
+            if !matches!(
+                &envelope.command,
+                DebugCommand::Terminate { .. } | DebugCommand::Close { .. }
+            ) {
+                return Err(HostTransportError::protocol(
+                    "cleanup-attempt script requires terminate or close",
+                ));
+            }
+            let prior = envelope.expected_state.ok_or_else(|| {
+                HostTransportError::protocol("cleanup attempt omitted prior state")
+            })?;
+            let closing_token = next_state_token(prior, 1);
+            self.push_scripted_event(
+                batch,
+                envelope.command_id,
+                session_id,
+                closing_token,
+                DebugEvent::StateChanged(SessionState::Closing {
+                    token: closing_token,
+                }),
+            )?;
+
+            let inherited = matches!(
+                self.attack,
+                ScriptedAttack::InheritedCleanupFailure
+                    | ScriptedAttack::WrongInheritedCleanupFailure
+            );
+            let mut cleanup_receipt = if inherited {
+                inherited_cleanup_receipt(&inherited_binding())
+            } else {
+                test_cleanup_receipt(&expected_sandbox_attestation())
+            };
+            cleanup_receipt = incomplete_cleanup_receipt(cleanup_receipt);
+            match self.attack {
+                ScriptedAttack::WrongCleanupFailureReceipt => {
+                    cleanup_receipt.policy_digest =
+                        PolicyDigest::new("4".repeat(64)).expect("forged policy digest");
+                }
+                ScriptedAttack::WrongInheritedCleanupFailure => {
+                    cleanup_receipt.process = Some(ProcessIdentity {
+                        process_id: ProcessId::new(40).expect("process id"),
+                        start_key: ProcessStartKey::new(8).expect("wrong process start"),
+                        binary_id: BinaryId::digest(b"inherited sandbox image"),
+                    });
+                }
+                _ => {}
+            }
+            let attempt = cleanup_attempt_failure(cleanup_receipt);
+            self.push_scripted_event(
+                batch,
+                envelope.command_id,
+                session_id,
+                closing_token,
+                DebugEvent::SandboxLifecycle(SandboxLifecycleEvent::CleanupAttemptFailed(
+                    attempt.clone(),
+                )),
+            )?;
+            if matches!(self.attack, ScriptedAttack::DuplicateCleanupFailureReceipt) {
+                self.push_scripted_event(
+                    batch,
+                    envelope.command_id,
+                    session_id,
+                    closing_token,
+                    DebugEvent::SandboxLifecycle(SandboxLifecycleEvent::CleanupAttemptFailed(
+                        attempt,
+                    )),
+                )?;
+            }
+
+            let failed_token = next_state_token(prior, 2);
+            self.push_scripted_event(
+                batch,
+                envelope.command_id,
+                session_id,
+                failed_token,
+                DebugEvent::StateChanged(SessionState::Failed {
+                    token: failed_token,
+                    message: TEST_SANDBOX_FAILURE_DETAIL.into(),
+                }),
+            )?;
+            let outcome = if matches!(self.attack, ScriptedAttack::CleanupFailureReportedAsSuccess)
+            {
+                CommandOutcome::Succeeded
+            } else {
+                CommandOutcome::Rejected {
+                    code: "sandbox-cleanup-incomplete".into(),
+                    message: "sandbox cleanup remains incomplete and requires retry".into(),
+                }
+            };
+            self.push_scripted_event(
+                batch,
+                envelope.command_id,
+                session_id,
+                failed_token,
+                DebugEvent::CommandResult {
+                    command_id: envelope.command_id,
+                    outcome,
                 },
             )
         }
@@ -2924,6 +3107,32 @@ mod tests {
             control_channel_closed: None,
             terminated_processes: 1,
             residuals: Vec::new(),
+        }
+    }
+
+    fn incomplete_cleanup_receipt(mut receipt: SandboxCleanupReceipt) -> SandboxCleanupReceipt {
+        receipt.outcome = CleanupOutcome::Incomplete;
+        receipt.handles_closed = false;
+        receipt.residuals.push(CleanupResidual {
+            kind: CleanupResidualKind::Handles,
+            detail: DiagnosticText::new("one provider handle remains open")
+                .expect("bounded cleanup residual"),
+        });
+        receipt
+    }
+
+    fn cleanup_attempt_failure(receipt: SandboxCleanupReceipt) -> SandboxCleanupAttemptFailure {
+        SandboxCleanupAttemptFailure {
+            failure: SandboxFailure {
+                session_id: receipt.session_id,
+                provider: receipt.provider.clone(),
+                stage: SandboxFailureStage::Cleanup,
+                kind: SandboxFailureKind::CleanupIncomplete,
+                retryable: true,
+                detail: DiagnosticText::new(TEST_SANDBOX_FAILURE_DETAIL)
+                    .expect("bounded sandbox failure"),
+            },
+            receipt,
         }
     }
 
@@ -3388,6 +3597,110 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_cleanup_attempt_retains_residual_evidence_and_allows_exact_retry() {
+        let mut client = scripted_client(ScriptedAttack::CleanupFailureThenCleanup);
+        prime_sandbox_stopped(&mut client);
+        let stopped = client
+            .session_state()
+            .expect("primed stopped state")
+            .state_token();
+
+        let failure = client
+            .submit(DebugCommand::Close { state: stopped })
+            .expect("exact incomplete cleanup evidence is a valid retained rejection");
+        assert!(matches!(failure.outcome, CommandOutcome::Rejected { .. }));
+        assert!(failure.events.iter().any(|event| matches!(
+            &event.event,
+            DebugEvent::SandboxLifecycle(SandboxLifecycleEvent::CleanupAttemptFailed(attempt))
+                if attempt.failure.stage == SandboxFailureStage::Cleanup
+                    && attempt.failure.kind == SandboxFailureKind::CleanupIncomplete
+                    && attempt.receipt.outcome == CleanupOutcome::Incomplete
+                    && !attempt.receipt.residuals.is_empty()
+        )));
+        assert_eq!(
+            client.session_state().map(SessionState::kind),
+            Some(SessionStateKind::Failed)
+        );
+        let session = client
+            .session
+            .as_ref()
+            .expect("cleanup-required session remains owned");
+        assert!(session.reducer.requires_cleanup_receipt());
+        assert_eq!(
+            session.reducer.sandbox_state(),
+            Some(SandboxLifecycleState::Cleanup)
+        );
+        assert!(!session.sandbox_cleanup_verified);
+        assert_eq!(
+            client.release_closed_session(),
+            Err(DebugHostClientError::SessionNotClosed {
+                state: SessionStateKind::Failed,
+            })
+        );
+
+        client.transport.attack = ScriptedAttack::ProvisioningFailureThenCleanup;
+        let failed = client.session_state().expect("failed state").state_token();
+        client
+            .submit(DebugCommand::Close { state: failed })
+            .expect("later exact complete cleanup closes the session");
+        assert_eq!(
+            client.session_state().map(SessionState::kind),
+            Some(SessionStateKind::Closed)
+        );
+        client.release_closed_session().expect("verified release");
+    }
+
+    #[test]
+    fn incomplete_cleanup_attempt_rejects_forgery_duplication_and_success_claims() {
+        let mut missing = scripted_client(ScriptedAttack::CleanupFailureWithoutReceipt);
+        prime_sandbox_stopped(&mut missing);
+        let stopped = missing.session_state().unwrap().state_token();
+        assert!(matches!(
+            missing.submit(DebugCommand::Close { state: stopped }),
+            Err(DebugHostClientError::RejectedCommandProducedEvidence { command_id })
+                if command_id.get() == 2
+        ));
+        assert_eq!(missing.connection_state(), ClientConnectionState::Failed);
+
+        let mut forged = scripted_client(ScriptedAttack::WrongCleanupFailureReceipt);
+        prime_sandbox_stopped(&mut forged);
+        let stopped = forged.session_state().unwrap().state_token();
+        assert_eq!(
+            forged.submit(DebugCommand::Close { state: stopped }),
+            Err(DebugHostClientError::CleanupReceipt(
+                CleanupReceiptError::BindingMismatch
+            ))
+        );
+        assert_eq!(forged.connection_state(), ClientConnectionState::Failed);
+
+        let mut duplicate = scripted_client(ScriptedAttack::DuplicateCleanupFailureReceipt);
+        prime_sandbox_stopped(&mut duplicate);
+        let stopped = duplicate.session_state().unwrap().state_token();
+        assert_eq!(
+            duplicate.submit(DebugCommand::Close { state: stopped }),
+            Err(DebugHostClientError::DuplicateCommandEvidence {
+                evidence: "sandbox-cleanup-evidence",
+            })
+        );
+        assert_eq!(duplicate.connection_state(), ClientConnectionState::Failed);
+
+        let mut contradictory = scripted_client(ScriptedAttack::CleanupFailureReportedAsSuccess);
+        prime_sandbox_stopped(&mut contradictory);
+        let stopped = contradictory.session_state().unwrap().state_token();
+        assert!(matches!(
+            contradictory.submit(DebugCommand::Close { state: stopped }),
+            Err(DebugHostClientError::UnexpectedCommandEvidence {
+                evidence: "sandbox-rejection-diagnostic",
+                ..
+            })
+        ));
+        assert_eq!(
+            contradictory.connection_state(),
+            ClientConnectionState::Failed
+        );
+    }
+
+    #[test]
     fn inherited_cleanup_failure_retains_exact_ownership_for_retry() {
         let mut client = scripted_client(ScriptedAttack::InheritedCleanupFailure);
         prime_inherited_observing(&mut client);
@@ -3399,6 +3712,15 @@ mod tests {
             .submit(DebugCommand::Close { state: observing })
             .expect("exact inherited cleanup failure remains representable");
         assert!(matches!(failure.outcome, CommandOutcome::Rejected { .. }));
+        let expected_process = inherited_binding().process().clone();
+        assert!(failure.events.iter().any(|event| matches!(
+            &event.event,
+            DebugEvent::SandboxLifecycle(SandboxLifecycleEvent::CleanupAttemptFailed(attempt))
+                if attempt.receipt.process.as_ref()
+                    == Some(&expected_process)
+                    && attempt.receipt.outcome == CleanupOutcome::Incomplete
+                    && !attempt.receipt.residuals.is_empty()
+        )));
         assert_eq!(
             client.session_state().map(SessionState::kind),
             Some(SessionStateKind::Failed)
@@ -3435,7 +3757,9 @@ mod tests {
             .state_token();
         assert_eq!(
             forged.submit(DebugCommand::Close { state: observing }),
-            Err(DebugHostClientError::UnexpectedSandboxProvider)
+            Err(DebugHostClientError::SessionMachine(
+                SessionMachineError::InheritedCleanupReceiptMismatch
+            ))
         );
         assert_eq!(forged.connection_state(), ClientConnectionState::Failed);
         assert_eq!(

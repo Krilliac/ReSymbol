@@ -15,11 +15,13 @@ use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
 pub use crate::identity::{HostRiskLeaseId, SandboxOwnershipLeaseId, SessionId};
-use crate::sandbox::{SandboxAttestation, SandboxLifecycleEvent, SandboxPolicy};
+use crate::sandbox::{
+    CleanupAttemptFailureError, SandboxAttestation, SandboxLifecycleEvent, SandboxPolicy,
+};
 use resymbol_core::BinaryId;
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 1;
+pub const PROTOCOL_MINOR: u16 = 2;
 pub const MAX_LAUNCH_ARGUMENTS: usize = 128;
 pub const MAX_LAUNCH_ARGUMENT_BYTES: usize = 256 * 1024;
 pub const MAX_MEMORY_READ_BYTES: u32 = 1024 * 1024;
@@ -1106,6 +1108,10 @@ impl DebugEvent {
         match self {
             Self::Capabilities(report) => report.validate(),
             Self::StateChanged(SessionState::Failed { message, .. }) => validate_reason(message),
+            Self::SandboxLifecycle(SandboxLifecycleEvent::CleanupAttemptFailed(attempt)) => {
+                attempt.validate()?;
+                Ok(())
+            }
             Self::StateChanged(_) | Self::SandboxAttested(_) | Self::SandboxLifecycle(_) => Ok(()),
             Self::MemoryRead { address, bytes, .. } => {
                 if bytes.is_empty() || bytes.len() > MAX_MEMORY_READ_BYTES as usize {
@@ -1198,6 +1204,9 @@ impl EventEnvelope {
                         unavailable.session_id
                     }
                     SandboxLifecycleEvent::Failed(failure) => failure.session_id,
+                    SandboxLifecycleEvent::CleanupAttemptFailed(attempt) => {
+                        attempt.failure.session_id
+                    }
                     SandboxLifecycleEvent::Closed(receipt) => receipt.session_id,
                 },
                 _ => unreachable!("sandbox event was matched above"),
@@ -1237,6 +1246,8 @@ impl EventSequenceCursor {
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ProtocolValidationError {
+    #[error(transparent)]
+    CleanupAttemptFailure(#[from] CleanupAttemptFailureError),
     #[error("{kind} identifier must be nonzero")]
     ZeroIdentifier { kind: &'static str },
     #[error("unsupported debugger protocol version {major}.{minor}")]
@@ -1317,6 +1328,12 @@ pub enum ProtocolValidationError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::ProvisioningEpoch;
+    use crate::sandbox::{
+        CleanupOutcome, CleanupReceiptId, CleanupResidual, CleanupResidualKind, DiagnosticText,
+        PolicyDigest, SandboxCleanupAttemptFailure, SandboxCleanupReceipt, SandboxFailure,
+        SandboxFailureKind, SandboxFailureStage, SandboxProviderSelection,
+    };
 
     fn session(value: u64) -> SessionId {
         SessionId::new(value).unwrap()
@@ -1355,6 +1372,53 @@ mod tests {
             session_id: Some(expected.session_id),
             expected_state: Some(expected),
             command,
+        }
+    }
+
+    fn cleanup_attempt_event() -> EventEnvelope {
+        let session_id = session(1);
+        let receipt = SandboxCleanupReceipt {
+            receipt_id: CleanupReceiptId::new("cleanup-attempt-1").expect("receipt id"),
+            session_id,
+            provisioning_epoch: ProvisioningEpoch::new("a".repeat(64)).expect("epoch"),
+            provider: SandboxProviderSelection::LocalAppContainer,
+            policy_digest: PolicyDigest::new("b".repeat(64)).expect("policy digest"),
+            process: None,
+            outcome: CleanupOutcome::Incomplete,
+            process_tree_terminated_and_reaped: true,
+            handles_closed: false,
+            file_system_rolled_back: true,
+            registry_rolled_back: true,
+            network_torn_down: true,
+            owned_paths_deleted: true,
+            appcontainer_profile_deleted: Some(true),
+            differencing_disk_discarded: None,
+            control_channel_closed: None,
+            terminated_processes: 1,
+            residuals: vec![CleanupResidual {
+                kind: CleanupResidualKind::Handles,
+                detail: DiagnosticText::new("provider handle remains open").expect("detail"),
+            }],
+        };
+        EventEnvelope {
+            version: ProtocolVersion::current(),
+            sequence: EventSequence::new(1).expect("sequence"),
+            session_id: Some(session_id),
+            state: Some(state(1, 2)),
+            caused_by: Some(CommandId::new(7).expect("command id")),
+            event: DebugEvent::SandboxLifecycle(SandboxLifecycleEvent::CleanupAttemptFailed(
+                SandboxCleanupAttemptFailure {
+                    failure: SandboxFailure {
+                        session_id,
+                        provider: SandboxProviderSelection::LocalAppContainer,
+                        stage: SandboxFailureStage::Cleanup,
+                        kind: SandboxFailureKind::CleanupIncomplete,
+                        retryable: true,
+                        detail: DiagnosticText::new("cleanup requires a retry").expect("detail"),
+                    },
+                    receipt,
+                },
+            )),
         }
     }
 
@@ -1627,6 +1691,23 @@ mod tests {
             mismatched_state.validate(),
             Err(ProtocolValidationError::StaleStateToken)
         );
+    }
+
+    #[test]
+    fn cleanup_attempt_failure_round_trips_and_rejects_unknown_fields() {
+        let envelope = cleanup_attempt_event();
+        envelope.validate().expect("valid outer binding");
+        let encoded = serde_json::to_value(&envelope).expect("serialize cleanup attempt");
+        let decoded: EventEnvelope =
+            serde_json::from_value(encoded.clone()).expect("deserialize cleanup attempt");
+        assert_eq!(decoded, envelope);
+
+        let mut unknown = encoded;
+        unknown["event"]["payload"]
+            .as_object_mut()
+            .expect("cleanup-attempt payload")
+            .insert("unexpected".to_owned(), serde_json::Value::Bool(true));
+        assert!(serde_json::from_value::<EventEnvelope>(unknown).is_err());
     }
 
     #[test]

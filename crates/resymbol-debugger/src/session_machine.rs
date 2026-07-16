@@ -528,23 +528,55 @@ impl SessionMachine {
         &self,
         receipt: &SandboxCleanupReceipt,
     ) -> Result<(), SessionMachineError> {
+        self.validate_cleanup_receipt_binding(receipt)?;
+        if receipt.outcome != CleanupOutcome::Complete {
+            return Err(SandboxMachineError::CleanupIncomplete.into());
+        }
+        Ok(())
+    }
+
+    /// Validates exact, incomplete cleanup-attempt evidence without advancing
+    /// the reducer or releasing sandbox ownership.
+    pub fn validate_cleanup_attempt_receipt(
+        &self,
+        receipt: &SandboxCleanupReceipt,
+    ) -> Result<(), SessionMachineError> {
+        self.validate_cleanup_receipt_binding(receipt)?;
+        if receipt.outcome != CleanupOutcome::Incomplete {
+            return Err(SessionMachineError::ExpectedIncompleteCleanupReceipt);
+        }
+        Ok(())
+    }
+
+    fn validate_cleanup_receipt_binding(
+        &self,
+        receipt: &SandboxCleanupReceipt,
+    ) -> Result<(), SessionMachineError> {
         match (&self.sandbox, &self.inherited_sandbox) {
             (Some(sandbox), None) => {
                 receipt
                     .validate_against(sandbox.expected_attestation())
                     .map_err(SandboxMachineError::Cleanup)?;
-                if receipt.outcome != CleanupOutcome::Complete {
-                    return Err(SandboxMachineError::CleanupIncomplete.into());
-                }
                 Ok(())
             }
-            (None, Some(binding)) => Self::validate_inherited_cleanup(binding, receipt),
+            (None, Some(binding)) => Self::validate_inherited_cleanup_binding(binding, receipt),
             (None, None) => Err(SessionMachineError::UnexpectedCleanupReceipt),
             (Some(_), Some(_)) => Err(SessionMachineError::ConflictingSandboxOwnership),
         }
     }
 
     fn validate_inherited_cleanup(
+        binding: &SandboxOwnershipBinding,
+        receipt: &SandboxCleanupReceipt,
+    ) -> Result<(), SessionMachineError> {
+        Self::validate_inherited_cleanup_binding(binding, receipt)?;
+        if receipt.outcome != CleanupOutcome::Complete {
+            return Err(SandboxMachineError::CleanupIncomplete.into());
+        }
+        Ok(())
+    }
+
+    fn validate_inherited_cleanup_binding(
         binding: &SandboxOwnershipBinding,
         receipt: &SandboxCleanupReceipt,
     ) -> Result<(), SessionMachineError> {
@@ -559,9 +591,6 @@ impl SessionMachine {
         receipt
             .validate_for_boundary(provider_boundary(binding.provider()))
             .map_err(SandboxMachineError::Cleanup)?;
-        if receipt.outcome != CleanupOutcome::Complete {
-            return Err(SandboxMachineError::CleanupIncomplete.into());
-        }
         Ok(())
     }
 
@@ -852,6 +881,8 @@ pub enum SessionMachineError {
     UnexpectedCleanupReceipt,
     #[error("inherited sandbox cleanup receipt does not match the exact ownership binding")]
     InheritedCleanupReceiptMismatch,
+    #[error("cleanup-attempt evidence must carry an incomplete receipt")]
+    ExpectedIncompleteCleanupReceipt,
     #[error("session contains conflicting sandbox ownership records")]
     ConflictingSandboxOwnership,
     #[error("failure message must be nonempty, single-line, and bounded")]
