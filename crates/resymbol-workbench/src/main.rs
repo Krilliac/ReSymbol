@@ -7,7 +7,7 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         persist_window: !cfg!(feature = "screenshot"),
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1_480.0, 900.0])
+            .with_inner_size([1_440.0, 900.0])
             .with_min_inner_size([1_024.0, 680.0])
             .with_title("ReSymbol Workbench"),
         ..Default::default()
