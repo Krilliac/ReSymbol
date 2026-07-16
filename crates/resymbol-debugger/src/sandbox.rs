@@ -8,7 +8,7 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use crate::identity::{ProvisioningEpoch, SessionId};
-use crate::protocol::ProcessIdentity;
+use crate::protocol::{AttachMode, ProcessIdentity};
 
 const MAX_PROVIDER_ID_BYTES: usize = 96;
 const MAX_ACK_ID_BYTES: usize = 128;
@@ -952,15 +952,191 @@ pub enum SandboxFailureKind {
     ProtocolViolation,
 }
 
+/// Exact controller-held operation context for one sandbox failure.
+///
+/// This is evidence, never authority. A launch binds the binary and helper
+/// build that produced the sandbox expectation, even if discovery failed
+/// before resources existed. An inherited attach binds the stable process
+/// identity and attach mode from the provider-issued ownership lease.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum SandboxFailureContext {
+    Launch {
+        binary_id: BinaryId,
+        helper_build: HelperBuildId,
+    },
+    InheritedAttach {
+        process: ProcessIdentity,
+        mode: AttachMode,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxFailure {
     pub session_id: SessionId,
+    pub provisioning_epoch: ProvisioningEpoch,
+    pub policy_digest: PolicyDigest,
     pub provider: SandboxProviderSelection,
+    pub context: SandboxFailureContext,
     pub stage: SandboxFailureStage,
     pub kind: SandboxFailureKind,
     pub retryable: bool,
     pub detail: DiagnosticText,
+}
+
+impl SandboxFailure {
+    /// Rejects semantically incoherent stage/kind pairs before command phase
+    /// or ownership context is considered.
+    pub fn validate_stage_kind(&self) -> Result<(), SandboxFailureValidationError> {
+        let compatible = match self.stage {
+            SandboxFailureStage::Policy => matches!(
+                self.kind,
+                SandboxFailureKind::InvalidPolicy | SandboxFailureKind::ProtocolViolation
+            ),
+            SandboxFailureStage::Discovery => matches!(
+                self.kind,
+                SandboxFailureKind::ProviderUnavailable
+                    | SandboxFailureKind::HelperFailure
+                    | SandboxFailureKind::ProtocolViolation
+            ),
+            SandboxFailureStage::Provisioning => matches!(
+                self.kind,
+                SandboxFailureKind::ProviderUnavailable
+                    | SandboxFailureKind::ResourceLimitReached
+                    | SandboxFailureKind::HelperFailure
+                    | SandboxFailureKind::ProtocolViolation
+            ),
+            SandboxFailureStage::Attestation => matches!(
+                self.kind,
+                SandboxFailureKind::AttestationRejected
+                    | SandboxFailureKind::HelperFailure
+                    | SandboxFailureKind::ProtocolViolation
+            ),
+            SandboxFailureStage::Launch => matches!(
+                self.kind,
+                SandboxFailureKind::LaunchDenied
+                    | SandboxFailureKind::ResourceLimitReached
+                    | SandboxFailureKind::HelperFailure
+                    | SandboxFailureKind::ProtocolViolation
+            ),
+            SandboxFailureStage::Runtime => matches!(
+                self.kind,
+                SandboxFailureKind::ResourceLimitReached
+                    | SandboxFailureKind::HelperFailure
+                    | SandboxFailureKind::ProtocolViolation
+            ),
+            SandboxFailureStage::Cleanup => {
+                matches!(self.kind, SandboxFailureKind::CleanupIncomplete)
+            }
+        };
+        if compatible {
+            Ok(())
+        } else {
+            Err(SandboxFailureValidationError::StageKind {
+                stage: self.stage,
+                kind: self.kind,
+            })
+        }
+    }
+
+    pub(crate) fn validate_against_expected(
+        &self,
+        expected: &ExpectedSandboxAttestation,
+    ) -> Result<(), SandboxFailureValidationError> {
+        self.validate_stage_kind()?;
+        if self.session_id != expected.session_id {
+            return Err(SandboxFailureValidationError::Session);
+        }
+        if self.provisioning_epoch != expected.provisioning_epoch {
+            return Err(SandboxFailureValidationError::ProvisioningEpoch);
+        }
+        if self.policy_digest != expected.policy_digest {
+            return Err(SandboxFailureValidationError::PolicyDigest);
+        }
+        if self.provider != expected.provider {
+            return Err(SandboxFailureValidationError::Provider);
+        }
+        match &self.context {
+            SandboxFailureContext::Launch {
+                binary_id,
+                helper_build,
+            } if binary_id == &expected.binary_id && helper_build == &expected.helper_build => {
+                Ok(())
+            }
+            SandboxFailureContext::Launch { binary_id, .. } if binary_id != &expected.binary_id => {
+                Err(SandboxFailureValidationError::BinaryIdentity)
+            }
+            SandboxFailureContext::Launch { .. } => Err(SandboxFailureValidationError::HelperBuild),
+            SandboxFailureContext::InheritedAttach { .. } => {
+                Err(SandboxFailureValidationError::ContextKind)
+            }
+        }
+    }
+
+    pub(crate) fn validate_against_inherited(
+        &self,
+        session_id: SessionId,
+        provisioning_epoch: &ProvisioningEpoch,
+        policy_digest: &PolicyDigest,
+        provider: &SandboxProviderSelection,
+        process: &ProcessIdentity,
+        mode: AttachMode,
+    ) -> Result<(), SandboxFailureValidationError> {
+        self.validate_stage_kind()?;
+        if self.session_id != session_id {
+            return Err(SandboxFailureValidationError::Session);
+        }
+        if &self.provisioning_epoch != provisioning_epoch {
+            return Err(SandboxFailureValidationError::ProvisioningEpoch);
+        }
+        if &self.policy_digest != policy_digest {
+            return Err(SandboxFailureValidationError::PolicyDigest);
+        }
+        if &self.provider != provider {
+            return Err(SandboxFailureValidationError::Provider);
+        }
+        match &self.context {
+            SandboxFailureContext::InheritedAttach {
+                process: actual,
+                mode: actual_mode,
+            } if actual == process && *actual_mode == mode => Ok(()),
+            SandboxFailureContext::InheritedAttach {
+                process: actual, ..
+            } if actual != process => Err(SandboxFailureValidationError::ProcessIdentity),
+            SandboxFailureContext::InheritedAttach { .. } => {
+                Err(SandboxFailureValidationError::AttachMode)
+            }
+            SandboxFailureContext::Launch { .. } => Err(SandboxFailureValidationError::ContextKind),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum SandboxFailureValidationError {
+    #[error("sandbox failure stage {stage:?} is incompatible with kind {kind:?}")]
+    StageKind {
+        stage: SandboxFailureStage,
+        kind: SandboxFailureKind,
+    },
+    #[error("sandbox failure belongs to another session")]
+    Session,
+    #[error("sandbox failure belongs to another provisioning epoch")]
+    ProvisioningEpoch,
+    #[error("sandbox failure policy digest mismatch")]
+    PolicyDigest,
+    #[error("sandbox failure provider mismatch")]
+    Provider,
+    #[error("sandbox failure operation-context kind mismatch")]
+    ContextKind,
+    #[error("sandbox failure binary identity mismatch")]
+    BinaryIdentity,
+    #[error("sandbox failure helper build mismatch")]
+    HelperBuild,
+    #[error("sandbox failure inherited process identity mismatch")]
+    ProcessIdentity,
+    #[error("sandbox failure inherited attach mode mismatch")]
+    AttachMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1066,12 +1242,21 @@ impl SandboxCleanupAttemptFailure {
         if self.failure.kind != SandboxFailureKind::CleanupIncomplete {
             return Err(CleanupAttemptFailureError::WrongKind);
         }
-        if !self.failure.retryable {
-            return Err(CleanupAttemptFailureError::NotRetryable);
-        }
         if self.failure.session_id != self.receipt.session_id
+            || self.failure.provisioning_epoch != self.receipt.provisioning_epoch
+            || self.failure.policy_digest != self.receipt.policy_digest
             || self.failure.provider != self.receipt.provider
         {
+            return Err(CleanupAttemptFailureError::FailureReceiptMismatch);
+        }
+        let context_matches = match (&self.failure.context, &self.receipt.process) {
+            (SandboxFailureContext::Launch { .. }, None) => true,
+            (SandboxFailureContext::InheritedAttach { process, .. }, Some(receipt_process)) => {
+                process == receipt_process
+            }
+            _ => false,
+        };
+        if !context_matches {
             return Err(CleanupAttemptFailureError::FailureReceiptMismatch);
         }
         if self.receipt.outcome != CleanupOutcome::Incomplete {
@@ -1158,8 +1343,6 @@ pub enum CleanupAttemptFailureError {
     WrongStage,
     #[error("cleanup-attempt failure must report incomplete cleanup")]
     WrongKind,
-    #[error("cleanup-attempt failure must remain retryable")]
-    NotRetryable,
     #[error("cleanup-attempt failure and receipt bindings differ")]
     FailureReceiptMismatch,
     #[error("cleanup-attempt failure must carry an incomplete receipt")]
@@ -1585,6 +1768,27 @@ mod tests {
         receipt
     }
 
+    fn failure_for_expected(
+        expected: &ExpectedSandboxAttestation,
+        stage: SandboxFailureStage,
+        kind: SandboxFailureKind,
+    ) -> SandboxFailure {
+        SandboxFailure {
+            session_id: expected.session_id,
+            provisioning_epoch: expected.provisioning_epoch.clone(),
+            policy_digest: expected.policy_digest.clone(),
+            provider: expected.provider.clone(),
+            context: SandboxFailureContext::Launch {
+                binary_id: expected.binary_id.clone(),
+                helper_build: expected.helper_build.clone(),
+            },
+            stage,
+            kind,
+            retryable: false,
+            detail: DiagnosticText::new("sandbox operation failed").expect("detail"),
+        }
+    }
+
     fn vm_policy() -> SandboxPolicy {
         let session_id = SessionId::new(7).expect("session id");
         SandboxPolicy {
@@ -1719,13 +1923,19 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_attempt_failure_requires_retryable_bounded_incomplete_evidence() {
+    fn cleanup_attempt_failure_validates_bounded_incomplete_evidence() {
         let expected = expected_attestation();
         let receipt = incomplete_receipt(&expected);
         let attempt = SandboxCleanupAttemptFailure {
             failure: SandboxFailure {
                 session_id: receipt.session_id,
+                provisioning_epoch: receipt.provisioning_epoch.clone(),
+                policy_digest: receipt.policy_digest.clone(),
                 provider: receipt.provider.clone(),
+                context: SandboxFailureContext::Launch {
+                    binary_id: expected.binary_id.clone(),
+                    helper_build: expected.helper_build.clone(),
+                },
                 stage: SandboxFailureStage::Cleanup,
                 kind: SandboxFailureKind::CleanupIncomplete,
                 retryable: true,
@@ -1751,10 +1961,9 @@ mod tests {
 
         let mut not_retryable = attempt.clone();
         not_retryable.failure.retryable = false;
-        assert_eq!(
-            not_retryable.validate(),
-            Err(CleanupAttemptFailureError::NotRetryable)
-        );
+        not_retryable
+            .validate()
+            .expect("retryability is advisory; failure remains fail-closed");
 
         let mut mismatched = attempt.clone();
         mismatched.failure.session_id = SessionId::new(99).expect("other session");
@@ -1791,6 +2000,148 @@ mod tests {
             Err(CleanupAttemptFailureError::Receipt(
                 CleanupReceiptError::TooManyResiduals
             ))
+        );
+    }
+
+    #[test]
+    fn sandbox_failure_stage_kind_matrix_is_exact() {
+        let expected = expected_attestation();
+        let stages = [
+            SandboxFailureStage::Policy,
+            SandboxFailureStage::Discovery,
+            SandboxFailureStage::Provisioning,
+            SandboxFailureStage::Attestation,
+            SandboxFailureStage::Launch,
+            SandboxFailureStage::Runtime,
+            SandboxFailureStage::Cleanup,
+        ];
+        let kinds = [
+            SandboxFailureKind::InvalidPolicy,
+            SandboxFailureKind::ProviderUnavailable,
+            SandboxFailureKind::AttestationRejected,
+            SandboxFailureKind::LaunchDenied,
+            SandboxFailureKind::ResourceLimitReached,
+            SandboxFailureKind::HelperFailure,
+            SandboxFailureKind::CleanupIncomplete,
+            SandboxFailureKind::ProtocolViolation,
+        ];
+        for stage in stages {
+            for kind in kinds {
+                let compatible = match stage {
+                    SandboxFailureStage::Policy => matches!(
+                        kind,
+                        SandboxFailureKind::InvalidPolicy | SandboxFailureKind::ProtocolViolation
+                    ),
+                    SandboxFailureStage::Discovery => matches!(
+                        kind,
+                        SandboxFailureKind::ProviderUnavailable
+                            | SandboxFailureKind::HelperFailure
+                            | SandboxFailureKind::ProtocolViolation
+                    ),
+                    SandboxFailureStage::Provisioning => matches!(
+                        kind,
+                        SandboxFailureKind::ProviderUnavailable
+                            | SandboxFailureKind::ResourceLimitReached
+                            | SandboxFailureKind::HelperFailure
+                            | SandboxFailureKind::ProtocolViolation
+                    ),
+                    SandboxFailureStage::Attestation => matches!(
+                        kind,
+                        SandboxFailureKind::AttestationRejected
+                            | SandboxFailureKind::HelperFailure
+                            | SandboxFailureKind::ProtocolViolation
+                    ),
+                    SandboxFailureStage::Launch => matches!(
+                        kind,
+                        SandboxFailureKind::LaunchDenied
+                            | SandboxFailureKind::ResourceLimitReached
+                            | SandboxFailureKind::HelperFailure
+                            | SandboxFailureKind::ProtocolViolation
+                    ),
+                    SandboxFailureStage::Runtime => matches!(
+                        kind,
+                        SandboxFailureKind::ResourceLimitReached
+                            | SandboxFailureKind::HelperFailure
+                            | SandboxFailureKind::ProtocolViolation
+                    ),
+                    SandboxFailureStage::Cleanup => kind == SandboxFailureKind::CleanupIncomplete,
+                };
+                let actual = failure_for_expected(&expected, stage, kind).validate_stage_kind();
+                assert_eq!(
+                    actual.is_ok(),
+                    compatible,
+                    "unexpected compatibility for {stage:?}/{kind:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sandbox_failure_launch_binding_rejects_every_freshness_mutation() {
+        let expected = expected_attestation();
+        let failure = failure_for_expected(
+            &expected,
+            SandboxFailureStage::Provisioning,
+            SandboxFailureKind::HelperFailure,
+        );
+        failure
+            .validate_against_expected(&expected)
+            .expect("exact failure binding");
+
+        let mut changed = failure.clone();
+        changed.session_id = SessionId::new(expected.session_id.get() + 1).expect("session");
+        assert_eq!(
+            changed.validate_against_expected(&expected),
+            Err(SandboxFailureValidationError::Session)
+        );
+        let mut changed = failure.clone();
+        changed.provisioning_epoch = ProvisioningEpoch::new("f".repeat(64)).expect("epoch");
+        assert_eq!(
+            changed.validate_against_expected(&expected),
+            Err(SandboxFailureValidationError::ProvisioningEpoch)
+        );
+        let mut changed = failure.clone();
+        changed.policy_digest = PolicyDigest::new("f".repeat(64)).expect("digest");
+        assert_eq!(
+            changed.validate_against_expected(&expected),
+            Err(SandboxFailureValidationError::PolicyDigest)
+        );
+        let mut changed = failure.clone();
+        changed.provider = SandboxProviderSelection::HyperV;
+        assert_eq!(
+            changed.validate_against_expected(&expected),
+            Err(SandboxFailureValidationError::Provider)
+        );
+        let mut changed = failure.clone();
+        let SandboxFailureContext::Launch { binary_id, .. } = &mut changed.context else {
+            unreachable!("launch context")
+        };
+        *binary_id = BinaryId::digest(b"another image");
+        assert_eq!(
+            changed.validate_against_expected(&expected),
+            Err(SandboxFailureValidationError::BinaryIdentity)
+        );
+        let mut changed = failure.clone();
+        let SandboxFailureContext::Launch { helper_build, .. } = &mut changed.context else {
+            unreachable!("launch context")
+        };
+        *helper_build = HelperBuildId::new("another-helper").expect("helper");
+        assert_eq!(
+            changed.validate_against_expected(&expected),
+            Err(SandboxFailureValidationError::HelperBuild)
+        );
+        let mut changed = failure;
+        changed.context = SandboxFailureContext::InheritedAttach {
+            process: ProcessIdentity {
+                process_id: crate::protocol::ProcessId::new(9).expect("process"),
+                start_key: crate::protocol::ProcessStartKey::new(10).expect("start key"),
+                binary_id: BinaryId::digest(b"another image"),
+            },
+            mode: AttachMode::Debug,
+        };
+        assert_eq!(
+            changed.validate_against_expected(&expected),
+            Err(SandboxFailureValidationError::ContextKind)
         );
     }
 

@@ -16,9 +16,10 @@ use crate::protocol::{
     StateGeneration, StateToken, StopId, StopReason, StopToken, ThreadId,
 };
 use crate::sandbox::{
-    CleanupOutcome, ExpectedSandboxAttestation, HelperBuildId, PolicyValidationError,
-    SandboxAttestation, SandboxCleanupReceipt, SandboxLifecycleState, SandboxMachine,
-    SandboxMachineError, provider_boundary,
+    CleanupOutcome, DiagnosticText, ExpectedSandboxAttestation, HelperBuildId,
+    PolicyValidationError, SandboxAttestation, SandboxCleanupReceipt, SandboxFailure,
+    SandboxFailureContext, SandboxFailureKind, SandboxFailureStage, SandboxFailureValidationError,
+    SandboxLifecycleState, SandboxMachine, SandboxMachineError, provider_boundary,
 };
 
 pub const MAX_REGISTERED_AUTHORIZATION_LEASES: usize = 64;
@@ -521,6 +522,82 @@ impl SessionMachine {
         self.sandbox.is_some() || self.inherited_sandbox.is_some()
     }
 
+    /// Produces exact, non-authority failure evidence from the reducer's
+    /// sandbox operation context. Host implementations should use this instead
+    /// of rebuilding evidence from command payloads.
+    pub fn bind_sandbox_failure(
+        &self,
+        stage: SandboxFailureStage,
+        kind: SandboxFailureKind,
+        retryable: bool,
+        detail: DiagnosticText,
+    ) -> Result<SandboxFailure, SessionMachineError> {
+        let failure = match (&self.sandbox, &self.inherited_sandbox) {
+            (Some(sandbox), None) => {
+                let expected = sandbox.expected_attestation();
+                SandboxFailure {
+                    session_id: expected.session_id,
+                    provisioning_epoch: expected.provisioning_epoch.clone(),
+                    policy_digest: expected.policy_digest.clone(),
+                    provider: expected.provider.clone(),
+                    context: SandboxFailureContext::Launch {
+                        binary_id: expected.binary_id.clone(),
+                        helper_build: expected.helper_build.clone(),
+                    },
+                    stage,
+                    kind,
+                    retryable,
+                    detail,
+                }
+            }
+            (None, Some(binding)) => SandboxFailure {
+                session_id: binding.session_id(),
+                provisioning_epoch: binding.provisioning_epoch().clone(),
+                policy_digest: binding.policy_digest().clone(),
+                provider: binding.provider().clone(),
+                context: SandboxFailureContext::InheritedAttach {
+                    process: binding.process().clone(),
+                    mode: binding.mode(),
+                },
+                stage,
+                kind,
+                retryable,
+                detail,
+            },
+            (None, None) => return Err(SessionMachineError::UnexpectedSandboxFailure),
+            (Some(_), Some(_)) => return Err(SessionMachineError::ConflictingSandboxOwnership),
+        };
+        failure.validate_stage_kind()?;
+        Ok(failure)
+    }
+
+    /// Validates a failure against controller-held sandbox ownership without
+    /// consuming or changing that ownership.
+    pub fn validate_sandbox_failure(
+        &self,
+        failure: &SandboxFailure,
+    ) -> Result<(), SessionMachineError> {
+        match (&self.sandbox, &self.inherited_sandbox) {
+            (Some(sandbox), None) => {
+                failure.validate_against_expected(sandbox.expected_attestation())?;
+                Ok(())
+            }
+            (None, Some(binding)) => {
+                failure.validate_against_inherited(
+                    binding.session_id(),
+                    binding.provisioning_epoch(),
+                    binding.policy_digest(),
+                    binding.provider(),
+                    binding.process(),
+                    binding.mode(),
+                )?;
+                Ok(())
+            }
+            (None, None) => Err(SessionMachineError::UnexpectedSandboxFailure),
+            (Some(_), Some(_)) => Err(SessionMachineError::ConflictingSandboxOwnership),
+        }
+    }
+
     /// Validates cleanup evidence without advancing the reducer. This lets a
     /// controller or host validate a lifecycle event before the correlated
     /// `Closed` state transition is committed.
@@ -883,6 +960,10 @@ pub enum SessionMachineError {
     InheritedCleanupReceiptMismatch,
     #[error("cleanup-attempt evidence must carry an incomplete receipt")]
     ExpectedIncompleteCleanupReceipt,
+    #[error("sandbox failure evidence arrived without retained sandbox ownership")]
+    UnexpectedSandboxFailure,
+    #[error(transparent)]
+    SandboxFailure(#[from] SandboxFailureValidationError),
     #[error("session contains conflicting sandbox ownership records")]
     ConflictingSandboxOwnership,
     #[error("failure message must be nonempty, single-line, and bounded")]
@@ -1712,6 +1793,135 @@ mod tests {
             )),
             Err(SessionMachineError::ProvisioningEpochMismatch)
         );
+    }
+
+    #[test]
+    fn host_reducer_binds_rollback_failure_without_restoring_command_authority() {
+        let mut machine = machine();
+        let initial = machine.state().state_token();
+        let open = command(
+            1,
+            initial,
+            DebugCommand::Open(sandbox_target(BinaryId::digest(b"rollback sample"))),
+        );
+        let checkpoint = machine
+            .begin_remote_command(&open)
+            .expect("begin host-side open");
+        let failure = machine
+            .bind_sandbox_failure(
+                SandboxFailureStage::Discovery,
+                SandboxFailureKind::HelperFailure,
+                true,
+                DiagnosticText::new("provider discovery failed").expect("detail"),
+            )
+            .expect("bind exact launch context");
+        machine
+            .validate_sandbox_failure(&failure)
+            .expect("host and validating reducer share the binding");
+        assert!(matches!(
+            failure.context,
+            SandboxFailureContext::Launch { .. }
+        ));
+
+        machine
+            .reject_remote_command(checkpoint)
+            .expect("rollback visible state");
+        assert_eq!(machine.state().kind(), SessionStateKind::Idle);
+        assert!(machine.expected_attestation().is_none());
+        assert_eq!(machine.last_command_id(), Some(open.command_id));
+        assert!(matches!(
+            machine.begin_remote_command(&open),
+            Err(SessionMachineError::NonMonotonicCommandId { .. })
+        ));
+        let replacement = command(
+            2,
+            initial,
+            DebugCommand::Open(sandbox_target(BinaryId::digest(b"rollback sample"))),
+        );
+        let _replacement_checkpoint = machine
+            .begin_remote_command(&replacement)
+            .expect("new command id remains usable");
+        assert_eq!(machine.state().state_token().generation.get(), 3);
+    }
+
+    #[test]
+    fn host_reducer_binds_and_retains_exact_inherited_failure_context() {
+        let process = process_identity(7100, 50, b"inherited failure image");
+        let binding = SandboxOwnershipBinding::new(
+            session_id(),
+            process.clone(),
+            AttachMode::Debug,
+            SandboxProviderSelection::LocalAppContainer,
+            PolicyDigest::new("6".repeat(64)).expect("policy digest"),
+            provisioning_epoch(),
+        );
+        let lease_id = ownership_lease_id('6');
+        let mut machine = machine();
+        machine
+            .register_sandbox_ownership_lease(SandboxOwnershipLease::new(
+                lease_id.clone(),
+                binding.clone(),
+            ))
+            .expect("register ownership lease");
+        let initial = machine.state().state_token();
+        let open = command(
+            1,
+            initial,
+            DebugCommand::Open(attach_target(AttachScope::OwnedSandbox {
+                process,
+                ownership_lease: lease_id,
+            })),
+        );
+        let _checkpoint = machine
+            .begin_remote_command(&open)
+            .expect("begin inherited open");
+        let failure = machine
+            .bind_sandbox_failure(
+                SandboxFailureStage::Runtime,
+                SandboxFailureKind::HelperFailure,
+                false,
+                DiagnosticText::new("inherited attach failed").expect("detail"),
+            )
+            .expect("bind inherited failure");
+        machine
+            .validate_sandbox_failure(&failure)
+            .expect("exact inherited failure");
+        assert!(matches!(
+            &failure.context,
+            SandboxFailureContext::InheritedAttach { process, mode }
+                if process == binding.process() && *mode == binding.mode()
+        ));
+
+        let mut wrong_process = failure.clone();
+        let SandboxFailureContext::InheritedAttach { process, .. } = &mut wrong_process.context
+        else {
+            unreachable!("inherited context")
+        };
+        *process = process_identity(7100, 51, b"inherited failure image");
+        assert_eq!(
+            machine.validate_sandbox_failure(&wrong_process),
+            Err(SessionMachineError::SandboxFailure(
+                SandboxFailureValidationError::ProcessIdentity
+            ))
+        );
+        let mut wrong_mode = failure.clone();
+        let SandboxFailureContext::InheritedAttach { mode, .. } = &mut wrong_mode.context else {
+            unreachable!("inherited context")
+        };
+        *mode = AttachMode::Snapshot;
+        assert_eq!(
+            machine.validate_sandbox_failure(&wrong_mode),
+            Err(SessionMachineError::SandboxFailure(
+                SandboxFailureValidationError::AttachMode
+            ))
+        );
+
+        machine
+            .mark_failed(failure.detail.as_str())
+            .expect("retain inherited failure");
+        assert_eq!(machine.state().kind(), SessionStateKind::Failed);
+        assert_eq!(machine.inherited_sandbox(), Some(&binding));
+        assert!(machine.requires_cleanup_receipt());
     }
 
     #[test]
