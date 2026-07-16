@@ -134,9 +134,10 @@ frozen snapshot. Image gaps, section zero-fill, loader-rounded padding, raw file
 beyond a smaller `VirtualSize`, address overflow, image overrun, and cross-region or cross-backing
 spans are rejected without a memory-read event.
 
-`OfflineImageDebugHost` advertises only `OfflineAnalysis` and supports only capability probing, that
-exact offline open, bounded RVA reads, and close. Dump, snapshot, observe, attach, launch, execution,
-write, register, breakpoint, terminate, and sandbox operations are rejected through the same
+`OfflineImageDebugHost` advertises `OfflineAnalysis` as available, reports every other capability as
+typed read-only or backend unavailability, and supports only capability probing, that exact offline
+open, bounded RVA reads, and close. Dump, snapshot, observe, attach, launch, execution, write,
+register, breakpoint, terminate, and sandbox operations are rejected through the same
 public-but-opaque, host-owned remote-command transaction path. Rejections restore visible reducer
 state while retaining command and authority-consumption watermarks, and emit only a correlated
 rejected command result. This host

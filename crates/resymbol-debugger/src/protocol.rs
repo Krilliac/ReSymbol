@@ -331,6 +331,26 @@ pub enum DebugCapability {
     HostAttach,
 }
 
+impl DebugCapability {
+    /// Complete, stable protocol order for capability negotiation.
+    pub const ALL: [Self; 14] = [
+        Self::OfflineAnalysis,
+        Self::DumpRead,
+        Self::SnapshotRead,
+        Self::ObserveProcess,
+        Self::LiveMemoryRead,
+        Self::LiveMemoryWrite,
+        Self::ExecutionControl,
+        Self::RegisterRead,
+        Self::RegisterWrite,
+        Self::SoftwareBreakpoints,
+        Self::HardwareBreakpoints,
+        Self::SandboxedLaunch,
+        Self::HostLaunch,
+        Self::HostAttach,
+    ];
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CapabilityUnavailableCode {
@@ -1608,6 +1628,17 @@ mod tests {
 
     #[test]
     fn capability_unavailability_is_bounded_and_duplicate_free() {
+        CapabilityReport {
+            statuses: DebugCapability::ALL
+                .map(|capability| CapabilityStatus {
+                    capability,
+                    availability: CapabilityAvailability::Available,
+                })
+                .into(),
+        }
+        .validate()
+        .expect("complete capability catalog is unique and bounded");
+
         let status = CapabilityStatus {
             capability: DebugCapability::LiveMemoryWrite,
             availability: CapabilityAvailability::Unavailable {

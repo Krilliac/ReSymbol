@@ -29,10 +29,10 @@ use crate::host_wire::{
 };
 use crate::identity::ProvisioningEpoch;
 use crate::protocol::{
-    CapabilityAvailability, CapabilityReport, CapabilityStatus, CommandEnvelope, CommandId,
-    CommandOutcome, DebugCapability, DebugCommand, DebugEvent, DebugTargetRequest, EventEnvelope,
-    EventSequence, MAX_MEMORY_READ_BYTES, MemoryAddress, OfflineTarget, ProtocolVersion,
-    ReadViewToken, SessionId, SessionStateKind,
+    CapabilityAvailability, CapabilityReport, CapabilityStatus, CapabilityUnavailableCode,
+    CommandEnvelope, CommandId, CommandOutcome, DebugCapability, DebugCommand, DebugEvent,
+    DebugTargetRequest, EventEnvelope, EventSequence, MAX_MEMORY_READ_BYTES, MemoryAddress,
+    OfflineTarget, ProtocolVersion, ReadViewToken, SessionId, SessionStateKind,
 };
 use crate::sandbox::HelperBuildId;
 use crate::session_machine::{RemoteCommandCheckpoint, SessionMachine, SessionMachineError};
@@ -926,10 +926,10 @@ impl OfflineImageDebugHost {
         command_id: CommandId,
     ) -> Result<Vec<HostFrame>, HostTransportError> {
         let report = CapabilityReport {
-            statuses: vec![CapabilityStatus {
-                capability: DebugCapability::OfflineAnalysis,
-                availability: CapabilityAvailability::Available,
-            }],
+            statuses: DebugCapability::ALL
+                .into_iter()
+                .map(offline_capability_status)
+                .collect(),
         };
         let mut events = Vec::with_capacity(2);
         self.push_global_event(&mut events, command_id, DebugEvent::Capabilities(report))?;
@@ -1118,6 +1118,35 @@ impl Drop for OfflineImageDebugHost {
 
 fn machine_error(error: SessionMachineError) -> HostTransportError {
     HostTransportError::protocol(error.to_string())
+}
+
+fn offline_capability_status(capability: DebugCapability) -> CapabilityStatus {
+    let availability = match capability {
+        DebugCapability::OfflineAnalysis => CapabilityAvailability::Available,
+        DebugCapability::LiveMemoryWrite
+        | DebugCapability::ExecutionControl
+        | DebugCapability::RegisterWrite
+        | DebugCapability::SoftwareBreakpoints
+        | DebugCapability::HardwareBreakpoints => CapabilityAvailability::Unavailable {
+            code: CapabilityUnavailableCode::TargetModeReadOnly,
+            reason: "verified offline images are immutable and non-executing".to_owned(),
+        },
+        DebugCapability::DumpRead
+        | DebugCapability::SnapshotRead
+        | DebugCapability::ObserveProcess
+        | DebugCapability::LiveMemoryRead
+        | DebugCapability::RegisterRead
+        | DebugCapability::SandboxedLaunch
+        | DebugCapability::HostLaunch
+        | DebugCapability::HostAttach => CapabilityAvailability::Unavailable {
+            code: CapabilityUnavailableCode::BackendUnavailable,
+            reason: "offline image host has no live, dump, snapshot, or launch backend".to_owned(),
+        },
+    };
+    CapabilityStatus {
+        capability,
+        availability,
+    }
 }
 
 fn bounded_rejection_message(error: &SessionMachineError) -> String {
@@ -1545,13 +1574,37 @@ mod tests {
         let mut client = client(image);
 
         let capabilities = client.probe_capabilities().expect("capabilities");
-        assert_eq!(
-            capabilities.statuses,
-            vec![CapabilityStatus {
-                capability: DebugCapability::OfflineAnalysis,
-                availability: CapabilityAvailability::Available,
-            }]
-        );
+        assert_eq!(capabilities.statuses.len(), DebugCapability::ALL.len());
+        for capability in DebugCapability::ALL {
+            let status = capabilities
+                .statuses
+                .iter()
+                .find(|status| status.capability == capability)
+                .expect("complete capability report");
+            match capability {
+                DebugCapability::OfflineAnalysis => {
+                    assert_eq!(status.availability, CapabilityAvailability::Available);
+                }
+                DebugCapability::LiveMemoryWrite
+                | DebugCapability::ExecutionControl
+                | DebugCapability::RegisterWrite
+                | DebugCapability::SoftwareBreakpoints
+                | DebugCapability::HardwareBreakpoints => assert!(matches!(
+                    status.availability,
+                    CapabilityAvailability::Unavailable {
+                        code: CapabilityUnavailableCode::TargetModeReadOnly,
+                        ..
+                    }
+                )),
+                _ => assert!(matches!(
+                    status.availability,
+                    CapabilityAvailability::Unavailable {
+                        code: CapabilityUnavailableCode::BackendUnavailable,
+                        ..
+                    }
+                )),
+            }
+        }
 
         client
             .begin_session(session_id(), provisioning_epoch(), helper_build())

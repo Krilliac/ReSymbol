@@ -1810,25 +1810,7 @@ impl SyntheticDebugHost {
             },
         };
         let report = CapabilityReport {
-            statuses: [
-                DebugCapability::OfflineAnalysis,
-                DebugCapability::DumpRead,
-                DebugCapability::SnapshotRead,
-                DebugCapability::ObserveProcess,
-                DebugCapability::LiveMemoryRead,
-                DebugCapability::LiveMemoryWrite,
-                DebugCapability::ExecutionControl,
-                DebugCapability::RegisterRead,
-                DebugCapability::RegisterWrite,
-                DebugCapability::SoftwareBreakpoints,
-                DebugCapability::HardwareBreakpoints,
-                DebugCapability::SandboxedLaunch,
-                DebugCapability::HostLaunch,
-                DebugCapability::HostAttach,
-            ]
-            .into_iter()
-            .map(unavailable)
-            .collect(),
+            statuses: DebugCapability::ALL.into_iter().map(unavailable).collect(),
         };
         let mut events = Vec::with_capacity(2);
         self.push_global_event(&mut events, command_id, DebugEvent::Capabilities(report))?;
