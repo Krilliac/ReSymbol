@@ -847,7 +847,9 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
             CommandOutcome::Rejected { .. } => {
                 match classify_rejected_response(envelope, &session.reducer, &evidence)? {
                     RejectedResponseDisposition::RollBack => {
-                        session.reducer.reject_remote_command(checkpoint)?;
+                        session
+                            .reducer
+                            .reject_remote_command(checkpoint, command_id)?;
                         if session.reducer.state() != &session.verified_state {
                             return Err(DebugHostClientError::ReducerStateMismatch {
                                 expected: session.verified_state.clone(),
@@ -856,6 +858,9 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
                         }
                     }
                     RejectedResponseDisposition::RetainCleanupRequiredFailure => {
+                        session
+                            .reducer
+                            .commit_remote_command(checkpoint, command_id)?;
                         session.verified_state = session.reducer.state().clone();
                         session.sandbox_cleanup_verified = false;
                     }
@@ -875,6 +880,9 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
                 let cleanup_verified = session.reducer.requires_cleanup_receipt()
                     && session.reducer.state().kind() == SessionStateKind::Closed
                     && evidence.cleanup_receipt.is_some();
+                session
+                    .reducer
+                    .commit_remote_command(checkpoint, command_id)?;
                 session.verified_state = session.reducer.state().clone();
                 session.sandbox_cleanup_verified |= cleanup_verified;
             }
@@ -3657,12 +3665,12 @@ mod tests {
             stop_before_entry: true,
         };
         let command = DebugCommand::Open(DebugTargetRequest::Launch(target.clone()));
-        let host_authority = HostRiskLease::new(
+        let host_authority = HostRiskLease::new_for_test(
             risk_lease,
             session_id(),
             provisioning_epoch(),
             HostRiskOperation::Launch {
-                intent: HostLaunchIntent::from_target(&target),
+                intent: HostLaunchIntent::from_target(&target).expect("host launch target"),
             },
         );
         let verifier = host_authority.verifier();
