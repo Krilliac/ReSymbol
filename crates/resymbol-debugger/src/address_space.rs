@@ -188,7 +188,9 @@ impl StaticAddressSpace {
         Self::from_validated_pe(analysis)
     }
 
-    fn from_validated_pe(analysis: &PeAnalysis) -> Result<Self, StaticAddressSpaceError> {
+    pub(crate) fn from_validated_pe(
+        analysis: &PeAnalysis,
+    ) -> Result<Self, StaticAddressSpaceError> {
         validate_image_alignment(analysis)?;
 
         let image_size = u64::from(analysis.size_of_image);

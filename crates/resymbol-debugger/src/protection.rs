@@ -1,9 +1,11 @@
-use std::cmp;
-
 use resymbol_analysis::{AnalysisError, ImportTarget, PeAnalysis, PeSection};
 use resymbol_core::BinaryId;
 use serde::Serialize;
 use thiserror::Error;
+
+use crate::address_space::{
+    RelativeAddress, StaticAddressSpace, StaticAddressSpaceError, StaticRegion, StaticRegionKind,
+};
 
 const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 const IMAGE_SCN_MEM_WRITE: u32 = 0x8000_0000;
@@ -156,10 +158,11 @@ pub fn scan_pe_protections(
         });
     }
 
+    let layout = StaticAddressSpace::from_pe(analysis)?;
     let mut findings = Vec::new();
     scan_imports(analysis, &mut findings);
-    scan_sections(analysis, bytes, &mut findings)?;
-    scan_entry_point(analysis, &mut findings)?;
+    scan_sections(analysis, bytes, &layout, &mut findings)?;
+    scan_entry_point(analysis, &layout, &mut findings)?;
     scan_tls_callbacks(analysis, &mut findings)?;
     findings.sort_by(|left, right| {
         left.kind
@@ -274,12 +277,22 @@ fn anti_debug_import_assessment(
 fn scan_sections(
     analysis: &PeAnalysis,
     bytes: &[u8],
+    layout: &StaticAddressSpace,
     findings: &mut Vec<ProtectionFinding>,
 ) -> Result<(), ProtectionScanError> {
+    let entry_section_index = layout
+        .entry_point
+        .and_then(|entry| layout.region_at(entry))
+        .and_then(section_table_index);
     for (index, section) in analysis.sections.iter().enumerate() {
         let table_index = u32::try_from(index)
             .map_err(|_| ProtectionScanError::SectionIndexConversion { index })?;
-        let span = cmp::max(section.virtual_size, section.raw_data_size);
+        let span = section_region(layout, table_index)
+            .and_then(|region| match &region.kind {
+                StaticRegionKind::Section { loaded_size, .. } => u32::try_from(*loaded_size).ok(),
+                _ => None,
+            })
+            .unwrap_or(0);
         let evidence = || ProtectionEvidence::Section {
             table_index,
             name: section.name.clone(),
@@ -348,10 +361,7 @@ fn scan_sections(
             }
         }
 
-        if analysis.entry_point_rva != 0
-            && writable
-            && section_contains_rva(section, analysis.entry_point_rva)
-        {
+        if writable && entry_section_index == Some(table_index) {
             findings.push(ProtectionFinding {
                 kind: ProtectionKind::WritableEntryPointSection,
                 severity: ProtectionSeverity::High,
@@ -371,6 +381,7 @@ fn scan_sections(
 
 fn scan_entry_point(
     analysis: &PeAnalysis,
+    layout: &StaticAddressSpace,
     findings: &mut Vec<ProtectionFinding>,
 ) -> Result<(), ProtectionScanError> {
     let rva = analysis.entry_point_rva;
@@ -378,13 +389,17 @@ fn scan_entry_point(
         return Ok(());
     }
 
-    let Some((index, section)) = analysis
-        .sections
-        .iter()
-        .enumerate()
-        .find(|(_, section)| section_contains_rva(section, rva))
-    else {
+    let address = RelativeAddress::new(u64::from(rva));
+    let region = layout.region_at(address);
+    let Some((section_index, section_name)) = region.and_then(|region| match &region.kind {
+        StaticRegionKind::Section {
+            table_index, name, ..
+        } => Some((*table_index, name)),
+        StaticRegionKind::Headers | StaticRegionKind::ImageGap => None,
+    }) else {
         let in_headers = rva < analysis.size_of_headers;
+        let file_backed = layout.file_offset_at(address).is_some();
+        let executable = region.is_some_and(|region| region.access.executable);
         findings.push(ProtectionFinding {
             kind: ProtectionKind::EntryPointOutsideSection,
             severity: ProtectionSeverity::High,
@@ -403,22 +418,20 @@ fn scan_entry_point(
                 rva,
                 section_index: None,
                 section_name: None,
-                file_backed: in_headers,
-                executable: false,
+                file_backed,
+                executable,
             }],
         });
         return Ok(());
     };
 
-    let section_index =
-        u32::try_from(index).map_err(|_| ProtectionScanError::SectionIndexConversion { index })?;
-    let executable = section.characteristics & IMAGE_SCN_MEM_EXECUTE != 0;
-    let delta = rva - section.virtual_address;
-    let file_backed = delta < section.raw_data_size;
+    let region = region.expect("section identity came from the current region");
+    let executable = region.access.executable;
+    let file_backed = region.file_offset_at(address).is_some();
     let location = || ProtectionEvidence::EntryPointLocation {
         rva,
         section_index: Some(section_index),
-        section_name: Some(section.name.clone()),
+        section_name: Some(section_name.clone()),
         file_backed,
         executable,
     };
@@ -439,7 +452,7 @@ fn scan_entry_point(
             severity: ProtectionSeverity::High,
             strength: EvidenceStrength::ExactArtifact,
             title: "Entry point has no initializing file bytes".to_owned(),
-            summary: "The declared entry point lies beyond the section's raw-data prefix, in its zero-filled virtual tail. TLS or other pre-entry behavior would have to populate executable bytes before control reaches it.".to_owned(),
+            summary: "The declared entry point has no initializing file bytes: it lies in section zero-fill or loader-rounded mapped padding. TLS or other pre-entry behavior would have to populate executable bytes before control reaches it.".to_owned(),
             evidence: vec![location()],
         });
     }
@@ -587,17 +600,31 @@ fn entropy_millibits(bytes: &[u8]) -> u16 {
     (entropy * 1000.0).round().clamp(0.0, 8000.0) as u16
 }
 
-fn section_contains_rva(section: &PeSection, rva: u32) -> bool {
-    let start = u64::from(section.virtual_address);
-    let size = u64::from(cmp::max(section.virtual_size, section.raw_data_size));
-    let address = u64::from(rva);
-    address >= start && address < start + size
+fn section_region(layout: &StaticAddressSpace, table_index: u32) -> Option<&StaticRegion> {
+    layout.regions().iter().find(|region| {
+        matches!(
+            &region.kind,
+            StaticRegionKind::Section {
+                table_index: actual,
+                ..
+            } if *actual == table_index
+        )
+    })
+}
+
+fn section_table_index(region: &StaticRegion) -> Option<u32> {
+    match &region.kind {
+        StaticRegionKind::Section { table_index, .. } => Some(*table_index),
+        StaticRegionKind::Headers | StaticRegionKind::ImageGap => None,
+    }
 }
 
 #[derive(Debug, Error)]
 pub enum ProtectionScanError {
     #[error(transparent)]
     InvalidAnalysis(#[from] AnalysisError),
+    #[error(transparent)]
+    StaticLayout(#[from] StaticAddressSpaceError),
     #[error("binary length {actual} cannot be represented in the portable model")]
     BinarySizeConversion { actual: usize },
     #[error("binary size mismatch: analysis expects {expected} bytes, received {actual}")]
@@ -628,21 +655,41 @@ pub enum ProtectionScanError {
 
 #[cfg(test)]
 mod tests {
-    use resymbol_analysis::{BinaryAnalysis, PeSection, analyze_bytes};
+    use resymbol_analysis::{BinaryAnalysis, PeAnalysis, PeSection, analyze_bytes};
+
+    use crate::address_space::{RelativeAddress, StaticAddressSpace};
 
     use super::{
-        EvidenceStrength, HIGH_ENTROPY_MILLIBITS, ProtectionSeverity, anti_debug_import_assessment,
-        entropy_millibits, packer_section_assessment, scan_pe_protections,
+        EvidenceStrength, HIGH_ENTROPY_MILLIBITS, ProtectionEvidence, ProtectionKind,
+        ProtectionSeverity, anti_debug_import_assessment, entropy_millibits,
+        packer_section_assessment, scan_entry_point, scan_pe_protections, scan_sections,
     };
 
     const FIXTURE: &[u8] =
         include_bytes!("../../../fixtures/pe-x64-msvc/artifacts/milestone2-stripped.exe");
 
-    #[test]
-    fn exact_fixture_scan_is_deterministic_and_identity_bound() {
+    fn fixture_analysis() -> PeAnalysis {
         let BinaryAnalysis::Pe(pe) = analyze_bytes(FIXTURE).expect("fixture analysis") else {
             panic!("fixture must remain PE")
         };
+        pe
+    }
+
+    fn text_section(virtual_size: u32, raw_data_size: u32) -> PeSection {
+        PeSection {
+            name: ".text".to_owned(),
+            raw_name: *b".text\0\0\0",
+            virtual_address: 0x1000,
+            virtual_size,
+            raw_data_offset: 0x400,
+            raw_data_size,
+            characteristics: 0xe000_0020,
+        }
+    }
+
+    #[test]
+    fn exact_fixture_scan_is_deterministic_and_identity_bound() {
+        let pe = fixture_analysis();
         let first = scan_pe_protections(&pe, FIXTURE).expect("protection scan");
         let second = scan_pe_protections(&pe, FIXTURE).expect("repeat scan");
         assert_eq!(first, second);
@@ -651,6 +698,68 @@ mod tests {
         let mut changed = FIXTURE.to_vec();
         changed[0] ^= 1;
         assert!(scan_pe_protections(&pe, &changed).is_err());
+    }
+
+    #[test]
+    fn entry_point_uses_canonical_loaded_and_file_backed_section_ranges() {
+        let mut pe = fixture_analysis();
+        pe.size_of_headers = 0x400;
+        pe.size_of_image = 0x6000;
+        pe.section_alignment = 0x1000;
+        pe.file_alignment = 0x200;
+        pe.entry_point_rva = 0x1900;
+        pe.coff.number_of_sections = 1;
+        pe.sections = vec![text_section(0x801, 0xa00)];
+
+        let layout = StaticAddressSpace::from_validated_pe(&pe).expect("canonical static layout");
+        assert_eq!(
+            layout.file_offset_at(RelativeAddress::new(0x1800)),
+            Some(0xc00)
+        );
+        assert_eq!(layout.file_offset_at(RelativeAddress::new(0x1801)), None);
+
+        let mut entry_findings = Vec::new();
+        scan_entry_point(&pe, &layout, &mut entry_findings).expect("entry scan");
+        assert!(
+            !entry_findings
+                .iter()
+                .any(|finding| finding.kind == ProtectionKind::EntryPointOutsideSection)
+        );
+        let finding = entry_findings
+            .iter()
+            .find(|finding| finding.kind == ProtectionKind::EntryPointWithoutFileBacking)
+            .expect("loader padding must require acknowledgement");
+        assert!(matches!(
+            finding.evidence.as_slice(),
+            [ProtectionEvidence::EntryPointLocation {
+                rva: 0x1900,
+                section_index: Some(0),
+                section_name: Some(name),
+                file_backed: false,
+                executable: true,
+            }] if name == ".text"
+        ));
+
+        let mut section_findings = Vec::new();
+        scan_sections(&pe, FIXTURE, &layout, &mut section_findings).expect("section scan");
+        assert!(
+            section_findings
+                .iter()
+                .any(|finding| finding.kind == ProtectionKind::WritableEntryPointSection)
+        );
+
+        pe.entry_point_rva = 0x1100;
+        pe.sections = vec![text_section(0, 0x200)];
+        let layout =
+            StaticAddressSpace::from_validated_pe(&pe).expect("zero-virtual-size fallback layout");
+        let mut fallback_findings = Vec::new();
+        scan_entry_point(&pe, &layout, &mut fallback_findings).expect("fallback entry scan");
+        assert!(fallback_findings.iter().all(|finding| !matches!(
+            finding.kind,
+            ProtectionKind::EntryPointOutsideSection
+                | ProtectionKind::EntryPointNonExecutableSection
+                | ProtectionKind::EntryPointWithoutFileBacking
+        )));
     }
 
     #[test]
