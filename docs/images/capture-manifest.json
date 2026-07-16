@@ -19,8 +19,8 @@
                          "view":  "overview",
                          "width":  1440,
                          "height":  900,
-                         "bytes":  245092,
-                         "sha256":  "eade425514e2a1dd061e87afc502b6d537696c3349e4dc0fd33fb912857ae0a2"
+                         "bytes":  244829,
+                         "sha256":  "9b01679639e379b36be76ee9b15daa9b2b000699f4c8614dd9611fef5d19e086"
                      },
                      {
                          "file":  "workbench-functions.png",
@@ -43,16 +43,16 @@
                          "view":  "address-space",
                          "width":  1440,
                          "height":  900,
-                         "bytes":  260166,
-                         "sha256":  "628b3c63fbecf74c380e97cb92a083f66849e39d0c1017dc9b0d78d4d05fb497"
+                         "bytes":  257464,
+                         "sha256":  "2f43d3aafa1cd64e542e453226a38c5dc69528487170626b04d8269b47ad042c"
                      },
                      {
                          "file":  "workbench-debugger-sandbox.png",
                          "view":  "debugger-sandbox",
                          "width":  1440,
                          "height":  900,
-                         "bytes":  272343,
-                         "sha256":  "e99c95f1bda243272297233af6fe0d45eebf29f5ac6a597c56d06061d957371c"
+                         "bytes":  272340,
+                         "sha256":  "465f5f607263edc004484bd2048d2387f344544e49b8f2d870a9227c08c8b8f7"
                      }
                  ]
 }

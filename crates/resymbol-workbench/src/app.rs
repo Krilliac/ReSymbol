@@ -3350,49 +3350,48 @@ impl WorkbenchApp {
             .inner_margin(egui::Margin::same(10))
             .corner_radius(4)
             .show(ui, |ui| {
-                egui::Grid::new("static-address-space-summary")
-                    .num_columns(3)
-                    .spacing(egui::vec2(28.0, 10.0))
-                    .show(ui, |ui| {
-                        property_cell(
-                            ui,
-                            "Preferred base",
-                            &format!("0x{:016X}", address_space.preferred_image_base),
-                            true,
-                        );
-                        property_cell(
-                            ui,
-                            "Image size",
-                            &format!("0x{:X}", address_space.image_size),
-                            true,
-                        );
-                        property_cell(
-                            ui,
-                            "Section / file align",
-                            &format!(
-                                "0x{:X} / 0x{:X}",
-                                address_space.section_alignment, address_space.file_alignment
-                            ),
-                            true,
-                        );
-                        ui.end_row();
-                        property_cell(
-                            ui,
-                            "Entry RVA",
-                            &address_space.entry_point.map_or_else(
-                                || "none".to_owned(),
-                                |entry| format!("0x{:08X}", entry.get()),
-                            ),
-                            true,
-                        );
-                        property_cell(
-                            ui,
-                            "Regions",
-                            &address_space.regions().len().to_string(),
-                            false,
-                        );
-                        property_cell(ui, "Indicators", &indicator_text, false);
-                    });
+                ui.columns(3, |columns| {
+                    property_cell(
+                        &mut columns[0],
+                        "Preferred base",
+                        &format!("0x{:016X}", address_space.preferred_image_base),
+                        true,
+                    );
+                    property_cell(
+                        &mut columns[1],
+                        "Image size",
+                        &format!("0x{:X}", address_space.image_size),
+                        true,
+                    );
+                    property_cell(
+                        &mut columns[2],
+                        "Section / file align",
+                        &format!(
+                            "0x{:X} / 0x{:X}",
+                            address_space.section_alignment, address_space.file_alignment
+                        ),
+                        true,
+                    );
+                });
+                ui.add_space(8.0);
+                ui.columns(3, |columns| {
+                    property_cell(
+                        &mut columns[0],
+                        "Entry RVA",
+                        &address_space.entry_point.map_or_else(
+                            || "none".to_owned(),
+                            |entry| format!("0x{:08X}", entry.get()),
+                        ),
+                        true,
+                    );
+                    property_cell(
+                        &mut columns[1],
+                        "Regions",
+                        &address_space.regions().len().to_string(),
+                        false,
+                    );
+                    property_cell(&mut columns[2], "Indicators", &indicator_text, false);
+                });
             });
 
         let findings = project.protection_assessment.findings();
