@@ -65,6 +65,19 @@ enum ExecutionGate {
     SandboxAccepted,
 }
 
+/// Ordinary-state checkpoint for one remote command, deliberately excluding
+/// command watermarks and one-use authority registries.
+#[derive(Debug)]
+pub(crate) struct RemoteCommandCheckpoint {
+    session_id: SessionId,
+    provisioning_epoch: ProvisioningEpoch,
+    state: SessionState,
+    target: Option<DebugTargetRequest>,
+    execution_gate: ExecutionGate,
+    sandbox: Option<SandboxMachine>,
+    inherited_sandbox: Option<SandboxOwnershipBinding>,
+}
+
 impl SessionMachine {
     #[must_use]
     pub fn new(
@@ -242,6 +255,48 @@ impl SessionMachine {
                 self.transition_to(SessionState::Closing { token: next })?;
             }
         }
+        Ok(&self.state)
+    }
+
+    /// Begins a command whose outcome is reported by an untrusted remote host.
+    ///
+    /// The returned checkpoint can restore only visible reducer state after an
+    /// explicit rejection. Command IDs and consumed/cleared authority remain
+    /// one-use even when the remote operation reports no effect.
+    pub(crate) fn begin_remote_command(
+        &mut self,
+        envelope: &CommandEnvelope,
+    ) -> Result<RemoteCommandCheckpoint, SessionMachineError> {
+        let checkpoint = RemoteCommandCheckpoint {
+            session_id: self.session_id,
+            provisioning_epoch: self.provisioning_epoch.clone(),
+            state: self.state.clone(),
+            target: self.target.clone(),
+            execution_gate: self.execution_gate,
+            sandbox: self.sandbox.clone(),
+            inherited_sandbox: self.inherited_sandbox.clone(),
+        };
+        self.accept_command(envelope)?;
+        Ok(checkpoint)
+    }
+
+    /// Restores visible state after an exact remote rejection without
+    /// restoring command IDs, token allocation, or one-use authority.
+    pub(crate) fn reject_remote_command(
+        &mut self,
+        checkpoint: RemoteCommandCheckpoint,
+    ) -> Result<&SessionState, SessionMachineError> {
+        if self.session_id != checkpoint.session_id {
+            return Err(SessionMachineError::SessionBindingMismatch);
+        }
+        if self.provisioning_epoch != checkpoint.provisioning_epoch {
+            return Err(SessionMachineError::ProvisioningEpochMismatch);
+        }
+        self.state = checkpoint.state;
+        self.target = checkpoint.target;
+        self.execution_gate = checkpoint.execution_gate;
+        self.sandbox = checkpoint.sandbox;
+        self.inherited_sandbox = checkpoint.inherited_sandbox;
         Ok(&self.state)
     }
 

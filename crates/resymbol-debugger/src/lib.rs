@@ -24,9 +24,11 @@ pub use address_space::{
 pub use authorization::{
     HostRiskLease, HostRiskOperation, SandboxOwnershipBinding, SandboxOwnershipLease,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use host_client::SyntheticDebugHost;
 pub use host_client::{
-    ClientConnectionState, CommandReceipt, DebugHostClient, DebugHostClientError,
-    HostFrameExchange, HostTransportError, InMemoryDebugHost, MAX_PENDING_COMMANDS,
+    ClientConnectionState, CommandReceipt, ControlShutdownReason, DebugHostClient,
+    DebugHostClientError, HostFrameExchange, HostTransportError, MAX_PENDING_COMMANDS,
 };
 pub use host_codec::{
     HostCodecError, HostFrame, decode_command_frame, decode_event_frame, encode_command_frame,

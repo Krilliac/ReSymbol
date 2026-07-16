@@ -145,7 +145,7 @@ pub struct HelloIdentity {
     pub nonce: [u8; 16],
     pub role: EndpointRole,
     pub direction: MessageDirection,
-    pub build_identity: String,
+    pub build_claim: String,
 }
 
 impl HelloIdentity {
@@ -153,14 +153,14 @@ impl HelloIdentity {
         nonce: [u8; 16],
         role: EndpointRole,
         direction: MessageDirection,
-        build_identity: impl Into<String>,
+        build_claim: impl Into<String>,
     ) -> Result<Self, WireError> {
-        let build_identity = build_identity.into();
+        let build_claim = build_claim.into();
         let hello = Self {
             nonce,
             role,
             direction,
-            build_identity,
+            build_claim,
         };
         hello.validate()?;
         Ok(hello)
@@ -173,18 +173,18 @@ impl HelloIdentity {
         if self.direction != self.role.outbound_direction() {
             return Err(WireError::RoleDirectionMismatch);
         }
-        validate_build_identity(&self.build_identity)?;
+        validate_build_claim(&self.build_claim)?;
         Ok(())
     }
 }
 
-fn validate_build_identity(build_identity: &str) -> Result<(), WireError> {
-    if build_identity.is_empty() || build_identity.chars().any(char::is_control) {
-        return Err(WireError::InvalidBuildIdentity);
+fn validate_build_claim(build_claim: &str) -> Result<(), WireError> {
+    if build_claim.is_empty() || build_claim.chars().any(char::is_control) {
+        return Err(WireError::InvalidBuildClaim);
     }
-    if build_identity.len() > MAX_BUILD_ID_BYTES {
-        return Err(WireError::BuildIdentityTooLong {
-            actual: build_identity.len(),
+    if build_claim.len() > MAX_BUILD_ID_BYTES {
+        return Err(WireError::BuildClaimTooLong {
+            actual: build_claim.len(),
             maximum: MAX_BUILD_ID_BYTES,
         });
     }
@@ -200,38 +200,39 @@ pub enum HandshakeState {
     Failed,
 }
 
-/// Directional nonce, role, version, and build-identity binding for one frame exchange.
+/// Directional nonce, role, version, and plaintext build-claim correlation.
 ///
 /// The machine deliberately owns no transport. Each side has an independent
 /// frame sequence, so the initial `Hello` and `HelloAck` are both sequence one.
 /// Any validation failure is terminal: callers must discard the channel rather
-/// than attempting to recover on bytes whose identity is no longer trusted.
-/// This handshake detects reflection, replay, downgrade, and accidental peer
-/// mismatch; it is not cryptographic peer authentication. A platform adapter
-/// must separately authenticate the transport and the helper it created.
+/// than attempting to recover from ambiguous channel state.
+/// This exchange detects reflection, replay, downgrade, and accidental build
+/// mismatch. The echoed caller nonce and self-reported build strings are not
+/// proof of peer identity. A platform adapter must authenticate the transport
+/// and the helper it created through an independent operating-system boundary.
 #[derive(Debug)]
-pub struct HandshakeMachine {
+pub struct BuildClaimHandshake {
     role: EndpointRole,
-    local_build_identity: String,
-    expected_peer_build_identity: String,
+    local_build_claim: String,
+    expected_peer_build_claim: String,
     offered_version: ProtocolVersion,
     negotiated_version: Option<ProtocolVersion>,
     nonce: Option<[u8; 16]>,
     state: HandshakeState,
 }
 
-impl HandshakeMachine {
+impl BuildClaimHandshake {
     pub fn initiator(
         role: EndpointRole,
         nonce: [u8; 16],
-        local_build_identity: impl Into<String>,
-        expected_peer_build_identity: impl Into<String>,
+        local_build_claim: impl Into<String>,
+        expected_peer_build_claim: impl Into<String>,
     ) -> Result<Self, HandshakeError> {
         Self::initiator_for_version(
             role,
             nonce,
-            local_build_identity,
-            expected_peer_build_identity,
+            local_build_claim,
+            expected_peer_build_claim,
             ProtocolVersion::CURRENT,
         )
     }
@@ -242,8 +243,8 @@ impl HandshakeMachine {
     pub fn initiator_for_version(
         role: EndpointRole,
         nonce: [u8; 16],
-        local_build_identity: impl Into<String>,
-        expected_peer_build_identity: impl Into<String>,
+        local_build_claim: impl Into<String>,
+        expected_peer_build_claim: impl Into<String>,
         offered_version: ProtocolVersion,
     ) -> Result<Self, HandshakeError> {
         if nonce.iter().all(|byte| *byte == 0) {
@@ -252,8 +253,8 @@ impl HandshakeMachine {
         offered_version.validate()?;
         Self::new(
             role,
-            local_build_identity.into(),
-            expected_peer_build_identity.into(),
+            local_build_claim.into(),
+            expected_peer_build_claim.into(),
             offered_version,
             Some(nonce),
             HandshakeState::Ready,
@@ -262,13 +263,13 @@ impl HandshakeMachine {
 
     pub fn responder(
         role: EndpointRole,
-        local_build_identity: impl Into<String>,
-        expected_peer_build_identity: impl Into<String>,
+        local_build_claim: impl Into<String>,
+        expected_peer_build_claim: impl Into<String>,
     ) -> Result<Self, HandshakeError> {
         Self::new(
             role,
-            local_build_identity.into(),
-            expected_peer_build_identity.into(),
+            local_build_claim.into(),
+            expected_peer_build_claim.into(),
             ProtocolVersion::CURRENT,
             None,
             HandshakeState::AwaitingHello,
@@ -277,18 +278,18 @@ impl HandshakeMachine {
 
     fn new(
         role: EndpointRole,
-        local_build_identity: String,
-        expected_peer_build_identity: String,
+        local_build_claim: String,
+        expected_peer_build_claim: String,
         offered_version: ProtocolVersion,
         nonce: Option<[u8; 16]>,
         state: HandshakeState,
     ) -> Result<Self, HandshakeError> {
-        validate_build_identity(&local_build_identity)?;
-        validate_build_identity(&expected_peer_build_identity)?;
+        validate_build_claim(&local_build_claim)?;
+        validate_build_claim(&expected_peer_build_claim)?;
         Ok(Self {
             role,
-            local_build_identity,
-            expected_peer_build_identity,
+            local_build_claim,
+            expected_peer_build_claim,
             offered_version,
             negotiated_version: None,
             nonce,
@@ -334,7 +335,7 @@ impl HandshakeMachine {
                 nonce,
                 self.role,
                 self.role.outbound_direction(),
-                self.local_build_identity.clone(),
+                self.local_build_claim.clone(),
             )?),
         )?;
         frame.version = self.offered_version;
@@ -379,7 +380,7 @@ impl HandshakeMachine {
                         hello.nonce,
                         self.role,
                         self.role.outbound_direction(),
-                        self.local_build_identity.clone(),
+                        self.local_build_claim.clone(),
                     )?),
                 )?;
                 acknowledgement.version = frame.version;
@@ -415,8 +416,8 @@ impl HandshakeMachine {
         if hello.direction != hello.role.outbound_direction() {
             return Err(HandshakeError::PeerDirectionMismatch);
         }
-        if hello.build_identity != self.expected_peer_build_identity {
-            return Err(HandshakeError::PeerBuildIdentityMismatch);
+        if hello.build_claim != self.expected_peer_build_claim {
+            return Err(HandshakeError::PeerBuildClaimMismatch);
         }
         Ok(())
     }
@@ -515,7 +516,7 @@ impl FrameHeader {
     fn control_len(&self) -> Result<usize, WireError> {
         let body = match &self.body {
             ControlBody::Hello(hello) => HELLO_FIXED_BYTES
-                .checked_add(hello.build_identity.len())
+                .checked_add(hello.build_claim.len())
                 .ok_or(WireError::LengthOverflow)?,
             ControlBody::Bytes(bytes) => bytes.len(),
         };
@@ -561,9 +562,9 @@ pub fn encode_control(header: &FrameHeader) -> Result<Vec<u8>, WireError> {
             out.push(hello.role as u8);
             out.push(hello.direction as u8);
             let length =
-                u16::try_from(hello.build_identity.len()).map_err(|_| WireError::LengthOverflow)?;
+                u16::try_from(hello.build_claim.len()).map_err(|_| WireError::LengthOverflow)?;
             out.extend_from_slice(&length.to_le_bytes());
-            out.extend_from_slice(hello.build_identity.as_bytes());
+            out.extend_from_slice(hello.build_claim.as_bytes());
         }
         ControlBody::Bytes(bytes) => out.extend_from_slice(bytes),
     }
@@ -616,7 +617,7 @@ pub fn decode_control(control: &[u8]) -> Result<FrameHeader, WireError> {
             return Err(WireError::Malformed("hello length mismatch"));
         }
         let build = std::str::from_utf8(&bytes[HELLO_FIXED_BYTES..])
-            .map_err(|_| WireError::InvalidBuildIdentity)?;
+            .map_err(|_| WireError::InvalidBuildClaim)?;
         ControlBody::Hello(HelloIdentity::new(nonce, role, direction, build)?)
     } else {
         ControlBody::Bytes(bytes.to_vec())
@@ -796,16 +797,16 @@ pub enum WireError {
     ZeroSequence,
     #[error("hello nonce must be nonzero")]
     ZeroHelloNonce,
-    #[error("invalid build identity")]
-    InvalidBuildIdentity,
+    #[error("invalid plaintext build claim")]
+    InvalidBuildClaim,
     #[error("unknown endpoint role {value}")]
     UnknownEndpointRole { value: u8 },
     #[error("unknown message direction {value}")]
     UnknownMessageDirection { value: u8 },
     #[error("hello endpoint role and direction disagree")]
     RoleDirectionMismatch,
-    #[error("build identity has {actual} bytes; maximum is {maximum}")]
-    BuildIdentityTooLong { actual: usize, maximum: usize },
+    #[error("plaintext build claim has {actual} bytes; maximum is {maximum}")]
+    BuildClaimTooLong { actual: usize, maximum: usize },
     #[error("control length cannot be zero")]
     ZeroControlLength,
     #[error("control has {declared} bytes; minimum is {minimum}")]
@@ -853,8 +854,8 @@ pub enum HandshakeError {
     PeerRoleMismatch,
     #[error("handshake peer direction does not match its endpoint role")]
     PeerDirectionMismatch,
-    #[error("handshake peer build identity does not match the expected identity")]
-    PeerBuildIdentityMismatch,
+    #[error("handshake peer build claim does not match the expected claim")]
+    PeerBuildClaimMismatch,
     #[error("handshake acknowledgement nonce does not match the challenge")]
     NonceMismatch,
     #[error("handshake has not been started")]
@@ -997,16 +998,19 @@ mod tests {
     #[test]
     fn handshake_binds_nonce_roles_directions_builds_and_sequences() {
         let nonce = [0x91; 16];
-        let mut controller = HandshakeMachine::initiator(
+        let mut controller = BuildClaimHandshake::initiator(
             EndpointRole::Controller,
             nonce,
             "controller/build-7",
             "host/build-4",
         )
         .unwrap();
-        let mut host =
-            HandshakeMachine::responder(EndpointRole::Host, "host/build-4", "controller/build-7")
-                .unwrap();
+        let mut host = BuildClaimHandshake::responder(
+            EndpointRole::Host,
+            "host/build-4",
+            "controller/build-7",
+        )
+        .unwrap();
 
         let hello = controller.begin(FrameSequence::new(1).unwrap()).unwrap();
         let acknowledgement = host.accept(&hello).unwrap().unwrap();
@@ -1027,7 +1031,7 @@ mod tests {
 
     #[test]
     fn handshake_rejects_reflection_and_becomes_terminal() {
-        let mut controller = HandshakeMachine::initiator(
+        let mut controller = BuildClaimHandshake::initiator(
             EndpointRole::Controller,
             [0x71; 16],
             "controller/build",
@@ -1048,7 +1052,7 @@ mod tests {
 
     #[test]
     fn handshake_rejects_nonce_build_and_order_mismatches() {
-        let mut out_of_order = HandshakeMachine::initiator(
+        let mut out_of_order = BuildClaimHandshake::initiator(
             EndpointRole::Controller,
             [0x31; 16],
             "controller/build",
@@ -1063,7 +1067,7 @@ mod tests {
             })
         );
 
-        let mut controller = HandshakeMachine::initiator(
+        let mut controller = BuildClaimHandshake::initiator(
             EndpointRole::Controller,
             [0x31; 16],
             "controller/build",
@@ -1093,18 +1097,18 @@ mod tests {
         );
 
         let mut host =
-            HandshakeMachine::responder(EndpointRole::Host, "host/build", "controller/expected")
+            BuildClaimHandshake::responder(EndpointRole::Host, "host/build", "controller/expected")
                 .unwrap();
         assert_eq!(
             host.accept(&hello(1)),
-            Err(HandshakeError::PeerBuildIdentityMismatch)
+            Err(HandshakeError::PeerBuildClaimMismatch)
         );
     }
 
     #[test]
     fn handshake_rejects_an_unsupported_offered_version_before_exchange() {
         assert!(matches!(
-            HandshakeMachine::initiator_for_version(
+            BuildClaimHandshake::initiator_for_version(
                 EndpointRole::Controller,
                 [0x41; 16],
                 "controller/build",
