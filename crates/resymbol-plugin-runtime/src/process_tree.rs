@@ -3,10 +3,7 @@
 //! Unix children become leaders of a fresh process group before `exec`, so a
 //! single signal can terminate the leader and all descendants that remain in
 //! that group. Linux and macOS observe natural leader exit without reaping,
-//! keeping its process-group identifier reserved while group termination is
-//! attempted. XNU's zombie-only `EPERM` exception is resolved by relinquishing
-//! destructive authority, reaping the leader, and accepting only an `ESRCH`
-//! signal-zero proof that the group is absent.
+//! keeping its process-group identifier reserved until group termination.
 //! Windows children are assigned to a kill-on-close Job Object.
 //! Windows' ordinary [`Command::spawn`] API cannot create a process already
 //! suspended inside a job, so there is an unavoidable spawn-to-assignment race
@@ -17,8 +14,6 @@ use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitSta
 
 #[cfg(target_os = "macos")]
 use kqueue::{Event, EventData, EventFilter, FilterFlag, Ident, Proc, Watcher};
-#[cfg(target_os = "macos")]
-use rustix::process::test_kill_process_group;
 #[cfg(target_os = "linux")]
 use rustix::process::{WaitId, WaitIdOptions, waitid};
 #[cfg(unix)]
@@ -45,8 +40,6 @@ pub(crate) struct ContainedChild {
     process_group: Option<Pid>,
     #[cfg(target_os = "macos")]
     exit_observation: MacOsExitObservation,
-    #[cfg(target_os = "macos")]
-    terminal_containment_error: Option<MacOsContainmentError>,
     #[cfg(windows)]
     job: Option<Job>,
 }
@@ -89,8 +82,6 @@ impl ContainedChild {
                 process_group: Some(process_group),
                 #[cfg(target_os = "macos")]
                 exit_observation,
-                #[cfg(target_os = "macos")]
-                terminal_containment_error: None,
             })
         }
 
@@ -144,14 +135,10 @@ impl ContainedChild {
     ///
     /// Linux uses `waitid(WNOWAIT)` and macOS uses a pre-registered kqueue
     /// `NOTE_EXIT` filter to observe exit without reaping. Both platforms
-    /// normally terminate the still-stable containment boundary before collecting
-    /// the direct child's status. macOS handles XNU's zombie-only `EPERM` by first
-    /// relinquishing destructive authority, reaping, and then requiring an `ESRCH`
-    /// absence proof, so a recycled identifier is never signaled destructively.
+    /// terminate the still-stable containment boundary before collecting the
+    /// direct child's status, so its process-group identifier cannot be reused
+    /// by an unrelated process during cleanup.
     pub(crate) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-        #[cfg(target_os = "macos")]
-        self.check_terminal_containment_error()?;
-
         if let Some(status) = self.direct_child_status {
             return Ok(Some(status));
         }
@@ -182,14 +169,9 @@ impl ContainedChild {
 
     /// Waits for and returns the direct child's exit status.
     ///
-    /// Linux and macOS retain the exited leader while terminating the containment
-    /// boundary. macOS' `EPERM` fallback clears destructive group authority before
-    /// reaping and reports an error unless the now-non-destructive probe proves
-    /// the group absent.
+    /// Linux and macOS retain the exited leader until the containment boundary
+    /// has been terminated, preventing process-group identifier reuse.
     pub(crate) fn wait(&mut self) -> io::Result<ExitStatus> {
-        #[cfg(target_os = "macos")]
-        self.check_terminal_containment_error()?;
-
         if let Some(status) = self.direct_child_status {
             return Ok(status);
         }
@@ -231,100 +213,51 @@ impl ContainedChild {
     }
 
     /// Terminates the still-stable containment boundary, then reaps its leader.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn reap_observed_direct_child(&mut self) -> io::Result<ExitStatus> {
-        self.terminate()?;
+        let containment_result = self.terminate_containment_group(true);
+        let child_result = terminate_direct_child(&mut self.child);
+        combine_termination_results(containment_result, child_result)?;
         let status = self.child.wait()?;
         self.direct_child_status = Some(status);
         Ok(status)
     }
 
-    /// Resolves XNU's zombie-only process-group `EPERM` without accepting a live descendant.
     #[cfg(target_os = "macos")]
-    fn reap_observed_direct_child(&mut self) -> io::Result<ExitStatus> {
-        let Some(process_group) = self.process_group else {
-            let status = self.child.wait()?;
-            self.direct_child_status = Some(status);
-            return Ok(status);
-        };
-
-        match kill_process_group(process_group, Signal::KILL) {
-            Ok(()) | Err(Errno::SRCH) => {
-                // Signal delivery succeeded or the group was already absent. Forget the identifier
-                // before reaping so no later call can target a recycled process group.
-                let _ = self.process_group.take();
-                let status = self.child.wait()?;
-                self.direct_child_status = Some(status);
-                Ok(status)
-            }
-            Err(Errno::PERM) => {
-                // XNU excludes zombie members from process-group signal delivery. A group whose
-                // only member is the observed-but-unreaped leader therefore reports EPERM. Clear
-                // destructive authority before reaping, then use signal 0 solely to prove absence;
-                // a recycled identifier can only produce a safe false failure at that point.
-                let _ = self.process_group.take();
-                let status = match self.child.wait() {
-                    Ok(status) => {
-                        self.direct_child_status = Some(status);
-                        status
-                    }
-                    Err(error) => {
-                        let error = io::Error::new(
-                            error.kind(),
-                            format!(
-                                "failed to reap the observed macOS process-group leader after kill returned EPERM: {error}"
-                            ),
-                        );
-                        return Err(self.remember_terminal_containment_error(error));
-                    }
-                };
-
-                if let Err(error) =
-                    require_macos_process_group_absent(test_kill_process_group(process_group))
-                {
-                    let error = io::Error::new(
+    fn terminate_macos_containment_group(&mut self) -> io::Result<()> {
+        match self.terminate_containment_group(false) {
+            Ok(()) => Ok(()),
+            Err(error) if error.raw_os_error() == Some(Errno::PERM.raw_os_error()) => {
+                match self.exit_observation.try_observe_exit() {
+                    Ok(true) => self.terminate_containment_group(true),
+                    Ok(false) => Err(error),
+                    Err(observation_error) => Err(io::Error::new(
                         error.kind(),
                         format!(
-                            "macOS process-group kill returned EPERM and absence could not be proven for {process_group:?}: {error}"
+                            "{error}; macOS child-exit observation also failed: {observation_error}"
                         ),
-                    );
-                    return Err(self.remember_terminal_containment_error(error));
+                    )),
                 }
-                Ok(status)
             }
-            Err(error) => Err(error.into()),
+            Err(error) => Err(error),
         }
-    }
-
-    #[cfg(target_os = "macos")]
-    fn check_terminal_containment_error(&self) -> io::Result<()> {
-        match &self.terminal_containment_error {
-            Some(error) => Err(error.to_io_error()),
-            None => Ok(()),
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    fn remember_terminal_containment_error(&mut self, error: io::Error) -> io::Error {
-        let error = MacOsContainmentError::from_io_error(error);
-        let returned = error.to_io_error();
-        self.terminal_containment_error = Some(error);
-        returned
     }
 
     #[cfg(unix)]
-    fn terminate_containment_group(&mut self) -> io::Result<()> {
+    fn terminate_containment_group(&mut self, direct_child_exit_observed: bool) -> io::Result<()> {
         match self.process_group {
             None => Ok(()),
-            Some(process_group) => match terminate_process_group(process_group) {
-                Ok(()) => {
-                    // Process-group identifiers can eventually be recycled. Forget the group after
-                    // a conclusive result so a repeated caller cannot signal an unrelated group.
-                    self.process_group = None;
-                    Ok(())
+            Some(process_group) => {
+                match terminate_process_group(process_group, direct_child_exit_observed) {
+                    Ok(()) => {
+                        // Process-group identifiers can eventually be recycled. Forget the group after
+                        // a conclusive result so a repeated caller cannot signal an unrelated group.
+                        self.process_group = None;
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
                 }
-                Err(error) => Err(error),
-            },
+            }
         }
     }
 
@@ -333,11 +266,11 @@ impl ContainedChild {
     /// Calling this method repeatedly is harmless. It initiates termination but
     /// deliberately leaves direct-child reaping to [`Self::wait`] or `Drop`.
     pub(crate) fn terminate(&mut self) -> io::Result<()> {
-        #[cfg(target_os = "macos")]
-        self.check_terminal_containment_error()?;
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let containment_result = self.terminate_containment_group(false);
 
-        #[cfg(unix)]
-        let containment_result = self.terminate_containment_group();
+        #[cfg(target_os = "macos")]
+        let containment_result = self.terminate_macos_containment_group();
 
         #[cfg(windows)]
         let containment_result = {
@@ -363,27 +296,6 @@ impl Drop for ContainedChild {
     fn drop(&mut self) {
         let _ = self.terminate();
         let _ = self.child.wait();
-    }
-}
-
-#[cfg(target_os = "macos")]
-#[derive(Debug)]
-struct MacOsContainmentError {
-    kind: io::ErrorKind,
-    message: String,
-}
-
-#[cfg(target_os = "macos")]
-impl MacOsContainmentError {
-    fn from_io_error(error: io::Error) -> Self {
-        Self {
-            kind: error.kind(),
-            message: error.to_string(),
-        }
-    }
-
-    fn to_io_error(&self) -> io::Error {
-        io::Error::new(self.kind, self.message.clone())
     }
 }
 
@@ -498,27 +410,31 @@ fn macos_exit_watch_error(context: &str, error: io::Error) -> io::Error {
 }
 
 #[cfg(unix)]
-fn terminate_process_group(process_group: Pid) -> io::Result<()> {
-    match kill_process_group(process_group, Signal::KILL) {
-        Ok(()) | Err(Errno::SRCH) => Ok(()),
-        Err(error) => Err(error.into()),
-    }
+fn terminate_process_group(process_group: Pid, direct_child_exit_observed: bool) -> io::Result<()> {
+    classify_process_group_kill(
+        kill_process_group(process_group, Signal::KILL),
+        direct_child_exit_observed,
+    )
 }
 
-#[cfg(target_os = "macos")]
-fn require_macos_process_group_absent(result: rustix::io::Result<()>) -> io::Result<()> {
+#[cfg(unix)]
+fn classify_process_group_kill(
+    result: rustix::io::Result<()>,
+    direct_child_exit_observed: bool,
+) -> io::Result<()> {
+    #[cfg(not(target_os = "macos"))]
+    let _ = direct_child_exit_observed;
+
     match result {
-        Err(Errno::SRCH) => Ok(()),
-        Ok(()) => Err(io::Error::other(
-            "process group still exists after its observed leader was reaped",
-        )),
-        Err(error) => {
-            let error: io::Error = error.into();
-            Err(io::Error::new(
-                error.kind(),
-                format!("process-group absence probe failed: {error}"),
-            ))
+        Ok(()) | Err(Errno::SRCH) => Ok(()),
+        #[cfg(target_os = "macos")]
+        Err(Errno::PERM) if direct_child_exit_observed => {
+            // XNU excludes zombie members from process-group signal delivery. Once NOTE_EXIT has
+            // observed the direct leader, a group containing only that zombie can therefore report
+            // EPERM even though there is no remaining process to terminate.
+            Ok(())
         }
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -608,7 +524,7 @@ fn append_cleanup_errors(
 mod tests {
     use super::ContainedChild;
     #[cfg(target_os = "macos")]
-    use super::{classify_macos_exit_event, require_macos_process_group_absent};
+    use super::{classify_macos_exit_event, classify_process_group_kill};
     #[cfg(target_os = "macos")]
     use kqueue::{Event, EventData, Ident, Proc};
     #[cfg(target_os = "macos")]
@@ -684,45 +600,36 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_group_absence_requires_esrch() {
-        assert!(require_macos_process_group_absent(Err(Errno::SRCH)).is_ok());
-        assert!(require_macos_process_group_absent(Ok(())).is_err());
-        assert!(require_macos_process_group_absent(Err(Errno::PERM)).is_err());
-        assert!(require_macos_process_group_absent(Err(Errno::INVAL)).is_err());
+    fn macos_group_kill_accepts_permission_denied_only_after_exit_observation() {
+        assert!(classify_process_group_kill(Ok(()), false).is_ok());
+        assert!(classify_process_group_kill(Err(Errno::SRCH), false).is_ok());
+        assert!(classify_process_group_kill(Err(Errno::PERM), true).is_ok());
+        assert_eq!(
+            classify_process_group_kill(Err(Errno::PERM), false)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(Errno::PERM.raw_os_error())
+        );
+        assert_eq!(
+            classify_process_group_kill(Err(Errno::INVAL), true)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(Errno::INVAL.raw_os_error())
+        );
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_terminal_containment_error_stays_sticky_after_status_is_cached() -> io::Result<()> {
-        let mut command = exit_command(0);
-        let mut child = ContainedChild::spawn(&mut command)?;
-        let _ = child.process_group.take();
-        let status = child.child.wait()?;
-        child.direct_child_status = Some(status);
+    fn macos_terminate_reaps_an_authoritatively_observed_immediate_exit() -> io::Result<()> {
+        for _ in 0..64 {
+            let mut command = exit_command(41);
+            let mut child = ContainedChild::spawn(&mut command)?;
+            child.exit_observation.observe_exit()?;
 
-        let expected = "synthetic terminal containment failure";
-        let first = child.remember_terminal_containment_error(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            expected,
-        ));
-        assert_eq!(first.kind(), io::ErrorKind::PermissionDenied);
-        assert_eq!(first.to_string(), expected);
-
-        let wait_error = child
-            .wait()
-            .expect_err("cached status must not mask the error");
-        assert_eq!(wait_error.kind(), io::ErrorKind::PermissionDenied);
-        assert_eq!(wait_error.to_string(), expected);
-        let poll_error = child
-            .try_wait()
-            .expect_err("polling must preserve the terminal containment error");
-        assert_eq!(poll_error.kind(), io::ErrorKind::PermissionDenied);
-        assert_eq!(poll_error.to_string(), expected);
-        let terminate_error = child
-            .terminate()
-            .expect_err("termination must preserve the terminal containment error");
-        assert_eq!(terminate_error.kind(), io::ErrorKind::PermissionDenied);
-        assert_eq!(terminate_error.to_string(), expected);
+            child.terminate()?;
+            assert_eq!(child.wait()?.code(), Some(41));
+            child.terminate()?;
+        }
         Ok(())
     }
 

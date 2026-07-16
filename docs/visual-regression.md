@@ -5,7 +5,9 @@ MSVC fixture: **Overview**, **Functions**, **Reconstruction Graph**, **Address S
 non-executing **Debugger / Sandbox Readiness** surface. The capture path builds the workbench with
 its opt-in `screenshot` feature, disables persisted window state and animation, clears interactive
 pointer state, sets a fixed native viewport and UI zoom, waits for the workbench panels to settle,
-and then uses egui's next-frame screenshot event. Every PNG must be exactly 1440x900 pixels.
+and then uses egui's next-frame screenshot event. The screenshot build disables eframe's normal
+monitor-size clamp so a smaller hosted-runner desktop cannot shrink the framebuffer. Every PNG must
+be exactly 1440x900 pixels.
 
 On Windows, regenerate the views with:
 

@@ -198,13 +198,16 @@ fn exercise_runtime() {
     let oversized = output_host
         .execute_trusted(&fixture.plugin, &fixture.request("oversized"))
         .expect_err("oversized stdout must terminate the plugin");
-    assert!(matches!(
-        &oversized,
-        PluginRuntimeError::StreamLimit {
-            stream: StreamKind::Stdout,
-            ..
-        }
-    ));
+    assert!(
+        matches!(
+            &oversized,
+            PluginRuntimeError::StreamLimit {
+                stream: StreamKind::Stdout,
+                ..
+            }
+        ),
+        "expected stdout stream limit, got {oversized:?}"
+    );
     // Closing stdout after the bounded prefix races the mock's BrokenPipe handler, which may append
     // its own bounded error. The pre-limit diagnostic and configured cap are the stable contract.
     let oversized_stderr = &oversized.diagnostics().unwrap().stderr;

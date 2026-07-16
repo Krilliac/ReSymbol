@@ -16,6 +16,7 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(viewport_size)
             .with_min_inner_size([1_024.0, 680.0])
+            .with_clamp_size_to_monitor_size(!cfg!(feature = "screenshot"))
             .with_title("ReSymbol Workbench"),
         ..Default::default()
     };
