@@ -14,6 +14,11 @@ ReSymbol currently implements the non-executing foundation for debugger and sand
 - a bounded control/raw-byte frame format for a future helper process; and
 - sandbox policy, attestation, failure, lifecycle, resource-limit, and cleanup-receipt data models.
 
+The debugger crate also exposes a bounded provider-readiness service. It is discovery only: it
+cannot execute a target, create an AppContainer profile, enable a Windows feature, create a VM, or
+provision any other resource. A readiness result means only that a caller may attempt provisioning;
+the suspended target still needs the exact policy/provider/build attestation described below.
+
 The Windows debugger host, AppContainer provider, Hyper-V provider, guest agent, live process attach,
 breakpoint engine, register access, memory access, and instruction editing are not implemented. The
 current types and UI must not be described as a working malware sandbox or live debugger.
@@ -39,6 +44,31 @@ Workbench UI thread
   cleanup complete.
 - The backend-neutral crate forbids unsafe code. Platform FFI belongs in a narrow Windows provider
   crate whose public types are opaque and whose cleanup behavior is testable.
+
+## Read-only provider discovery
+
+`SandboxProviderReadinessService` owns one injected `SandboxProviderProbeBackend`. Both are safe to
+replace between calls and own no provider or operating-system handles. A probe may run on any thread,
+but it must be read-only and thread-safe. The service rejects a mismatched provider identity,
+boundary, or required-guarantee set and returns an indeterminate result rather than weakening the
+request.
+
+Reports are strict, bounded Serde values containing the exact requested provider, boundary, and
+guarantees; a typed reason; and a deterministic set of unresolved requirements. The requested
+guarantees in a report are requirements, not claims about a created sandbox. Only
+`ready-for-provisioning-attempt` is available—there is deliberately no "sandbox guaranteed" state.
+
+`SystemSandboxProviderProbe` is intentionally conservative. It uses only the compile-time platform
+target. Off Windows it reports `unsupported-platform`. On Windows it reports
+`capabilities-unverified` plus exact AppContainer, optional-feature, virtualization, policy, helper,
+or sealed-image requirements. It does not trust environment variables, registry implementation
+details, localized command output, or paths found through the user `PATH`; it does not invoke DISM or
+PowerShell; and it never enables a feature or requests elevation. A future Windows adapter may
+return readiness only after non-mutating, stable operating-system capability checks.
+
+Deterministic fake backends exercise ready, unavailable, missing-capability, and provider-mismatch
+paths without touching the host. Production provisioning and runtime attestation remain separate
+subsystems.
 
 ## Target modes
 
