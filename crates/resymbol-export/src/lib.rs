@@ -29,6 +29,7 @@ pub use model::{
     ProjectionWarningCode,
 };
 pub use pdb::{MAX_PDB_PUBLIC_SYMBOLS, PdbError, render_pdb};
+pub use project::NameSelection;
 
 /// Maximum UTF-8 byte length accepted for a source symbol name.
 pub const MAX_NAME_BYTES: usize = 1_024;

@@ -22,6 +22,10 @@ pub enum ExportError {
     ZeroImageSize,
     #[error("image base plus virtual image size overflows the address space")]
     ImageAddressOverflow,
+    #[error("name-selection count {found} does not match graph claim count {expected}")]
+    NameSelectionCountMismatch { expected: usize, found: usize },
+    #[error("claim {index} is marked alias-only but is not a name claim")]
+    AliasOnlyNonNameClaim { index: usize },
     #[error("binary field `{field}` is not bounded canonical text")]
     InvalidBinaryText { field: &'static str },
     #[error("export {resource} limit of {limit} was exceeded")]

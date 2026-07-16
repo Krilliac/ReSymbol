@@ -617,6 +617,13 @@ fn derive_function_status(
     function: &ExportFunction,
     claims: &[FunctionClaimDetail],
 ) -> FunctionStatus {
+    let Some(selected_name) = function
+        .selected_name
+        .as_ref()
+        .map(|name| name.source.text.as_str())
+    else {
+        return FunctionStatus::AutomaticFallback;
+    };
     if function.selected_name.as_ref().is_some_and(|name| {
         matches!(
             &name.source.attribution.provenance.producer,
@@ -628,14 +635,6 @@ fn derive_function_status(
     if !function.alternate_names.is_empty() {
         return FunctionStatus::Conflict;
     }
-
-    let Some(selected_name) = function
-        .selected_name
-        .as_ref()
-        .map(|name| name.source.text.as_str())
-    else {
-        return FunctionStatus::AutomaticFallback;
-    };
     let selected_claims = claims.iter().filter(|claim| {
         claim.kind == FunctionClaimKind::Name && claim.value.as_str() == selected_name
     });
@@ -1043,6 +1042,11 @@ mod tests {
         assert_eq!(
             derive_function_status(&export_function(None, false), &[]),
             FunctionStatus::AutomaticFallback
+        );
+        assert_eq!(
+            derive_function_status(&export_function(None, true), &[]),
+            FunctionStatus::AutomaticFallback,
+            "alias-only proposals do not become an implied primary conflict"
         );
     }
 }
