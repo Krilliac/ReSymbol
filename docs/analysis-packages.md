@@ -31,7 +31,7 @@ Every package contains four top-level fields:
   "binary_sha256": "<64 lowercase hexadecimal characters>",
   "generator_version": "0.1.0-alpha.1",
   "payload": {},
-  "schema_version": 6
+  "schema_version": 7
 }
 ```
 
@@ -41,8 +41,8 @@ Every package contains four top-level fields:
 - `payload` contains one validated `AnalysisSession`: deterministic base analysis, a plugin-run
   ledger, and accepted plugin claims.
 
-This package envelope currently writes schema 6. The CLI can also inspect and export schemas 1
-through 5 through the compatibility paths described below, while other schema versions fail
+This package envelope currently writes schema 7. The CLI can also inspect and export schemas 1
+through 6 through the compatibility paths described below, while other schema versions fail
 explicitly. The debugger-neutral JSON produced by `resymbol export --format json` is a different
 artifact with its own schema version; its current projection is schema 6.
 
@@ -61,7 +61,7 @@ the bytes it names. ReSymbol fully validates the package, canonicalizes and read
 and requires its exact size and SHA-256 to match before emitting inspection output to stdout.
 Failures report on stderr. A successful human summary includes
 `source binary: <canonical-path>` and `identity gate: matched`. With `--json`, stdout stays pure
-package JSON and omits both status lines. This gate applies to supported schemas 1 through 6 but
+package JSON and omits both status lines. This gate applies to supported schemas 1 through 7 but
 performs no reanalysis, legacy-result reconstruction, or rewrite of either input.
 
 A package must not be applied to a loaded program until its SHA-256 identity has been compared with
@@ -103,14 +103,17 @@ is reported as unavailable. Schema 4 records pointer control flow but predates r
 through 4 remains available, but loading cannot discover omitted descriptors without the executable
 bytes. Schema 5 records both RTTI descriptor layouts but predates transitive executable thunk-chain
 discovery; its existing calls and thunks remain available, but loading cannot add omitted hops.
-Reanalyze the exact original executable to create a schema 6 package with all current recovery
-results. The compatibility reader explicitly rejects a schema 2 or 3 envelope whose base
+Schema 6 records that closure but predates TLS callback discovery and callback-based thunk seeding.
+The TLS callback result family is therefore reported as unavailable for every schema 1-through-6
+package. Reanalyze the exact original executable to create a schema 7 package with all current
+recovery results. The compatibility reader explicitly rejects a schema 2 or 3 envelope whose base
 analysis, base graph, or plugin claims contain a schema-4 `function-pointer` target. It also rejects
 any schema 1-through-4 payload whose RTTI base records have a missing or null
 `class_hierarchy_descriptor_rva`. Schema 1's closed migration path rejects every persisted
 post-schema-1 control-flow record; schemas 2 through 5 explicitly reject a deterministic base thunk
 source valid only through schema-6 transitive endpoint seeding. Changing only the envelope label is
-not migration. Plugin-supplied exact thunk claims remain independent of the built-in base-analysis
+not migration. Schemas 1 through 6 also reject schema-7 TLS callback state and callback-only base
+thunk seeds. Plugin-supplied exact thunk claims remain independent of the built-in base-analysis
 seed invariant.
 `inspect --json`, with or without the optional binary gate, emits only package JSON. For schema 1 it
 preserves the validated original representation rather than placing the migrated current payload
@@ -138,8 +141,10 @@ The base analysis includes:
 
 - normalized binary identity and image metadata;
 - COFF and optional-header fields used by analysis;
-- bounded section, import, export, and exception-directory records;
+- bounded section, import, export, exception-directory, and TLS-directory records;
 - x64 `RUNTIME_FUNCTION` entries as evidence-backed candidate function boundaries;
+- up to 4,096 ordered PE32+ TLS callback entries with duplicates preserved, their callback-table
+  RVA, and an independent partial-scan flag;
 - bounded direct-call records with explicit internal-function, exact parsed import-IAT, or read-only
   function-pointer targets; one-instruction thunks may likewise target internal functions, exact
   parsed import-IAT slots, or read-only function-pointer slots, with a persisted partial-scan flag;
@@ -148,15 +153,21 @@ The base analysis includes:
 - validated modern MSVC x64 Rev1 RTTI records, including type descriptors, class hierarchy and
   legacy 24-byte or `BCD_HASPCHD` 28-byte base-class records, vftable locations, and executable
   virtual-slot targets; and
-- a symbol graph containing exact export names, metadata-derived boundaries, function entries,
-  direct calls, thunks, string literals, data references, recovered RTTI type names, vftable names,
-  and class-membership claims for virtual-slot targets.
+- a symbol graph containing exact export names, metadata-derived boundaries, entry-point and
+  TLS-callback function entries, direct calls, thunks, string literals, data references, recovered
+  RTTI type names, vftable names, and class-membership claims for virtual-slot targets.
 
 ReSymbol derives the combined symbol graph from the base graph plus `plugin_claims`; it does not
 serialize a second independently mutable graph. Session validation rejects duplicate run IDs,
 noncanonical artifact fingerprints or versions, claims for another binary or an out-of-image range,
 producer/run mismatches, invalid subject/assertion combinations, and ledger counts that do not
 match the accepted claims.
+
+Plugins granted `symbols.read` receive the same detached base analysis as JSON, so schema-7
+sessions add the TLS directory and callback fields to that object. This is additive data inside the
+existing request payload: it does not change the plugin API or wire protocol 1.0, add a new
+assertion shape, or change neutral projection schema 6. Plugins without `symbols.read` still receive
+no base analysis.
 
 Plugin execution is transactional. A failed process run contributes no claims, so an invalid,
 crashed, timed-out, or quarantined plugin cannot corrupt the deterministic base analysis. Ordinary
@@ -166,6 +177,28 @@ plugin could not complete successfully.
 
 The package does not contain the analyzed executable itself. It also does not claim to recover an
 original source name when only a reconstructed or inferred name is available.
+
+### PE32+ TLS callback boundary
+
+TLS callback discovery consumes optional-header data-directory entry 9. A present directory must
+have a fully file-backed declared range and contain at least the 40-byte PE32+ TLS-directory
+prefix. `AddressOfCallbacks` and each nonzero callback entry are preferred-image VAs, not RVAs;
+ReSymbol subtracts the preferred image base with checked arithmetic and rejects values outside the
+declared image.
+
+The callback table is read as ordered eight-byte slots. Source order and duplicate entries are
+preserved in the base analysis, every retained slot must be fully file-backed, and every callback
+endpoint must begin in file-backed executable data. ReSymbol retains at most 4,096 nonzero entries,
+then performs a cap-plus-one probe. A null next slot proves that the 4,096-entry table is complete;
+a nonzero next slot keeps that deterministic prefix and sets `tls_callback_scan_truncated` without
+retaining or following the extra entry.
+
+Each retained callback slot produces a `FunctionEntry` claim with exact metadata evidence and
+`pe-tls-callback` provenance. The `callback_slot_rva` and `table_index` evidence artifacts keep
+claims separate when multiple slots repeat the same target RVA. Callback targets also join the
+deterministic initial thunk seeds, so an exact supported first-instruction thunk can be retained
+without turning the callback into an unbounded body scan. ReSymbol never executes a callback and
+does not infer its name or extent.
 
 ### MSVC x64 RTTI boundary
 
@@ -365,7 +398,7 @@ inspection of the exact original PE. It emits deterministic, bounded, pure-Rust 
 containing selected public function and global names and verbatim section headers. Same-RVA
 function/global collisions prefer the function; unnamed functions do not suppress globals. The
 writer does not synthesize private symbols, compilands, source lines, locals, prototypes, function
-extents, or type records, and it does not add fields to package schema 6 or neutral projection
+extents, or type records, and it does not add fields to package schema 7 or neutral projection
 schema 6. Generating the file requires no separately installed Visual Studio, DIA, LLVM, or
 compiler toolchain; Windows compatibility CI validates it with native and DIA-backed
 `llvm-pdbutil` reads and a direct DIA identity/public-symbol probe.

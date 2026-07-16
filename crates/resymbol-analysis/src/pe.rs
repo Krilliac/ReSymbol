@@ -13,7 +13,8 @@ use resymbol_core::{
 use crate::{
     AnalysisError, CoffHeader, DataDirectory, ImportTarget, MsvcRttiVftable, PeAnalysis,
     PeControlFlowTarget, PeDataDirectories, PeDataReference, PeDirectCall, PeExport, PeExportName,
-    PeImport, PeImportLibrary, PeRecoveredString, PeSection, PeThunk, RuntimeFunction,
+    PeImport, PeImportLibrary, PeRecoveredString, PeSection, PeThunk, PeTlsCallback,
+    RuntimeFunction,
     code_recovery::{
         CodeRecoveryInput, recover_code, validate_code_recovery, validate_data_references,
     },
@@ -36,6 +37,7 @@ const IMPORT_DESCRIPTOR_SIZE: usize = 20;
 const IMPORT_DESCRIPTOR_SIZE_U32: u32 = 20;
 const RUNTIME_FUNCTION_SIZE: usize = 12;
 const RUNTIME_FUNCTION_SIZE_U32: u32 = 12;
+const TLS_DIRECTORY_SIZE_U32: u32 = 40;
 
 const MACHINE_AMD64: u16 = 0x8664;
 const OPTIONAL_MAGIC_PE32_PLUS: u16 = 0x020b;
@@ -53,6 +55,7 @@ const MAX_EXPORT_FUNCTIONS: u64 = 65_536;
 const MAX_EXPORT_NAMES: u64 = 65_536;
 const MAX_EXPORT_NAME_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_RUNTIME_FUNCTIONS: u64 = 262_144;
+const MAX_TLS_CALLBACKS: u64 = 4_096;
 const MAX_DEBUG_DIRECTORY_ENTRIES: u64 = 4_096;
 const MAX_CODEVIEW_RECORD_BYTES: u64 = 64 * 1_024;
 const MAX_CODEVIEW_PATH_BYTES: u64 = 4_096;
@@ -87,6 +90,7 @@ const EXPORT_DIRECTORY_INDEX: usize = 0;
 const IMPORT_DIRECTORY_INDEX: usize = 1;
 const EXCEPTION_DIRECTORY_INDEX: usize = 3;
 const DEBUG_DIRECTORY_INDEX: usize = 6;
+const TLS_DIRECTORY_INDEX: usize = 9;
 
 const IMAGE_DEBUG_TYPE_CODEVIEW: u32 = 2;
 const CODEVIEW_RSDS_HEADER_SIZE: usize = 24;
@@ -190,6 +194,9 @@ pub(crate) struct SymbolGraphInput<'a> {
     pub sections: &'a [PeSection],
     pub exports: &'a [PeExport],
     pub runtime_functions: &'a [RuntimeFunction],
+    pub tls_directory_rva: Option<u32>,
+    pub tls_callback_table_rva: Option<u32>,
+    pub tls_callbacks: &'a [PeTlsCallback],
     pub direct_calls: &'a [PeDirectCall],
     pub thunks: &'a [PeThunk],
     pub strings: &'a [PeRecoveredString],
@@ -217,6 +224,14 @@ pub fn analyze_pe(bytes: &[u8]) -> Result<PeAnalysis, AnalysisError> {
         headers.directories.exceptions,
         headers.size_of_image,
     )?;
+    let (tls_callback_table_rva, tls_callbacks, tls_callback_scan_truncated) = parse_tls_callbacks(
+        &reader,
+        &mapper,
+        headers.directories.tls,
+        headers.image_base,
+        headers.size_of_image,
+        &headers.sections,
+    )?;
     let (msvc_rtti_vftables, msvc_rtti_scan_truncated) = parse_msvc_rtti(
         &mapper,
         &headers.sections,
@@ -232,6 +247,7 @@ pub fn analyze_pe(bytes: &[u8]) -> Result<PeAnalysis, AnalysisError> {
         imports: &imports,
         exports: &exports,
         runtime_functions: &runtime_functions,
+        tls_callbacks: &tls_callbacks,
         msvc_rtti_vftables: &msvc_rtti_vftables,
     });
 
@@ -242,6 +258,9 @@ pub fn analyze_pe(bytes: &[u8]) -> Result<PeAnalysis, AnalysisError> {
         sections: &headers.sections,
         exports: &exports,
         runtime_functions: &runtime_functions,
+        tls_directory_rva: headers.directories.tls.map(|directory| directory.rva),
+        tls_callback_table_rva,
+        tls_callbacks: &tls_callbacks,
         direct_calls: &code_recovery.direct_calls,
         thunks: &code_recovery.thunks,
         strings: &string_recovery.strings,
@@ -266,6 +285,9 @@ pub fn analyze_pe(bytes: &[u8]) -> Result<PeAnalysis, AnalysisError> {
         export_library_name,
         exports,
         runtime_functions,
+        tls_callback_table_rva,
+        tls_callback_scan_truncated,
+        tls_callbacks,
         code_recovery_scan_truncated: code_recovery.scan_truncated,
         direct_calls: code_recovery.direct_calls,
         thunks: code_recovery.thunks,
@@ -547,6 +569,24 @@ pub(crate) fn validate_pe_analysis(analysis: &PeAnalysis) -> Result<(), Analysis
             minimum: OPTIONAL_HEADER_MIN_SIZE,
         });
     }
+    let required_optional_header_size = [
+        (analysis.directories.exports, EXPORT_DIRECTORY_INDEX),
+        (analysis.directories.imports, IMPORT_DIRECTORY_INDEX),
+        (analysis.directories.exceptions, EXCEPTION_DIRECTORY_INDEX),
+        (analysis.directories.tls, TLS_DIRECTORY_INDEX),
+    ]
+    .into_iter()
+    .filter_map(|(directory, index)| {
+        directory.map(|_| OPTIONAL_HEADER_MIN_SIZE + (index + 1) * DATA_DIRECTORY_SIZE)
+    })
+    .max()
+    .unwrap_or(OPTIONAL_HEADER_MIN_SIZE);
+    if usize::from(analysis.coff.optional_header_size) < required_optional_header_size {
+        return Err(AnalysisError::OptionalHeaderTooSmall {
+            actual: usize::from(analysis.coff.optional_header_size),
+            minimum: required_optional_header_size,
+        });
+    }
     let section_count = u64::try_from(analysis.sections.len())
         .map_err(|_| AnalysisError::IntegerConversion("section count"))?;
     enforce_limit("section", section_count, MAX_SECTIONS)?;
@@ -572,6 +612,7 @@ pub(crate) fn validate_pe_analysis(analysis: &PeAnalysis) -> Result<(), Analysis
         ("export directory", analysis.directories.exports),
         ("import directory", analysis.directories.imports),
         ("exception directory", analysis.directories.exceptions),
+        ("TLS directory", analysis.directories.tls),
     ] {
         if let Some(directory) = directory {
             if directory.rva == 0 || directory.size == 0 {
@@ -633,6 +674,7 @@ pub(crate) fn validate_pe_analysis(analysis: &PeAnalysis) -> Result<(), Analysis
         ("export directory", analysis.directories.exports),
         ("import directory", analysis.directories.imports),
         ("exception directory", analysis.directories.exceptions),
+        ("TLS directory", analysis.directories.tls),
     ] {
         if let Some(directory) = directory {
             if !model_rva_is_backed(analysis, directory.rva, directory.size) {
@@ -971,6 +1013,7 @@ pub(crate) fn validate_pe_analysis(analysis: &PeAnalysis) -> Result<(), Analysis
         }
     }
 
+    validate_tls_callbacks(analysis)?;
     validate_msvc_rtti(analysis)?;
     validate_code_recovery(analysis)?;
     validate_recovered_strings(
@@ -987,6 +1030,9 @@ pub(crate) fn validate_pe_analysis(analysis: &PeAnalysis) -> Result<(), Analysis
         sections: &analysis.sections,
         exports: &analysis.exports,
         runtime_functions: &analysis.runtime_functions,
+        tls_directory_rva: analysis.directories.tls.map(|directory| directory.rva),
+        tls_callback_table_rva: analysis.tls_callback_table_rva,
+        tls_callbacks: &analysis.tls_callbacks,
         direct_calls: &analysis.direct_calls,
         thunks: &analysis.thunks,
         strings: &analysis.strings,
@@ -997,6 +1043,114 @@ pub(crate) fn validate_pe_analysis(analysis: &PeAnalysis) -> Result<(), Analysis
         return invalid_field(
             "symbol graph",
             "does not semantically match claims derived from the PE metadata",
+        );
+    }
+    Ok(())
+}
+
+fn validate_tls_callbacks(analysis: &PeAnalysis) -> Result<(), AnalysisError> {
+    match analysis.directories.tls {
+        Some(directory) => {
+            if directory.size < TLS_DIRECTORY_SIZE_U32 {
+                return invalid_field(
+                    "TLS directory size",
+                    "must be at least the 40-byte PE32+ TLS directory size",
+                );
+            }
+        }
+        None => {
+            if analysis.tls_callback_table_rva.is_some()
+                || !analysis.tls_callbacks.is_empty()
+                || analysis.tls_callback_scan_truncated
+            {
+                return invalid_field(
+                    "TLS callbacks",
+                    "a callback table, entries, or a partial scan exists without a TLS directory",
+                );
+            }
+            return Ok(());
+        }
+    }
+
+    let Some(table_rva) = analysis.tls_callback_table_rva else {
+        if !analysis.tls_callbacks.is_empty() || analysis.tls_callback_scan_truncated {
+            return invalid_field(
+                "TLS callbacks",
+                "entries or a partial scan exist without a callback-table RVA",
+            );
+        }
+        return Ok(());
+    };
+
+    let callback_count = u64::try_from(analysis.tls_callbacks.len())
+        .map_err(|_| AnalysisError::IntegerConversion("TLS callback count"))?;
+    enforce_limit("TLS callback", callback_count, MAX_TLS_CALLBACKS)?;
+    if analysis.tls_callback_scan_truncated && callback_count != MAX_TLS_CALLBACKS {
+        return invalid_field(
+            "TLS callback scan state",
+            "can be partial only after retaining the full callback cap",
+        );
+    }
+
+    for (index, callback) in analysis.tls_callbacks.iter().enumerate() {
+        let expected_index = u32::try_from(index)
+            .map_err(|_| AnalysisError::IntegerConversion("TLS callback table index"))?;
+        if callback.table_index != expected_index {
+            return invalid_field(
+                "TLS callback table index",
+                format!(
+                    "entry {index} records index {} instead of {expected_index}",
+                    callback.table_index
+                ),
+            );
+        }
+        let slot_delta = expected_index
+            .checked_mul(8)
+            .ok_or(AnalysisError::ArithmeticOverflow(
+                "TLS callback slot position",
+            ))?;
+        let slot_rva = table_rva
+            .checked_add(slot_delta)
+            .ok_or(AnalysisError::ArithmeticOverflow("TLS callback slot RVA"))?;
+        if !model_rva_is_backed(analysis, slot_rva, 8) {
+            return invalid_field(
+                "TLS callback slot",
+                format!("entry {index} at RVA {slot_rva:#x} is not fully backed by file data"),
+            );
+        }
+        let executable = section_for_rva(callback.callback_rva, &analysis.sections)
+            .is_some_and(|(_, section)| section.characteristics & IMAGE_SCN_MEM_EXECUTE != 0)
+            && model_rva_is_backed(analysis, callback.callback_rva, 1);
+        if !executable {
+            return invalid_field(
+                "TLS callback target",
+                format!(
+                    "entry {index} resolves to RVA {:#x}, which is not fully file-backed executable data",
+                    callback.callback_rva
+                ),
+            );
+        }
+    }
+
+    let next_index = u32::try_from(analysis.tls_callbacks.len())
+        .map_err(|_| AnalysisError::IntegerConversion("TLS callback terminator index"))?;
+    let next_delta = next_index
+        .checked_mul(8)
+        .ok_or(AnalysisError::ArithmeticOverflow(
+            "TLS callback terminator position",
+        ))?;
+    let next_slot_rva =
+        table_rva
+            .checked_add(next_delta)
+            .ok_or(AnalysisError::ArithmeticOverflow(
+                "TLS callback terminator RVA",
+            ))?;
+    if !model_rva_is_backed(analysis, next_slot_rva, 8) {
+        return invalid_field(
+            "TLS callback terminator",
+            format!(
+                "slot at RVA {next_slot_rva:#x} after the retained callbacks is not fully backed by file data"
+            ),
         );
     }
     Ok(())
@@ -1230,6 +1384,13 @@ fn parse_headers(reader: &Reader<'_>) -> Result<ParsedHeaders, AnalysisError> {
             directory_count,
             EXCEPTION_DIRECTORY_INDEX,
             "exception directory",
+        )?,
+        tls: read_directory(
+            reader,
+            optional_offset,
+            directory_count,
+            TLS_DIRECTORY_INDEX,
+            "TLS directory",
         )?,
     };
     let debug_directory = read_directory(
@@ -1736,6 +1897,111 @@ fn parse_exports(
     Ok((export_library_name, exports))
 }
 
+fn parse_tls_callbacks(
+    reader: &Reader<'_>,
+    mapper: &RvaMap<'_>,
+    directory: Option<DataDirectory>,
+    image_base: u64,
+    size_of_image: u32,
+    sections: &[PeSection],
+) -> Result<(Option<u32>, Vec<PeTlsCallback>, bool), AnalysisError> {
+    let Some(directory) = directory else {
+        return Ok((None, Vec::new(), false));
+    };
+    enforce_directory_size("TLS-directory byte", directory.size)?;
+    if directory.size < TLS_DIRECTORY_SIZE_U32 {
+        return invalid_field(
+            "TLS directory size",
+            "must be at least the 40-byte PE32+ TLS directory size",
+        );
+    }
+    let directory_size = usize::try_from(directory.size)
+        .map_err(|_| AnalysisError::IntegerConversion("TLS-directory size"))?;
+    let directory_offset = mapper.offset(directory.rva, directory_size, "TLS directory")?;
+    let callbacks_va = reader.u64(
+        checked_add(directory_offset, 24, "TLS AddressOfCallbacks file offset")?,
+        "TLS AddressOfCallbacks",
+    )?;
+    if callbacks_va == 0 {
+        return Ok((None, Vec::new(), false));
+    }
+    let callbacks_rva = tls_va_to_rva(
+        callbacks_va,
+        image_base,
+        size_of_image,
+        "TLS AddressOfCallbacks",
+    )?;
+
+    let retained_capacity = usize::try_from(MAX_TLS_CALLBACKS)
+        .map_err(|_| AnalysisError::IntegerConversion("TLS callback limit"))?;
+    let mut callbacks = Vec::with_capacity(retained_capacity);
+    for table_index in 0..=MAX_TLS_CALLBACKS {
+        let slot_delta = table_index
+            .checked_mul(8)
+            .ok_or(AnalysisError::ArithmeticOverflow(
+                "TLS callback slot position",
+            ))?;
+        let slot_delta = u32::try_from(slot_delta)
+            .map_err(|_| AnalysisError::IntegerConversion("TLS callback slot position"))?;
+        let slot_rva = callbacks_rva
+            .checked_add(slot_delta)
+            .ok_or(AnalysisError::ArithmeticOverflow("TLS callback slot RVA"))?;
+        let slot_offset = mapper.offset(slot_rva, 8, "TLS callback slot")?;
+        let callback_va = reader.u64(slot_offset, "TLS callback VA")?;
+        if callback_va == 0 {
+            return Ok((Some(callbacks_rva), callbacks, false));
+        }
+        if table_index == MAX_TLS_CALLBACKS {
+            return Ok((Some(callbacks_rva), callbacks, true));
+        }
+
+        let callback_rva =
+            tls_va_to_rva(callback_va, image_base, size_of_image, "TLS callback VA")?;
+        let executable = section_for_rva(callback_rva, sections)
+            .is_some_and(|(_, section)| section.characteristics & IMAGE_SCN_MEM_EXECUTE != 0)
+            && mapper.is_backed(callback_rva, 1);
+        if !executable {
+            return invalid_field(
+                "TLS callback target",
+                format!(
+                    "table entry {table_index} resolves to RVA {callback_rva:#x}, which is not fully file-backed executable data"
+                ),
+            );
+        }
+        callbacks.push(PeTlsCallback {
+            table_index: u32::try_from(table_index)
+                .map_err(|_| AnalysisError::IntegerConversion("TLS callback table index"))?,
+            callback_rva,
+        });
+    }
+    unreachable!("the bounded TLS callback loop always returns")
+}
+
+fn tls_va_to_rva(
+    va: u64,
+    image_base: u64,
+    size_of_image: u32,
+    field: &'static str,
+) -> Result<u32, AnalysisError> {
+    let rva = va
+        .checked_sub(image_base)
+        .ok_or_else(|| AnalysisError::InvalidField {
+            field,
+            reason: format!("VA {va:#x} is below preferred image base {image_base:#x}"),
+        })?;
+    let rva = u32::try_from(rva).map_err(|_| AnalysisError::InvalidField {
+        field,
+        reason: format!("VA {va:#x} does not fit a 32-bit image RVA"),
+    })?;
+    if rva >= size_of_image {
+        return invalid_field(
+            field,
+            format!("VA {va:#x} resolves outside the declared image"),
+        );
+    }
+    Ok(rva)
+}
+
 fn parse_runtime_functions(
     reader: &Reader<'_>,
     mapper: &RvaMap<'_>,
@@ -1836,6 +2102,9 @@ pub(crate) fn build_symbol_graph(
         sections,
         exports,
         runtime_functions,
+        tls_directory_rva,
+        tls_callback_table_rva,
+        tls_callbacks,
         direct_calls,
         thunks,
         strings,
@@ -1990,6 +2259,85 @@ pub(crate) fn build_symbol_graph(
                 entry_point_confidence,
                 vec![evidence],
                 provenance("pe-entry-point"),
+            )?)?;
+        }
+    }
+
+    if !tls_callbacks.is_empty() {
+        let tls_directory_rva = tls_directory_rva.ok_or_else(|| AnalysisError::InvalidField {
+            field: "TLS callbacks",
+            reason: "entries exist without a TLS directory".to_owned(),
+        })?;
+        let callback_table_rva =
+            tls_callback_table_rva.ok_or_else(|| AnalysisError::InvalidField {
+                field: "TLS callbacks",
+                reason: "entries exist without a callback-table RVA".to_owned(),
+            })?;
+        for callback in tls_callbacks {
+            let slot_delta =
+                callback
+                    .table_index
+                    .checked_mul(8)
+                    .ok_or(AnalysisError::ArithmeticOverflow(
+                        "TLS callback slot position",
+                    ))?;
+            let callback_slot_rva = callback_table_rva
+                .checked_add(slot_delta)
+                .ok_or(AnalysisError::ArithmeticOverflow("TLS callback slot RVA"))?;
+            let (section_index, section) = file_backed_executable_section_for_rva(
+                identity,
+                callback.callback_rva,
+                sections,
+            )
+            .ok_or_else(|| AnalysisError::InvalidField {
+                field: "TLS callback target",
+                reason: format!(
+                    "entry {} resolves to RVA {:#x}, which is not fully file-backed executable data",
+                    callback.table_index, callback.callback_rva
+                ),
+            })?;
+            let mut evidence = Evidence::new(
+                metadata_kind.clone(),
+                "exact executable callback address from the PE32+ TLS callback table",
+            )?;
+            evidence.confidence = Some(exact_metadata_confidence);
+            evidence.artifacts.insert(
+                "tls_directory_rva".to_owned(),
+                format!("{tls_directory_rva:#x}"),
+            );
+            evidence.artifacts.insert(
+                "callback_table_rva".to_owned(),
+                format!("{callback_table_rva:#x}"),
+            );
+            evidence.artifacts.insert(
+                "callback_slot_rva".to_owned(),
+                format!("{callback_slot_rva:#x}"),
+            );
+            evidence
+                .artifacts
+                .insert("table_index".to_owned(), callback.table_index.to_string());
+            evidence.artifacts.insert(
+                "callback_rva".to_owned(),
+                format!("{:#x}", callback.callback_rva),
+            );
+            evidence
+                .artifacts
+                .insert("section_index".to_owned(), section_index.to_string());
+            if !section.name.is_empty() {
+                evidence
+                    .artifacts
+                    .insert("section_name".to_owned(), section.name.clone());
+            }
+            graph.submit_claim(SymbolClaim::new(
+                SymbolSubject::Function {
+                    binary: identity.id.clone(),
+                    rva: u64::from(callback.callback_rva),
+                    size: None,
+                },
+                SymbolAssertion::FunctionEntry,
+                entry_point_confidence,
+                vec![evidence],
+                provenance("pe-tls-callback"),
             )?)?;
         }
     }

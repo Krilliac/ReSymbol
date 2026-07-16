@@ -46,6 +46,7 @@ use serde_json::{Map, Value};
 
 const NO_PCHD_BASE_DESCRIPTOR_SCHEMA_VERSION: u32 = 5;
 const TRANSITIVE_THUNK_CHAIN_SCHEMA_VERSION: u32 = 6;
+const TLS_CALLBACK_SCHEMA_VERSION: u32 = 7;
 const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 
 #[derive(Debug, Parser)]
@@ -292,6 +293,7 @@ fn analyze(args: AnalyzeArgs, safe_mode: bool, plugin_dir: PathBuf) -> Result<()
         TransitiveThunkRecoveryAvailability::Recorded,
         StringDataRecoveryAvailability::Recorded,
         RttiRecoveryAvailability::Recorded,
+        TlsCallbackAvailability::Recorded,
     )?;
     println!("package: {}", output.display());
     println!("plugin directory: {}", plugin_dir.display());
@@ -356,6 +358,7 @@ fn inspect(args: InspectArgs) -> Result<()> {
         loaded.transitive_thunk_recovery_availability,
         loaded.string_data_recovery_availability,
         loaded.rtti_recovery_availability,
+        loaded.tls_callback_availability,
     )?;
 
     Ok(())
@@ -480,6 +483,23 @@ enum RttiRecoveryAvailability {
     RecordedWithoutNoPchdBaseDescriptors(u32),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TlsCallbackAvailability {
+    Recorded,
+    Unavailable(u32),
+}
+
+impl TlsCallbackAvailability {
+    fn export_summary_line(self) -> Option<String> {
+        match self {
+            Self::Recorded => None,
+            Self::Unavailable(schema_version) => Some(format!(
+                "TLS callback recovery: unavailable (schema {schema_version} package predates TLS callback data; reanalyze the exact original binary)"
+            )),
+        }
+    }
+}
+
 impl RttiRecoveryAvailability {
     fn summary_line(self) -> Option<String> {
         match self {
@@ -497,6 +517,7 @@ struct LoadedAnalysisPackage {
     transitive_thunk_recovery_availability: TransitiveThunkRecoveryAvailability,
     string_data_recovery_availability: StringDataRecoveryAvailability,
     rtti_recovery_availability: RttiRecoveryAvailability,
+    tls_callback_availability: TlsCallbackAvailability,
     schema1_source: Option<ResymPackage<Value>>,
 }
 
@@ -522,7 +543,7 @@ fn read_analysis_package(
         1 => CodeRecoveryAvailability::UnavailableSchema1,
         2 => CodeRecoveryAvailability::RecordedWithoutReadOnlyPointerControlFlow(2),
         3 => CodeRecoveryAvailability::RecordedWithoutReadOnlyPointerControlFlow(3),
-        4..=6 => CodeRecoveryAvailability::Recorded,
+        4..=7 => CodeRecoveryAvailability::Recorded,
         _ => bail!("unsupported analysis package schema {schema_version}"),
     };
     let transitive_thunk_recovery_availability = match schema_version {
@@ -530,21 +551,29 @@ fn read_analysis_package(
         2..=5 => TransitiveThunkRecoveryAvailability::RecordedWithoutTransitiveThunkChains(
             schema_version,
         ),
-        6 => TransitiveThunkRecoveryAvailability::Recorded,
+        6..=7 => TransitiveThunkRecoveryAvailability::Recorded,
         _ => bail!("unsupported analysis package schema {schema_version}"),
     };
     let string_data_recovery_availability = match schema_version {
         1 => StringDataRecoveryAvailability::UnavailableSchema1,
         2 => StringDataRecoveryAvailability::UnavailableSchema2,
-        3..=6 => StringDataRecoveryAvailability::Recorded,
+        3..=7 => StringDataRecoveryAvailability::Recorded,
         _ => bail!("unsupported analysis package schema {schema_version}"),
     };
     let rtti_recovery_availability = match schema_version {
         1..=4 => RttiRecoveryAvailability::RecordedWithoutNoPchdBaseDescriptors(schema_version),
-        5..=6 => RttiRecoveryAvailability::Recorded,
+        5..=7 => RttiRecoveryAvailability::Recorded,
+        _ => bail!("unsupported analysis package schema {schema_version}"),
+    };
+    let tls_callback_availability = match schema_version {
+        1..=6 => TlsCallbackAvailability::Unavailable(schema_version),
+        TLS_CALLBACK_SCHEMA_VERSION => TlsCallbackAvailability::Recorded,
         _ => bail!("unsupported analysis package schema {schema_version}"),
     };
     let schema1_source = (preserve_schema1_source && schema_version == 1).then(|| package.clone());
+    if schema_version < TLS_CALLBACK_SCHEMA_VERSION {
+        reject_pre_v7_tls_callback_semantics(package.payload(), schema_version)?;
+    }
     if schema_version < NO_PCHD_BASE_DESCRIPTOR_SCHEMA_VERSION {
         reject_pre_v5_no_pchd_base_descriptors(package.payload(), schema_version)?;
     }
@@ -559,7 +588,8 @@ fn read_analysis_package(
         3 => serde_json::from_value(payload).context("cannot decode schema-v3 analysis payload"),
         4 => serde_json::from_value(payload).context("cannot decode schema-v4 analysis payload"),
         5 => serde_json::from_value(payload).context("cannot decode schema-v5 analysis payload"),
-        6 => serde_json::from_value(payload).context("cannot decode current analysis payload"),
+        6 => serde_json::from_value(payload).context("cannot decode schema-v6 analysis payload"),
+        7 => serde_json::from_value(payload).context("cannot decode current analysis payload"),
         _ => bail!("unsupported analysis package schema {schema_version}"),
     })?;
     if (2..TRANSITIVE_THUNK_CHAIN_SCHEMA_VERSION).contains(&schema_version) {
@@ -574,8 +604,48 @@ fn read_analysis_package(
         transitive_thunk_recovery_availability,
         string_data_recovery_availability,
         rtti_recovery_availability,
+        tls_callback_availability,
         schema1_source,
     })
+}
+
+fn reject_pre_v7_tls_callback_semantics(payload: &Value, schema_version: u32) -> Result<()> {
+    debug_assert!((1..TLS_CALLBACK_SCHEMA_VERSION).contains(&schema_version));
+    let Some(analysis) = payload.pointer("/base_analysis/analysis") else {
+        return Ok(());
+    };
+    let uses_tls_shape = analysis.as_object().is_some_and(|analysis| {
+        [
+            "tls_callback_table_rva",
+            "tls_callback_scan_truncated",
+            "tls_callbacks",
+        ]
+        .iter()
+        .any(|key| analysis.contains_key(*key))
+            || analysis
+                .get("directories")
+                .and_then(Value::as_object)
+                .is_some_and(|directories| directories.contains_key("tls"))
+    });
+    let base_graph_uses_tls_claim = analysis
+        .pointer("/symbol_graph/claims")
+        .and_then(Value::as_array)
+        .is_some_and(|claims| {
+            claims.iter().any(|claim| {
+                claim.pointer("/provenance/method").and_then(Value::as_str)
+                    == Some("pe-tls-callback")
+                    && claim
+                        .pointer("/provenance/producer/kind")
+                        .and_then(Value::as_str)
+                        == Some("core")
+            })
+        });
+    if uses_tls_shape || base_graph_uses_tls_claim {
+        bail!(
+            "package schema {schema_version} predates bounded PE TLS callback recovery but its base analysis contains schema-7 TLS callback semantics; legacy envelopes cannot be relabeled, so reanalyze the exact original binary"
+        );
+    }
+    Ok(())
 }
 
 fn reject_pre_v5_no_pchd_base_descriptors(payload: &Value, schema_version: u32) -> Result<()> {
@@ -929,6 +999,9 @@ impl SchemaV1PeAnalysis {
             export_library_name: self.export_library_name,
             exports: self.exports,
             runtime_functions: self.runtime_functions,
+            tls_callback_table_rva: None,
+            tls_callback_scan_truncated: false,
+            tls_callbacks: Vec::new(),
             code_recovery_scan_truncated: false,
             direct_calls: Vec::new(),
             thunks: Vec::new(),
@@ -1062,6 +1135,9 @@ fn export(args: ExportArgs) -> Result<()> {
         println!("{line}");
     }
     if let Some(line) = package_data.rtti_recovery_availability.summary_line() {
+        println!("{line}");
+    }
+    if let Some(line) = package_data.tls_callback_availability.export_summary_line() {
         println!("{line}");
     }
     println!(
@@ -2128,6 +2204,7 @@ fn print_session_summary(
     transitive_thunk_recovery_availability: TransitiveThunkRecoveryAvailability,
     string_data_recovery_availability: StringDataRecoveryAvailability,
     rtti_recovery_availability: RttiRecoveryAvailability,
+    tls_callback_availability: TlsCallbackAvailability,
 ) -> Result<()> {
     print_analysis_summary(
         session.base_analysis(),
@@ -2135,6 +2212,7 @@ fn print_session_summary(
         transitive_thunk_recovery_availability,
         string_data_recovery_availability,
         rtti_recovery_availability,
+        tls_callback_availability,
     );
     let succeeded = session
         .plugin_runs()
@@ -2179,6 +2257,7 @@ fn print_analysis_summary(
     transitive_thunk_recovery_availability: TransitiveThunkRecoveryAvailability,
     string_data_recovery_availability: StringDataRecoveryAvailability,
     rtti_recovery_availability: RttiRecoveryAvailability,
+    tls_callback_availability: TlsCallbackAvailability,
 ) {
     let identity = analysis.identity();
     println!("size: {} bytes", identity.size);
@@ -2242,6 +2321,9 @@ fn print_analysis_summary(
                 forwarder_count
             );
             println!("runtime functions: {}", pe.runtime_functions.len());
+            for line in tls_callback_summary_lines(pe, tls_callback_availability) {
+                println!("{line}");
+            }
             for line in code_recovery_summary_lines(pe, code_recovery_availability) {
                 println!("{line}");
             }
@@ -2266,6 +2348,29 @@ fn print_analysis_summary(
     }
 
     println!("base claims: {}", analysis.symbol_graph().claims().len());
+}
+
+fn tls_callback_summary_lines(
+    pe: &resymbol_analysis::PeAnalysis,
+    availability: TlsCallbackAvailability,
+) -> [String; 2] {
+    match availability {
+        TlsCallbackAvailability::Recorded => [
+            format!("TLS callbacks: {}", pe.tls_callbacks.len()),
+            if pe.tls_callback_scan_truncated {
+                "TLS callback scan: partial (fixed callback limit reached; deterministic prefix retained)"
+                    .to_owned()
+            } else {
+                "TLS callback scan: complete".to_owned()
+            },
+        ],
+        TlsCallbackAvailability::Unavailable(schema_version) => [
+            format!("TLS callbacks: unavailable (not recorded by schema {schema_version})"),
+            format!(
+                "TLS callback scan: not run (schema {schema_version} package predates TLS callback recovery; reanalyze the exact original binary)"
+            ),
+        ],
+    }
 }
 
 fn code_recovery_summary_lines(
@@ -3529,6 +3634,51 @@ entrypoint = "Plugin.dll"
     }
 
     #[test]
+    fn tls_callback_summaries_distinguish_current_complete_partial_and_legacy_data() {
+        let mut analysis = analyze_bytes(&pe_fixture()).expect("analyze PE fixture");
+        let BinaryAnalysis::Pe(pe) = &mut analysis else {
+            panic!("PE analysis expected");
+        };
+
+        assert_eq!(
+            tls_callback_summary_lines(pe, TlsCallbackAvailability::Recorded),
+            [
+                format!("TLS callbacks: {}", pe.tls_callbacks.len()),
+                "TLS callback scan: complete".to_owned(),
+            ]
+        );
+        assert_eq!(
+            TlsCallbackAvailability::Recorded.export_summary_line(),
+            None
+        );
+
+        pe.tls_callback_scan_truncated = true;
+        assert_eq!(
+            tls_callback_summary_lines(pe, TlsCallbackAvailability::Recorded)[1],
+            "TLS callback scan: partial (fixed callback limit reached; deterministic prefix retained)"
+        );
+
+        for schema_version in 1..TLS_CALLBACK_SCHEMA_VERSION {
+            let availability = TlsCallbackAvailability::Unavailable(schema_version);
+            assert_eq!(
+                tls_callback_summary_lines(pe, availability),
+                [
+                    format!("TLS callbacks: unavailable (not recorded by schema {schema_version})"),
+                    format!(
+                        "TLS callback scan: not run (schema {schema_version} package predates TLS callback recovery; reanalyze the exact original binary)"
+                    ),
+                ]
+            );
+            assert_eq!(
+                availability.export_summary_line(),
+                Some(format!(
+                    "TLS callback recovery: unavailable (schema {schema_version} package predates TLS callback data; reanalyze the exact original binary)"
+                ))
+            );
+        }
+    }
+
+    #[test]
     fn command_line_accepts_exact_plugin_state_commands() {
         let fingerprint = "a".repeat(64);
         let cli = Cli::try_parse_from([
@@ -3847,7 +3997,7 @@ entrypoint = "Plugin.dll"
 
         let package: ResymPackage<AnalysisSession> =
             read_file_bound(&output).expect("read bound package");
-        assert_eq!(CURRENT_SCHEMA_VERSION, 6);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 7);
         assert_eq!(package.schema_version(), CURRENT_SCHEMA_VERSION);
         assert_eq!(
             package.binary_sha256(),
@@ -3910,6 +4060,36 @@ entrypoint = "Plugin.dll"
         .expect("JSON inspection serializes validated package");
     }
 
+    fn strip_schema_v7_tls_semantics(value: &mut Value) {
+        let pe = value
+            .pointer_mut("/payload/base_analysis/analysis")
+            .and_then(Value::as_object_mut)
+            .expect("serialized PE analysis object");
+        for field in [
+            "tls_callback_table_rva",
+            "tls_callback_scan_truncated",
+            "tls_callbacks",
+        ] {
+            pe.remove(field);
+        }
+        pe.get_mut("directories")
+            .and_then(Value::as_object_mut)
+            .expect("serialized PE data directories")
+            .remove("tls");
+        pe.get_mut("symbol_graph")
+            .and_then(|graph| graph.get_mut("claims"))
+            .and_then(Value::as_array_mut)
+            .expect("serialized base claims")
+            .retain(|claim| {
+                claim.pointer("/provenance/method").and_then(Value::as_str)
+                    != Some("pe-tls-callback")
+                    || claim
+                        .pointer("/provenance/producer/kind")
+                        .and_then(Value::as_str)
+                        != Some("core")
+            });
+    }
+
     fn schema_v1_package_skeleton() -> (Value, BinaryId) {
         let base_analysis = analyze_bytes(&pe_fixture()).expect("analyze PE fixture");
         let binary = base_analysis.identity().id.clone();
@@ -3919,6 +4099,7 @@ entrypoint = "Plugin.dll"
             .expect("create current package value");
         let mut value = serde_json::to_value(package).expect("serialize package value");
         value["schema_version"] = serde_json::json!(1);
+        strip_schema_v7_tls_semantics(&mut value);
 
         let pe = value
             .pointer_mut("/payload/base_analysis/analysis")
@@ -4013,6 +4194,27 @@ entrypoint = "Plugin.dll"
         let original_package = fs::read(&package_path).expect("read original inspection package");
         let loaded = read_analysis_package(&package_path, true)
             .expect("read current package before binary verification");
+        assert_eq!(loaded.package.schema_version(), CURRENT_SCHEMA_VERSION);
+        assert_eq!(
+            loaded.code_recovery_availability,
+            CodeRecoveryAvailability::Recorded
+        );
+        assert_eq!(
+            loaded.transitive_thunk_recovery_availability,
+            TransitiveThunkRecoveryAvailability::Recorded
+        );
+        assert_eq!(
+            loaded.string_data_recovery_availability,
+            StringDataRecoveryAvailability::Recorded
+        );
+        assert_eq!(
+            loaded.rtti_recovery_availability,
+            RttiRecoveryAvailability::Recorded
+        );
+        assert_eq!(
+            loaded.tls_callback_availability,
+            TlsCallbackAvailability::Recorded
+        );
 
         let verified = verify_inspection_binary(&loaded, &binary_path)
             .expect("exact current binary passes the inspection gate");
@@ -4287,6 +4489,7 @@ entrypoint = "Plugin.dll"
             .expect("create current package value");
         let mut value = serde_json::to_value(package).expect("serialize package value");
         value["schema_version"] = serde_json::json!(1);
+        strip_schema_v7_tls_semantics(&mut value);
         let pe = value
             .pointer_mut("/payload/base_analysis/analysis")
             .and_then(Value::as_object_mut)
@@ -4342,9 +4545,17 @@ entrypoint = "Plugin.dll"
             decoded.rtti_recovery_availability,
             RttiRecoveryAvailability::RecordedWithoutNoPchdBaseDescriptors(1)
         );
+        assert_eq!(
+            decoded.tls_callback_availability,
+            TlsCallbackAvailability::Unavailable(1)
+        );
         let BinaryAnalysis::Pe(pe) = decoded.package.payload().base_analysis() else {
             panic!("PE analysis expected");
         };
+        assert!(pe.directories.tls.is_none());
+        assert!(pe.tls_callback_table_rva.is_none());
+        assert!(!pe.tls_callback_scan_truncated);
+        assert!(pe.tls_callbacks.is_empty());
         assert!(!pe.code_recovery_scan_truncated);
         assert!(pe.direct_calls.is_empty());
         assert!(pe.thunks.is_empty());
@@ -4365,6 +4576,15 @@ entrypoint = "Plugin.dll"
             .pointer("/payload/base_analysis/analysis")
             .and_then(Value::as_object)
             .expect("schema-v1 PE payload remains an object");
+        assert!(!inspected_pe.contains_key("tls_callback_table_rva"));
+        assert!(!inspected_pe.contains_key("tls_callback_scan_truncated"));
+        assert!(!inspected_pe.contains_key("tls_callbacks"));
+        assert!(
+            !inspected_pe["directories"]
+                .as_object()
+                .expect("schema-v1 PE directories remain an object")
+                .contains_key("tls")
+        );
         assert!(!inspected_pe.contains_key("code_recovery_scan_truncated"));
         assert!(!inspected_pe.contains_key("direct_calls"));
         assert!(!inspected_pe.contains_key("thunks"));
@@ -4408,6 +4628,7 @@ entrypoint = "Plugin.dll"
             .expect("create current package value");
         let mut value = serde_json::to_value(package).expect("serialize package value");
         value["schema_version"] = serde_json::json!(2);
+        strip_schema_v7_tls_semantics(&mut value);
         let pe = value
             .pointer_mut("/payload/base_analysis/analysis")
             .and_then(Value::as_object_mut)
@@ -4451,6 +4672,10 @@ entrypoint = "Plugin.dll"
         assert_eq!(
             decoded.rtti_recovery_availability,
             RttiRecoveryAvailability::RecordedWithoutNoPchdBaseDescriptors(2)
+        );
+        assert_eq!(
+            decoded.tls_callback_availability,
+            TlsCallbackAvailability::Unavailable(2)
         );
         assert!(decoded.schema1_source.is_none());
         let BinaryAnalysis::Pe(pe) = decoded.package.payload().base_analysis() else {
@@ -4506,6 +4731,7 @@ entrypoint = "Plugin.dll"
             .expect("create current package value");
         let mut value = serde_json::to_value(package).expect("serialize package value");
         value["schema_version"] = serde_json::json!(3);
+        strip_schema_v7_tls_semantics(&mut value);
         fs::write(
             &path,
             serde_json::to_vec(&value).expect("encode schema-v3 package"),
@@ -4530,6 +4756,10 @@ entrypoint = "Plugin.dll"
         assert_eq!(
             decoded.rtti_recovery_availability,
             RttiRecoveryAvailability::RecordedWithoutNoPchdBaseDescriptors(3)
+        );
+        assert_eq!(
+            decoded.tls_callback_availability,
+            TlsCallbackAvailability::Unavailable(3)
         );
         assert!(decoded.schema1_source.is_none());
         assert_eq!(
@@ -4598,6 +4828,7 @@ entrypoint = "Plugin.dll"
             .expect("create current package value");
         let mut value = serde_json::to_value(package).expect("serialize package value");
         value["schema_version"] = serde_json::json!(4);
+        strip_schema_v7_tls_semantics(&mut value);
         fs::write(
             &path,
             serde_json::to_vec(&value).expect("encode schema-v4 package"),
@@ -4622,6 +4853,10 @@ entrypoint = "Plugin.dll"
         assert_eq!(
             decoded.rtti_recovery_availability,
             RttiRecoveryAvailability::RecordedWithoutNoPchdBaseDescriptors(4)
+        );
+        assert_eq!(
+            decoded.tls_callback_availability,
+            TlsCallbackAvailability::Unavailable(4)
         );
         assert!(decoded.schema1_source.is_none());
         let BinaryAnalysis::Pe(decoded_pe) = decoded.package.payload().base_analysis() else {
@@ -4666,6 +4901,7 @@ entrypoint = "Plugin.dll"
             .expect("create current package value");
         let mut value = serde_json::to_value(package).expect("serialize package value");
         value["schema_version"] = serde_json::json!(5);
+        strip_schema_v7_tls_semantics(&mut value);
         fs::write(
             &path,
             serde_json::to_vec(&value).expect("encode schema-v5 package"),
@@ -4690,6 +4926,10 @@ entrypoint = "Plugin.dll"
         assert_eq!(
             decoded.rtti_recovery_availability,
             RttiRecoveryAvailability::Recorded
+        );
+        assert_eq!(
+            decoded.tls_callback_availability,
+            TlsCallbackAvailability::Unavailable(5)
         );
         let BinaryAnalysis::Pe(pe) = decoded.package.payload().base_analysis() else {
             panic!("PE analysis expected");
@@ -4717,6 +4957,263 @@ entrypoint = "Plugin.dll"
     }
 
     #[test]
+    fn inspect_and_json_export_accept_schema_v6_without_tls_callback_recovery() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let path = temp.path().join("schema-v6.resym");
+        let output = temp.path().join("schema-v6.json");
+        let base_analysis = analyze_bytes(&pe_fixture()).expect("analyze PE fixture");
+        let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
+            .expect("create base-only session");
+        let package = ResymPackage::from_bound_payload("0.1.0-alpha.6", session)
+            .expect("create current package value");
+        let mut value = serde_json::to_value(package).expect("serialize package value");
+        value["schema_version"] = serde_json::json!(6);
+        strip_schema_v7_tls_semantics(&mut value);
+        let pe = value
+            .pointer("/payload/base_analysis/analysis")
+            .and_then(Value::as_object)
+            .expect("serialized PE analysis object");
+        for field in [
+            "tls_callback_table_rva",
+            "tls_callback_scan_truncated",
+            "tls_callbacks",
+        ] {
+            assert!(
+                !pe.contains_key(field),
+                "the no-TLS fixture must be representable by schema 6"
+            );
+        }
+        assert!(
+            !pe["directories"]
+                .as_object()
+                .expect("serialized PE directories")
+                .contains_key("tls")
+        );
+        fs::write(
+            &path,
+            serde_json::to_vec(&value).expect("encode schema-v6 package"),
+        )
+        .expect("write schema-v6 package");
+
+        let decoded = read_analysis_package(&path, true)
+            .expect("CLI compatibility policy accepts schema 6 explicitly");
+        assert_eq!(decoded.package.schema_version(), 6);
+        assert_eq!(
+            decoded.code_recovery_availability,
+            CodeRecoveryAvailability::Recorded
+        );
+        assert_eq!(
+            decoded.transitive_thunk_recovery_availability,
+            TransitiveThunkRecoveryAvailability::Recorded
+        );
+        assert_eq!(
+            decoded.string_data_recovery_availability,
+            StringDataRecoveryAvailability::Recorded
+        );
+        assert_eq!(
+            decoded.rtti_recovery_availability,
+            RttiRecoveryAvailability::Recorded
+        );
+        assert_eq!(
+            decoded.tls_callback_availability,
+            TlsCallbackAvailability::Unavailable(6)
+        );
+        let BinaryAnalysis::Pe(pe) = decoded.package.payload().base_analysis() else {
+            panic!("PE analysis expected");
+        };
+        assert!(pe.directories.tls.is_none());
+        assert!(pe.tls_callback_table_rva.is_none());
+        assert!(!pe.tls_callback_scan_truncated);
+        assert!(pe.tls_callbacks.is_empty());
+
+        inspect(InspectArgs {
+            package: path.clone(),
+            binary: None,
+            json: false,
+        })
+        .expect("CLI inspection accepts schema 6");
+        export(ExportArgs {
+            package: path,
+            format: ExportFormat::Json,
+            output: Some(output.clone()),
+            binary: None,
+        })
+        .expect("JSON export accepts schema 6");
+        let projection: Value =
+            serde_json::from_slice(&fs::read(output).expect("read schema-v6 JSON projection"))
+                .expect("projection JSON is valid");
+        assert_eq!(
+            projection["schema_version"], 6,
+            "package schema 7 must not change debugger projection schema 6"
+        );
+    }
+
+    #[test]
+    fn cli_rejects_schema_v8_before_decoding_the_analysis_payload() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let path = temp.path().join("schema-v8.resym");
+        let base_analysis = analyze_bytes(&pe_fixture()).expect("analyze PE fixture");
+        let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
+            .expect("create base-only session");
+        let package = ResymPackage::from_bound_payload("0.1.0-future", session)
+            .expect("create current package value");
+        let mut value = serde_json::to_value(package).expect("serialize package value");
+        value["schema_version"] = serde_json::json!(8);
+        value["payload"] = serde_json::json!("not an analysis session");
+        fs::write(
+            &path,
+            serde_json::to_vec(&value).expect("encode future package"),
+        )
+        .expect("write future package");
+
+        let error = match read_analysis_package(&path, false) {
+            Ok(_) => panic!("schema 8 must be rejected"),
+            Err(error) => error,
+        };
+        let diagnostic = format!("{error:#}");
+        assert!(diagnostic.contains("unsupported package schema 8"));
+        assert!(diagnostic.contains("schemas 1 through 7"));
+        assert!(!diagnostic.contains("analysis payload"));
+    }
+
+    #[test]
+    fn pre_v7_tls_gate_rejects_each_exact_base_analysis_shape_for_schemas_1_through_6() {
+        for schema_version in 1..TLS_CALLBACK_SCHEMA_VERSION {
+            for analysis in [
+                serde_json::json!({"tls_callback_table_rva": null}),
+                serde_json::json!({"tls_callback_scan_truncated": false}),
+                serde_json::json!({"tls_callbacks": []}),
+                serde_json::json!({"directories": {"tls": null}}),
+            ] {
+                let payload = serde_json::json!({
+                    "base_analysis": {"analysis": analysis},
+                    "plugin_claims": []
+                });
+                let error = reject_pre_v7_tls_callback_semantics(&payload, schema_version)
+                    .expect_err("an exact schema-7 TLS key must reject a legacy envelope");
+                let diagnostic = error.to_string();
+                assert!(diagnostic.contains(&format!("package schema {schema_version}")));
+                assert!(diagnostic.contains("schema-7 TLS callback semantics"));
+                assert!(diagnostic.contains("cannot be relabeled"));
+            }
+        }
+    }
+
+    #[test]
+    fn cli_runs_the_pre_v7_tls_gate_before_legacy_payload_decoding() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let base_analysis = analyze_bytes(&pe_fixture()).expect("analyze PE fixture");
+        let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
+            .expect("create base-only session");
+        let package = ResymPackage::from_bound_payload("0.1.0", session)
+            .expect("create current package value");
+        let current = serde_json::to_value(package).expect("serialize current package value");
+
+        for schema_version in 1..TLS_CALLBACK_SCHEMA_VERSION {
+            let mut value = current.clone();
+            value["schema_version"] = serde_json::json!(schema_version);
+            value["payload"]["base_analysis"]["analysis"]["tls_callbacks"] = serde_json::json!([]);
+            let path = temp
+                .path()
+                .join(format!("relabeled-tls-schema-{schema_version}.resym"));
+            fs::write(
+                &path,
+                serde_json::to_vec(&value).expect("encode relabeled package"),
+            )
+            .expect("write relabeled package");
+
+            let error = match read_analysis_package(&path, false) {
+                Ok(_) => panic!("schema {schema_version} must reject schema-7 TLS semantics"),
+                Err(error) => error,
+            };
+            let diagnostic = format!("{error:#}");
+            assert!(diagnostic.contains("schema-7 TLS callback semantics"));
+            assert!(!diagnostic.contains("cannot decode schema"));
+        }
+    }
+
+    #[test]
+    fn pre_v7_tls_gate_rejects_only_core_base_graph_tls_provenance() {
+        let core_base_claim = serde_json::json!({
+            "base_analysis": {
+                "analysis": {
+                    "symbol_graph": {
+                        "claims": [{
+                            "provenance": {
+                                "producer": {"kind": "core"},
+                                "method": "pe-tls-callback"
+                            }
+                        }]
+                    }
+                }
+            },
+            "plugin_claims": []
+        });
+        for schema_version in 1..TLS_CALLBACK_SCHEMA_VERSION {
+            reject_pre_v7_tls_callback_semantics(&core_base_claim, schema_version)
+                .expect_err("core pe-tls-callback provenance must reject a legacy envelope");
+        }
+
+        for allowed in [
+            serde_json::json!({
+                "base_analysis": {
+                    "analysis": {"symbol_graph": {"claims": []}}
+                },
+                "plugin_claims": [{
+                    "tls_callback_table_rva": 0x2200,
+                    "directories": {"tls": {"rva": 0x2100, "size": 40}},
+                    "provenance": {
+                        "producer": {"kind": "core"},
+                        "method": "pe-tls-callback"
+                    }
+                }]
+            }),
+            serde_json::json!({
+                "base_analysis": {
+                    "analysis": {
+                        "symbol_graph": {
+                            "claims": [{
+                                "provenance": {
+                                    "producer": {"kind": "plugin"},
+                                    "method": "pe-tls-callback"
+                                }
+                            }]
+                        }
+                    }
+                },
+                "plugin_claims": []
+            }),
+            serde_json::json!({
+                "base_analysis": {
+                    "analysis": {
+                        "extension": {
+                            "tls_callback_table_rva": 0x2200,
+                            "tls_callback_scan_truncated": true,
+                            "tls_callbacks": [],
+                            "directories": {"tls": null}
+                        },
+                        "symbol_graph": {
+                            "claims": [{
+                                "provenance": {
+                                    "producer": {"kind": "core"},
+                                    "method": "plugin-pe-tls-callback"
+                                }
+                            }]
+                        }
+                    }
+                },
+                "plugin_claims": []
+            }),
+        ] {
+            for schema_version in 1..TLS_CALLBACK_SCHEMA_VERSION {
+                reject_pre_v7_tls_callback_semantics(&allowed, schema_version).expect(
+                    "plugin claims, plugin producers, and unrelated nested shapes remain valid",
+                );
+            }
+        }
+    }
+
+    #[test]
     fn schemas_v2_through_v5_reject_relabeled_schema_v6_transitive_thunk_chains() {
         let temp = tempfile::tempdir().expect("create temporary directory");
         let base_analysis = analyze_bytes(&pe_transitive_thunk_chain_fixture())
@@ -4732,7 +5229,9 @@ entrypoint = "Plugin.dll"
             .expect("create transitive thunk-chain session");
         let package = ResymPackage::from_bound_payload("0.1.0", session)
             .expect("create current package value");
-        let current = serde_json::to_value(package).expect("serialize current package value");
+        let mut current = serde_json::to_value(package).expect("serialize current package value");
+        current["schema_version"] = serde_json::json!(6);
+        strip_schema_v7_tls_semantics(&mut current);
         let current_path = temp.path().join("schema-v6-thunk-chain.resym");
         fs::write(
             &current_path,
@@ -4745,6 +5244,10 @@ entrypoint = "Plugin.dll"
         assert_eq!(
             decoded.transitive_thunk_recovery_availability,
             TransitiveThunkRecoveryAvailability::Recorded
+        );
+        assert_eq!(
+            decoded.tls_callback_availability,
+            TlsCallbackAvailability::Unavailable(6)
         );
 
         for schema_version in 2..TRANSITIVE_THUNK_CHAIN_SCHEMA_VERSION {
@@ -4783,6 +5286,7 @@ entrypoint = "Plugin.dll"
             .expect("create current package value");
         let mut value = serde_json::to_value(package).expect("serialize current package value");
         value["schema_version"] = serde_json::json!(5);
+        strip_schema_v7_tls_semantics(&mut value);
         install_schema_v1_plugin_claims(
             &mut value,
             vec![
@@ -4853,6 +5357,7 @@ entrypoint = "Plugin.dll"
             for omit_pchd_field in [false, true] {
                 let mut value = current.clone();
                 value["schema_version"] = serde_json::json!(schema_version);
+                strip_schema_v7_tls_semantics(&mut value);
                 let base_class = value
                     .pointer_mut(
                         "/payload/base_analysis/analysis/msvc_rtti_vftables/0/base_classes/0",
@@ -4981,6 +5486,7 @@ entrypoint = "Plugin.dll"
         for schema_version in [2, 3] {
             let mut value = current.clone();
             value["schema_version"] = serde_json::json!(schema_version);
+            strip_schema_v7_tls_semantics(&mut value);
             value["payload"]["base_analysis"]["analysis"]["direct_calls"][0]["target"] = serde_json::json!({
                 "kind": "function-pointer",
                 "slot_rva": 0x1300,
@@ -5018,6 +5524,7 @@ entrypoint = "Plugin.dll"
         for schema_version in [2, 3] {
             let mut value = current.clone();
             value["schema_version"] = serde_json::json!(schema_version);
+            strip_schema_v7_tls_semantics(&mut value);
             value["payload"]["base_analysis"]["analysis"]["thunks"][0]["target"] = serde_json::json!({
                 "kind": "function-pointer",
                 "slot_rva": 0x1300,

@@ -19,7 +19,7 @@ pub use types::{
     BinaryAnalysis, CoffHeader, DataDirectory, ImportTarget, MsvcRttiBaseClass, MsvcRttiVftable,
     PeAnalysis, PeControlFlowTarget, PeDataDirectories, PeDataReference, PeDirectCall, PeExport,
     PeExportName, PeImport, PeImportLibrary, PeRecoveredString, PeSection, PeStringEncoding,
-    PeThunk, RuntimeFunction,
+    PeThunk, PeTlsCallback, RuntimeFunction,
 };
 
 /// Detect and analyze a supported binary container.

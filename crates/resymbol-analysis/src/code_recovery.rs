@@ -7,7 +7,7 @@ use iced_x86::{Code, Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Reg
 
 use crate::{
     AnalysisError, MsvcRttiVftable, PeAnalysis, PeControlFlowTarget, PeDataReference, PeDirectCall,
-    PeExport, PeImportLibrary, PeSection, PeThunk, RuntimeFunction,
+    PeExport, PeImportLibrary, PeSection, PeThunk, PeTlsCallback, RuntimeFunction,
     pe::{RvaMap, section_for_rva},
 };
 
@@ -41,6 +41,7 @@ pub(crate) struct CodeRecoveryInput<'a, 'data> {
     pub imports: &'a [PeImportLibrary],
     pub exports: &'a [PeExport],
     pub runtime_functions: &'a [RuntimeFunction],
+    pub tls_callbacks: &'a [PeTlsCallback],
     pub msvc_rtti_vftables: &'a [MsvcRttiVftable],
 }
 
@@ -589,15 +590,7 @@ pub(crate) fn recover_code(input: CodeRecoveryInput<'_, '_>) -> CodeRecovery {
 
     let direct_calls = direct_calls.into_iter().collect::<Vec<_>>();
     let data_references = data_references.into_iter().collect::<Vec<_>>();
-    let mut pending_thunk_layer = thunk_seeds(
-        input.mapper,
-        input.sections,
-        input.entry_point_rva,
-        input.exports,
-        input.runtime_functions,
-        &direct_calls,
-        input.msvc_rtti_vftables,
-    );
+    let mut pending_thunk_layer = thunk_seeds(&input, &direct_calls);
     let mut visited_thunk_candidates = BTreeSet::new();
     let mut thunks = BTreeSet::new();
     'thunk_layers: while !pending_thunk_layer.is_empty() {
@@ -872,41 +865,50 @@ fn decode_rip_relative_indirect_target(
     .then_some(PeControlFlowTarget::FunctionPointer { slot_rva, rva })
 }
 
-fn thunk_seeds(
-    mapper: &RvaMap<'_>,
-    sections: &[PeSection],
-    entry_point_rva: u32,
-    exports: &[PeExport],
-    runtime_functions: &[RuntimeFunction],
-    direct_calls: &[PeDirectCall],
-    msvc_rtti_vftables: &[MsvcRttiVftable],
-) -> BTreeSet<u32> {
+fn thunk_seeds(input: &CodeRecoveryInput<'_, '_>, direct_calls: &[PeDirectCall]) -> BTreeSet<u32> {
     let mut seeds = BTreeSet::new();
-    if entry_point_rva != 0 {
-        insert_executable_seed(&mut seeds, mapper, sections, entry_point_rva);
+    if input.entry_point_rva != 0 {
+        insert_executable_seed(
+            &mut seeds,
+            input.mapper,
+            input.sections,
+            input.entry_point_rva,
+        );
     }
-    for rva in runtime_functions.iter().map(|function| function.begin_rva) {
-        insert_executable_seed(&mut seeds, mapper, sections, rva);
+    for rva in input
+        .runtime_functions
+        .iter()
+        .map(|function| function.begin_rva)
+    {
+        insert_executable_seed(&mut seeds, input.mapper, input.sections, rva);
     }
-    for rva in exports.iter().filter_map(|export| {
+    for rva in input.exports.iter().filter_map(|export| {
         (export.forwarded_to.is_none())
             .then_some(export.address_rva)
             .flatten()
     }) {
-        insert_executable_seed(&mut seeds, mapper, sections, rva);
+        insert_executable_seed(&mut seeds, input.mapper, input.sections, rva);
     }
     for rva in direct_calls.iter().filter_map(|call| match call.target {
         PeControlFlowTarget::Function { rva }
         | PeControlFlowTarget::FunctionPointer { rva, .. } => Some(rva),
         PeControlFlowTarget::ImportIat { .. } => None,
     }) {
-        insert_executable_seed(&mut seeds, mapper, sections, rva);
+        insert_executable_seed(&mut seeds, input.mapper, input.sections, rva);
     }
-    for rva in msvc_rtti_vftables
+    for rva in input
+        .tls_callbacks
+        .iter()
+        .map(|callback| callback.callback_rva)
+    {
+        insert_executable_seed(&mut seeds, input.mapper, input.sections, rva);
+    }
+    for rva in input
+        .msvc_rtti_vftables
         .iter()
         .flat_map(|vftable| vftable.virtual_function_rvas.iter().copied())
     {
-        insert_executable_seed(&mut seeds, mapper, sections, rva);
+        insert_executable_seed(&mut seeds, input.mapper, input.sections, rva);
     }
     seeds
 }
@@ -1061,7 +1063,7 @@ pub(crate) fn validate_code_recovery(analysis: &PeAnalysis) -> Result<(), Analys
     {
         return invalid(
             "thunk source",
-            "is not reachable from a metadata, direct-call, or RTTI seed through retained thunk edges",
+            "is not reachable from a deterministic initial seed through retained thunk edges",
         );
     }
     Ok(())
@@ -1156,6 +1158,12 @@ fn model_thunk_seeds(analysis: &PeAnalysis) -> BTreeSet<u32> {
                 | PeControlFlowTarget::FunctionPointer { rva, .. } => Some(rva),
                 PeControlFlowTarget::ImportIat { .. } => None,
             }),
+    );
+    seeds.extend(
+        analysis
+            .tls_callbacks
+            .iter()
+            .map(|callback| callback.callback_rva),
     );
     seeds.extend(
         analysis

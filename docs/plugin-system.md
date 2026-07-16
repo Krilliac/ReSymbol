@@ -400,6 +400,9 @@ reference; a thunk does not.
 rejects unsupported encoding names, invalid literal text, and zero instruction sizes before
 submission. `AnalysisRequest.BaseAnalysis` contains the detached canonical base analysis only when
 `symbols.read` was granted; without that permission it is `null`.
+Package schema 7 adds the TLS directory, callback-table RVA, ordered callback records, and partial
+flag to that detached JSON object. Those fields are additive data, not a new managed SDK type or
+plugin assertion; the plugin API remains unchanged.
 
 #### Managed plugin author quickstart
 
@@ -486,6 +489,11 @@ plugin assertion or target shape. Package schema 6's transitive built-in thunk d
 the existing exact `thunk-target` assertions instead of adding a chain-depth or terminal-target
 shape; the wire handshake remains `resymbol.plugin-wire` 1.0. Plugin-supplied thunk claims remain
 independent of the deterministic base analyzer's transitive seed-closure invariant.
+Package schema 7's TLS callback discovery likewise reuses existing `function-entry` assertions for
+retained callback slots and existing exact `thunk-target` assertions for callback-seeded hops;
+it adds no assertion or control-flow target shape. Plugins granted `symbols.read` observe the
+additive TLS directory and ordered callback fields in detached base-analysis JSON. The plugin API,
+WIT/ABI, `resymbol.plugin-wire` 1.0 handshake, and neutral projection schema 6 remain unchanged.
 
 ### Tool-hosted bridges (planned host)
 

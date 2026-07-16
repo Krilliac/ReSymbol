@@ -47,6 +47,17 @@ prereleases; breaking changes remain explicit.
   relationships. Base-class arrays may mix the legacy 24-byte descriptor with the 28-byte
   `BCD_HASPCHD` form. A hierarchy link is absent for the legacy form and required for the extended
   form; an extended root must link to its owning hierarchy.
+- Added bounded PE32+ x86-64 TLS callback discovery from optional-header data-directory entry 9.
+  ReSymbol requires the declared directory to be fully file-backed and contain at least the
+  40-byte PE32+ TLS-directory prefix, converts `AddressOfCallbacks` and callback preferred-image
+  VAs to RVAs with checked image bounds, retains ordered entries including duplicates, and requires
+  every eight-byte slot and executable endpoint to be file-backed. It retains at most 4,096
+  callbacks, then probes one more
+  slot: null means the 4,096-entry table is complete, while nonzero records an explicit partial
+  flag without retaining the extra entry. Each retained slot produces an exact `FunctionEntry`
+  claim with `pe-tls-callback` provenance and distinct slot/index evidence, including when callback
+  target RVAs repeat. Retained targets seed only the existing one-instruction thunk check, not a
+  callback-body sweep. ReSymbol never loads or executes the image.
 - Expanded the source-available, byte-reproducible MSVC x64 fixture corpus to four PE inputs:
   optimized and unoptimized builds, each with and without CodeView metadata. The existing optimized
   filenames remain stable, exact hashes bind every checked-in executable, and the semantic oracle
@@ -56,6 +67,9 @@ prereleases; breaking changes remain explicit.
 - Added focused synthetic RTTI fixtures for all-legacy and mixed base-class descriptor hierarchies
   alongside the existing extended-form coverage, without regenerating or changing the hashes of
   the four checked-in MSVC corpus binaries.
+- Added focused synthetic TLS-directory fixtures for ordered and duplicate callbacks, malformed
+  preferred VAs and backing, the 4,096-entry retention boundary, partial scans, graph provenance,
+  and callback-seeded thunks without changing the four checked-in MSVC corpus binaries or hashes.
 - Added a pure-Rust x86-64 decoder that performs a bounded control-flow-guided block sweep of fully
   file-backed `RUNTIME_FUNCTION` ranges for supported direct calls and data references, and checks
   seeded executable candidates for one-instruction internal, import, or read-only function-pointer
@@ -117,7 +131,7 @@ prereleases; breaking changes remain explicit.
   extents, and types; ordinary generation requires no Visual Studio, DIA, LLVM, or compiler
   installation.
 - Added optional `resymbol inspect PACKAGE --binary EXACT_ORIGINAL_BINARY` verification for package
-  schemas 1 through 6. Inspection validates the package first, then requires the supplied file's
+  schemas 1 through 7. Inspection validates the package first, then requires the supplied file's
   exact size and SHA-256 to match before any inspection output reaches stdout. Failures report on
   stderr. Human summaries add
   `source binary: <canonical-path>` and `identity gate: matched`; `--json` remains pure package JSON.
@@ -140,13 +154,15 @@ prereleases; breaking changes remain explicit.
   and no longer quarantine the plugin artifact.
 - Raised the pinned Rust source-build toolchain and workspace MSRV to 1.86 for the Component Model
   host. Ordinary release users and users of the bundled WASM example still need no compiler.
-- New `.resym` analyses use package schema 6. Schema 4 introduced the `function-pointer`
+- New `.resym` analyses use package schema 7. Schema 4 introduced the `function-pointer`
   control-flow target, which persists both the read-only slot RVA and resolved function RVA and
   requires a paired same-site slot data reference for a direct call but not for a pointer thunk.
   Schema 5 preserves a legacy 24-byte RTTI base-class descriptor with a null
   `class_hierarchy_descriptor_rva`; the 28-byte `BCD_HASPCHD` form retains its validated nonzero
   hierarchy link. Schema 6 permits persisted thunk sources reached through the deterministic
-  transitive thunk closure while retaining the same exact per-hop relationship shape.
+  transitive thunk closure while retaining the same exact per-hop relationship shape. Schema 7
+  adds TLS-directory identity, callback-table RVA, ordered callback records, and the independent
+  callback-scan partial flag.
 - The debugger-neutral JSON projection now uses schema 6. Schema 4 added attributed string and
   data-reference arrays to schema 3's entry attribution and control-flow relationships; schema 5
   added `referenced_string_rva` correlation; and schema 6 adds explicit `function-pointer` targets.
@@ -154,7 +170,7 @@ prereleases; breaking changes remain explicit.
   same-site data-reference reduction selects a conflicting noncompanion reference, the projection
   omits the pointer call with an `unsupported-assertion` warning instead of flattening it.
 - `resymbol analyze` and `resymbol inspect` report recovered string, data-reference, direct-call,
-  and thunk counts plus their applicable partial-recovery status.
+  thunk, and TLS-callback counts plus their applicable partial-recovery status.
 - Address-kind collision diagnostics and both standalone debugger writers now share one
   mutation-aware rule: a same-RVA global is suppressed only when the writer actually emits a
   function record. Entry-only function evidence does not become a debugger mutation.
@@ -179,7 +195,7 @@ schema versions independently.
 
 ### Compatibility
 
-- The CLI can inspect and export package schemas 1 through 5 through explicit, validated in-memory
+- The CLI can inspect and export package schemas 1 through 6 through explicit, validated in-memory
   compatibility paths. It revalidates persisted metadata, plugin runs and claims, binary binding,
   and rebuilds the deterministic base graph; it does not rewrite a legacy package. `inspect --json`
   preserves the validated original representation instead of mislabeling migrated content.
@@ -194,27 +210,33 @@ schema versions independently.
   recovery, while schemas 2 and 3 both predate read-only function-pointer call and thunk
   resolution. Schema 4 retains those pointer relationships but predates legacy 24-byte base-class
   descriptor recovery. Schema 5 includes that RTTI recovery but predates transitive executable
-  thunk-chain discovery. Schemas 1 through 5 cannot gain omitted results during loading. Reanalyze
-  the exact original binary to create schema 6 with current recovery. The reader rejects
-  schema 2 or 3 envelopes containing schema-4 function-pointer targets in base relationships,
+  thunk-chain discovery. Schema 6 includes that closure but predates TLS callback discovery and
+  callback-based thunk seeding. Schemas 1 through 6 report TLS callback recovery unavailable and
+  cannot gain omitted results during loading. Reanalyze the exact original binary to create schema
+  7 with current recovery. The reader rejects schema 2 or 3 envelopes containing schema-4
+  function-pointer targets in base relationships,
   symbol graphs, or plugin claims. It also rejects a schema 1-through-4 payload containing an RTTI
   base record whose `class_hierarchy_descriptor_rva` is missing or null instead of accepting
   relabeled schema-5 semantics, and rejects a schema 1-through-5 envelope containing a base thunk
-  source that depends on schema-6 transitive endpoint seeding. Changing only the envelope label is
-  never migration.
-- Package schema 6 and neutral projection schema 6 are independent version domains. Generic
+  source that depends on schema-6 transitive endpoint seeding, and rejects schema 1-through-6
+  envelopes containing schema-7 TLS callback state or callback-only base thunk seeds. Changing
+  only the envelope label is never migration.
+- Package schema 7 and neutral projection schema 6 are independent version domains. Generic
   package readers still require an explicit compatibility range and application-defined payload
   migration to accept an older schema.
 - Markdown export is presentation-only and does not change either version domain: new analyses
-  continue to use package schema 6 and the neutral projection continues to use schema 6.
+  continue to use package schema 7 and the neutral projection continues to use schema 6.
 - MAP export consumes the current validated session and neutral projection without adding fields to
-  package schema 6 or projection schema 6.
+  package schema 7 or projection schema 6.
 - PDB export consumes the same current session and projection plus a byte-backed inspection of the
-  exact original PE. It does not add fields to package schema 6 or projection schema 6.
+  exact original PE. It does not add fields to package schema 7 or projection schema 6.
 - The external plugin wire remains protocol 1.0. Dual-layout RTTI recovery changes deterministic
   base-analysis/package content but adds no plugin assertion or control-flow target shape.
   Transitive built-in thunk discovery likewise composes existing exact `thunk-target` claims and
-  does not add a terminal-target field or change the wire handshake.
+  does not add a terminal-target field or change the wire handshake. TLS callback records are an
+  additive field in the detached base-analysis JSON exposed by `symbols.read`; they reuse the
+  existing `function-entry` assertion and do not change the plugin API, plugin wire, or neutral
+  projection schema.
 - Managed-plugin execution adds no package-schema field: successful runs and validated claims use
   the existing `AnalysisSession` plugin ledger and claim representation.
 - WASM-plugin execution likewise adds no package-schema field. It uses the existing plugin ledger,

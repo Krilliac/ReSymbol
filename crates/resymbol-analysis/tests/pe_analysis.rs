@@ -1,7 +1,7 @@
 use resymbol_analysis::{
     AnalysisError, AnalysisSession, BinaryAnalysis, ImportTarget, PeControlFlowTarget,
-    PeDataReference, PeDirectCall, PeRecoveredString, PeStringEncoding, PeThunk, PluginRunRecord,
-    PluginRunStatus, SessionValidationError, analyze_bytes, analyze_pe,
+    PeDataReference, PeDirectCall, PeRecoveredString, PeStringEncoding, PeThunk, PeTlsCallback,
+    PluginRunRecord, PluginRunStatus, SessionValidationError, analyze_bytes, analyze_pe,
 };
 use resymbol_core::{
     BinaryId, ClaimProducer, ClaimProvenance, Confidence, ControlFlowTarget, Evidence,
@@ -15,6 +15,10 @@ const OPTIONAL_OFFSET: usize = COFF_OFFSET + 20;
 const SECTION_OFFSET: usize = OPTIONAL_OFFSET + 0xf0;
 const RAW_OFFSET: usize = 0x200;
 const SECTION_RVA: u32 = 0x1000;
+const IMAGE_BASE: u64 = 0x0000_0001_4000_0000;
+const TLS_DIRECTORY_RVA: u32 = 0x1380;
+const TLS_CALLBACK_TABLE_RVA: u32 = 0x13c0;
+const TLS_CALLBACK_LIMIT: usize = 4_096;
 const DIRECT_CALL_EVIDENCE_SUMMARY: &str = concat!(
     "exact supported x64 call encoding observed during a bounded ",
     "control-flow-guided traversal of a file-backed runtime-function range",
@@ -142,6 +146,65 @@ fn fixture() -> Vec<u8> {
     put_u32(&mut bytes, exception, 0x1000);
     put_u32(&mut bytes, exception + 4, 0x1020);
     put_u32(&mut bytes, exception + 8, 0x1350);
+    bytes
+}
+
+fn set_tls_directory(bytes: &mut [u8], directory_rva: u32, directory_size: u32, callbacks_va: u64) {
+    set_directory(bytes, 9, directory_rva, directory_size);
+    put_u64(bytes, file_offset(directory_rva) + 24, callbacks_va);
+}
+
+fn tls_callbacks_fixture(callback_rvas: &[u32]) -> Vec<u8> {
+    let mut bytes = fixture();
+    set_tls_directory(
+        &mut bytes,
+        TLS_DIRECTORY_RVA,
+        40,
+        IMAGE_BASE + u64::from(TLS_CALLBACK_TABLE_RVA),
+    );
+    for (index, callback_rva) in callback_rvas.iter().copied().enumerate() {
+        let slot = file_offset(TLS_CALLBACK_TABLE_RVA) + index * 8;
+        put_u64(&mut bytes, slot, IMAGE_BASE + u64::from(callback_rva));
+    }
+    let terminator = file_offset(TLS_CALLBACK_TABLE_RVA) + callback_rvas.len() * 8;
+    put_u64(&mut bytes, terminator, 0);
+    bytes
+}
+
+fn expanded_tls_callbacks_fixture(callback_count: usize, next_slot_nonzero: bool) -> Vec<u8> {
+    const EXPANDED_SECTION_SIZE: u32 = 0x9000;
+
+    assert!(callback_count <= TLS_CALLBACK_LIMIT);
+    let mut bytes = fixture();
+    bytes.resize(
+        RAW_OFFSET + usize::try_from(EXPANDED_SECTION_SIZE).expect("expanded TLS fixture size"),
+        0,
+    );
+    put_u32(&mut bytes, OPTIONAL_OFFSET + 56, 0xa000);
+    put_u32(&mut bytes, SECTION_OFFSET + 8, EXPANDED_SECTION_SIZE);
+    put_u32(&mut bytes, SECTION_OFFSET + 16, EXPANDED_SECTION_SIZE);
+    set_tls_directory(
+        &mut bytes,
+        TLS_DIRECTORY_RVA,
+        40,
+        IMAGE_BASE + u64::from(TLS_CALLBACK_TABLE_RVA),
+    );
+    for index in 0..callback_count {
+        put_u64(
+            &mut bytes,
+            file_offset(TLS_CALLBACK_TABLE_RVA) + index * 8,
+            IMAGE_BASE + 0x1040,
+        );
+    }
+    put_u64(
+        &mut bytes,
+        file_offset(TLS_CALLBACK_TABLE_RVA) + callback_count * 8,
+        if next_slot_nonzero {
+            IMAGE_BASE + 0x1060
+        } else {
+            0
+        },
+    );
     bytes
 }
 
@@ -963,6 +1026,576 @@ fn emits_one_metadata_claim_for_a_file_backed_executable_pe_entry_point() {
     assert_eq!(entry.confidence().get(), 0.99);
     assert_eq!(entry.evidence()[0].kind.as_str(), EvidenceKind::METADATA);
     assert_eq!(entry.evidence()[0].artifacts["entry_point_rva"], "0x1000");
+}
+
+#[test]
+fn distinguishes_absent_zero_and_empty_tls_callback_tables() {
+    let absent = analyze_pe(&fixture()).expect("PE without a TLS directory");
+    assert_eq!(absent.directories.tls, None);
+    assert_eq!(absent.tls_callback_table_rva, None);
+    assert!(absent.tls_callbacks.is_empty());
+    assert!(!absent.tls_callback_scan_truncated);
+
+    let mut zero = fixture();
+    set_tls_directory(&mut zero, TLS_DIRECTORY_RVA, 40, 0);
+    let zero = analyze_pe(&zero).expect("zero AddressOfCallbacks is an absent table");
+    assert_eq!(
+        zero.directories.tls,
+        Some(resymbol_analysis::DataDirectory {
+            rva: TLS_DIRECTORY_RVA,
+            size: 40,
+        })
+    );
+    assert_eq!(zero.tls_callback_table_rva, None);
+    assert!(zero.tls_callbacks.is_empty());
+    assert!(!zero.tls_callback_scan_truncated);
+
+    let empty = analyze_pe(&tls_callbacks_fixture(&[]))
+        .expect("a file-backed null callback slot is an empty table");
+    assert_eq!(empty.tls_callback_table_rva, Some(TLS_CALLBACK_TABLE_RVA));
+    assert!(empty.tls_callbacks.is_empty());
+    assert!(!empty.tls_callback_scan_truncated);
+    assert!(
+        empty
+            .symbol_graph
+            .claims()
+            .iter()
+            .all(|claim| claim.provenance().method != "pe-tls-callback")
+    );
+}
+
+#[test]
+fn recovers_tls_callbacks_with_exact_evidence_and_round_trips_the_graph() {
+    let analysis =
+        analyze_pe(&tls_callbacks_fixture(&[0x1040, 0x1080])).expect("two exact TLS callbacks");
+
+    assert_eq!(
+        analysis.tls_callbacks,
+        [
+            PeTlsCallback {
+                table_index: 0,
+                callback_rva: 0x1040,
+            },
+            PeTlsCallback {
+                table_index: 1,
+                callback_rva: 0x1080,
+            },
+        ]
+    );
+    assert_eq!(
+        analysis.tls_callback_table_rva,
+        Some(TLS_CALLBACK_TABLE_RVA)
+    );
+    assert!(!analysis.tls_callback_scan_truncated);
+
+    let callback_claims = analysis
+        .symbol_graph
+        .claims()
+        .iter()
+        .filter(|claim| claim.provenance().method == "pe-tls-callback")
+        .collect::<Vec<_>>();
+    assert_eq!(callback_claims.len(), 2);
+    let second = callback_claims
+        .iter()
+        .copied()
+        .find(|claim| {
+            matches!(
+                (claim.subject(), claim.assertion()),
+                (
+                    SymbolSubject::Function {
+                        rva: 0x1080,
+                        size: None,
+                        ..
+                    },
+                    SymbolAssertion::FunctionEntry,
+                )
+            )
+        })
+        .expect("second callback has one function-entry claim");
+    assert_eq!(second.confidence().get(), 0.99);
+    assert_eq!(second.evidence()[0].kind.as_str(), EvidenceKind::METADATA);
+    assert_eq!(
+        second.evidence()[0].summary,
+        "exact executable callback address from the PE32+ TLS callback table"
+    );
+    assert_eq!(
+        second.evidence()[0]
+            .confidence
+            .expect("exact callback evidence")
+            .get(),
+        1.0
+    );
+    assert_eq!(
+        second.evidence()[0].artifacts["tls_directory_rva"],
+        "0x1380"
+    );
+    assert_eq!(
+        second.evidence()[0].artifacts["callback_table_rva"],
+        "0x13c0"
+    );
+    assert_eq!(
+        second.evidence()[0].artifacts["callback_slot_rva"],
+        "0x13c8"
+    );
+    assert_eq!(second.evidence()[0].artifacts["table_index"], "1");
+    assert_eq!(second.evidence()[0].artifacts["callback_rva"], "0x1080");
+    assert_eq!(second.evidence()[0].artifacts["section_index"], "0");
+    assert_eq!(second.evidence()[0].artifacts["section_name"], ".all");
+    assert!(matches!(
+        &second.provenance().producer,
+        ClaimProducer::Core { component, version }
+            if component == "resymbol-analysis" && !version.is_empty()
+    ));
+    assert_eq!(second.provenance().method, "pe-tls-callback");
+    assert_eq!(second.provenance().run_id, None);
+    assert_eq!(
+        analysis
+            .rebuild_symbol_graph()
+            .expect("rebuild TLS callback graph"),
+        analysis.symbol_graph
+    );
+
+    let encoded = serde_json::to_string(&analysis).expect("serialize TLS callback analysis");
+    let decoded = serde_json::from_str::<resymbol_analysis::PeAnalysis>(&encoded)
+        .expect("deserialize TLS callback analysis");
+    assert_eq!(decoded, analysis);
+    let session = AnalysisSession::new(BinaryAnalysis::Pe(decoded), Vec::new(), Vec::new())
+        .expect("TLS callback analysis remains a valid session base");
+    let encoded = serde_json::to_string(&session).expect("serialize TLS callback session");
+    assert_eq!(
+        serde_json::from_str::<AnalysisSession>(&encoded)
+            .expect("deserialize TLS callback session"),
+        session
+    );
+}
+
+#[test]
+fn preserves_duplicate_tls_callback_records_and_emits_one_entry_claim_per_slot() {
+    let analysis = analyze_pe(&tls_callbacks_fixture(&[0x1040, 0x1040]))
+        .expect("duplicate TLS callbacks retain loader order");
+
+    assert_eq!(
+        analysis.tls_callbacks,
+        [
+            PeTlsCallback {
+                table_index: 0,
+                callback_rva: 0x1040,
+            },
+            PeTlsCallback {
+                table_index: 1,
+                callback_rva: 0x1040,
+            },
+        ]
+    );
+    let entry_claims = analysis
+        .symbol_graph
+        .claims()
+        .iter()
+        .filter(|claim| {
+            claim.provenance().method == "pe-tls-callback"
+                && matches!(claim.subject(), SymbolSubject::Function { rva: 0x1040, .. })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(entry_claims.len(), 2);
+    assert_eq!(entry_claims[0].evidence()[0].artifacts["table_index"], "0");
+    assert_eq!(entry_claims[1].evidence()[0].artifacts["table_index"], "1");
+    assert_eq!(
+        entry_claims[0].evidence()[0].artifacts["callback_slot_rva"],
+        "0x13c0"
+    );
+    assert_eq!(
+        entry_claims[1].evidence()[0].artifacts["callback_slot_rva"],
+        "0x13c8"
+    );
+    assert_eq!(
+        analysis
+            .rebuild_symbol_graph()
+            .expect("rebuild per-slot TLS graph"),
+        analysis.symbol_graph
+    );
+}
+
+#[test]
+fn seeds_jump_thunks_from_tls_callbacks_without_other_metadata_predecessors() {
+    let mut bytes = tls_callbacks_fixture(&[0x1040]);
+    put_rel32_instruction(&mut bytes, 0x1040, 0xe9, 0x1060);
+    put_rel8_instruction(&mut bytes, 0x1060, 0xeb, 0x1080);
+    bytes[file_offset(0x1080)] = 0xc3;
+    put_rel32_instruction(&mut bytes, 0x10a0, 0xe9, 0x10c0);
+    bytes[file_offset(0x10c0)] = 0xc3;
+
+    let analysis = analyze_pe(&bytes).expect("TLS callback is a trusted thunk root");
+    assert_eq!(
+        analysis.thunks,
+        [
+            PeThunk {
+                rva: 0x1040,
+                instruction_size: 5,
+                target: PeControlFlowTarget::Function { rva: 0x1060 },
+            },
+            PeThunk {
+                rva: 0x1060,
+                instruction_size: 2,
+                target: PeControlFlowTarget::Function { rva: 0x1080 },
+            },
+        ]
+    );
+    assert!(analysis.thunks.iter().all(|thunk| thunk.rva != 0x10a0));
+    assert!(analysis.symbol_graph.claims().iter().any(|claim| matches!(
+        (claim.subject(), claim.assertion()),
+        (
+            SymbolSubject::Function { rva: 0x1040, .. },
+            SymbolAssertion::ThunkTarget {
+                target: ControlFlowTarget::Function { rva: 0x1060 },
+            },
+        )
+    )));
+    assert!(analysis.symbol_graph.claims().iter().any(|claim| matches!(
+        (claim.subject(), claim.assertion()),
+        (
+            SymbolSubject::Function { rva: 0x1060, .. },
+            SymbolAssertion::ThunkTarget {
+                target: ControlFlowTarget::Function { rva: 0x1080 },
+            },
+        )
+    )));
+}
+
+#[test]
+fn rejects_malformed_tls_directories_tables_and_callback_endpoints() {
+    let mut short_directory = fixture();
+    set_tls_directory(
+        &mut short_directory,
+        TLS_DIRECTORY_RVA,
+        39,
+        IMAGE_BASE + u64::from(TLS_CALLBACK_TABLE_RVA),
+    );
+    let error = analyze_pe(&short_directory).expect_err("PE32+ TLS directory needs 40 bytes");
+    assert!(matches!(
+        error,
+        AnalysisError::InvalidField {
+            field: "TLS directory size",
+            ..
+        }
+    ));
+
+    let mut padded_directory = tls_callbacks_fixture(&[]);
+    set_directory(&mut padded_directory, 9, TLS_DIRECTORY_RVA, 48);
+    let padded = analyze_pe(&padded_directory)
+        .expect("a fully backed forward-compatible TLS directory may exceed 40 bytes");
+    assert_eq!(padded.directories.tls.expect("TLS directory").size, 48);
+
+    let mut over_limit_directory = fixture();
+    set_directory(
+        &mut over_limit_directory,
+        9,
+        TLS_DIRECTORY_RVA,
+        64 * 1024 * 1024 + 1,
+    );
+    let error = analyze_pe(&over_limit_directory)
+        .expect_err("TLS directory bytes remain subject to the global directory cap");
+    assert!(matches!(
+        error,
+        AnalysisError::LimitExceeded {
+            kind: "TLS-directory byte",
+            count: 67_108_865,
+            limit: 67_108_864,
+        }
+    ));
+
+    let mut unbacked_directory = fixture();
+    set_directory(&mut unbacked_directory, 9, 0x15f0, 40);
+    let error = analyze_pe(&unbacked_directory).expect_err("TLS directory must be file-backed");
+    assert!(matches!(
+        error,
+        AnalysisError::UnmappedRva {
+            context: "TLS directory",
+            rva: 0x15f0,
+            size: 40,
+        }
+    ));
+
+    let mut below_base_table = fixture();
+    set_tls_directory(&mut below_base_table, TLS_DIRECTORY_RVA, 40, IMAGE_BASE - 1);
+    let error = analyze_pe(&below_base_table)
+        .expect_err("AddressOfCallbacks is a preferred-base VA, not an RVA");
+    assert!(matches!(
+        error,
+        AnalysisError::InvalidField {
+            field: "TLS AddressOfCallbacks",
+            ..
+        }
+    ));
+
+    let mut unbacked_table = fixture();
+    set_tls_directory(
+        &mut unbacked_table,
+        TLS_DIRECTORY_RVA,
+        40,
+        IMAGE_BASE + 0x1600,
+    );
+    let error = analyze_pe(&unbacked_table).expect_err("callback table must be file-backed");
+    assert!(matches!(
+        error,
+        AnalysisError::UnmappedRva {
+            context: "TLS callback slot",
+            rva: 0x1600,
+            size: 8,
+        }
+    ));
+
+    let mut below_base_callback = tls_callbacks_fixture(&[]);
+    put_u64(
+        &mut below_base_callback,
+        file_offset(TLS_CALLBACK_TABLE_RVA),
+        IMAGE_BASE - 1,
+    );
+    let error = analyze_pe(&below_base_callback).expect_err("callback entries are VAs, not RVAs");
+    assert!(matches!(
+        error,
+        AnalysisError::InvalidField {
+            field: "TLS callback VA",
+            ..
+        }
+    ));
+
+    let mut non_executable_callback = tls_callbacks_fixture(&[]);
+    put_u64(
+        &mut non_executable_callback,
+        file_offset(TLS_CALLBACK_TABLE_RVA),
+        IMAGE_BASE + 0x100,
+    );
+    put_u64(
+        &mut non_executable_callback,
+        file_offset(TLS_CALLBACK_TABLE_RVA) + 8,
+        0,
+    );
+    let error = analyze_pe(&non_executable_callback)
+        .expect_err("a backed PE header byte is not an executable callback endpoint");
+    assert!(matches!(
+        error,
+        AnalysisError::InvalidField {
+            field: "TLS callback target",
+            ..
+        }
+    ));
+
+    let mut unbacked_executable_callback = tls_callbacks_fixture(&[]);
+    put_u32(&mut unbacked_executable_callback, SECTION_OFFSET + 8, 0x700);
+    put_u64(
+        &mut unbacked_executable_callback,
+        file_offset(TLS_CALLBACK_TABLE_RVA),
+        IMAGE_BASE + 0x1600,
+    );
+    put_u64(
+        &mut unbacked_executable_callback,
+        file_offset(TLS_CALLBACK_TABLE_RVA) + 8,
+        0,
+    );
+    let error = analyze_pe(&unbacked_executable_callback)
+        .expect_err("an executable virtual tail is not a file-backed callback endpoint");
+    assert!(matches!(
+        error,
+        AnalysisError::InvalidField {
+            field: "TLS callback target",
+            ..
+        }
+    ));
+
+    let mut missing_terminator = fixture();
+    set_tls_directory(
+        &mut missing_terminator,
+        TLS_DIRECTORY_RVA,
+        40,
+        IMAGE_BASE + 0x15f8,
+    );
+    put_u64(
+        &mut missing_terminator,
+        file_offset(0x15f8),
+        IMAGE_BASE + 0x1040,
+    );
+    let error = analyze_pe(&missing_terminator)
+        .expect_err("an unterminated callback table cannot run past file backing");
+    assert!(matches!(
+        error,
+        AnalysisError::UnmappedRva {
+            context: "TLS callback slot",
+            rva: 0x1600,
+            size: 8,
+        }
+    ));
+}
+
+#[test]
+fn rejects_tls_table_and_callback_vas_outside_the_declared_image_or_rva_width() {
+    let too_wide_va = IMAGE_BASE + u64::from(u32::MAX) + 1;
+    for (label, table_va, expected_reason) in [
+        (
+            "table outside image",
+            IMAGE_BASE + 0x2000,
+            "outside the declared image",
+        ),
+        (
+            "table RVA wider than u32",
+            too_wide_va,
+            "does not fit a 32-bit image RVA",
+        ),
+    ] {
+        let mut bytes = fixture();
+        set_tls_directory(&mut bytes, TLS_DIRECTORY_RVA, 40, table_va);
+        let error = analyze_pe(&bytes).expect_err(label);
+        assert!(matches!(
+            error,
+            AnalysisError::InvalidField {
+                field: "TLS AddressOfCallbacks",
+                reason,
+            } if reason.contains(expected_reason)
+        ));
+    }
+
+    for (label, callback_va, expected_reason) in [
+        (
+            "callback outside image",
+            IMAGE_BASE + 0x2000,
+            "outside the declared image",
+        ),
+        (
+            "callback RVA wider than u32",
+            too_wide_va,
+            "does not fit a 32-bit image RVA",
+        ),
+    ] {
+        let mut bytes = tls_callbacks_fixture(&[]);
+        put_u64(&mut bytes, file_offset(TLS_CALLBACK_TABLE_RVA), callback_va);
+        let error = analyze_pe(&bytes).expect_err(label);
+        assert!(matches!(
+            error,
+            AnalysisError::InvalidField {
+                field: "TLS callback VA",
+                reason,
+            } if reason.contains(expected_reason)
+        ));
+    }
+}
+
+#[test]
+fn tls_callback_cap_distinguishes_exact_completion_from_partial_recovery() {
+    let complete = analyze_pe(&expanded_tls_callbacks_fixture(TLS_CALLBACK_LIMIT, false))
+        .expect("exactly-cap callbacks followed by null are complete");
+    assert_eq!(complete.tls_callbacks.len(), TLS_CALLBACK_LIMIT);
+    assert_eq!(complete.tls_callbacks[0].table_index, 0);
+    assert_eq!(
+        complete.tls_callbacks[TLS_CALLBACK_LIMIT - 1].table_index,
+        u32::try_from(TLS_CALLBACK_LIMIT - 1).expect("TLS callback limit fits u32")
+    );
+    assert!(!complete.tls_callback_scan_truncated);
+    assert_eq!(
+        complete
+            .symbol_graph
+            .claims()
+            .iter()
+            .filter(|claim| claim.provenance().method == "pe-tls-callback")
+            .count(),
+        TLS_CALLBACK_LIMIT
+    );
+
+    let partial = analyze_pe(&expanded_tls_callbacks_fixture(TLS_CALLBACK_LIMIT, true))
+        .expect("the first non-null slot after the cap proves partial recovery");
+    assert_eq!(partial.tls_callbacks.len(), TLS_CALLBACK_LIMIT);
+    assert!(partial.tls_callback_scan_truncated);
+    assert!(
+        partial
+            .tls_callbacks
+            .iter()
+            .all(|callback| callback.callback_rva == 0x1040)
+    );
+    assert_eq!(
+        partial
+            .symbol_graph
+            .claims()
+            .iter()
+            .filter(|claim| claim.provenance().method == "pe-tls-callback")
+            .count(),
+        TLS_CALLBACK_LIMIT,
+        "every retained metadata slot keeps its own exact evidence claim"
+    );
+    let callback_claims = partial
+        .symbol_graph
+        .claims()
+        .iter()
+        .filter(|claim| claim.provenance().method == "pe-tls-callback")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        callback_claims[0].evidence()[0].artifacts["callback_slot_rva"],
+        "0x13c0"
+    );
+    assert_eq!(
+        callback_claims[TLS_CALLBACK_LIMIT - 1].evidence()[0].artifacts["table_index"],
+        (TLS_CALLBACK_LIMIT - 1).to_string()
+    );
+}
+
+#[test]
+fn validated_deserialization_rejects_tampered_tls_callback_state_and_graphs() {
+    let analysis =
+        analyze_pe(&tls_callbacks_fixture(&[0x1040, 0x1080])).expect("valid TLS callback analysis");
+    let original = serde_json::to_value(analysis).expect("serialize TLS callback analysis");
+
+    let mut missing_directory = original.clone();
+    missing_directory["directories"]["tls"] = serde_json::Value::Null;
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(missing_directory)
+        .expect_err("callback state cannot outlive its TLS directory");
+    assert!(error.to_string().contains("without a TLS directory"));
+
+    let mut short_optional_header = original.clone();
+    short_optional_header["coff"]["optional_header_size"] = serde_json::json!(112);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(short_optional_header)
+        .expect_err("persisted TLS state requires optional-header directory entry 9");
+    assert!(error.to_string().contains("at least 192 bytes"));
+
+    let mut missing_table = original.clone();
+    missing_table["tls_callback_table_rva"] = serde_json::Value::Null;
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(missing_table)
+        .expect_err("callback entries require their table RVA");
+    assert!(error.to_string().contains("without a callback-table RVA"));
+
+    let mut noncanonical_index = original.clone();
+    noncanonical_index["tls_callbacks"][1]["table_index"] = serde_json::json!(7);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(noncanonical_index)
+        .expect_err("callback table indices preserve exact source order");
+    assert!(error.to_string().contains("TLS callback table index"));
+
+    let mut impossible_partial = original.clone();
+    impossible_partial["tls_callback_scan_truncated"] = serde_json::json!(true);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(impossible_partial)
+        .expect_err("partial state requires the full retained cap");
+    assert!(error.to_string().contains("TLS callback scan state"));
+
+    let mut non_executable_target = original.clone();
+    non_executable_target["tls_callbacks"][0]["callback_rva"] = serde_json::json!(0x100);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(non_executable_target)
+        .expect_err("persisted callback targets remain file-backed executable");
+    assert!(error.to_string().contains("TLS callback target"));
+
+    let mut stale_graph = original;
+    stale_graph["tls_callbacks"][0]["callback_rva"] = serde_json::json!(0x1060);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(stale_graph)
+        .expect_err("the deterministic graph must bind the exact callback model");
+    assert!(error.to_string().contains("symbol graph"));
+
+    let analysis =
+        analyze_pe(&tls_callbacks_fixture(&[0x1040, 0x1080])).expect("valid TLS callback analysis");
+    let mut stale_evidence = serde_json::to_value(analysis).expect("serialize callback graph");
+    let callback_claim = stale_evidence["symbol_graph"]["claims"]
+        .as_array_mut()
+        .expect("claim array")
+        .iter_mut()
+        .find(|claim| claim["provenance"]["method"] == "pe-tls-callback")
+        .expect("TLS callback claim");
+    callback_claim["evidence"][0]["artifacts"]["callback_slot_rva"] = serde_json::json!("0x13d0");
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(stale_evidence)
+        .expect_err("persisted callback evidence must match its exact table slot");
+    assert!(error.to_string().contains("symbol graph"));
 }
 
 #[test]

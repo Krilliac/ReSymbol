@@ -63,6 +63,15 @@ pub struct PeAnalysis {
     pub export_library_name: Option<String>,
     pub exports: Vec<PeExport>,
     pub runtime_functions: Vec<RuntimeFunction>,
+    /// RVA of the callback pointer array named by the TLS directory, when nonzero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_callback_table_rva: Option<u32>,
+    /// Whether the TLS callback array had more entries than the fixed retention cap.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub tls_callback_scan_truncated: bool,
+    /// Ordered, non-null entries from the PE32+ TLS callback array.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tls_callbacks: Vec<PeTlsCallback>,
     /// Whether bounded instruction decoding stopped before every eligible candidate was checked.
     #[serde(default, skip_serializing_if = "is_false")]
     pub code_recovery_scan_truncated: bool,
@@ -115,6 +124,9 @@ impl PeAnalysis {
             sections: &self.sections,
             exports: &self.exports,
             runtime_functions: &self.runtime_functions,
+            tls_directory_rva: self.directories.tls.map(|directory| directory.rva),
+            tls_callback_table_rva: self.tls_callback_table_rva,
+            tls_callbacks: &self.tls_callbacks,
             direct_calls: &self.direct_calls,
             thunks: &self.thunks,
             strings: &self.strings,
@@ -143,6 +155,12 @@ struct UncheckedPeAnalysis {
     export_library_name: Option<String>,
     exports: Vec<PeExport>,
     runtime_functions: Vec<RuntimeFunction>,
+    #[serde(default)]
+    tls_callback_table_rva: Option<u32>,
+    #[serde(default)]
+    tls_callback_scan_truncated: bool,
+    #[serde(default)]
+    tls_callbacks: Vec<PeTlsCallback>,
     #[serde(default)]
     code_recovery_scan_truncated: bool,
     #[serde(default)]
@@ -185,6 +203,9 @@ impl TryFrom<UncheckedPeAnalysis> for PeAnalysis {
             export_library_name: value.export_library_name,
             exports: value.exports,
             runtime_functions: value.runtime_functions,
+            tls_callback_table_rva: value.tls_callback_table_rva,
+            tls_callback_scan_truncated: value.tls_callback_scan_truncated,
+            tls_callbacks: value.tls_callbacks,
             code_recovery_scan_truncated: value.code_recovery_scan_truncated,
             direct_calls: value.direct_calls,
             thunks: value.thunks,
@@ -226,6 +247,9 @@ pub struct PeDataDirectories {
     pub exports: Option<DataDirectory>,
     pub imports: Option<DataDirectory>,
     pub exceptions: Option<DataDirectory>,
+    /// PE optional-header data-directory entry 9.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<DataDirectory>,
 }
 
 /// One 40-byte PE section-table entry.
@@ -294,6 +318,16 @@ pub struct RuntimeFunction {
     pub unwind_info_rva: u32,
     /// Zero-based position in the exception table. This preserves duplicates.
     pub table_index: u32,
+}
+
+/// One non-null entry from an x64 PE TLS callback pointer array.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeTlsCallback {
+    /// Zero-based position in the callback pointer array.
+    pub table_index: u32,
+    /// RVA obtained by subtracting the preferred image base from the slot's VA.
+    pub callback_rva: u32,
 }
 
 /// A statically resolved target used by the bounded PE control-flow model.

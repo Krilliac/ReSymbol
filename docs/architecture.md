@@ -4,8 +4,9 @@ This document records the intended architecture and the invariants that new comp
 preserve. ReSymbol is in early development; sections marked as design describe the target system,
 not necessarily behavior implemented in the current checkout.
 
-The current implementation covers bounded PE32+ x86-64 ingestion, a conservative metadata-derived
-symbol graph, modern MSVC x64 Rev1 RTTI/vftable discovery, canonical JSON `.resym` packages, plugin
+The current implementation covers bounded PE32+ x86-64 ingestion, including ordered TLS callback
+discovery, a conservative metadata-derived symbol graph, modern MSVC x64 Rev1 RTTI/vftable
+discovery, canonical JSON `.resym` packages, plugin
 discovery/contracts, a no-WASI WebAssembly Component Model host, and trusted external-process,
 native C/C++, and managed/.NET analysis runtimes. It also includes a validated, debugger-neutral
 export projection, deterministic Microsoft-linker-style MAP output, an exact-RSDS public-symbol PDB
@@ -78,12 +79,13 @@ unrelated signature index, and removing a plugin's results should not require re
 have no dependency on that plugin.
 
 The implemented slice extracts PE image/section metadata, imports, exports, forwarded exports, x64
-`RUNTIME_FUNCTION` records, bounded exact strings, supported RIP-relative data references, bounded
-direct calls and thunks, and a bounded modern MSVC x64 RTTI/vftable subset without loading or
-executing the input. Exact export names, corroborated metadata-backed boundaries, supported decoded
-function entries and relationships, validated string literals, RTTI type/vftable names, and
-function-to-class relationships from virtual slots become evidence-bearing graph claims. Broader
-candidate discovery and unsupported evidence sources remain planned.
+`RUNTIME_FUNCTION` records, ordered TLS callbacks, bounded exact strings, supported RIP-relative
+data references, bounded direct calls and thunks, and a bounded modern MSVC x64 RTTI/vftable subset
+without loading or executing the input. Exact export names, corroborated metadata-backed
+boundaries, slot-attributed TLS callback entries, supported decoded function entries and relationships,
+validated string literals, RTTI type/vftable names, and function-to-class relationships from
+virtual slots become evidence-bearing graph claims. Broader candidate discovery and unsupported
+evidence sources remain planned.
 
 The analyzer is exercised against a checked-in, source-available four-artifact MSVC x64 fixture
 matrix. The existing `milestone2-symbolized.exe` and `milestone2-stripped.exe` remain the optimized
@@ -107,6 +109,19 @@ including exact direct and pointer-backed hops, connected cycles, and disconnect
 rejection. The checked-in four-artifact MSVC corpus and its semantic oracle were not changed to
 claim compiler-produced transitive-chain coverage.
 
+PE32+ TLS callback discovery is proven with focused synthetic PE fixtures rather than regenerated
+corpus binaries. A present optional-header data-directory entry 9 must expose a fully file-backed
+declared range containing at least the 40-byte PE32+ TLS-directory prefix. `AddressOfCallbacks`
+and each nonzero callback pointer are preferred-image VAs; checked subtraction converts them to
+in-image RVAs. The parser preserves table order and duplicate entries, requires each eight-byte
+slot to be fully file-backed and each retained target to begin in file-backed executable data, and
+retains at most 4,096 entries. It then probes one additional slot: null proves an exactly capped
+table complete, while nonzero records a partial deterministic prefix without retaining that entry.
+Graph construction emits one `FunctionEntry` claim per retained slot with `pe-tls-callback`
+provenance. Its `callback_slot_rva` and `table_index` evidence keeps claims separate when target
+RVAs repeat.
+The four checked-in MSVC fixture binaries, semantic oracle, and recorded hashes remain unchanged.
+
 The x86-64 decoder is a pure-Rust, bounded control-flow-guided block sweep used only over complete
 file-backed executable exception ranges and the first instruction at deterministic thunk seeds.
 Each distinct exception range seeds an ordered worklist. Pending supported direct conditional and
@@ -121,9 +136,11 @@ pointer interpretation. A non-IAT slot must be eight fully file-backed bytes in 
 readable, non-writable, non-executable data. Its little-endian preferred-image VA is resolved one
 hop to a file-backed executable endpoint, and the control-flow target retains both the slot and
 endpoint. A pointer call also retains a same-site data reference; a pointer thunk does not require
-or invent one. Deterministic metadata, export, call-target, and RTTI thunk candidates are processed
-first in RVA order. Each retained internal thunk endpoint seeds the next sorted layer until that
-causal closure is exhausted. The graph preserves each exact hop instead of rewriting a direct call
+or invent one. Deterministic metadata, export, call-target, TLS-callback, and RTTI thunk candidates
+are processed first in RVA order. A TLS callback endpoint is checked only as a one-instruction
+thunk seed, not swept as a callback body. Each retained internal thunk endpoint seeds the next
+sorted layer until that causal closure is exhausted. The graph preserves each exact hop instead of
+rewriting a direct call
 or earlier thunk to a terminal endpoint. A global visited set decodes a candidate once, so connected
 cycles retain their exact non-self edges and terminate; persisted disconnected thunk cycles are
 invalid. Import-IAT targets stop the executable chain. This endpoint traversal does not follow
@@ -253,6 +270,9 @@ warning. Pointer thunks require no paired data reference.
 Transitive thunk chains require no new projection shape: each exact `ThunkTarget` edge projects
 independently, every internal hop is a projected function entry, and connected cycles remain exact
 relationships rather than an invented terminal destination.
+TLS callbacks likewise require no new neutral projection shape: each slot-backed callback claim
+uses the existing attributed function-entry assertion. Package schema 7 therefore leaves neutral
+projection schema 6 unchanged.
 
 The first writers serialize the projection as JSON, render bounded Markdown or
 Microsoft-linker-style MAP text, emit an exact-RSDS public-symbol PDB, or generate self-contained
@@ -506,23 +526,31 @@ A plugin declares a supported API range. Unsupported plugins are marked incompat
 loaded optimistically. Schema migrations are explicit and must preserve provenance. Before 1.0,
 breaking changes are expected, but they still require version bumps and release notes.
 
-The current CLI writes analysis-package schema 6 and can inspect or export schemas 1 through 5
+The current CLI writes analysis-package schema 7 and can inspect or export schemas 1 through 6
 through explicit compatibility paths. It migrates schema 1 into a validated current session,
 rebuilds the base graph from persisted legacy metadata, and never rewrites the source package.
 Schema 2 already records direct calls and thunks but predates recovered strings and data references;
 schema 3 includes string/data recovery but predates read-only function-pointer call and thunk
 resolution; schema 4 records pointer control flow but predates 24-byte RTTI base-class descriptor
-recovery; schema 5 records that RTTI form but predates transitive executable thunk-chain discovery.
+recovery; schema 5 records that RTTI form but predates transitive executable thunk-chain discovery;
+and schema 6 records that closure but predates TLS callback discovery and callback-based thunk
+seeding.
 Because a package omits the analyzed binary bytes, compatibility loading cannot recreate absent
-recovery results; obtaining them requires reanalyzing the exact original binary into schema 6.
+recovery results. Schemas 1 through 6 report TLS callbacks unavailable; obtaining every current
+result requires reanalyzing the exact original binary into schema 7.
 Schemas 2 and 3 are also semantically gated against relabeled schema-4 `function-pointer` targets.
 All schemas 1 through 4 are semantically gated against relabeled schema-5 base-class records whose
 `class_hierarchy_descriptor_rva` is missing or null. Schemas 1 through 5 reject a deterministic
 base thunk source that is valid only under schema-6 transitive endpoint seeding.
+Schemas 1 through 6 reject schema-7 TLS fields, core `pe-tls-callback` claims, and callback-only
+base thunk seeds rather than accepting a relabeled package.
 The independently versioned debugger-neutral projection is schema 6; its string-reference
 correlation and exact per-hop thunk relationships are derived from already validated claims and
 therefore do not require a projection-schema change or legacy package rewrite. The equal numeric
-versions do not couple these two compatibility domains.
+versions do not couple these two compatibility domains. Package schema 7 also leaves the plugin
+API and external wire protocol 1.0 unchanged. Plugins with `symbols.read` can observe the additive
+TLS fields in detached base-analysis JSON; plugins without that permission receive no base
+analysis.
 
 ## Core invariants
 

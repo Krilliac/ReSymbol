@@ -11,8 +11,9 @@ CMake, Visual Studio, LLVM, DIA, or another compiler to run an official archive.
 ## Current scope
 
 The current analyzer accepts native Windows x86-64 PE32+ input. It safely extracts image and section
-metadata, imports, exports, forwarded exports, and x64 exception-directory records. Exact export
-names and metadata-backed `RUNTIME_FUNCTION` ranges become evidence-bearing symbol-graph claims.
+metadata, imports, exports, forwarded exports, x64 exception-directory records, and ordered TLS
+callback records. Exact export names, metadata-backed `RUNTIME_FUNCTION` ranges, and retained TLS
+callback slots become evidence-bearing symbol-graph claims.
 It also performs a bounded pure-Rust x86-64 control-flow-guided block sweep inside fully file-backed
 exception ranges and checks seeded executable candidates for one-instruction internal, import,
 or read-only function-pointer thunks. It follows supported direct same-range branches, stops paths
@@ -22,8 +23,10 @@ data references, and thunks without inventing source names or function sizes. Ex
 `FF 25 disp32`/`48 FF 25 disp32` pointer thunks use the same IAT-first, one-hop slot policy as
 `FF 15 disp32`/`48 FF 15 disp32` calls. Resolved pointer control flow preserves both the slot and
 endpoint; calls retain a paired same-site data reference, while thunks do not require one. A
-retained internal thunk endpoint seeds the next sorted executable-candidate layer. The analyzer
-therefore preserves exact chains such as `A -> B` and `B -> C` without rewriting a call or earlier
+retained TLS callback endpoint joins the initial first-instruction thunk seeds, and a retained
+internal thunk endpoint seeds the next sorted executable-candidate layer. TLS callback bodies are
+not swept. The analyzer therefore preserves exact chains such as `A -> B` and `B -> C` without
+rewriting a call or earlier
 thunk to `C`; connected cycles terminate through global candidate deduplication, while a persisted
 disconnected cycle is invalid. This is not pointer-slot chaining: every non-IAT pointer operand is
 still dereferenced exactly once. A separate bounded pass recovers exact NUL-terminated ASCII and
@@ -41,8 +44,8 @@ and the 28-byte `BCD_HASPCHD` form with a required hierarchy reference. A hierar
 an extended root must link to its owning hierarchy, while a legacy root is validated without
 inventing the absent field. x86 RTTI and other ABI variants remain unsupported. It can export a
 neutral JSON projection, a bounded human-readable Markdown report, deterministic
-Microsoft-linker-style MAP text, an exact-RSDS
-public-symbol PDB, or self-contained import scripts for IDA and Ghidra. The PDB slice currently
+Microsoft-linker-style MAP text, an exact-RSDS public-symbol PDB, or self-contained import scripts
+for IDA and Ghidra. The PDB slice currently
 supports PE32+ x86-64 and public named functions/globals only; richer PDB records, DWARF, native
 debugger-database files, packed binaries, .NET assemblies, other CPU architectures, ELF, Mach-O,
 and richer debugger integration are future analysis milestones.
@@ -50,9 +53,10 @@ and richer debugger integration are future analysis milestones.
 The core PE/RTTI analysis is offline and never executes the input. Its narrow decoder is included
 in the executable and requires no native library or compiler. Code recovery decodes at most 64 MiB
 and 1,000,000 instructions, discovers at most 262,144 block starts, and retains at most 8,192 direct
-calls, 32,768 data references, and 4,096 thunks. String recovery has its own bounded scan and
-retention budgets. Original thunk seeds are processed before later sorted endpoint layers; reaching
-a shared decode or thunk-retention limit preserves deterministic valid hops and marks code recovery
+calls, 32,768 data references, and 4,096 thunks. TLS callback discovery separately retains at most
+4,096 ordered entries. String recovery has its own bounded scan and retention budgets. Original
+thunk seeds are processed before later sorted endpoint layers; reaching a shared decode or
+thunk-retention limit preserves deterministic valid hops and marks code recovery
 partial. An internal target covered by known `RUNTIME_FUNCTION` metadata is suppressed
 unless its RVA matches a recorded runtime-function begin. The guided sweep suppresses unreachable
 post-terminal bytes and can cross jump-over data, but it remains heuristic-confidence evidence:
@@ -196,30 +200,44 @@ Inspection validates the package first and emits no inspection data to stdout un
 file's exact size and SHA-256 match; failures report on stderr. Human output includes
 `source binary: <canonical-path>` and `identity gate: matched` after a successful check. JSON mode
 emits only the validated package JSON, with neither status line mixed into stdout. This works for
-supported package schemas 1 through 6 and only verifies identity: it does not rerun analysis, fill
+supported package schemas 1 through 7 and only verifies identity: it does not rerun analysis, fill
 in results absent from an older schema, or rewrite the package or binary.
 
-Both `analyze` and `inspect` report recovered direct-call, thunk, string, and data-reference counts
-and whether each bounded recovery pass was complete or partial. They also report MSVC RTTI vftable,
-unique-type, base-record, and virtual-slot counts. A partial line appears when a fixed scan,
-retention, or aggregate discovery budget was reached; the package preserves the independent flags
-for downstream review.
+Both `analyze` and `inspect` report recovered direct-call, thunk, string, data-reference, and TLS
+callback counts and whether each bounded recovery pass was complete or partial. They also report
+MSVC RTTI vftable, unique-type, base-record, and virtual-slot counts. A partial line appears when a
+fixed scan, retention, or aggregate discovery budget was reached; the package preserves the
+independent flags for downstream review.
 
-New analyses write package schema 6. `inspect` and `export` can also open schemas 1 through 5.
+For PE32+ inputs, TLS callback discovery reads optional-header data-directory entry 9. ReSymbol
+requires the declared directory to be fully file-backed and contain at least the 40-byte PE32+
+TLS-directory prefix, converts preferred-image callback VAs to checked RVAs, preserves table order
+and duplicate entries, and requires every eight-byte slot and callback endpoint to be file-backed,
+with endpoints in
+executable data. It retains at most 4,096 callbacks and then probes one additional slot. Null proves
+that an exactly capped table is complete; nonzero records a partial deterministic prefix without
+retaining or following the extra entry. Each retained slot becomes `FunctionEntry` evidence with
+`pe-tls-callback` provenance and distinct `callback_slot_rva` and `table_index` artifacts, including
+when target RVAs repeat. Retained targets seed only the bounded first-instruction thunk check, not
+a callback body sweep; no callback is loaded or executed.
+
+New analyses write package schema 7. `inspect` and `export` can also open schemas 1 through 6.
 Schema 1 is migrated into a validated current in-memory session and its base graph is rebuilt;
-schemas 2 through 5 use explicit compatibility paths. None rewrites the legacy package. Because
+schemas 2 through 6 use explicit compatibility paths. None rewrites the legacy package. Because
 `.resym` does not contain the original executable, compatibility loading cannot run missing
 recovery passes: schema 1 has no direct-call or thunk records, schemas 1 and 2 have no string or
 data-reference records, and schemas 2 and 3 have no read-only function-pointer call or thunk
 results. Schema 4 contains pointer control flow but lacks recovery of 24-byte RTTI base-class
 descriptors without `pCHD`; schemas 1 through 4 report that result family as unavailable. Schema 5
-contains both RTTI layouts but lacks transitive executable thunk-chain discovery. Schemas 2 through
-5 retain their stored direct calls and thunks, but omitted result families remain unavailable.
-Analyze the exact original binary again to create schema 6 with all current results. Relabeling a schema-4
-pointer target beneath a schema 2 or 3 envelope is rejected, as is placing an RTTI base record with
+contains both RTTI layouts but lacks transitive executable thunk-chain discovery. Schema 6 contains
+that closure but lacks TLS callback discovery and callback-based thunk seeding. Schemas 2 through
+6 retain their stored direct calls and thunks, but omitted result families remain unavailable.
+Analyze the exact original binary again to create schema 7 with all current results. Relabeling a
+schema-4 pointer target beneath a schema 2 or 3 envelope is rejected, as is placing an RTTI base record with
 a missing or null `class_hierarchy_descriptor_rva` beneath any schema 1-through-4 envelope. A
 schema 1-through-5 envelope also cannot contain a deterministic base thunk source that depends on
-schema-6 transitive endpoint seeding.
+schema-6 transitive endpoint seeding. Schemas 1 through 6 also reject schema-7 TLS callback state
+and callback-only base thunk seeds.
 
 Export a package to a specific destination with `--output`:
 
@@ -239,13 +257,14 @@ Without `--output`, those formats write `application.symbols.json`, `application
 `application.map`, `application.pdb`, `application.ida.py`, and
 `ReSymbolImport_<first-12-binary-sha256>.java` beside the package, respectively. Markdown is a
 deterministic presentation report for human review, not a stable machine-interchange format; use
-JSON for integrations. New analyses write `.resym` package schema 6; export also accepts package
-schemas 1 through 5 through validated compatibility paths without rewriting them. The current
+JSON for integrations. New analyses write `.resym` package schema 7; export also accepts package
+schemas 1 through 6 through validated compatibility paths without rewriting them. The current
 neutral projection is independently schema 6, and MAP/PDB add no schema fields. Projection schema
 5 correlates exact or content-interior data-reference targets with retained strings, excluding NUL
 terminators and requiring UTF-16LE code-unit alignment; projection schema 6 adds explicit
-function-pointer slot and endpoint targets. A missing correlation does not prove the target is not
-a string. A custom
+function-pointer slot and endpoint targets. TLS callback metadata adds no projection field: its
+slot-backed function-entry claims and callback-seeded thunks use existing schema-6 shapes. A missing
+correlation does not prove the target is not a string. A custom
 Ghidra filename
 must use a lowercase `.java` extension and a valid conservative Java-identifier stem; the generated
 public class uses that stem.

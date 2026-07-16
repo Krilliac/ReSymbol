@@ -12,19 +12,22 @@ exception metadata, and derives conservative metadata-backed claims. Canonical `
 now carry an `AnalysisSession`: deterministic base analysis, an auditable plugin-run ledger, and
 separately validated plugin claims with a derived combined graph.
 
-The CLI writes package schema 6 and can inspect or export schemas 1 through 5 through explicit
+The CLI writes package schema 7 and can inspect or export schemas 1 through 6 through explicit
 compatibility paths. Schema 1 is migrated in memory by revalidating persisted metadata and
 rebuilding the base graph; schema 2 already contains direct-call and thunk recovery, and schema 3
 adds string/data recovery. Schema 4 adds read-only pointer control flow but predates legacy 24-byte
 RTTI base-class descriptor recovery. Schema 5 adds that RTTI form but predates transitive executable
-thunk-chain discovery. Older packages do not embed executable bytes, so compatibility loading
+thunk-chain discovery. Schema 6 adds that closure but predates TLS callback discovery and
+callback-based thunk seeding. Older packages do not embed executable bytes, so compatibility loading
 cannot reconstruct results that were never recorded. Reanalyzing the exact original binary is
 required for transitive thunk chains in schemas 1 through 5, 24-byte descriptors in schemas 1
 through 4, read-only function-pointer calls and thunks in schemas 2 and 3, strings/data references
-in schemas 1 and 2, and all code recovery when starting from schema 1. Relabeled schema-6-only
-transitive base-thunk sources are rejected under schema 1-through-5 envelopes.
+in schemas 1 and 2, TLS callbacks in schemas 1 through 6, and all code recovery when starting from
+schema 1. Relabeled schema-6-only
+transitive base-thunk sources are rejected under schema 1-through-5 envelopes; schemas 1 through 6
+also reject schema-7 TLS callback state and callback-only base thunk seeds.
 
-For every supported package schema, 1 through 6, `resymbol inspect` can optionally accept the exact
+For every supported package schema, 1 through 7, `resymbol inspect` can optionally accept the exact
 original binary and require its size and SHA-256 to match before inspection data reaches stdout;
 failures report on stderr. Human inspection reports the canonical source path and a matched identity
 gate, while JSON remains pure package data. This is an identity check only: it does not rerun
@@ -37,6 +40,17 @@ layouts may be mixed within one hierarchy; root and nested hierarchy links are r
 the corresponding `pCHD` field exists. It recovers stored class/type names and vftable names and
 records function-to-class memberships without inventing virtual-method names. Fixed scan, record,
 slot, and name budgets surface partial discovery explicitly.
+
+A bounded PE32+ TLS callback slice is now implemented from optional-header data-directory entry 9.
+It requires a fully file-backed declared directory containing at least the 40-byte PE32+
+TLS-directory prefix, converts preferred-image callback VAs to RVAs with checked image bounds,
+preserves callback-table order and duplicates, and requires file-backed eight-byte slots plus
+file-backed executable endpoints. It retains at most 4,096 entries, then probes one more slot: null
+proves an exactly capped table
+complete, while nonzero records an explicit partial prefix without retaining the extra entry.
+Each retained slot emits a `FunctionEntry` claim with `pe-tls-callback` provenance and distinct
+slot/index evidence, including duplicate target RVAs. Retained targets join the deterministic
+first-instruction thunk seeds without causing a callback-body sweep or executing the input.
 
 A bounded pure-Rust x86-64 code-recovery slice is also implemented. Its control-flow-guided block
 sweep starts at fully file-backed `RUNTIME_FUNCTION` entries, follows supported direct same-range
@@ -130,12 +144,13 @@ The first export checkpoint is implemented as a validated, debugger-neutral proj
 deterministic JSON output, a bounded human-readable Markdown report, PE-only
 Microsoft-linker-style MAP text, an exact-RSDS public-symbol PDB, and standalone IDAPython and
 Ghidra Java import scripts. Markdown is presentation-only rather than a stable interchange schema;
-JSON remains the machine-consumable artifact. New analyses write package schema 6, while export also
-accepts package schemas 1 through 5 through validated compatibility paths. The neutral projection is
+JSON remains the machine-consumable artifact. New analyses write package schema 7, while export also
+accepts package schemas 1 through 6 through validated compatibility paths. The neutral projection is
 independently schema 6; MAP and PDB add no schema fields, and no exporter rewrites its source
 package. Projection schema 5 correlates exact or valid content-interior data-reference targets with
 retained strings while excluding NUL terminators and misaligned UTF-16LE interiors; projection
-schema 6 preserves function-pointer slot and resolved-target RVAs. The scripts
+schema 6 preserves function-pointer slot and resolved-target RVAs. TLS callback endpoints reuse its
+existing function-entry and thunk shapes, so no TLS-specific projection field is added. The scripts
 bind to the exact loaded binary SHA-256, resolve addresses as loaded image base plus RVA, preserve
 user-authored names and existing function bodies, and continue past per-symbol application errors.
 They are deliberately narrower than the planned interactive debugger bridges: prototypes, types,
@@ -173,7 +188,8 @@ data references, and modern RTTI/vftables without executing the fixture binaries
 inputs are repository/source test data rather than portable runtime archive contents. Read-only
 function-pointer calls and thunks, plus all-legacy and mixed 24/28-byte RTTI descriptor
 hierarchies, are covered by focused synthetic PE fixtures. Exact transitive thunk chains, connected
-cycles, and disconnected-cycle rejection are also synthetic-only coverage.
+cycles, disconnected-cycle rejection, and bounded TLS callback discovery are also synthetic-only
+coverage.
 These focused slices do not change the four corpus binaries, their semantic oracle, or their
 recorded hashes.
 

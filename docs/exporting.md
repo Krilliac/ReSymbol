@@ -71,8 +71,10 @@ reduces that graph to a bounded export projection. The projection is tied to one
 SHA-256 and uses RVAs rather than assuming a process or debugger load address.
 
 After a successful write, the CLI prints the destination, binary SHA-256, projected entity counts,
-and a bounded summary of projection warning groups. Inspect those warnings before applying a
-script; the output file is still created when a deliberate lossy reduction is safe and diagnosed.
+TLS callback availability, and a bounded summary of projection warning groups. Schemas 1 through 6
+report TLS callback recovery as unavailable and direct the user to reanalyze the exact original
+binary. Inspect the warnings before applying a script; the output file is still created when a
+deliberate lossy reduction is safe and diagnosed.
 
 Both generated debugger scripts enforce the same application rules:
 
@@ -115,17 +117,20 @@ added deterministic string correlation to each data reference. Schema 6 adds the
 projection schema is independent from the `.resym` package-envelope schema; consumers must validate
 the version of the artifact they are actually reading.
 
-The CLI can export package schemas 1 through 5 through validated in-memory compatibility paths.
+The CLI can export package schemas 1 through 6 through validated in-memory compatibility paths.
 Migration neither rewrites the package nor reruns analysis: the package does not embed executable
 bytes. Schema 1 therefore has no available direct calls, thunks, strings, or data references.
 Schema 2 retains its persisted calls and thunks but predates strings and data references. Schema 3
 retains those records, but schemas 2 and 3 both predate read-only function-pointer call and thunk
 resolution. Schema 4 retains pointer control flow but predates legacy 24-byte MSVC RTTI base-class
 descriptor recovery. Schema 5 records both RTTI descriptor layouts but predates transitive
-executable thunk-chain discovery. Reanalyze the exact original binary to produce schema 6 before
-expecting all current recovery relationships in the export. Schemas 1 through 4 reject relabeled
-RTTI base records whose `class_hierarchy_descriptor_rva` is missing or null, and schemas 1 through
-5 reject a deterministic base thunk source valid only through schema-6 endpoint seeding.
+executable thunk-chain discovery. Schema 6 records that closure but predates TLS callback
+discovery and callback-based thunk seeding. Reanalyze the exact original binary to produce schema 7
+before expecting all current recovery relationships in the export. Schemas 1 through 4 reject
+relabeled RTTI base records whose `class_hierarchy_descriptor_rva` is missing or null, and schemas 1
+through 5 reject a deterministic base thunk source valid only through schema-6 endpoint seeding.
+Schemas 1 through 6 reject schema-7 TLS fields, core `pe-tls-callback` claims, and callback-only
+base thunk seeds rather than accepting a relabeled package.
 
 Entries are emitted in stable order. Name and range conflicts are resolved conservatively, and
 colliding selected names receive deterministic output suffixes rather than silently referring to
@@ -163,6 +168,13 @@ canonical terminal target. Each internal hop references a projected function ent
 cycles are representable as exact non-self edges, while the validated built-in base analysis rejects
 cycles disconnected from its deterministic initial thunk seeds. This uses the existing projection
 schema 6 relationship model and does not add a chain-depth or terminal-target field.
+
+The ordered TLS directory and callback-table records, including each retained `FunctionEntry`
+claim's exact slot/index evidence, remain package/base-graph-only. A callback target can contribute
+its `pe-tls-callback` provenance to the existing entry-attribution model, where duplicate claims for
+one RVA reduce to one selected attribution; a callback-seeded exact thunk projects through the
+existing per-hop relationship. No TLS-specific field is added to neutral projection schema 6, and
+callbacks seed only the first-instruction thunk check rather than a body sweep.
 
 Built-in control-flow recovery is a bounded control-flow-guided block sweep with heuristic
 confidence, not a complete recursive disassembler. It recognizes only exact RIP-relative
@@ -310,7 +322,7 @@ schema-6 JSON record.
 Markdown is a human-facing presentation format, not a stable interchange contract. Its wording,
 table layout, and section organization may evolve between alpha releases. Tools should consume the
 `json` output and validate its `schema_version` instead of parsing the report. New analyses write
-package schema 6; export also accepts package schemas 1 through 5 through validated compatibility
+package schema 7; export also accepts package schemas 1 through 6 through validated compatibility
 paths without rewriting them. The current neutral projection is schema 6, and adding this writer
 changes neither independently versioned domain.
 
@@ -340,8 +352,8 @@ resymbol export application.resym --format map
 The default destination is `application.map`. This is a deterministic text export, not a claim that
 every debugger or linker will accept it. ReSymbol currently rejects non-PE sessions and
 projections, mismatched session/projection binary fields, selected symbol RVAs outside real PE
-sections, and a nonzero entry point outside those sections. New analyses write package schema 6;
-export also accepts package schemas 1 through 5 through validated compatibility paths without
+sections, and a nonzero entry point outside those sections. New analyses write package schema 7;
+export also accepts package schemas 1 through 6 through validated compatibility paths without
 rewriting them. The current neutral projection is schema 6, and MAP adds no schema fields.
 
 The writer emits the PE timestamp and preferred load address, one group for each final PE section,

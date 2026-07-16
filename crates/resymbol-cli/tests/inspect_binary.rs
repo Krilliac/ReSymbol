@@ -1,6 +1,7 @@
 use std::{fs, path::PathBuf, process::Command};
 
 use resymbol_core::BinaryId;
+use resymbol_package::CURRENT_SCHEMA_VERSION;
 use serde_json::Value;
 
 fn cli() -> PathBuf {
@@ -71,7 +72,10 @@ fn inspect_binary_gate_keeps_stdout_pure_and_inputs_unchanged() {
     assert!(json.stderr.is_empty());
     let document: Value =
         serde_json::from_slice(&json.stdout).expect("stdout is exactly one JSON document");
-    assert_eq!(document["schema_version"], 6);
+    assert_eq!(
+        document["schema_version"],
+        u64::from(CURRENT_SCHEMA_VERSION)
+    );
     let json_stdout = String::from_utf8(json.stdout).expect("JSON stdout is UTF-8");
     assert!(!json_stdout.contains("identity gate"));
     assert!(!json_stdout.contains("source binary"));
