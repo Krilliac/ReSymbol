@@ -410,8 +410,10 @@ rewriting them. The current neutral projection is schema 6, and MAP adds no sche
 The writer emits the PE timestamp and preferred load address, one group for each final PE section,
 selected public names in RVA order, and the entry-point `section:offset`. Section numbers are
 one-based and offsets are relative to the section's virtual address. The `Rva+Base` column is the
-preferred image base plus each symbol RVA. Section length is the greater of virtual size and raw
-data size. Section bytes safe in the whitespace-delimited format are retained; unsafe bytes become
+preferred image base plus each symbol RVA. Section length uses `VirtualSize` when nonzero and falls
+back to `SizeOfRawData` only when `VirtualSize` is zero, so raw file-alignment padding is not mapped
+as loaded RVA space. Section bytes safe in the whitespace-delimited format are retained; unsafe
+bytes become
 `_xhh_` escapes with lowercase hexadecimal digits (for example, a space byte becomes `_x20_`), and
 an empty raw name becomes `_x00_`.
 
