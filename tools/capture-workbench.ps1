@@ -67,6 +67,7 @@ try {
                 ArgumentList = $quotedBinary
                 WorkingDirectory = $repoRoot
                 PassThru = $true
+                WindowStyle = 'Hidden'
             }
             $process = Start-Process @startParameters
             try {
