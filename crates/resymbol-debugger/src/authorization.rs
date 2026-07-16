@@ -5,21 +5,126 @@
 //! 256-bit lease identifier. Possessing a syntactically valid identifier does
 //! not create authority unless the exact grant is registered and unconsumed.
 
+use std::path::{Path, PathBuf};
+
 use resymbol_core::BinaryId;
 
 use crate::identity::{HostRiskLeaseId, ProvisioningEpoch, SandboxOwnershipLeaseId, SessionId};
-use crate::protocol::{AttachMode, ProcessIdentity};
+use crate::protocol::{AttachMode, LaunchTarget, ProcessIdentity};
 use crate::sandbox::{PolicyDigest, SandboxProviderSelection};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostRiskOperation {
     Launch {
-        binary_id: BinaryId,
+        intent: HostLaunchIntent,
     },
     Attach {
         process: ProcessIdentity,
         mode: AttachMode,
     },
+}
+
+/// Exact, non-authority description of one approved host launch.
+///
+/// The environment is implicitly `Host`: sandboxed launches use provider
+/// attestation instead of a host-risk lease. Lexical executable and working
+/// directory paths are retained together so relative resolution cannot be
+/// changed after approval.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostLaunchIntent {
+    binary_id: BinaryId,
+    executable: PathBuf,
+    arguments: Vec<String>,
+    working_directory: Option<PathBuf>,
+    stop_before_entry: bool,
+}
+
+impl HostLaunchIntent {
+    #[must_use]
+    pub fn from_target(target: &LaunchTarget) -> Self {
+        Self {
+            binary_id: target.binary_id.clone(),
+            executable: target.executable.clone(),
+            arguments: target.arguments.clone(),
+            working_directory: target.working_directory.clone(),
+            stop_before_entry: target.stop_before_entry,
+        }
+    }
+
+    #[must_use]
+    pub const fn binary_id(&self) -> &BinaryId {
+        &self.binary_id
+    }
+
+    #[must_use]
+    pub fn executable(&self) -> &Path {
+        &self.executable
+    }
+
+    #[must_use]
+    pub fn arguments(&self) -> &[String] {
+        &self.arguments
+    }
+
+    #[must_use]
+    pub fn working_directory(&self) -> Option<&Path> {
+        self.working_directory.as_deref()
+    }
+
+    #[must_use]
+    pub const fn stop_before_entry(&self) -> bool {
+        self.stop_before_entry
+    }
+}
+
+/// Cloneable comparison record for the controller-side transcript verifier.
+///
+/// This value is not authority. The sole move-only [`HostRiskLease`] must be
+/// registered independently on the host session worker before the command can
+/// succeed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostRiskVerifier {
+    id: HostRiskLeaseId,
+    session_id: SessionId,
+    provisioning_epoch: ProvisioningEpoch,
+    operation: HostRiskOperation,
+}
+
+impl HostRiskVerifier {
+    #[must_use]
+    pub const fn new(
+        id: HostRiskLeaseId,
+        session_id: SessionId,
+        provisioning_epoch: ProvisioningEpoch,
+        operation: HostRiskOperation,
+    ) -> Self {
+        Self {
+            id,
+            session_id,
+            provisioning_epoch,
+            operation,
+        }
+    }
+
+    #[must_use]
+    pub const fn id(&self) -> &HostRiskLeaseId {
+        &self.id
+    }
+
+    #[must_use]
+    pub const fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    #[must_use]
+    pub const fn provisioning_epoch(&self) -> &ProvisioningEpoch {
+        &self.provisioning_epoch
+    }
+
+    #[must_use]
+    pub const fn operation(&self) -> &HostRiskOperation {
+        &self.operation
+    }
 }
 
 /// Host-local approval grant. Register this on the owning session worker only
@@ -37,9 +142,7 @@ pub enum HostRiskOperation {
 /// ```
 #[derive(Debug, PartialEq, Eq)]
 pub struct HostRiskLease {
-    id: HostRiskLeaseId,
-    session_id: SessionId,
-    operation: HostRiskOperation,
+    verifier: HostRiskVerifier,
 }
 
 impl HostRiskLease {
@@ -47,28 +150,42 @@ impl HostRiskLease {
     pub const fn new(
         id: HostRiskLeaseId,
         session_id: SessionId,
+        provisioning_epoch: ProvisioningEpoch,
         operation: HostRiskOperation,
     ) -> Self {
         Self {
-            id,
-            session_id,
-            operation,
+            verifier: HostRiskVerifier::new(id, session_id, provisioning_epoch, operation),
         }
     }
 
     #[must_use]
     pub const fn id(&self) -> &HostRiskLeaseId {
-        &self.id
+        self.verifier.id()
     }
 
     #[must_use]
     pub const fn session_id(&self) -> SessionId {
-        self.session_id
+        self.verifier.session_id()
+    }
+
+    #[must_use]
+    pub const fn provisioning_epoch(&self) -> &ProvisioningEpoch {
+        self.verifier.provisioning_epoch()
     }
 
     #[must_use]
     pub const fn operation(&self) -> &HostRiskOperation {
-        &self.operation
+        self.verifier.operation()
+    }
+
+    #[must_use]
+    pub fn verifier(&self) -> HostRiskVerifier {
+        self.verifier.clone()
+    }
+
+    #[must_use]
+    pub(crate) fn into_verifier(self) -> HostRiskVerifier {
+        self.verifier
     }
 }
 
@@ -156,6 +273,31 @@ pub struct SandboxOwnershipLease {
     binding: SandboxOwnershipBinding,
 }
 
+/// Cloneable comparison record for the controller-side transcript verifier.
+/// The provider-issued [`SandboxOwnershipLease`] remains the sole authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxOwnershipVerifier {
+    id: SandboxOwnershipLeaseId,
+    binding: SandboxOwnershipBinding,
+}
+
+impl SandboxOwnershipVerifier {
+    #[must_use]
+    pub const fn new(id: SandboxOwnershipLeaseId, binding: SandboxOwnershipBinding) -> Self {
+        Self { id, binding }
+    }
+
+    #[must_use]
+    pub const fn id(&self) -> &SandboxOwnershipLeaseId {
+        &self.id
+    }
+
+    #[must_use]
+    pub const fn binding(&self) -> &SandboxOwnershipBinding {
+        &self.binding
+    }
+}
+
 impl SandboxOwnershipLease {
     #[must_use]
     pub const fn new(id: SandboxOwnershipLeaseId, binding: SandboxOwnershipBinding) -> Self {
@@ -173,6 +315,16 @@ impl SandboxOwnershipLease {
     }
 
     #[must_use]
+    pub fn verifier(&self) -> SandboxOwnershipVerifier {
+        SandboxOwnershipVerifier::new(self.id.clone(), self.binding.clone())
+    }
+
+    #[must_use]
+    pub(crate) fn into_verifier(self) -> SandboxOwnershipVerifier {
+        SandboxOwnershipVerifier::new(self.id, self.binding)
+    }
+
+    #[must_use]
     pub fn into_binding(self) -> SandboxOwnershipBinding {
         self.binding
     }
@@ -183,7 +335,7 @@ mod tests {
     use super::*;
 
     use crate::identity::{HostRiskLeaseId, SandboxOwnershipLeaseId};
-    use crate::protocol::{ProcessId, ProcessStartKey};
+    use crate::protocol::{LaunchEnvironment, ProcessId, ProcessStartKey};
 
     fn assert_clone<T: Clone>() {}
 
@@ -192,7 +344,9 @@ mod tests {
         assert_clone::<HostRiskLeaseId>();
         assert_clone::<SandboxOwnershipLeaseId>();
         assert_clone::<HostRiskOperation>();
+        assert_clone::<HostRiskVerifier>();
         assert_clone::<SandboxOwnershipBinding>();
+        assert_clone::<SandboxOwnershipVerifier>();
     }
 
     #[test]
@@ -200,16 +354,31 @@ mod tests {
         let session_id = SessionId::new(7).expect("session id");
         let risk_id = HostRiskLeaseId::new("a".repeat(64)).expect("host-risk lease id");
         let binary_id = BinaryId::digest(b"approved target");
+        let epoch = ProvisioningEpoch::new("9".repeat(64)).expect("provisioning epoch");
+        let target = LaunchTarget {
+            binary_id,
+            executable: PathBuf::from("sample.exe"),
+            arguments: vec!["--safe".to_owned()],
+            working_directory: Some(PathBuf::from("workspace")),
+            environment: LaunchEnvironment::Host {
+                risk_lease: risk_id.clone(),
+            },
+            stop_before_entry: true,
+        };
+        let operation = HostRiskOperation::Launch {
+            intent: HostLaunchIntent::from_target(&target),
+        };
         let risk = HostRiskLease::new(
             risk_id.clone(),
             session_id,
-            HostRiskOperation::Launch {
-                binary_id: binary_id.clone(),
-            },
+            epoch.clone(),
+            operation.clone(),
         );
         assert_eq!(risk.id(), &risk_id);
         assert_eq!(risk.session_id(), session_id);
-        assert_eq!(risk.operation(), &HostRiskOperation::Launch { binary_id });
+        assert_eq!(risk.provisioning_epoch(), &epoch);
+        assert_eq!(risk.operation(), &operation);
+        assert_eq!(risk.verifier().operation(), &operation);
 
         let binding = SandboxOwnershipBinding::new(
             session_id,

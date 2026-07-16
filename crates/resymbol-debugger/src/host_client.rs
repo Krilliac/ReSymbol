@@ -7,7 +7,7 @@ use std::{marker::PhantomData, rc::Rc};
 
 use thiserror::Error;
 
-use crate::authorization::{HostRiskLease, SandboxOwnershipLease};
+use crate::authorization::{HostRiskVerifier, SandboxOwnershipVerifier};
 use crate::host_codec::{
     HostCodecError, HostFrame, decode_command_frame, decode_event_frame, encode_command_frame,
     encode_event_frame,
@@ -72,6 +72,12 @@ pub trait HostFrameExchange {
     /// Best-effort control-channel shutdown. This is never cleanup evidence.
     fn shutdown_control(&mut self, reason: ControlShutdownReason)
     -> Result<(), HostTransportError>;
+
+    /// Mandatory non-panicking emergency teardown for owned control/process
+    /// resources. Implementations must synchronously sever the channel and
+    /// trigger kill-on-close ownership where applicable. This is never target
+    /// or sandbox cleanup evidence.
+    fn abort_control(&mut self, reason: ControlShutdownReason);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,41 +171,41 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
         ) {
             Ok(responses) => responses,
             Err(error) => {
-                let _ = transport.shutdown_control(ControlShutdownReason::TransportFailure);
+                transport.abort_control(ControlShutdownReason::TransportFailure);
                 return Err(error.into());
             }
         };
         if let Err(error) = responses.validate(DEFAULT_HOST_RESPONSE_LIMITS) {
-            let _ = transport.shutdown_control(ControlShutdownReason::BuildClaimFailed);
+            transport.abort_control(ControlShutdownReason::BuildClaimFailed);
             return Err(error.into());
         }
         if responses.len() != 1 {
-            let _ = transport.shutdown_control(ControlShutdownReason::BuildClaimFailed);
+            transport.abort_control(ControlShutdownReason::BuildClaimFailed);
             return Err(DebugHostClientError::UnexpectedHandshakeResponseCount {
                 actual: responses.len(),
             });
         }
         let acknowledgement = &responses.as_slice()[0];
         if !acknowledgement.raw().is_empty() {
-            let _ = transport.shutdown_control(ControlShutdownReason::BuildClaimFailed);
+            transport.abort_control(ControlShutdownReason::BuildClaimFailed);
             return Err(DebugHostClientError::HandshakeCarriedRawPayload);
         }
         if let Err(error) = handshake.accept(acknowledgement.header()) {
-            let _ = transport.shutdown_control(ControlShutdownReason::BuildClaimFailed);
+            transport.abort_control(ControlShutdownReason::BuildClaimFailed);
             return Err(error.into());
         }
         if handshake.state() != HandshakeState::Established {
-            let _ = transport.shutdown_control(ControlShutdownReason::BuildClaimFailed);
+            transport.abort_control(ControlShutdownReason::BuildClaimFailed);
             return Err(DebugHostClientError::HandshakeIncomplete);
         }
         let Some(negotiated_version) = handshake.negotiated_version() else {
-            let _ = transport.shutdown_control(ControlShutdownReason::BuildClaimFailed);
+            transport.abort_control(ControlShutdownReason::BuildClaimFailed);
             return Err(DebugHostClientError::HandshakeIncomplete);
         };
         let typed_version = match bind_typed_protocol_version(negotiated_version) {
             Ok(version) => version,
             Err(error) => {
-                let _ = transport.shutdown_control(ControlShutdownReason::BuildClaimFailed);
+                transport.abort_control(ControlShutdownReason::BuildClaimFailed);
                 return Err(error);
             }
         };
@@ -282,14 +288,14 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
                 } else {
                     ClientConnectionState::Failed
                 };
-                self.shutdown_transport(ControlShutdownReason::TransportFailure);
+                self.abort_transport(ControlShutdownReason::TransportFailure);
                 return Err(error.into());
             }
         };
         let result = self.accept_capability_batch(command_id, responses);
         if result.is_err() {
             self.connection_state = ClientConnectionState::Failed;
-            self.shutdown_transport(ControlShutdownReason::ProtocolFailure);
+            self.abort_transport(ControlShutdownReason::ProtocolFailure);
         }
         result
     }
@@ -320,36 +326,36 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
         Ok(())
     }
 
-    /// Registers one controller-side host-risk grant in the validating reducer.
+    /// Registers controller-side comparison data in the validating reducer.
     ///
-    /// The trusted transport/session worker must independently register the
-    /// same grant with the host; command payloads carry only its one-use ID.
-    pub fn register_host_risk_lease(
+    /// This cloneable value is not authority. The sole move-only lease must be
+    /// registered independently with the trusted host session worker.
+    pub fn register_host_risk_verifier(
         &mut self,
-        lease: HostRiskLease,
+        verifier: HostRiskVerifier,
     ) -> Result<(), DebugHostClientError> {
         self.require_session_open()?;
         self.session
             .as_mut()
             .ok_or(DebugHostClientError::SessionNotOwned)?
             .reducer
-            .register_host_risk_lease(lease)?;
+            .register_host_risk_verifier(verifier)?;
         Ok(())
     }
 
-    /// Registers one controller-side sandbox-ownership grant in the validating
-    /// reducer. The host must receive its own out-of-band copy from the trusted
-    /// provider; no serialized command can create this authority.
-    pub fn register_sandbox_ownership_lease(
+    /// Registers non-authority sandbox-ownership comparison data in the
+    /// validating reducer. The provider-issued move-only lease must be moved
+    /// independently into the trusted host worker.
+    pub fn register_sandbox_ownership_verifier(
         &mut self,
-        lease: SandboxOwnershipLease,
+        verifier: SandboxOwnershipVerifier,
     ) -> Result<(), DebugHostClientError> {
         self.require_session_open()?;
         self.session
             .as_mut()
             .ok_or(DebugHostClientError::SessionNotOwned)?
             .reducer
-            .register_sandbox_ownership_lease(lease)?;
+            .register_sandbox_ownership_verifier(verifier)?;
         Ok(())
     }
 
@@ -425,7 +431,7 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
                 } else {
                     ClientConnectionState::Failed
                 };
-                self.shutdown_transport(ControlShutdownReason::TransportFailure);
+                self.abort_transport(ControlShutdownReason::TransportFailure);
                 return Err(error.into());
             }
         };
@@ -447,7 +453,7 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
                 state: session.verified_state.kind(),
             });
         }
-        if session.reducer.expected_attestation().is_some() && !session.sandbox_cleanup_verified {
+        if session.reducer.requires_cleanup_receipt() && !session.sandbox_cleanup_verified {
             return Err(DebugHostClientError::SandboxCleanupNotVerified);
         }
         self.transport
@@ -469,7 +475,7 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
         ) {
             return Err(DebugHostClientError::SessionAbandonRequiresFailedConnection);
         }
-        self.shutdown_transport(ControlShutdownReason::ExplicitAbandon);
+        self.abort_transport(ControlShutdownReason::ExplicitAbandon);
         self.session
             .take()
             .map(|session| session.verified_state)
@@ -486,7 +492,7 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
             .as_ref()
             .map(|session| session.verified_state.clone())
             .ok_or(DebugHostClientError::SessionNotOwned)?;
-        self.shutdown_transport(ControlShutdownReason::ExplicitAbandon);
+        self.abort_transport(ControlShutdownReason::ExplicitAbandon);
         self.connection_state = ClientConnectionState::Disconnected;
         self.session = None;
         Ok(state)
@@ -534,7 +540,7 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
         self.session = Some(session);
         if result.is_err() {
             self.connection_state = ClientConnectionState::Failed;
-            self.shutdown_transport(ControlShutdownReason::ProtocolFailure);
+            self.abort_transport(ControlShutdownReason::ProtocolFailure);
         }
         result
     }
@@ -841,7 +847,7 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
                     return Err(DebugHostClientError::MissingCommandState { command_id });
                 }
                 validate_success_evidence(envelope, &session.reducer, &evidence)?;
-                let cleanup_verified = session.reducer.expected_attestation().is_some()
+                let cleanup_verified = session.reducer.requires_cleanup_receipt()
                     && session.reducer.state().kind() == SessionStateKind::Closed
                     && evidence.cleanup_receipt.is_some();
                 session.verified_state = session.reducer.state().clone();
@@ -888,9 +894,9 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
         }
     }
 
-    fn shutdown_transport(&mut self, reason: ControlShutdownReason) {
+    fn abort_transport(&mut self, reason: ControlShutdownReason) {
         if !self.transport_shutdown {
-            let _ = self.transport.shutdown_control(reason);
+            self.transport.abort_control(reason);
             self.transport_shutdown = true;
         }
     }
@@ -904,7 +910,7 @@ impl<T: HostFrameExchange> Drop for DebugHostClient<T> {
             } else {
                 ControlShutdownReason::Graceful
             };
-            let _ = self.transport.shutdown_control(reason);
+            self.transport.abort_control(reason);
             self.transport_shutdown = true;
         }
     }
@@ -1056,10 +1062,13 @@ fn validate_sandbox_lifecycle(
                     evidence: "sandbox-cleanup-receipt",
                 });
             }
-            let expected = reducer
-                .expected_attestation()
-                .ok_or(DebugHostClientError::UnexpectedSandboxEvidence)?;
-            receipt.validate_against(expected)?;
+            if let Some(expected) = reducer.expected_attestation() {
+                receipt.validate_against(expected)?;
+            } else if reducer.inherited_sandbox().is_some() {
+                reducer.validate_cleanup_receipt(receipt)?;
+            } else {
+                return Err(DebugHostClientError::UnexpectedSandboxEvidence);
+            }
             evidence.cleanup_receipt = Some(receipt.clone());
         }
     }
@@ -1170,7 +1179,7 @@ fn validate_success_evidence(
         DebugCommand::Detach { .. } => final_state == SessionStateKind::Detached,
         DebugCommand::Terminate { .. } | DebugCommand::Close { .. } => {
             final_state == SessionStateKind::Closed
-                && (reducer.expected_attestation().is_none() || evidence.cleanup_receipt.is_some())
+                && (!reducer.requires_cleanup_receipt() || evidence.cleanup_receipt.is_some())
         }
         DebugCommand::ProbeCapabilities => false,
     };
@@ -1807,6 +1816,10 @@ impl HostFrameExchange for SyntheticDebugHost {
         self.disconnected = true;
         Ok(())
     }
+
+    fn abort_control(&mut self, _reason: ControlShutdownReason) {
+        self.disconnected = true;
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1845,19 +1858,23 @@ mod tests {
     use resymbol_core::BinaryId;
 
     use super::*;
-    use crate::authorization::HostRiskOperation;
+    use crate::authorization::{
+        HostLaunchIntent, HostRiskLease, HostRiskOperation, SandboxOwnershipBinding,
+        SandboxOwnershipVerifier,
+    };
     use crate::host_response::{MAX_RESPONSE_BYTES, MAX_RESPONSE_FRAME_BYTES};
     use crate::host_wire::{ControlBody, FrameHeader, MessageKind};
-    use crate::identity::HostRiskLeaseId;
+    use crate::identity::{HostRiskLeaseId, SandboxOwnershipLeaseId};
     use crate::protocol::{
-        LaunchEnvironment, LaunchTarget, MAX_MEMORY_READ_BYTES, MemoryAddress, OfflineTarget,
-        ReadViewToken, StateGeneration, StopReason, ThreadId,
+        AttachMode, AttachScope, AttachTarget, LaunchEnvironment, LaunchTarget,
+        MAX_MEMORY_READ_BYTES, MemoryAddress, OfflineTarget, ProcessId, ProcessIdentity,
+        ProcessStartKey, ReadViewToken, StateGeneration, StopReason, ThreadId,
     };
     use crate::sandbox::{
         ChildProcessProfile, CleanupOutcome, CleanupReceiptId, DynamicCodeProfile,
-        ExpectedSandboxAttestation, IsolationBoundary, ProcessMitigationProfile, SandboxGuarantee,
-        SandboxNetworkMode, SandboxPolicy, SandboxPolicyApprovalId, SandboxProviderSelection,
-        SandboxResourceLimits, Win32kProfile,
+        ExpectedSandboxAttestation, IsolationBoundary, PolicyDigest, ProcessMitigationProfile,
+        SandboxGuarantee, SandboxNetworkMode, SandboxPolicy, SandboxPolicyApprovalId,
+        SandboxProviderSelection, SandboxResourceLimits, Win32kProfile,
     };
 
     fn session_id() -> SessionId {
@@ -2036,6 +2053,10 @@ mod tests {
         ) -> Result<(), HostTransportError> {
             self.inner.shutdown_control(reason)
         }
+
+        fn abort_control(&mut self, reason: ControlShutdownReason) {
+            self.inner.abort_control(reason);
+        }
     }
 
     impl HostFrameExchange for OverBudgetHost {
@@ -2094,6 +2115,10 @@ mod tests {
         ) -> Result<(), HostTransportError> {
             self.inner.shutdown_control(reason)
         }
+
+        fn abort_control(&mut self, reason: ControlShutdownReason) {
+            self.inner.abort_control(reason);
+        }
     }
 
     fn mutating_client(mutation: ResponseMutation) -> DebugHostClient<MutatingHost> {
@@ -2111,6 +2136,8 @@ mod tests {
         ForgedAttestation,
         MissingCleanup,
         WrongCleanup,
+        InheritedCleanup,
+        WrongInheritedCleanup,
     }
 
     struct ScriptedHost {
@@ -2180,7 +2207,10 @@ mod tests {
                         DebugEvent::SandboxAttested(forged),
                     )?;
                 }
-                ScriptedAttack::MissingCleanup | ScriptedAttack::WrongCleanup => {
+                ScriptedAttack::MissingCleanup
+                | ScriptedAttack::WrongCleanup
+                | ScriptedAttack::InheritedCleanup
+                | ScriptedAttack::WrongInheritedCleanup => {
                     let prior = envelope
                         .expected_state
                         .ok_or_else(|| HostTransportError::protocol("close omitted state"))?;
@@ -2204,6 +2234,45 @@ mod tests {
                             session_id,
                             closing_token,
                             DebugEvent::SandboxLifecycle(SandboxLifecycleEvent::Closed(wrong)),
+                        )?;
+                    } else if matches!(
+                        self.attack,
+                        ScriptedAttack::InheritedCleanup | ScriptedAttack::WrongInheritedCleanup
+                    ) {
+                        let mut receipt = inherited_cleanup_receipt(&inherited_binding());
+                        if matches!(self.attack, ScriptedAttack::WrongInheritedCleanup) {
+                            receipt.process = Some(ProcessIdentity {
+                                process_id: ProcessId::new(41).expect("wrong process id"),
+                                start_key: ProcessStartKey::new(8).expect("wrong process start"),
+                                binary_id: BinaryId::digest(b"different inherited image"),
+                            });
+                        }
+                        self.push_scripted_event(
+                            &mut batch,
+                            envelope.command_id,
+                            session_id,
+                            closing_token,
+                            DebugEvent::SandboxLifecycle(SandboxLifecycleEvent::Closed(receipt)),
+                        )?;
+                        let closed = SessionState::Closed {
+                            token: next_state_token(prior, 2),
+                        };
+                        self.push_scripted_event(
+                            &mut batch,
+                            envelope.command_id,
+                            session_id,
+                            closed.state_token(),
+                            DebugEvent::StateChanged(closed),
+                        )?;
+                        self.push_scripted_event(
+                            &mut batch,
+                            envelope.command_id,
+                            session_id,
+                            next_state_token(prior, 2),
+                            DebugEvent::CommandResult {
+                                command_id: envelope.command_id,
+                                outcome: CommandOutcome::Succeeded,
+                            },
                         )?;
                     } else {
                         let closed = SessionState::Closed {
@@ -2291,6 +2360,10 @@ mod tests {
             self.shutdown = true;
             Ok(())
         }
+
+        fn abort_control(&mut self, _reason: ControlShutdownReason) {
+            self.shutdown = true;
+        }
     }
 
     fn next_state_token(prior: StateToken, offset: u64) -> StateToken {
@@ -2334,6 +2407,11 @@ mod tests {
         ) -> Result<(), HostTransportError> {
             self.shutdowns.borrow_mut().push(reason);
             self.inner.shutdown_control(reason)
+        }
+
+        fn abort_control(&mut self, reason: ControlShutdownReason) {
+            self.shutdowns.borrow_mut().push(reason);
+            self.inner.abort_control(reason);
         }
     }
 
@@ -2443,6 +2521,45 @@ mod tests {
         }
     }
 
+    fn inherited_binding() -> SandboxOwnershipBinding {
+        SandboxOwnershipBinding::new(
+            session_id(),
+            ProcessIdentity {
+                process_id: ProcessId::new(40).expect("process id"),
+                start_key: ProcessStartKey::new(7).expect("process start key"),
+                binary_id: BinaryId::digest(b"inherited sandbox image"),
+            },
+            AttachMode::ObserveReadOnly,
+            SandboxProviderSelection::LocalAppContainer,
+            PolicyDigest::new("7".repeat(64)).expect("policy digest"),
+            provisioning_epoch(),
+        )
+    }
+
+    fn inherited_cleanup_receipt(binding: &SandboxOwnershipBinding) -> SandboxCleanupReceipt {
+        SandboxCleanupReceipt {
+            receipt_id: CleanupReceiptId::new("inherited-cleanup-receipt")
+                .expect("test receipt id"),
+            session_id: binding.session_id(),
+            provisioning_epoch: binding.provisioning_epoch().clone(),
+            provider: binding.provider().clone(),
+            policy_digest: binding.policy_digest().clone(),
+            process: Some(binding.process().clone()),
+            outcome: CleanupOutcome::Complete,
+            process_tree_terminated_and_reaped: true,
+            handles_closed: true,
+            file_system_rolled_back: true,
+            registry_rolled_back: true,
+            network_torn_down: true,
+            owned_paths_deleted: true,
+            appcontainer_profile_deleted: Some(true),
+            differencing_disk_discarded: None,
+            control_channel_closed: None,
+            terminated_processes: 1,
+            residuals: Vec::new(),
+        }
+    }
+
     fn scripted_client(attack: ScriptedAttack) -> DebugHostClient<ScriptedHost> {
         DebugHostClient::connect(
             ScriptedHost::new(attack),
@@ -2484,6 +2601,52 @@ mod tests {
                     StopReason::Initial,
                     ThreadId::new(1).expect("test thread id"),
                 )
+                .unwrap();
+            reducer.state().clone()
+        };
+        client
+            .session
+            .as_mut()
+            .expect("test session exists")
+            .verified_state = verified_state;
+        client.next_command_id = 2;
+    }
+
+    fn prime_inherited_observing(client: &mut DebugHostClient<ScriptedHost>) {
+        client
+            .begin_session(session_id(), provisioning_epoch(), helper_build())
+            .unwrap();
+        let binding = inherited_binding();
+        let lease_id = SandboxOwnershipLeaseId::new("8".repeat(64)).expect("ownership lease id");
+        let verified_state = {
+            let reducer = &mut client
+                .session
+                .as_mut()
+                .expect("test session exists")
+                .reducer;
+            reducer
+                .register_sandbox_ownership_verifier(SandboxOwnershipVerifier::new(
+                    lease_id.clone(),
+                    binding.clone(),
+                ))
+                .unwrap();
+            let state = reducer.state().state_token();
+            let open = CommandEnvelope {
+                version: ProtocolVersion::current(),
+                command_id: CommandId::new(1).unwrap(),
+                session_id: Some(session_id()),
+                expected_state: Some(state),
+                command: DebugCommand::Open(DebugTargetRequest::Attach(AttachTarget {
+                    scope: AttachScope::OwnedSandbox {
+                        process: binding.process().clone(),
+                        ownership_lease: lease_id,
+                    },
+                    mode: binding.mode(),
+                })),
+            };
+            reducer.accept_command(&open).unwrap();
+            reducer
+                .complete_open_observing(binding.process().process_id)
                 .unwrap();
             reducer.state().clone()
         };
@@ -2656,7 +2819,42 @@ mod tests {
     }
 
     #[test]
-    fn active_session_drop_and_abandon_only_shutdown_control() {
+    fn client_accepts_only_exact_inherited_sandbox_cleanup() {
+        let mut client = scripted_client(ScriptedAttack::InheritedCleanup);
+        prime_inherited_observing(&mut client);
+        let state = client.session_state().unwrap().state_token();
+        let receipt = client.submit(DebugCommand::Close { state }).unwrap();
+        assert_eq!(receipt.outcome, CommandOutcome::Succeeded);
+        assert_eq!(
+            client.session_state().unwrap().kind(),
+            SessionStateKind::Closed
+        );
+        assert!(
+            client
+                .session
+                .as_ref()
+                .expect("session retained until release")
+                .sandbox_cleanup_verified
+        );
+
+        let mut forged = scripted_client(ScriptedAttack::WrongInheritedCleanup);
+        prime_inherited_observing(&mut forged);
+        let state = forged.session_state().unwrap().state_token();
+        assert_eq!(
+            forged.submit(DebugCommand::Close { state }),
+            Err(DebugHostClientError::SessionMachine(
+                SessionMachineError::InheritedCleanupReceiptMismatch
+            ))
+        );
+        assert_eq!(
+            forged.session_state().unwrap().kind(),
+            SessionStateKind::Observing
+        );
+        assert_eq!(forged.connection_state(), ClientConnectionState::Failed);
+    }
+
+    #[test]
+    fn active_session_drop_and_abandon_force_control_abort() {
         let dropped = Rc::new(RefCell::new(Vec::new()));
         {
             let mut client = DebugHostClient::connect(
@@ -2771,11 +2969,10 @@ mod tests {
     }
 
     #[test]
-    fn rejected_host_operation_consumes_its_controller_authority() {
-        let binary_id = BinaryId::digest(b"synthetic host-risk sample");
+    fn rejected_host_operation_consumes_its_controller_verifier() {
         let risk_lease = HostRiskLeaseId::new("a".repeat(64)).expect("host-risk lease id");
-        let command = DebugCommand::Open(DebugTargetRequest::Launch(LaunchTarget {
-            binary_id: binary_id.clone(),
+        let target = LaunchTarget {
+            binary_id: BinaryId::digest(b"synthetic host-risk sample"),
             executable: PathBuf::from("sample.exe"),
             arguments: Vec::new(),
             working_directory: None,
@@ -2783,18 +2980,23 @@ mod tests {
                 risk_lease: risk_lease.clone(),
             },
             stop_before_entry: true,
-        }));
+        };
+        let command = DebugCommand::Open(DebugTargetRequest::Launch(target.clone()));
+        let host_authority = HostRiskLease::new(
+            risk_lease,
+            session_id(),
+            provisioning_epoch(),
+            HostRiskOperation::Launch {
+                intent: HostLaunchIntent::from_target(&target),
+            },
+        );
+        let verifier = host_authority.verifier();
         let mut client = client(host());
         client
             .begin_session(session_id(), provisioning_epoch(), helper_build())
             .unwrap();
-        client
-            .register_host_risk_lease(HostRiskLease::new(
-                risk_lease,
-                session_id(),
-                HostRiskOperation::Launch { binary_id },
-            ))
-            .unwrap();
+        client.register_host_risk_verifier(verifier).unwrap();
+        let _sole_host_authority = host_authority;
 
         let rejected = client.submit(command.clone()).unwrap();
         assert!(matches!(rejected.outcome, CommandOutcome::Rejected { .. }));

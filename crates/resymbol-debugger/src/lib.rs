@@ -22,7 +22,8 @@ pub use address_space::{
     StaticAddressSpaceError, StaticRegion, StaticRegionKind,
 };
 pub use authorization::{
-    HostRiskLease, HostRiskOperation, SandboxOwnershipBinding, SandboxOwnershipLease,
+    HostLaunchIntent, HostRiskLease, HostRiskOperation, HostRiskVerifier, SandboxOwnershipBinding,
+    SandboxOwnershipLease, SandboxOwnershipVerifier,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use host_client::SyntheticDebugHost;
@@ -81,5 +82,6 @@ pub use sandbox::{
     VmIsolationIdentity, Win32kProfile,
 };
 pub use session_machine::{
-    MAX_REGISTERED_AUTHORIZATION_LEASES, SessionMachine, SessionMachineError,
+    MAX_REGISTERED_AUTHORIZATION_LEASES, RemoteCommandCheckpoint, SessionMachine,
+    SessionMachineError,
 };

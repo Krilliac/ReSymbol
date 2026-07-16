@@ -45,8 +45,9 @@ Workbench UI thread
 - The UI owns product state and never receives a platform handle.
 - `DebugHostClient` is deliberately `!Send` and `!Sync`. One connection worker constructs and owns
   it; UI code uses bounded queues. Its synchronous exchange calls are never made on the UI thread.
-- One client owns one connection and at most one session. It cannot release a session before the
-  reducer reports `Closed`, and it cannot disconnect while it still owns that session.
+- One client owns one connection and at most one session. Graceful release and disconnect require
+  reducer state `Closed`. Explicit abandon, transport failure, or client drop may sever only the
+  control channel while preserving the last non-`Closed` state; none supplies cleanup evidence.
 - One `SessionWorker` owns every debug event, target process/thread, Job, profile, staging directory,
   provider, and cleanup transition for a session.
 - Provider and debug-event methods are worker-thread-only and non-hot-reloadable until close and
@@ -119,9 +120,10 @@ tests:
 1. Every command is bound to one session and a monotonically increasing correlation identifier.
 2. State-sensitive commands carry the exact current generation and, when stopped, a fresh stop
    token. Accepted mutations invalidate queued stop-sensitive actions.
-3. Host launch and attach require a host-local, registered one-use risk lease. The lease binds the
-   session and exact operation to either the launch `BinaryId` or an attach identity containing PID,
-   trusted process-start key, executable `BinaryId`, and attach mode; a wire payload cannot mint authority.
+3. Host launch and attach require a host-local, registered one-use risk lease. A launch lease binds
+   the session, provisioning epoch, `BinaryId`, exact executable path, argument vector, working
+   directory, host environment, and stop-before-entry mode. An attach lease binds PID, trusted
+   process-start key, executable `BinaryId`, and attach mode. A wire payload cannot mint authority.
 4. A target is created suspended. Continue is impossible until the expected attestation is accepted
    for that exact session, binary, policy, provider, build, and fresh 256-bit provisioning epoch.
 5. Memory writes are bounded equal-length compare-before-write operations with complete-write and
@@ -171,6 +173,9 @@ The current seam is intentionally narrow:
   reducer path; non-transition events carry the exact current state token, memory/breakpoint evidence
   must match the request, and a rejected command may not claim any effect. Its command identifier and
   any presented one-use authority remain consumed without cloning the reducer or lease;
+- `RemoteCommandCheckpoint` is a public opaque transaction value so an external host worker can use
+  the same begin/reject semantics. It restores only ordinary visible state; command, run/stop, and
+  one-use authorization watermarks remain consumed;
 - attestation and cleanup events are bound both to the outer event session and to the reducer's exact
   binary, policy, provider, build, provisioning epoch, and cleanup expectation before `Closed` can be
   accepted or released;
@@ -178,16 +183,19 @@ The current seam is intentionally narrow:
   capability as unavailable, supports only offline open/close, and rejects every other operation
   without producing security evidence;
 - host-risk and sandbox-ownership grant objects are host-local and non-serializable. Commands carry
-  only strict 64-character lowercase-hex lease IDs; the reducer bounds registrations, consumes a
-  presented lease even on mismatch, and drops every unused lease after a target opens;
-- authority-bearing lease values and the `SessionMachine` consumption registry are deliberately
-  non-cloneable. Ownership moves into one session worker, while pure lease IDs, operation bindings,
-  and retained sandbox evidence remain cloneable value data;
+  only strict 64-character lowercase-hex lease IDs; the host reducer bounds registrations, consumes
+  a presented lease even on mismatch, and drops every unused lease after a target opens. The client
+  receives only a cloneable non-authority verifier record, while the sole move-only lease transfers
+  to the host worker;
+- authority-bearing lease values and each `SessionMachine` consumption registry are deliberately
+  non-cloneable. Pure lease IDs, exact launch/attach comparison records, and retained sandbox
+  evidence remain cloneable value data without granting host authority;
 - only `Closed` sessions can be released, and both newly provisioned and inherited sandbox closure
   require a complete receipt. Inherited cleanup is validated against the retained session,
   provisioning epoch, provider, policy digest, and PID/start-key/image process identity before the
-  reducer can enter `Closed`. Active abandon, transport loss, and client drop perform deterministic
-  best-effort control-channel shutdown but never imply cleanup or synthesize `Closed`; and
+  reducer can enter `Closed`. Active abandon, transport loss, and client drop invoke the transport's
+  mandatory non-panicking abort contract, including kill-on-close ownership where applicable, but
+  never imply cleanup or synthesize `Closed`; and
 - the client and transport expose value types only. Future process, pipe, token, Job, VM, and provider
   handles stay opaque inside the owning host implementation.
 

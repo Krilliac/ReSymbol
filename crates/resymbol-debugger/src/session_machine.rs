@@ -6,7 +6,8 @@ use resymbol_core::BinaryId;
 use thiserror::Error;
 
 use crate::authorization::{
-    HostRiskLease, HostRiskOperation, SandboxOwnershipBinding, SandboxOwnershipLease,
+    HostLaunchIntent, HostRiskLease, HostRiskOperation, HostRiskVerifier, SandboxOwnershipBinding,
+    SandboxOwnershipLease, SandboxOwnershipVerifier,
 };
 use crate::identity::{HostRiskLeaseId, ProvisioningEpoch, SandboxOwnershipLeaseId};
 use crate::protocol::{
@@ -52,8 +53,8 @@ pub struct SessionMachine {
     execution_gate: ExecutionGate,
     sandbox: Option<SandboxMachine>,
     inherited_sandbox: Option<SandboxOwnershipBinding>,
-    host_risk_leases: BTreeMap<HostRiskLeaseId, Option<HostRiskLease>>,
-    sandbox_ownership_leases: BTreeMap<SandboxOwnershipLeaseId, Option<SandboxOwnershipLease>>,
+    host_risk_leases: BTreeMap<HostRiskLeaseId, Option<HostRiskVerifier>>,
+    sandbox_ownership_leases: BTreeMap<SandboxOwnershipLeaseId, Option<SandboxOwnershipVerifier>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,7 +69,7 @@ enum ExecutionGate {
 /// Ordinary-state checkpoint for one remote command, deliberately excluding
 /// command watermarks and one-use authority registries.
 #[derive(Debug)]
-pub(crate) struct RemoteCommandCheckpoint {
+pub struct RemoteCommandCheckpoint {
     session_id: SessionId,
     provisioning_epoch: ProvisioningEpoch,
     state: SessionState,
@@ -162,16 +163,29 @@ impl SessionMachine {
         &mut self,
         lease: HostRiskLease,
     ) -> Result<(), SessionMachineError> {
+        self.register_host_risk_verifier(lease.into_verifier())
+    }
+
+    /// Registers non-authority comparison data in a controller-side shadow
+    /// reducer. The sole move-only lease must be registered independently on
+    /// the host worker; this verifier cannot authorize that worker.
+    pub(crate) fn register_host_risk_verifier(
+        &mut self,
+        verifier: HostRiskVerifier,
+    ) -> Result<(), SessionMachineError> {
         self.require_state("register host-risk lease", &[SessionStateKind::Idle])?;
-        self.require_session(lease.session_id())?;
-        if self.host_risk_leases.contains_key(lease.id()) {
+        self.require_session(verifier.session_id())?;
+        if verifier.provisioning_epoch() != &self.provisioning_epoch {
+            return Err(SessionMachineError::ProvisioningEpochMismatch);
+        }
+        if self.host_risk_leases.contains_key(verifier.id()) {
             return Err(SessionMachineError::DuplicateAuthorizationLease);
         }
         if self.host_risk_leases.len() >= MAX_REGISTERED_AUTHORIZATION_LEASES {
             return Err(SessionMachineError::TooManyAuthorizationLeases);
         }
         self.host_risk_leases
-            .insert(lease.id().clone(), Some(lease));
+            .insert(verifier.id().clone(), Some(verifier));
         Ok(())
     }
 
@@ -181,22 +195,31 @@ impl SessionMachine {
         &mut self,
         lease: SandboxOwnershipLease,
     ) -> Result<(), SessionMachineError> {
+        self.register_sandbox_ownership_verifier(lease.into_verifier())
+    }
+
+    /// Registers non-authority ownership comparison data in a controller-side
+    /// shadow reducer. Provider authority remains solely in the host lease.
+    pub(crate) fn register_sandbox_ownership_verifier(
+        &mut self,
+        verifier: SandboxOwnershipVerifier,
+    ) -> Result<(), SessionMachineError> {
         self.require_state(
             "register sandbox-ownership lease",
             &[SessionStateKind::Idle],
         )?;
-        self.require_session(lease.binding().session_id())?;
-        if lease.binding().provisioning_epoch() != &self.provisioning_epoch {
+        self.require_session(verifier.binding().session_id())?;
+        if verifier.binding().provisioning_epoch() != &self.provisioning_epoch {
             return Err(SessionMachineError::ProvisioningEpochMismatch);
         }
-        if self.sandbox_ownership_leases.contains_key(lease.id()) {
+        if self.sandbox_ownership_leases.contains_key(verifier.id()) {
             return Err(SessionMachineError::DuplicateAuthorizationLease);
         }
         if self.sandbox_ownership_leases.len() >= MAX_REGISTERED_AUTHORIZATION_LEASES {
             return Err(SessionMachineError::TooManyAuthorizationLeases);
         }
         self.sandbox_ownership_leases
-            .insert(lease.id().clone(), Some(lease));
+            .insert(verifier.id().clone(), Some(verifier));
         Ok(())
     }
 
@@ -263,7 +286,7 @@ impl SessionMachine {
     /// The returned checkpoint can restore only visible reducer state after an
     /// explicit rejection. Command IDs and consumed/cleared authority remain
     /// one-use even when the remote operation reports no effect.
-    pub(crate) fn begin_remote_command(
+    pub fn begin_remote_command(
         &mut self,
         envelope: &CommandEnvelope,
     ) -> Result<RemoteCommandCheckpoint, SessionMachineError> {
@@ -282,7 +305,7 @@ impl SessionMachine {
 
     /// Restores visible state after an exact remote rejection without
     /// restoring command IDs, token allocation, or one-use authority.
-    pub(crate) fn reject_remote_command(
+    pub fn reject_remote_command(
         &mut self,
         checkpoint: RemoteCommandCheckpoint,
     ) -> Result<&SessionState, SessionMachineError> {
@@ -491,6 +514,36 @@ impl SessionMachine {
         Ok(&self.state)
     }
 
+    /// Reports whether this session owns either a newly provisioned or an
+    /// inherited sandbox whose closure requires exact cleanup evidence.
+    #[must_use]
+    pub const fn requires_cleanup_receipt(&self) -> bool {
+        self.sandbox.is_some() || self.inherited_sandbox.is_some()
+    }
+
+    /// Validates cleanup evidence without advancing the reducer. This lets a
+    /// controller or host validate a lifecycle event before the correlated
+    /// `Closed` state transition is committed.
+    pub fn validate_cleanup_receipt(
+        &self,
+        receipt: &SandboxCleanupReceipt,
+    ) -> Result<(), SessionMachineError> {
+        match (&self.sandbox, &self.inherited_sandbox) {
+            (Some(sandbox), None) => {
+                receipt
+                    .validate_against(sandbox.expected_attestation())
+                    .map_err(SandboxMachineError::Cleanup)?;
+                if receipt.outcome != CleanupOutcome::Complete {
+                    return Err(SandboxMachineError::CleanupIncomplete.into());
+                }
+                Ok(())
+            }
+            (None, Some(binding)) => Self::validate_inherited_cleanup(binding, receipt),
+            (None, None) => Err(SessionMachineError::UnexpectedCleanupReceipt),
+            (Some(_), Some(_)) => Err(SessionMachineError::ConflictingSandboxOwnership),
+        }
+    }
+
     fn validate_inherited_cleanup(
         binding: &SandboxOwnershipBinding,
         receipt: &SandboxCleanupReceipt,
@@ -531,7 +584,7 @@ impl SessionMachine {
                     self.consume_host_risk_lease(
                         risk_lease,
                         &HostRiskOperation::Launch {
-                            binary_id: target.binary_id.clone(),
+                            intent: HostLaunchIntent::from_target(target),
                         },
                     )?;
                     (None, ExecutionGate::HostRiskAccepted, None)
@@ -645,12 +698,15 @@ impl SessionMachine {
         id: &HostRiskLeaseId,
         expected: &HostRiskOperation,
     ) -> Result<(), SessionMachineError> {
-        let lease = self
+        let verifier = self
             .host_risk_leases
             .get_mut(id)
             .and_then(Option::take)
             .ok_or(SessionMachineError::HostRiskLeaseUnavailable)?;
-        if lease.session_id() != self.session_id || lease.operation() != expected {
+        if verifier.session_id() != self.session_id
+            || verifier.provisioning_epoch() != &self.provisioning_epoch
+            || verifier.operation() != expected
+        {
             return Err(SessionMachineError::HostRiskLeaseMismatch);
         }
         Ok(())
@@ -662,12 +718,12 @@ impl SessionMachine {
         process: &crate::protocol::ProcessIdentity,
         mode: AttachMode,
     ) -> Result<SandboxOwnershipBinding, SessionMachineError> {
-        let lease = self
+        let verifier = self
             .sandbox_ownership_leases
             .get_mut(id)
             .and_then(Option::take)
             .ok_or(SessionMachineError::SandboxOwnershipLeaseUnavailable)?;
-        let binding = lease.binding();
+        let binding = verifier.binding();
         if binding.session_id() != self.session_id
             || binding.provisioning_epoch() != &self.provisioning_epoch
             || binding.process() != process
@@ -675,7 +731,7 @@ impl SessionMachine {
         {
             return Err(SessionMachineError::SandboxOwnershipLeaseMismatch);
         }
-        Ok(lease.into_binding())
+        Ok(binding.clone())
     }
 
     fn require_open_target(
@@ -919,6 +975,18 @@ mod tests {
             environment: LaunchEnvironment::Host { risk_lease },
             stop_before_entry: true,
         })
+    }
+
+    fn host_launch_operation(
+        binary_id: BinaryId,
+        risk_lease: HostRiskLeaseId,
+    ) -> HostRiskOperation {
+        let DebugTargetRequest::Launch(target) = host_target(binary_id, risk_lease) else {
+            unreachable!("host target is a launch")
+        };
+        HostRiskOperation::Launch {
+            intent: HostLaunchIntent::from_target(&target),
+        }
     }
 
     fn attach_target(scope: AttachScope) -> DebugTargetRequest {
@@ -1264,9 +1332,8 @@ mod tests {
             .register_host_risk_lease(HostRiskLease::new(
                 risk_lease.clone(),
                 session_id(),
-                HostRiskOperation::Launch {
-                    binary_id: binary.clone(),
-                },
+                provisioning_epoch(),
+                host_launch_operation(binary.clone(), risk_lease.clone()),
             ))
             .expect("register host-risk lease");
         let initial = machine.state().state_token();
@@ -1294,9 +1361,8 @@ mod tests {
             .register_host_risk_lease(HostRiskLease::new(
                 lease_id.clone(),
                 session_id(),
-                HostRiskOperation::Launch {
-                    binary_id: approved.clone(),
-                },
+                provisioning_epoch(),
+                host_launch_operation(approved.clone(), lease_id.clone()),
             ))
             .expect("register host-risk lease");
 
@@ -1322,11 +1388,61 @@ mod tests {
             machine.register_host_risk_lease(HostRiskLease::new(
                 host_risk_lease_id('c'),
                 session_id(),
-                HostRiskOperation::Launch {
-                    binary_id: BinaryId::digest(b"approved host target"),
-                },
+                provisioning_epoch(),
+                host_launch_operation(
+                    BinaryId::digest(b"approved host target"),
+                    host_risk_lease_id('c'),
+                ),
             )),
             Err(SessionMachineError::DuplicateAuthorizationLease)
+        );
+    }
+
+    #[test]
+    fn host_launch_lease_binds_arguments_working_directory_and_epoch() {
+        let binary = BinaryId::digest(b"approved host launch");
+        let lease_id = host_risk_lease_id('6');
+        let DebugTargetRequest::Launch(mut approved) = host_target(binary, lease_id.clone()) else {
+            unreachable!("host target is a launch")
+        };
+        approved.arguments = vec!["--approved".to_owned()];
+        approved.working_directory = Some(PathBuf::from("approved-workdir"));
+
+        let mut machine = machine();
+        machine
+            .register_host_risk_lease(HostRiskLease::new(
+                lease_id.clone(),
+                session_id(),
+                provisioning_epoch(),
+                HostRiskOperation::Launch {
+                    intent: HostLaunchIntent::from_target(&approved),
+                },
+            ))
+            .expect("register exact launch intent");
+
+        let mut changed = approved.clone();
+        changed.arguments = vec!["--different".to_owned()];
+        let initial = machine.state().state_token();
+        assert_eq!(
+            machine.accept_command(&command(
+                1,
+                initial,
+                DebugCommand::Open(DebugTargetRequest::Launch(changed)),
+            )),
+            Err(SessionMachineError::HostRiskLeaseMismatch)
+        );
+
+        let stale_id = host_risk_lease_id('9');
+        assert_eq!(
+            machine.register_host_risk_lease(HostRiskLease::new(
+                stale_id,
+                session_id(),
+                ProvisioningEpoch::new("f".repeat(64)).expect("stale epoch"),
+                HostRiskOperation::Launch {
+                    intent: HostLaunchIntent::from_target(&approved),
+                },
+            )),
+            Err(SessionMachineError::ProvisioningEpochMismatch)
         );
     }
 
@@ -1340,6 +1456,7 @@ mod tests {
             .register_host_risk_lease(HostRiskLease::new(
                 lease_id.clone(),
                 session_id(),
+                provisioning_epoch(),
                 HostRiskOperation::Attach {
                     process: approved.clone(),
                     mode: AttachMode::Debug,
@@ -1377,6 +1494,7 @@ mod tests {
             .register_host_risk_lease(HostRiskLease::new(
                 mode_lease.clone(),
                 session_id(),
+                provisioning_epoch(),
                 HostRiskOperation::Attach {
                     process: approved.clone(),
                     mode: AttachMode::Debug,
