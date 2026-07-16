@@ -51,6 +51,7 @@ pub struct SessionMachine {
     state: SessionState,
     target: Option<DebugTargetRequest>,
     last_command_id: Option<CommandId>,
+    last_state_generation: StateGeneration,
     last_stop_id: u64,
     last_run_id: u64,
     execution_gate: ExecutionGate,
@@ -78,7 +79,8 @@ enum ExecutionGate {
 /// Its fields stay private so an external host worker can resolve a command
 /// only through [`SessionMachine::commit_remote_command`] or
 /// [`SessionMachine::reject_remote_command`]. Its rollback image deliberately
-/// excludes command, run/stop, and one-use authority watermarks.
+/// excludes command, state-generation, run/stop, and one-use authority
+/// watermarks.
 /// Dropping or forgetting an unresolved ticket deliberately leaves the reducer
 /// in [`SessionMachineError::RemoteCommandPending`]; this is a fail-closed
 /// terminal condition for that reducer instance, not an implicit rollback.
@@ -141,6 +143,7 @@ struct RemoteCommandPostAcceptState {
     state: SessionState,
     target: Option<DebugTargetRequest>,
     last_command_id: Option<CommandId>,
+    last_state_generation: StateGeneration,
     last_stop_id: u64,
     last_run_id: u64,
     execution_gate: ExecutionGate,
@@ -169,6 +172,7 @@ impl SessionMachine {
             state: SessionState::Idle { token },
             target: None,
             last_command_id: None,
+            last_state_generation: StateGeneration::new(1).expect("initial generation is nonzero"),
             last_stop_id: 0,
             last_run_id: 0,
             execution_gate: ExecutionGate::NotApplicable,
@@ -408,6 +412,9 @@ impl SessionMachine {
 
     /// Restores visible state after an exact, effect-free remote rejection
     /// without restoring command IDs, token allocation, or one-use authority.
+    /// Visible state is restored exactly while the already-consumed generation
+    /// remains a private high-water mark, so a later transition cannot reuse
+    /// the rejected command's state token.
     pub fn reject_remote_command(
         &mut self,
         checkpoint: RemoteCommandCheckpoint,
@@ -459,6 +466,7 @@ impl SessionMachine {
             state: self.state.clone(),
             target: self.target.clone(),
             last_command_id: self.last_command_id,
+            last_state_generation: self.last_state_generation,
             last_stop_id: self.last_stop_id,
             last_run_id: self.last_run_id,
             execution_gate: self.execution_gate,
@@ -908,7 +916,9 @@ impl SessionMachine {
     }
 
     fn transition_to(&mut self, next: SessionState) -> Result<(), SessionMachineError> {
-        self.state.validate_successor(&next)?;
+        self.state
+            .validate_successor_from_generation(&next, self.last_state_generation)?;
+        self.last_state_generation = next.state_token().generation;
         self.state = next;
         Ok(())
     }
@@ -1024,7 +1034,7 @@ impl SessionMachine {
     fn next_state_token(&self) -> Result<StateToken, SessionMachineError> {
         Ok(StateToken {
             session_id: self.session_id,
-            generation: self.state.state_token().generation.checked_next()?,
+            generation: self.last_state_generation.checked_next()?,
         })
     }
 
@@ -2298,6 +2308,7 @@ mod tests {
             .reject_remote_command(checkpoint, open.command_id)
             .expect("rollback visible state");
         assert_eq!(machine.state().kind(), SessionStateKind::Idle);
+        assert_eq!(machine.state().state_token(), initial);
         assert!(machine.expected_attestation().is_none());
         assert_eq!(machine.last_command_id(), Some(open.command_id));
         assert!(matches!(
@@ -2329,7 +2340,7 @@ mod tests {
         let lease_id = ownership_lease_id('6');
         let mut machine = machine();
         machine
-            .register_sandbox_ownership_lease(SandboxOwnershipLease::new(
+            .register_sandbox_ownership_lease(SandboxOwnershipLease::new_for_test(
                 lease_id.clone(),
                 binding.clone(),
             ))
