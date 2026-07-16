@@ -6,6 +6,7 @@
 //! command unavailable.
 
 use std::{
+    fmt,
     fs::{self, File, Metadata},
     io::{self, Read},
     path::{Path, PathBuf},
@@ -47,13 +48,25 @@ pub const MAX_OFFLINE_IMAGE_BYTES: u64 = 1024 * 1024 * 1024;
 /// `origin_path` is canonicalized exactly once during construction. `bytes`
 /// are retained in an [`Arc`] and are never refreshed from disk, so later file
 /// replacement cannot change the image served by an established host.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct VerifiedOfflineImage {
     origin_path: PathBuf,
     identity: BinaryIdentity,
     bytes: Arc<[u8]>,
     analysis: BinaryAnalysis,
     address_space: StaticAddressSpace,
+}
+
+impl fmt::Debug for VerifiedOfflineImage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VerifiedOfflineImage")
+            .field("origin_path", &self.origin_path)
+            .field("identity", &self.identity)
+            .field("snapshot_len", &self.bytes.len())
+            .field("region_count", &self.address_space.regions().len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl VerifiedOfflineImage {
@@ -748,7 +761,7 @@ impl OfflineImageDebugHost {
             Err(error) => return self.rejected(command_id, "command-rejected", error),
         };
         if target.path != self.image.origin_path {
-            self.reject_remote_command(checkpoint)?;
+            self.reject_remote_command(checkpoint, command_id)?;
             return self.rejected(
                 command_id,
                 "offline-target-mismatch",
@@ -764,6 +777,7 @@ impl OfflineImageDebugHost {
             .complete_open_offline()
             .map_err(machine_error)?
             .clone();
+        self.commit_remote_command(checkpoint, command_id)?;
         self.push_session_event(&mut events, command_id, DebugEvent::StateChanged(offline))?;
         self.push_succeeded(&mut events, command_id)?;
         Ok(events)
@@ -782,7 +796,7 @@ impl OfflineImageDebugHost {
             Err(error) => return self.rejected(command_id, "command-rejected", error),
         };
         if !matches!(view, ReadViewToken::Offline { .. }) {
-            self.reject_remote_command(checkpoint)?;
+            self.reject_remote_command(checkpoint, command_id)?;
             return self.rejected(
                 command_id,
                 "offline-view-required",
@@ -792,10 +806,11 @@ impl OfflineImageDebugHost {
         let bytes = match self.image.read_rva(address, size) {
             Ok(bytes) => bytes,
             Err(error) => {
-                self.reject_remote_command(checkpoint)?;
+                self.reject_remote_command(checkpoint, command_id)?;
                 return self.rejected(command_id, "offline-range-unavailable", error);
             }
         };
+        self.commit_remote_command(checkpoint, command_id)?;
 
         let mut events = Vec::with_capacity(2);
         self.push_session_event(
@@ -816,7 +831,7 @@ impl OfflineImageDebugHost {
         envelope: CommandEnvelope,
         command_id: CommandId,
     ) -> Result<Vec<HostFrame>, HostTransportError> {
-        let _checkpoint = match self.begin_remote_command(&envelope) {
+        let checkpoint = match self.begin_remote_command(&envelope) {
             Ok(checkpoint) => checkpoint,
             Err(error) => return self.rejected(command_id, "command-rejected", error),
         };
@@ -828,6 +843,7 @@ impl OfflineImageDebugHost {
             .complete_close(None)
             .map_err(machine_error)?
             .clone();
+        self.commit_remote_command(checkpoint, command_id)?;
         self.push_session_event(&mut events, command_id, DebugEvent::StateChanged(closed))?;
         self.push_succeeded(&mut events, command_id)?;
         Ok(events)
@@ -839,7 +855,7 @@ impl OfflineImageDebugHost {
         command_id: CommandId,
     ) -> Result<Vec<HostFrame>, HostTransportError> {
         if let Ok(checkpoint) = self.begin_remote_command(&envelope) {
-            self.reject_remote_command(checkpoint)?;
+            self.reject_remote_command(checkpoint, command_id)?;
         }
         self.rejected(
             command_id,
@@ -864,9 +880,21 @@ impl OfflineImageDebugHost {
     fn reject_remote_command(
         &mut self,
         checkpoint: RemoteCommandCheckpoint,
+        command_id: CommandId,
     ) -> Result<(), HostTransportError> {
         self.machine_mut()?
-            .reject_remote_command(checkpoint)
+            .reject_remote_command(checkpoint, command_id)
+            .map(|_| ())
+            .map_err(machine_error)
+    }
+
+    fn commit_remote_command(
+        &mut self,
+        checkpoint: RemoteCommandCheckpoint,
+        command_id: CommandId,
+    ) -> Result<(), HostTransportError> {
+        self.machine_mut()?
+            .commit_remote_command(checkpoint, command_id)
             .map(|_| ())
             .map_err(machine_error)
     }
@@ -1029,7 +1057,13 @@ impl HostFrameExchange for OfflineImageDebugHost {
         request: HostFrame,
         limits: HostResponseLimits,
     ) -> Result<HostResponseBatch, HostTransportError> {
-        let frames = self.exchange_inner(request)?;
+        let frames = match self.exchange_inner(request) {
+            Ok(frames) => frames,
+            Err(error) => {
+                self.abort_control(ControlShutdownReason::ProtocolFailure);
+                return Err(error);
+            }
+        };
         match HostResponseBatch::try_from_frames(frames, limits) {
             Ok(batch) => Ok(batch),
             Err(error) => {
@@ -1235,7 +1269,7 @@ mod tests {
     }
 
     fn helper_build() -> HelperBuildId {
-        HelperBuildId::new("offline-host/test-1").expect("helper build")
+        HelperBuildId::new("offline-host-test-1").expect("helper build")
     }
 
     fn host(image: VerifiedOfflineImage) -> OfflineImageDebugHost {
