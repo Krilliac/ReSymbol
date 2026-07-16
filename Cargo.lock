@@ -3002,6 +3002,7 @@ dependencies = [
 name = "resymbol-debugger"
 version = "0.1.0-alpha.1"
 dependencies = [
+ "getrandom 0.3.4",
  "resymbol-analysis",
  "resymbol-core",
  "serde",
