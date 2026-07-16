@@ -19,32 +19,32 @@
                          "view":  "overview",
                          "width":  1440,
                          "height":  900,
-                         "bytes":  220956,
-                         "sha256":  "328fc62aece173d253438445c9386cae587afae20ef25263c75836b874536f73"
+                         "bytes":  219180,
+                         "sha256":  "2b33764ba7e5159f90cf6254176c96c3aafe692ae38cefa2203bd6d9ae16876a"
                      },
                      {
                          "file":  "workbench-functions.png",
                          "view":  "functions",
                          "width":  1440,
                          "height":  900,
-                         "bytes":  227051,
-                         "sha256":  "bb8fca69c9e51facf38d6305d0b9f63a0f1b9cafddc62deeaf768ded56c78c0e"
+                         "bytes":  226971,
+                         "sha256":  "665dd0de6857d09d6e387febb962b00b07f92bee1284ac0b43a0b5d138eb6e4f"
                      },
                      {
                          "file":  "workbench-graph.png",
                          "view":  "graph",
                          "width":  1440,
                          "height":  900,
-                         "bytes":  253220,
-                         "sha256":  "0ec35b82297578edfbce5c7e08db4213c051125dd28c9b5dddd66a4d140c56ed"
+                         "bytes":  253155,
+                         "sha256":  "44985228507439b36bf7e245c2d09cc180b7610a7f072240be2a90855a26efc4"
                      },
                      {
                          "file":  "workbench-address-space.png",
                          "view":  "address-space",
                          "width":  1440,
                          "height":  900,
-                         "bytes":  243756,
-                         "sha256":  "c796fc0e0717a57cb52b25ea192dc818a6220716bd4981bb2961d0a177652111"
+                         "bytes":  233780,
+                         "sha256":  "cfdb97824a07aab0d867515971bba1a21e7d987da6603c66fc3be96afafe9ee0"
                      }
                  ]
 }
