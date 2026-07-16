@@ -15,7 +15,8 @@ use crate::{
     PeControlFlowTarget, PeDataDirectories, PeDataReference, PeDelayImportLibrary, PeDirectCall,
     PeExport, PeExportName, PeGuardAddressTakenIatEntry, PeGuardCfFunction,
     PeGuardEhContinuationTarget, PeGuardLongJumpTarget, PeImport, PeImportLibrary,
-    PeRecoveredString, PeSection, PeThunk, PeTlsCallback, RuntimeFunction,
+    PeLoadConfigSecurityAnchors, PeRecoveredString, PeSection, PeThunk, PeTlsCallback,
+    RuntimeFunction,
     code_recovery::{
         CodeRecoveryInput, recover_code, validate_code_recovery, validate_data_references,
     },
@@ -41,6 +42,13 @@ const DELAY_IMPORT_DESCRIPTOR_SIZE_U32: u32 = 32;
 const RUNTIME_FUNCTION_SIZE: usize = 12;
 const RUNTIME_FUNCTION_SIZE_U32: u32 = 12;
 const TLS_DIRECTORY_SIZE_U32: u32 = 40;
+const LOAD_CONFIG_SECURITY_ANCHOR_SIZE_U32: u32 = 8;
+const LOAD_CONFIG_SECURITY_COOKIE_FIELDS_SIZE_U32: u32 = 96;
+const LOAD_CONFIG_SECURITY_COOKIE_OFFSET: usize = 88;
+const LOAD_CONFIG_GUARD_CF_CHECK_POINTER_FIELDS_SIZE_U32: u32 = 120;
+const LOAD_CONFIG_GUARD_CF_CHECK_POINTER_OFFSET: usize = 112;
+const LOAD_CONFIG_GUARD_CF_DISPATCH_POINTER_FIELDS_SIZE_U32: u32 = 128;
+const LOAD_CONFIG_GUARD_CF_DISPATCH_POINTER_OFFSET: usize = 120;
 const LOAD_CONFIG_GUARD_FIELDS_SIZE_U32: u32 = 148;
 const LOAD_CONFIG_GUARD_CF_FUNCTION_TABLE_OFFSET: usize = 128;
 const LOAD_CONFIG_GUARD_CF_FUNCTION_COUNT_OFFSET: usize = 136;
@@ -221,6 +229,7 @@ struct ParsedHeaders {
 
 struct ParsedLoadConfigMetadata {
     load_config_size: Option<u32>,
+    security_anchors: PeLoadConfigSecurityAnchors,
     guard_flags: Option<u32>,
     function_table_rva: Option<u32>,
     functions: Vec<PeGuardCfFunction>,
@@ -309,6 +318,7 @@ pub fn analyze_pe(bytes: &[u8]) -> Result<PeAnalysis, AnalysisError> {
     )?;
     let ParsedLoadConfigMetadata {
         load_config_size,
+        security_anchors: load_config_security_anchors,
         guard_flags,
         function_table_rva: guard_cf_function_table_rva,
         functions: guard_cf_functions,
@@ -399,6 +409,7 @@ pub fn analyze_pe(bytes: &[u8]) -> Result<PeAnalysis, AnalysisError> {
         exports,
         runtime_functions,
         load_config_size,
+        load_config_security_anchors,
         guard_flags,
         guard_cf_function_table_rva,
         guard_cf_functions,
@@ -1466,6 +1477,7 @@ fn validate_load_config_metadata(
 ) -> Result<(), AnalysisError> {
     validate_guard_cf_functions(analysis)?;
 
+    let has_security_anchor_state = !analysis.load_config_security_anchors.is_empty();
     let has_address_taken_iat_state = analysis.guard_address_taken_iat_entry_table_rva.is_some()
         || !analysis.guard_address_taken_iat_entries.is_empty();
     let has_long_jump_state = analysis.guard_long_jump_target_table_rva.is_some()
@@ -1476,6 +1488,12 @@ fn validate_load_config_metadata(
         has_address_taken_iat_state || has_long_jump_state || has_eh_continuation_state;
 
     let Some(directory) = analysis.directories.load_config else {
+        if has_security_anchor_state {
+            return invalid_field(
+                "load-config security anchors",
+                "anchor state exists without a load-config directory",
+            );
+        }
         if has_extended_state {
             return invalid_field(
                 "load-config guard target metadata",
@@ -1486,7 +1504,8 @@ fn validate_load_config_metadata(
     };
     let load_config_size = analysis
         .load_config_size
-        .expect("GuardCF validation requires a load-config size");
+        .expect("load-config validation requires a declared structure size");
+    validate_load_config_security_anchors(analysis, directory, load_config_size)?;
 
     let mut table_ranges = Vec::new();
     if let Some(table_rva) = analysis.guard_cf_function_table_rva {
@@ -1612,6 +1631,40 @@ fn validate_load_config_metadata(
         }
     }
     Ok(())
+}
+
+fn validate_load_config_security_anchors(
+    analysis: &PeAnalysis,
+    directory: DataDirectory,
+    load_config_size: u32,
+) -> Result<(), AnalysisError> {
+    let anchors = &analysis.load_config_security_anchors;
+    if load_config_size < LOAD_CONFIG_SECURITY_COOKIE_FIELDS_SIZE_U32
+        && anchors.security_cookie_rva.is_some()
+    {
+        return invalid_field(
+            "security cookie",
+            "anchor state exists in a load-config structure too short to contain the SecurityCookie field",
+        );
+    }
+    if load_config_size < LOAD_CONFIG_GUARD_CF_CHECK_POINTER_FIELDS_SIZE_U32
+        && anchors.guard_cf_check_function_pointer_rva.is_some()
+    {
+        return invalid_field(
+            "GuardCF check-function pointer slot",
+            "anchor state exists in a load-config structure too short to contain the GuardCFCheckFunctionPointer field",
+        );
+    }
+    if load_config_size < LOAD_CONFIG_GUARD_CF_DISPATCH_POINTER_FIELDS_SIZE_U32
+        && anchors.guard_cf_dispatch_function_pointer_rva.is_some()
+    {
+        return invalid_field(
+            "GuardCF dispatch-function pointer slot",
+            "anchor state exists in a load-config structure too short to contain the GuardCFDispatchFunctionPointer field",
+        );
+    }
+
+    validate_load_config_security_anchor_layout(anchors, directory, &analysis.sections)
 }
 
 fn validate_guard_cf_functions(analysis: &PeAnalysis) -> Result<(), AnalysisError> {
@@ -3269,6 +3322,7 @@ fn parse_load_config_metadata(
     )?;
     let mut parsed = ParsedLoadConfigMetadata {
         load_config_size: parsed_guard_cf.load_config_size,
+        security_anchors: PeLoadConfigSecurityAnchors::default(),
         guard_flags: parsed_guard_cf.guard_flags,
         function_table_rva: parsed_guard_cf.function_table_rva,
         functions: parsed_guard_cf.functions,
@@ -3280,14 +3334,24 @@ fn parse_load_config_metadata(
         eh_continuation_targets: Vec::new(),
     };
 
-    let (Some(directory), Some(load_config_size), Some(guard_flags)) =
-        (directory, parsed.load_config_size, parsed.guard_flags)
-    else {
+    let (Some(directory), Some(load_config_size)) = (directory, parsed.load_config_size) else {
         return Ok(parsed);
     };
     let directory_size = usize::try_from(directory.size)
         .map_err(|_| AnalysisError::IntegerConversion("load-config-directory size"))?;
     let directory_offset = mapper.offset(directory.rva, directory_size, "load-config directory")?;
+    parsed.security_anchors = parse_load_config_security_anchors(
+        reader,
+        directory,
+        directory_offset,
+        load_config_size,
+        image_base,
+        size_of_image,
+        sections,
+    )?;
+    let Some(guard_flags) = parsed.guard_flags else {
+        return Ok(parsed);
+    };
     let guard_table_context = GuardTableParseContext {
         directory,
         image_base,
@@ -3476,6 +3540,123 @@ fn parse_load_config_metadata(
     }
 
     Ok(parsed)
+}
+
+fn parse_load_config_security_anchors(
+    reader: &Reader<'_>,
+    directory: DataDirectory,
+    directory_offset: usize,
+    load_config_size: u32,
+    image_base: u64,
+    size_of_image: u32,
+    sections: &[PeSection],
+) -> Result<PeLoadConfigSecurityAnchors, AnalysisError> {
+    let read_anchor = |minimum_size: u32,
+                       field_offset: usize,
+                       offset_context: &'static str,
+                       field_context: &'static str|
+     -> Result<Option<u32>, AnalysisError> {
+        if load_config_size < minimum_size {
+            return Ok(None);
+        }
+        let field_va = reader.u64(
+            checked_add(directory_offset, field_offset, offset_context)?,
+            field_context,
+        )?;
+        if field_va == 0 {
+            Ok(None)
+        } else {
+            image_va_to_rva(field_va, image_base, size_of_image, field_context).map(Some)
+        }
+    };
+
+    let anchors = PeLoadConfigSecurityAnchors {
+        security_cookie_rva: read_anchor(
+            LOAD_CONFIG_SECURITY_COOKIE_FIELDS_SIZE_U32,
+            LOAD_CONFIG_SECURITY_COOKIE_OFFSET,
+            "SecurityCookie field offset",
+            "SecurityCookie",
+        )?,
+        guard_cf_check_function_pointer_rva: read_anchor(
+            LOAD_CONFIG_GUARD_CF_CHECK_POINTER_FIELDS_SIZE_U32,
+            LOAD_CONFIG_GUARD_CF_CHECK_POINTER_OFFSET,
+            "GuardCF check-function pointer field offset",
+            "GuardCFCheckFunctionPointer",
+        )?,
+        guard_cf_dispatch_function_pointer_rva: read_anchor(
+            LOAD_CONFIG_GUARD_CF_DISPATCH_POINTER_FIELDS_SIZE_U32,
+            LOAD_CONFIG_GUARD_CF_DISPATCH_POINTER_OFFSET,
+            "GuardCF dispatch-function pointer field offset",
+            "GuardCFDispatchFunctionPointer",
+        )?,
+    };
+    validate_load_config_security_anchor_layout(&anchors, directory, sections)?;
+    Ok(anchors)
+}
+
+fn validate_load_config_security_anchor_layout(
+    anchors: &PeLoadConfigSecurityAnchors,
+    directory: DataDirectory,
+    sections: &[PeSection],
+) -> Result<(), AnalysisError> {
+    let anchor_ranges = [
+        ("security cookie", anchors.security_cookie_rva),
+        (
+            "GuardCF check-function pointer slot",
+            anchors.guard_cf_check_function_pointer_rva,
+        ),
+        (
+            "GuardCF dispatch-function pointer slot",
+            anchors.guard_cf_dispatch_function_pointer_rva,
+        ),
+    ];
+
+    for (label, rva) in anchor_ranges {
+        let Some(rva) = rva else {
+            continue;
+        };
+        if section_for_rva_range(rva, LOAD_CONFIG_SECURITY_ANCHOR_SIZE_U32, sections).is_none() {
+            return invalid_field(
+                label,
+                format!("RVA {rva:#x} does not name an eight-byte range within one mapped section"),
+            );
+        }
+        if ranges_overlap(
+            u64::from(directory.rva),
+            u64::from(directory.size),
+            u64::from(rva),
+            u64::from(LOAD_CONFIG_SECURITY_ANCHOR_SIZE_U32),
+        )? {
+            return invalid_field(label, "overlaps the declared load-config directory range");
+        }
+    }
+
+    for first in 0..anchor_ranges.len() {
+        let Some(first_rva) = anchor_ranges[first].1 else {
+            continue;
+        };
+        for second in first + 1..anchor_ranges.len() {
+            let Some(second_rva) = anchor_ranges[second].1 else {
+                continue;
+            };
+            if ranges_overlap(
+                u64::from(first_rva),
+                u64::from(LOAD_CONFIG_SECURITY_ANCHOR_SIZE_U32),
+                u64::from(second_rva),
+                u64::from(LOAD_CONFIG_SECURITY_ANCHOR_SIZE_U32),
+            )? {
+                return invalid_field(
+                    "load-config security anchors",
+                    format!(
+                        "{} overlaps {}",
+                        anchor_ranges[first].0, anchor_ranges[second].0
+                    ),
+                );
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn parse_guard_cf_functions(

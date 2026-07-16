@@ -73,6 +73,12 @@ pub struct PeAnalysis {
     /// Size declared by the PE32+ load-configuration structure, when present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load_config_size: Option<u32>,
+    /// Checked storage anchors from the PE32+ load-config security prefix.
+    ///
+    /// Schema 11 serializes this object even when every anchor is absent so
+    /// prior packages cannot acquire this recovery result by relabeling.
+    #[serde(default)]
+    pub load_config_security_anchors: PeLoadConfigSecurityAnchors,
     /// Exact `GuardFlags` value when the load configuration is large enough to contain it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guard_flags: Option<u32>,
@@ -211,6 +217,8 @@ struct UncheckedPeAnalysis {
     #[serde(default)]
     load_config_size: Option<u32>,
     #[serde(default)]
+    load_config_security_anchors: PeLoadConfigSecurityAnchors,
+    #[serde(default)]
     guard_flags: Option<u32>,
     #[serde(default)]
     guard_cf_function_table_rva: Option<u32>,
@@ -278,6 +286,7 @@ impl TryFrom<UncheckedPeAnalysis> for PeAnalysis {
             exports: value.exports,
             runtime_functions: value.runtime_functions,
             load_config_size: value.load_config_size,
+            load_config_security_anchors: value.load_config_security_anchors,
             guard_flags: value.guard_flags,
             guard_cf_function_table_rva: value.guard_cf_function_table_rva,
             guard_cf_functions: value.guard_cf_functions,
@@ -445,6 +454,31 @@ pub struct PeTlsCallback {
     pub table_index: u32,
     /// RVA obtained by subtracting the preferred image base from the slot's VA.
     pub callback_rva: u32,
+}
+
+/// Checked storage RVAs advertised by the PE32+ load-config security prefix.
+#[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeLoadConfigSecurityAnchors {
+    /// RVA of the eight-byte Visual C++ `/GS` security-cookie storage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_cookie_rva: Option<u32>,
+    /// RVA of the eight-byte slot patched with the GuardCF check function pointer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard_cf_check_function_pointer_rva: Option<u32>,
+    /// RVA of the eight-byte slot patched with the GuardCF dispatch function pointer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard_cf_dispatch_function_pointer_rva: Option<u32>,
+}
+
+impl PeLoadConfigSecurityAnchors {
+    /// Whether the load-config prefix advertises no nonzero security anchor.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.security_cookie_rva.is_none()
+            && self.guard_cf_check_function_pointer_rva.is_none()
+            && self.guard_cf_dispatch_function_pointer_rva.is_none()
+    }
 }
 
 /// One record from the PE Guard Control Flow function table (GFIDS).

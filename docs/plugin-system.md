@@ -422,6 +422,11 @@ arrays are present even when empty, array length is the retained count, and raw 
 serialized. These are inventory records only: GIAT entries are import slots and the other entries
 are valid continuation/landing addresses, so they emit no function-entry assertion or thunk seed.
 They remain additive detached JSON visible only with `symbols.read`.
+Package schema 11 adds the always-present `load_config_security_anchors` object with optional
+checked security-cookie and GuardCF check/dispatch pointer-slot storage RVAs. Slot contents are not
+dereferenced or serialized, and the object emits no claims or thunk seeds. It is additive detached
+JSON visible only with `symbols.read`; plugins without that permission still receive no base
+analysis.
 
 #### Managed plugin author quickstart
 
@@ -521,6 +526,8 @@ and supported seeded thunks reuse existing `function-entry` and exact `thunk-tar
 Package schema 10's Guard address-taken IAT, long-jump, and EH-continuation inventories add no claim
 or control-flow target shape. They are additive `symbols.read` state and leave the plugin API,
 WIT/ABI, wire 1.0 handshake, and projection schema 6 unchanged.
+Package schema 11's load-config security-anchor object is another additive `symbols.read` field and
+likewise leaves the plugin API, WIT/ABI, wire 1.0 handshake, and projection schema 6 unchanged.
 
 ### Tool-hosted bridges (planned host)
 

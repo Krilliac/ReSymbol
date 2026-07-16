@@ -31,7 +31,7 @@ Every package contains four top-level fields:
   "binary_sha256": "<64 lowercase hexadecimal characters>",
   "generator_version": "0.1.0-alpha.1",
   "payload": {},
-  "schema_version": 10
+  "schema_version": 11
 }
 ```
 
@@ -41,8 +41,8 @@ Every package contains four top-level fields:
 - `payload` contains one validated `AnalysisSession`: deterministic base analysis, a plugin-run
   ledger, and accepted plugin claims.
 
-This package envelope currently writes schema 10. The CLI can also inspect and export schemas 1
-through 9 through the compatibility paths described below, while other schema versions fail
+This package envelope currently writes schema 11. The CLI can also inspect and export schemas 1
+through 10 through the compatibility paths described below, while other schema versions fail
 explicitly. The debugger-neutral JSON produced by `resymbol export --format json` is a different
 artifact with its own schema version; its current projection is schema 6.
 
@@ -61,7 +61,7 @@ the bytes it names. ReSymbol fully validates the package, canonicalizes and read
 and requires its exact size and SHA-256 to match before emitting inspection output to stdout.
 Failures report on stderr. A successful human summary includes
 `source binary: <canonical-path>` and `identity gate: matched`. With `--json`, stdout stays pure
-package JSON and omits both status lines. This gate applies to supported schemas 1 through 10 but
+package JSON and omits both status lines. This gate applies to supported schemas 1 through 11 but
 performs no reanalysis, legacy-result reconstruction, or rewrite of either input.
 
 A package must not be applied to a loaded program until its SHA-256 identity has been compared with
@@ -106,11 +106,14 @@ discovery; its existing calls and thunks remain available, but loading cannot ad
 Schema 6 records that closure but predates TLS callback discovery and callback-based thunk seeding.
 Schema 7 records TLS callbacks but predates modern PE32+ delay-import recovery. Schema 8 records
 delay imports but predates load-config GuardCF recovery. Schema 9 records GuardCF functions but
-predates the Guard address-taken IAT, long-jump, and EH-continuation inventories. The TLS callback result family is therefore
+predates the Guard address-taken IAT, long-jump, and EH-continuation inventories. Schema 10 records
+those inventories but predates checked security-cookie and GuardCF check/dispatch pointer-slot
+anchors. The TLS callback result family is therefore
 reported as unavailable for every schema 1-through-6 package, delay imports are unavailable for
 schemas 1 through 7, and GuardCF recovery is unavailable for schemas 1 through 8. Modern Guard
-target inventories are unavailable for schemas 1 through 9. Reanalyze the exact original executable
-to create a schema 10 package with all current recovery results. The
+target inventories are unavailable for schemas 1 through 9, and load-config security anchors are
+unavailable for schemas 1 through 10. Reanalyze the exact original executable
+to create a schema 11 package with all current recovery results. The
 compatibility reader explicitly
 rejects a schema 2 or 3 envelope whose base
 analysis, base graph, or plugin claims contain a schema-4 `function-pointer` target. It also rejects
@@ -120,19 +123,21 @@ post-schema-1 control-flow record; schemas 2 through 5 explicitly reject a deter
 source valid only through schema-6 transitive endpoint seeding. Changing only the envelope label is
 not migration. Schemas 1 through 6 also reject schema-7 TLS callback state and callback-only base
 thunk seeds. Schemas 1 through 7 reject the exact schema-8 base-analysis `delay_imports` inventory
-key and `directories.delay_imports` directory key. Schemas 8 through 10 reject a payload missing
+key and `directories.delay_imports` directory key. Schemas 8 through 11 reject a payload missing
 that explicit delay-import inventory marker.
 Schemas 1 through 8 reject schema-9 `load_config_size`, `guard_flags`,
 `guard_cf_function_table_rva`, and `guard_cf_functions` fields, the `directories.load_config` key,
-and core `pe-guard-cf-function` claims. Schemas 9 and 10 reject a payload missing the explicit
+and core `pe-guard-cf-function` claims. Schemas 9 through 11 reject a payload missing the explicit
 `guard_cf_functions` inventory marker, including when the correct inventory is empty.
 Schemas 1 through 9 reject schema-10 Guard address-taken IAT, long-jump, and EH-continuation table
-RVA or inventory fields. Schema 10 rejects a payload missing any of its explicit
+RVA or inventory fields. Schemas 10 and 11 reject a payload missing any of the explicit
 `guard_address_taken_iat_entries`, `guard_long_jump_targets`, or
 `guard_eh_continuation_targets` markers, including when the inventories are empty.
+Schemas 1 through 10 reject the schema-11 `load_config_security_anchors` base-analysis key. Schema
+11 requires that value to be an object, including `{}` when all three anchors are absent.
 Plugin-supplied exact thunk claims remain independent of the built-in base-analysis seed invariant.
 `inspect --json`, with or without the optional binary gate, emits only package JSON. For every
-legacy schema 1 through 9 it preserves the validated original representation rather than placing
+legacy schema 1 through 10 it preserves the validated original representation rather than placing
 the migrated current payload beneath a legacy schema label.
 
 ## Current `AnalysisSession` payload
@@ -161,20 +166,26 @@ The base analysis includes:
   TLS-directory, and load-config records;
 - a separate ordered delay-import inventory retaining the DLL name, descriptor RVA and exact
   attributes value, name/HMOD/IAT/INT base RVAs, optional BIAT/UIAT base RVAs, per-entry lookup/IAT
-  RVAs and hints/names or ordinals, and the timestamp, but not raw array contents; schemas 8 through 10
+  RVAs and hints/names or ordinals, and the timestamp, but not raw array contents; schemas 8 through 11
   always serialize this inventory, including an empty array, as an explicit compatibility marker;
 - x64 `RUNTIME_FUNCTION` entries as evidence-backed candidate function boundaries;
 - up to 4,096 ordered PE32+ TLS callback entries with duplicates preserved, their callback-table
   RVA, and an independent partial-scan flag;
 - PE32+ load-config state as `directories.load_config {rva,size}`, optional `load_config_size`,
   optional `guard_flags`, optional checked `guard_cf_function_table_rva`, and the ordered
-  `guard_cf_functions` records `{table_index,rva,metadata}`; schemas 9 and 10 always serialize that array,
+  `guard_cf_functions` records `{table_index,rva,metadata}`; schemas 9 through 11 always serialize that array,
   including when empty, as an explicit compatibility marker. Its length is the retained count;
   neither a separate count nor raw GFIDS table bytes are serialized;
 - optional checked table RVAs and ordered schema-10 inventories for Guard address-taken IAT entries
   `{table_index,iat_rva,metadata}`, long-jump targets `{table_index,target_rva,metadata}`, and
-  EH-continuation targets `{table_index,target_rva,metadata}`. Schema 10 always serializes all three arrays,
+  EH-continuation targets `{table_index,target_rva,metadata}`. Schemas 10 and 11 always serialize all three arrays,
   including when empty; array length is the retained count and raw table bytes are not serialized;
+- a schema-11 `load_config_security_anchors` object with optional checked
+  `security_cookie_rva`, `guard_cf_check_function_pointer_rva`, and
+  `guard_cf_dispatch_function_pointer_rva` fields. The object is always serialized, even as `{}`;
+  each nonzero preferred-image VA becomes an eight-byte storage RVA wholly inside one mapped
+  section and disjoint from the load-config directory and other anchors. Slot contents are not
+  dereferenced or serialized, and the anchors add no claims or thunk seeds;
 - bounded direct-call records with explicit internal-function, exact parsed import-IAT, or read-only
   function-pointer targets; one-instruction thunks may likewise target internal functions, exact
   parsed import-IAT slots, or read-only function-pointer slots, with a persisted partial-scan flag;
@@ -516,7 +527,7 @@ inspection of the exact original PE. It emits deterministic, bounded, pure-Rust 
 containing selected public function and global names and verbatim section headers. Same-RVA
 function/global collisions prefer the function; unnamed functions do not suppress globals. The
 writer does not synthesize private symbols, compilands, source lines, locals, prototypes, function
-extents, or type records, and it does not add fields to package schema 10 or neutral projection
+extents, or type records, and it does not add fields to package schema 11 or neutral projection
 schema 6. Generating the file requires no separately installed Visual Studio, DIA, LLVM, or
 compiler toolchain; Windows compatibility CI validates it with native and DIA-backed
 `llvm-pdbutil` reads and a direct DIA identity/public-symbol probe.

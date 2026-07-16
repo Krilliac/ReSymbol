@@ -1,9 +1,9 @@
 use resymbol_analysis::{
     AnalysisError, AnalysisSession, BinaryAnalysis, ImportTarget, PeControlFlowTarget,
     PeDataReference, PeDirectCall, PeGuardAddressTakenIatEntry, PeGuardCfFunction,
-    PeGuardEhContinuationTarget, PeGuardLongJumpTarget, PeRecoveredString, PeStringEncoding,
-    PeThunk, PeTlsCallback, PluginRunRecord, PluginRunStatus, SessionValidationError,
-    analyze_bytes, analyze_pe,
+    PeGuardEhContinuationTarget, PeGuardLongJumpTarget, PeLoadConfigSecurityAnchors,
+    PeRecoveredString, PeStringEncoding, PeThunk, PeTlsCallback, PluginRunRecord, PluginRunStatus,
+    SessionValidationError, analyze_bytes, analyze_pe,
 };
 use resymbol_core::{
     BinaryId, ClaimProducer, ClaimProvenance, Confidence, ControlFlowTarget, Evidence,
@@ -22,6 +22,9 @@ const TLS_DIRECTORY_RVA: u32 = 0x1380;
 const TLS_CALLBACK_TABLE_RVA: u32 = 0x13c0;
 const TLS_CALLBACK_LIMIT: usize = 4_096;
 const LOAD_CONFIG_DIRECTORY_RVA: u32 = 0x1380;
+const LOAD_CONFIG_SECURITY_COOKIE_FIELDS_SIZE: u32 = 96;
+const LOAD_CONFIG_GUARD_CF_CHECK_POINTER_FIELDS_SIZE: u32 = 120;
+const LOAD_CONFIG_GUARD_CF_DISPATCH_POINTER_FIELDS_SIZE: u32 = 128;
 const LOAD_CONFIG_GUARD_FIELDS_SIZE: u32 = 148;
 const LOAD_CONFIG_GUARD_ADDRESS_TAKEN_IAT_FIELDS_SIZE: u32 = 176;
 const LOAD_CONFIG_GUARD_LONG_JUMP_FIELDS_SIZE: u32 = 192;
@@ -31,6 +34,9 @@ const EXTENDED_GUARD_CF_FUNCTION_TABLE_RVA: u32 = 0x14a0;
 const GUARD_ADDRESS_TAKEN_IAT_TABLE_RVA: u32 = 0x14c0;
 const GUARD_LONG_JUMP_TARGET_TABLE_RVA: u32 = 0x14e0;
 const GUARD_EH_CONTINUATION_TABLE_RVA: u32 = 0x1500;
+const SECURITY_COOKIE_RVA: u32 = 0x1520;
+const GUARD_CF_CHECK_FUNCTION_POINTER_RVA: u32 = 0x1528;
+const GUARD_CF_DISPATCH_FUNCTION_POINTER_RVA: u32 = 0x1530;
 const GUARD_CF_FUNCTION_LIMIT: u64 = 262_144;
 const IMAGE_GUARD_CF_FUNCTION_TABLE_PRESENT: u32 = 0x0000_0400;
 const IMAGE_GUARD_CF_EXPORT_SUPPRESSION_INFO_PRESENT: u32 = 0x0000_4000;
@@ -438,6 +444,39 @@ fn set_guard_cf_load_config(
     put_u64(bytes, load_config + 128, table_va);
     put_u64(bytes, load_config + 136, function_count);
     put_u32(bytes, load_config + 144, guard_flags);
+}
+
+fn set_load_config_security_anchors(
+    bytes: &mut [u8],
+    directory_size: u32,
+    load_config_size: u32,
+    security_cookie_va: u64,
+    guard_cf_check_function_pointer_va: u64,
+    guard_cf_dispatch_function_pointer_va: u64,
+) {
+    set_directory(bytes, 10, LOAD_CONFIG_DIRECTORY_RVA, directory_size);
+    let load_config = file_offset(LOAD_CONFIG_DIRECTORY_RVA);
+    put_u32(bytes, load_config, load_config_size);
+    put_u64(bytes, load_config + 88, security_cookie_va);
+    put_u64(bytes, load_config + 112, guard_cf_check_function_pointer_va);
+    put_u64(
+        bytes,
+        load_config + 120,
+        guard_cf_dispatch_function_pointer_va,
+    );
+}
+
+fn load_config_security_anchor_fixture() -> Vec<u8> {
+    let mut bytes = fixture();
+    set_load_config_security_anchors(
+        &mut bytes,
+        LOAD_CONFIG_GUARD_CF_DISPATCH_POINTER_FIELDS_SIZE,
+        LOAD_CONFIG_GUARD_CF_DISPATCH_POINTER_FIELDS_SIZE,
+        IMAGE_BASE + u64::from(SECURITY_COOKIE_RVA),
+        IMAGE_BASE + u64::from(GUARD_CF_CHECK_FUNCTION_POINTER_RVA),
+        IMAGE_BASE + u64::from(GUARD_CF_DISPATCH_FUNCTION_POINTER_RVA),
+    );
+    bytes
 }
 
 fn write_guard_cf_records<const N: usize>(
@@ -1412,6 +1451,7 @@ fn analyzes_minimal_pe_with_imports_exports_and_runtime_functions() {
     assert_eq!(analysis.runtime_functions[0].end_rva, 0x1020);
     assert_eq!(analysis.directories.load_config, None);
     assert_eq!(analysis.load_config_size, None);
+    assert!(analysis.load_config_security_anchors.is_empty());
     assert_eq!(analysis.guard_flags, None);
     assert_eq!(analysis.guard_cf_function_table_rva, None);
     assert!(analysis.guard_cf_functions.is_empty());
@@ -2268,6 +2308,297 @@ fn rejects_unsorted_and_duplicate_guard_cf_function_rvas() {
             "{label}: {error}"
         );
     }
+}
+
+#[test]
+fn recovers_load_config_security_anchors_without_inventing_control_flow_evidence() {
+    let baseline = analyze_pe(&fixture()).expect("valid baseline fixture");
+    let analysis = analyze_pe(&load_config_security_anchor_fixture())
+        .expect("valid load-config security anchors");
+
+    assert_eq!(
+        analysis.load_config_size,
+        Some(LOAD_CONFIG_GUARD_CF_DISPATCH_POINTER_FIELDS_SIZE)
+    );
+    assert_eq!(
+        analysis.load_config_security_anchors,
+        PeLoadConfigSecurityAnchors {
+            security_cookie_rva: Some(SECURITY_COOKIE_RVA),
+            guard_cf_check_function_pointer_rva: Some(GUARD_CF_CHECK_FUNCTION_POINTER_RVA),
+            guard_cf_dispatch_function_pointer_rva: Some(GUARD_CF_DISPATCH_FUNCTION_POINTER_RVA),
+        }
+    );
+    assert_eq!(analysis.guard_flags, None);
+    assert_eq!(
+        analysis.symbol_graph.claims().len(),
+        baseline.symbol_graph.claims().len()
+    );
+    assert_eq!(analysis.thunks.len(), baseline.thunks.len());
+
+    let encoded = serde_json::to_string(&analysis).expect("serialize security anchors");
+    assert!(encoded.contains("\"load_config_security_anchors\""));
+    let decoded: resymbol_analysis::PeAnalysis =
+        serde_json::from_str(&encoded).expect("deserialize security anchors");
+    assert_eq!(decoded, analysis);
+}
+
+#[test]
+fn respects_each_load_config_security_anchor_size_boundary() {
+    for (load_config_size, expected) in [
+        (
+            LOAD_CONFIG_SECURITY_COOKIE_FIELDS_SIZE - 1,
+            PeLoadConfigSecurityAnchors::default(),
+        ),
+        (
+            LOAD_CONFIG_SECURITY_COOKIE_FIELDS_SIZE,
+            PeLoadConfigSecurityAnchors {
+                security_cookie_rva: Some(SECURITY_COOKIE_RVA),
+                ..PeLoadConfigSecurityAnchors::default()
+            },
+        ),
+        (
+            LOAD_CONFIG_GUARD_CF_CHECK_POINTER_FIELDS_SIZE - 1,
+            PeLoadConfigSecurityAnchors {
+                security_cookie_rva: Some(SECURITY_COOKIE_RVA),
+                ..PeLoadConfigSecurityAnchors::default()
+            },
+        ),
+        (
+            LOAD_CONFIG_GUARD_CF_CHECK_POINTER_FIELDS_SIZE,
+            PeLoadConfigSecurityAnchors {
+                security_cookie_rva: Some(SECURITY_COOKIE_RVA),
+                guard_cf_check_function_pointer_rva: Some(GUARD_CF_CHECK_FUNCTION_POINTER_RVA),
+                ..PeLoadConfigSecurityAnchors::default()
+            },
+        ),
+        (
+            LOAD_CONFIG_GUARD_CF_DISPATCH_POINTER_FIELDS_SIZE - 1,
+            PeLoadConfigSecurityAnchors {
+                security_cookie_rva: Some(SECURITY_COOKIE_RVA),
+                guard_cf_check_function_pointer_rva: Some(GUARD_CF_CHECK_FUNCTION_POINTER_RVA),
+                ..PeLoadConfigSecurityAnchors::default()
+            },
+        ),
+        (
+            LOAD_CONFIG_GUARD_CF_DISPATCH_POINTER_FIELDS_SIZE,
+            PeLoadConfigSecurityAnchors {
+                security_cookie_rva: Some(SECURITY_COOKIE_RVA),
+                guard_cf_check_function_pointer_rva: Some(GUARD_CF_CHECK_FUNCTION_POINTER_RVA),
+                guard_cf_dispatch_function_pointer_rva: Some(
+                    GUARD_CF_DISPATCH_FUNCTION_POINTER_RVA,
+                ),
+            },
+        ),
+    ] {
+        let mut bytes = fixture();
+        set_load_config_security_anchors(
+            &mut bytes,
+            LOAD_CONFIG_GUARD_CF_DISPATCH_POINTER_FIELDS_SIZE,
+            load_config_size,
+            IMAGE_BASE + u64::from(SECURITY_COOKIE_RVA),
+            IMAGE_BASE + u64::from(GUARD_CF_CHECK_FUNCTION_POINTER_RVA),
+            IMAGE_BASE + u64::from(GUARD_CF_DISPATCH_FUNCTION_POINTER_RVA),
+        );
+        let analysis =
+            analyze_pe(&bytes).expect("bytes past the declared load-config size remain opaque");
+        assert_eq!(analysis.load_config_security_anchors, expected);
+        assert_eq!(analysis.guard_flags, None);
+    }
+}
+
+#[test]
+fn rejects_invalid_load_config_security_anchor_vas_and_layouts() {
+    for (label, field, security_cookie_va, check_va, dispatch_va, expected_reason) in [
+        (
+            "below image base",
+            "SecurityCookie",
+            IMAGE_BASE - 1,
+            0,
+            0,
+            "below preferred image base",
+        ),
+        (
+            "outside image",
+            "GuardCFDispatchFunctionPointer",
+            0,
+            0,
+            IMAGE_BASE + 0x2000,
+            "outside the declared image",
+        ),
+        (
+            "header anchor",
+            "security cookie",
+            IMAGE_BASE + 0x100,
+            0,
+            0,
+            "within one mapped section",
+        ),
+        (
+            "crosses section end",
+            "security cookie",
+            IMAGE_BASE + 0x15fc,
+            0,
+            0,
+            "within one mapped section",
+        ),
+        (
+            "overlaps load config",
+            "security cookie",
+            IMAGE_BASE + u64::from(LOAD_CONFIG_DIRECTORY_RVA),
+            0,
+            0,
+            "overlaps the declared load-config directory",
+        ),
+    ] {
+        let mut bytes = fixture();
+        set_load_config_security_anchors(
+            &mut bytes,
+            LOAD_CONFIG_GUARD_CF_DISPATCH_POINTER_FIELDS_SIZE,
+            LOAD_CONFIG_GUARD_CF_DISPATCH_POINTER_FIELDS_SIZE,
+            security_cookie_va,
+            check_va,
+            dispatch_va,
+        );
+        let error = analyze_pe(&bytes).expect_err("invalid security anchor must be rejected");
+        assert!(
+            matches!(
+                &error,
+                AnalysisError::InvalidField {
+                    field: actual_field,
+                    reason,
+                } if *actual_field == field && reason.contains(expected_reason)
+            ),
+            "{label}: {error}"
+        );
+    }
+
+    let mut pairwise_overlap = fixture();
+    set_load_config_security_anchors(
+        &mut pairwise_overlap,
+        LOAD_CONFIG_GUARD_CF_DISPATCH_POINTER_FIELDS_SIZE,
+        LOAD_CONFIG_GUARD_CF_DISPATCH_POINTER_FIELDS_SIZE,
+        IMAGE_BASE + u64::from(SECURITY_COOKIE_RVA),
+        IMAGE_BASE + u64::from(SECURITY_COOKIE_RVA + 4),
+        0,
+    );
+    let error = analyze_pe(&pairwise_overlap)
+        .expect_err("security-anchor storage ranges must be pairwise disjoint");
+    assert!(matches!(
+        error,
+        AnalysisError::InvalidField {
+            field: "load-config security anchors",
+            reason,
+        } if reason.contains("security cookie overlaps GuardCF check-function pointer slot")
+    ));
+
+    let mut virtual_tail = fixture();
+    put_u32(&mut virtual_tail, SECTION_OFFSET + 8, 0x800);
+    set_load_config_security_anchors(
+        &mut virtual_tail,
+        LOAD_CONFIG_SECURITY_COOKIE_FIELDS_SIZE,
+        LOAD_CONFIG_SECURITY_COOKIE_FIELDS_SIZE,
+        IMAGE_BASE + 0x17f8,
+        0,
+        0,
+    );
+    let analysis = analyze_pe(&virtual_tail)
+        .expect("an eight-byte anchor may live wholly inside a mapped zero-fill tail");
+    assert_eq!(
+        analysis.load_config_security_anchors.security_cookie_rva,
+        Some(0x17f8)
+    );
+}
+
+#[test]
+fn validated_deserialization_rejects_tampered_load_config_security_anchors() {
+    let analysis = analyze_pe(&load_config_security_anchor_fixture())
+        .expect("valid load-config security anchors");
+    let original = serde_json::to_value(analysis).expect("serialize security anchors");
+
+    let mut legacy_absence = original.clone();
+    legacy_absence
+        .as_object_mut()
+        .expect("analysis object")
+        .remove("load_config_security_anchors");
+    let decoded: resymbol_analysis::PeAnalysis = serde_json::from_value(legacy_absence)
+        .expect("legacy analyses default the security-anchor object to empty");
+    assert!(decoded.load_config_security_anchors.is_empty());
+
+    for (field, shortened_size, expected_field) in [
+        (
+            "security_cookie_rva",
+            LOAD_CONFIG_SECURITY_COOKIE_FIELDS_SIZE - 1,
+            "security cookie",
+        ),
+        (
+            "guard_cf_check_function_pointer_rva",
+            LOAD_CONFIG_GUARD_CF_CHECK_POINTER_FIELDS_SIZE - 1,
+            "GuardCF check-function pointer slot",
+        ),
+        (
+            "guard_cf_dispatch_function_pointer_rva",
+            LOAD_CONFIG_GUARD_CF_DISPATCH_POINTER_FIELDS_SIZE - 1,
+            "GuardCF dispatch-function pointer slot",
+        ),
+    ] {
+        let mut shortened = original.clone();
+        shortened["load_config_size"] = serde_json::json!(shortened_size);
+        for other_field in [
+            "security_cookie_rva",
+            "guard_cf_check_function_pointer_rva",
+            "guard_cf_dispatch_function_pointer_rva",
+        ] {
+            if other_field != field {
+                shortened["load_config_security_anchors"]
+                    .as_object_mut()
+                    .expect("security-anchor object")
+                    .remove(other_field);
+            }
+        }
+        let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(shortened)
+            .expect_err("retained anchor requires its load-config structure prefix");
+        assert!(
+            error.to_string().contains(expected_field),
+            "{field}: {error}"
+        );
+    }
+
+    let mut missing_directory = original.clone();
+    missing_directory["directories"]["load_config"] = serde_json::Value::Null;
+    missing_directory["load_config_size"] = serde_json::Value::Null;
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(missing_directory)
+        .expect_err("security-anchor state cannot outlive its load-config directory");
+    assert!(error.to_string().contains("load-config security anchors"));
+
+    let mut header_anchor = original.clone();
+    header_anchor["load_config_security_anchors"]["security_cookie_rva"] = serde_json::json!(0x100);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(header_anchor)
+        .expect_err("persisted anchors remain mapped into one section");
+    assert!(error.to_string().contains("within one mapped section"));
+
+    let mut directory_overlap = original.clone();
+    directory_overlap["load_config_security_anchors"]["security_cookie_rva"] =
+        serde_json::json!(LOAD_CONFIG_DIRECTORY_RVA);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(directory_overlap)
+        .expect_err("persisted anchors remain disjoint from the load-config directory");
+    assert!(
+        error
+            .to_string()
+            .contains("overlaps the declared load-config")
+    );
+
+    let mut pairwise_overlap = original.clone();
+    pairwise_overlap["load_config_security_anchors"]["guard_cf_check_function_pointer_rva"] =
+        serde_json::json!(SECURITY_COOKIE_RVA);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(pairwise_overlap)
+        .expect_err("persisted security-anchor ranges remain pairwise disjoint");
+    assert!(error.to_string().contains("security cookie overlaps"));
+
+    let mut unknown_inner_field = original;
+    unknown_inner_field["load_config_security_anchors"]["unexpected"] = serde_json::json!(1);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(unknown_inner_field)
+        .expect_err("unknown fields inside the security-anchor marker are rejected");
+    assert!(error.to_string().contains("unknown field"));
 }
 
 #[test]
