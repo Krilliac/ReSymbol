@@ -13,7 +13,10 @@ use resymbol_analysis::{
 use resymbol_core::BinaryId;
 use thiserror::Error;
 
-use crate::{ExportBinaryFormat, ExportProjection, ProjectionValidationError};
+use crate::{
+    ExportBinaryFormat, ExportProjection, ProjectionValidationError,
+    selection::{SelectedPublicSymbol, collect_public_symbols, public_symbol_candidate_count},
+};
 
 mod msf;
 mod streams;
@@ -56,32 +59,6 @@ pub enum PdbError {
     LogicalStreamEncoding { reason: String },
     #[error("cannot encode the PDB MSF container: {reason}")]
     MsfEncoding { reason: String },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum SymbolKind {
-    Function,
-    Global,
-}
-
-impl SymbolKind {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Function => "function",
-            Self::Global => "global",
-        }
-    }
-
-    const fn is_function(self) -> bool {
-        matches!(self, Self::Function)
-    }
-}
-
-#[derive(Debug)]
-struct CandidateSymbol<'projection> {
-    rva: u64,
-    kind: SymbolKind,
-    name: &'projection str,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -131,19 +108,8 @@ pub fn render_pdb(
 
     // Enforce the cheap pre-allocation gate before deep validation or symbol
     // collection so an oversized hostile model cannot force writer growth.
-    let selected_count = projection
-        .functions
-        .iter()
-        .filter(|value| value.selected_name.is_some())
-        .count()
-        .checked_add(
-            projection
-                .globals
-                .iter()
-                .filter(|value| value.selected_name.is_some())
-                .count(),
-        )
-        .ok_or(PdbError::SymbolLimitExceeded {
+    let selected_count =
+        public_symbol_candidate_count(projection).ok_or(PdbError::SymbolLimitExceeded {
             limit: MAX_PDB_PUBLIC_SYMBOLS,
         })?;
     if selected_count > MAX_PDB_PUBLIC_SYMBOLS {
@@ -156,7 +122,13 @@ pub fn render_pdb(
     validate_projection_binding(analysis, projection)?;
     validate_source_binding(analysis, &source)?;
 
-    let candidates = collect_symbols(projection, selected_count)?;
+    let mut candidates = Vec::<SelectedPublicSymbol<'_>>::new();
+    candidates
+        .try_reserve_exact(selected_count)
+        .map_err(|_| PdbError::LogicalStreamEncoding {
+            reason: "memory allocation failed while planning public symbols".to_owned(),
+        })?;
+    collect_public_symbols(projection, &mut candidates);
     let mut publics = Vec::new();
     publics
         .try_reserve_exact(candidates.len())
@@ -167,12 +139,12 @@ pub fn render_pdb(
         let address = section_address(candidate.rva, &analysis.sections).ok_or_else(|| {
             PdbError::SymbolOutsideSections {
                 kind: candidate.kind.as_str(),
-                name: candidate.name.to_owned(),
+                name: candidate.output_name.to_owned(),
                 rva: candidate.rva,
             }
         })?;
         publics.push(PdbPublicSymbol {
-            name: candidate.name,
+            name: candidate.output_name,
             section: address.index,
             offset: address.offset,
             is_function: candidate.kind.is_function(),
@@ -283,45 +255,6 @@ fn read_u32(bytes: &[u8; 40], offset: usize) -> u32 {
             .try_into()
             .expect("fixed PE section-header field is four bytes"),
     )
-}
-
-fn collect_symbols(
-    projection: &ExportProjection,
-    selected_count: usize,
-) -> Result<Vec<CandidateSymbol<'_>>, PdbError> {
-    let mut values = Vec::new();
-    values
-        .try_reserve_exact(selected_count)
-        .map_err(|_| PdbError::LogicalStreamEncoding {
-            reason: "memory allocation failed while planning public symbols".to_owned(),
-        })?;
-    for function in &projection.functions {
-        if let Some(name) = &function.selected_name {
-            values.push(CandidateSymbol {
-                rva: function.rva,
-                kind: SymbolKind::Function,
-                name: &name.output_name,
-            });
-        }
-    }
-    for global in &projection.globals {
-        if let Some(name) = &global.selected_name {
-            values.push(CandidateSymbol {
-                rva: global.rva,
-                kind: SymbolKind::Global,
-                name: &name.output_name,
-            });
-        }
-    }
-    values.sort_unstable_by(|left, right| {
-        (left.rva, left.kind, left.name).cmp(&(right.rva, right.kind, right.name))
-    });
-
-    // Function candidates sort before globals and win only when they actually
-    // have a selected name. Equal-kind duplicate RVAs are already forbidden by
-    // projection validation.
-    values.dedup_by_key(|value| value.rva);
-    Ok(values)
 }
 
 fn section_address(rva: u64, sections: &[PeSection]) -> Option<SectionAddress> {

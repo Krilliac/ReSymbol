@@ -281,7 +281,9 @@ Ghidra Java import scripts. Markdown is presentation-only rather than a stable i
 JSON remains the machine-consumable artifact. New analyses write package schema 13, while export also
 accepts package schemas 1 through 12 through validated compatibility paths. The neutral projection is
 independently schema 6; MAP and PDB add no schema fields, and no exporter rewrites its source
-package. Projection schema 5 correlates exact or valid content-interior data-reference targets with
+package. Every target now has a deterministic bounded aggregate loss report with stable codes;
+the CLI summarizes it separately from neutral projection warnings and `--fail-on-loss` rejects
+either loss domain before rendering or publication. Projection schema 5 correlates exact or valid content-interior data-reference targets with
 retained strings while excluding NUL terminators and misaligned UTF-16LE interiors; projection
 schema 6 preserves function-pointer slot and resolved-target RVAs. TLS callback endpoints reuse its
 existing function-entry and thunk shapes, so no TLS-specific projection field is added. Delay-load
@@ -454,11 +456,12 @@ The MVP should be useful without AI, a network connection, Ghidra, or IDA.
 - MAP or simple public-symbol export (PE MAP implemented for selected named symbols)
 - Synthetic PDB export for validated public functions and globals (exact-RSDS public-symbol slice
   implemented)
-- Explicit lossy-export diagnostics
+- Explicit lossy-export diagnostics (implemented with bounded target reports and `--fail-on-loss`)
 
-The neutral projection already emits structured diagnostics for reductions such as unsupported
-assertions, name collisions, conflicting sizes, and overlapping ranges. Target-specific loss
-summaries and richer in-tool review remain part of this milestone. The first PE MAP writer is now a
+The neutral projection emits structured diagnostics for reductions such as unsupported assertions,
+name collisions, conflicting sizes, and overlapping ranges. Target-specific loss summaries are now
+implemented from the exact writer selection rules; richer in-tool review remains part of this
+milestone. The first PE MAP writer is now a
 separate `resymbol export` format, and the first synthetic PDB writer covers exact-RSDS public
 symbols. Richer MAP coverage, PDB private/type/line information, and interactive bridges remain
 planned.

@@ -3,7 +3,10 @@ use std::fmt::Write as _;
 use resymbol_analysis::{AnalysisSession, BinaryAnalysis, PeAnalysis, PeSection};
 use thiserror::Error;
 
-use crate::{ExportBinaryFormat, ExportProjection, ProjectionValidationError};
+use crate::{
+    ExportBinaryFormat, ExportProjection, ProjectionValidationError,
+    selection::{collect_public_symbols, public_symbol_candidate_count},
+};
 
 /// Maximum UTF-8 byte length accepted for the display module name in a MAP header.
 pub const MAX_MAP_MODULE_NAME_BYTES: usize = 255;
@@ -53,28 +56,6 @@ pub enum MapError {
     OutputLimitExceeded { limit: usize },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum SymbolKind {
-    Function,
-    Global,
-}
-
-impl SymbolKind {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Function => "function",
-            Self::Global => "global",
-        }
-    }
-}
-
-#[derive(Debug)]
-struct MapSymbol<'projection> {
-    rva: u64,
-    kind: SymbolKind,
-    name: &'projection str,
-}
-
 #[derive(Debug, Clone, Copy)]
 struct SectionAddress {
     index: usize,
@@ -121,19 +102,8 @@ pub fn render_map(
 
     // Count before deep projection validation so a deliberately oversized
     // package cannot force the writer to allocate or sort an unbounded row set.
-    let selected_count = projection
-        .functions
-        .iter()
-        .filter(|value| value.selected_name.is_some())
-        .count()
-        .checked_add(
-            projection
-                .globals
-                .iter()
-                .filter(|value| value.selected_name.is_some())
-                .count(),
-        )
-        .ok_or(MapError::SymbolLimitExceeded {
+    let selected_count =
+        public_symbol_candidate_count(projection).ok_or(MapError::SymbolLimitExceeded {
             limit: MAX_MAP_SYMBOLS,
         })?;
     enforce_symbol_limit(selected_count)?;
@@ -141,13 +111,14 @@ pub fn render_map(
     projection.validate()?;
     validate_projection_binding(analysis, projection)?;
 
-    let symbols = collect_symbols(projection);
+    let mut symbols = Vec::with_capacity(selected_count);
+    collect_public_symbols(projection, &mut symbols);
     let mut mapped_symbols = Vec::with_capacity(symbols.len());
     for symbol in symbols {
         let address = section_address(symbol.rva, &analysis.sections).ok_or_else(|| {
             MapError::SymbolOutsideSections {
                 kind: symbol.kind.as_str(),
-                name: symbol.name.to_owned(),
+                name: symbol.output_name.to_owned(),
                 rva: symbol.rva,
             }
         })?;
@@ -221,7 +192,7 @@ pub fn render_map(
             &mut output,
             format_args!(
                 " {:04x}:{:08x}       {:<26} {:016x}     <resymbol>\n",
-                address.index, address.offset, symbol.name, flat_address
+                address.index, address.offset, symbol.output_name, flat_address
             ),
         )?;
     }
@@ -287,37 +258,6 @@ fn validate_projection_binding(
         });
     }
     Ok(())
-}
-
-fn collect_symbols(projection: &ExportProjection) -> Vec<MapSymbol<'_>> {
-    let mut values = Vec::new();
-    for function in &projection.functions {
-        if let Some(name) = &function.selected_name {
-            values.push(MapSymbol {
-                rva: function.rva,
-                kind: SymbolKind::Function,
-                name: &name.output_name,
-            });
-        }
-    }
-    for global in &projection.globals {
-        if let Some(name) = &global.selected_name {
-            values.push(MapSymbol {
-                rva: global.rva,
-                kind: SymbolKind::Global,
-                name: &name.output_name,
-            });
-        }
-    }
-    values.sort_by(|left, right| {
-        (left.rva, left.kind, left.name).cmp(&(right.rva, right.kind, right.name))
-    });
-
-    // A function is ordered first and is the one retained for an address-kind
-    // collision. Equal-kind duplicate RVAs are already forbidden by projection
-    // validation.
-    values.dedup_by_key(|value| value.rva);
-    values
 }
 
 fn section_address(rva: u64, sections: &[PeSection]) -> Option<SectionAddress> {

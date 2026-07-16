@@ -24,8 +24,9 @@ use resymbol_core::{
     },
 };
 use resymbol_export::{
-    ExportProjection, MAX_MAP_MODULE_NAME_BYTES, render_ghidra_java, render_ida_python, render_map,
-    render_markdown, render_pdb, validate_ghidra_java_class_name,
+    ExportLossReport, ExportProjection, ExportTarget, MAX_MAP_MODULE_NAME_BYTES,
+    render_ghidra_java, render_ida_python, render_map, render_markdown, render_pdb,
+    validate_ghidra_java_class_name,
 };
 #[cfg(test)]
 use resymbol_package::read_file_bound;
@@ -140,6 +141,10 @@ struct ExportArgs {
         required_if_eq("format", "pdb")
     )]
     binary: Option<PathBuf>,
+
+    /// Reject before rendering or publishing if neutral warnings or target-specific loss exist.
+    #[arg(long)]
+    fail_on_loss: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -167,6 +172,17 @@ impl ExportFormat {
             Self::Pdb => "exact-RSDS public-symbol PDB",
             Self::IdaPython => "IDA Python",
             Self::GhidraJava => "Ghidra Java",
+        }
+    }
+
+    const fn target(self) -> ExportTarget {
+        match self {
+            Self::Json => ExportTarget::Json,
+            Self::Markdown => ExportTarget::Markdown,
+            Self::Map => ExportTarget::Map,
+            Self::Pdb => ExportTarget::Pdb,
+            Self::IdaPython => ExportTarget::IdaPython,
+            Self::GhidraJava => ExportTarget::GhidraJava,
         }
     }
 }
@@ -1536,6 +1552,7 @@ fn export(args: ExportArgs) -> Result<()> {
         format,
         output,
         binary,
+        fail_on_loss,
     } = args;
     if format != ExportFormat::Pdb && binary.is_some() {
         bail!("--binary is accepted only with --format pdb");
@@ -1550,6 +1567,15 @@ fn export(args: ExportArgs) -> Result<()> {
         .with_context(|| format!("cannot read package {}", package_path.display()))?;
     let projection = ExportProjection::from_session(package_data.package.payload())
         .context("cannot build debugger export projection")?;
+    let warning_occurrences = projection
+        .warnings
+        .iter()
+        .map(|warning| u128::from(warning.occurrences))
+        .sum::<u128>();
+    let loss_report = ExportLossReport::for_projection(format.target(), &projection)
+        .context("cannot assess target-specific export loss")?;
+    let loss_occurrences = loss_report.occurrence_count();
+    enforce_export_loss_policy(fail_on_loss, warning_occurrences, loss_occurrences)?;
     let source_binary = if format == ExportFormat::Pdb {
         let binary = binary.context("--format pdb requires --binary <EXACT_ORIGINAL_PE>")?;
         let identity = package_data.package.payload().base_analysis().identity();
@@ -1604,11 +1630,6 @@ fn export(args: ExportArgs) -> Result<()> {
     };
     write_export_new(&output, &rendered)?;
 
-    let warning_occurrences = projection
-        .warnings
-        .iter()
-        .map(|warning| warning.occurrences)
-        .sum::<u64>();
     println!("package: {}", package_path.display());
     if let Some(source) = &source_binary {
         println!("source binary: {}", source.path().display());
@@ -1677,7 +1698,7 @@ fn export(args: ExportArgs) -> Result<()> {
         println!("{line}");
     }
     println!(
-        "warnings: {} group(s), {warning_occurrences} occurrence(s)",
+        "neutral warnings: {} group(s), {warning_occurrences} occurrence(s)",
         projection.warnings.len()
     );
     for warning in projection.warnings.iter().take(20) {
@@ -1698,6 +1719,18 @@ fn export(args: ExportArgs) -> Result<()> {
             projection.warnings.len() - 20
         );
     }
+    println!(
+        "target loss: {} item(s), {loss_occurrences} occurrence(s)",
+        loss_report.items().len()
+    );
+    for item in loss_report.items() {
+        println!(
+            "  {} x{}: {}",
+            item.code().as_str(),
+            item.occurrences(),
+            item.message()
+        );
+    }
     match format {
         ExportFormat::Json | ExportFormat::Markdown => println!(
             "identity binding: projection records the exact binary SHA-256; no debugger program was modified"
@@ -1713,6 +1746,19 @@ fn export(args: ExportArgs) -> Result<()> {
         ),
     }
 
+    Ok(())
+}
+
+fn enforce_export_loss_policy(
+    fail_on_loss: bool,
+    warning_occurrences: u128,
+    loss_occurrences: u64,
+) -> Result<()> {
+    if fail_on_loss && (warning_occurrences != 0 || loss_occurrences != 0) {
+        bail!(
+            "--fail-on-loss rejected export before rendering: neutral warnings: {warning_occurrences} occurrence(s); target loss: {loss_occurrences} occurrence(s)"
+        );
+    }
     Ok(())
 }
 
@@ -4226,6 +4272,7 @@ entrypoint = "Plugin.dll"
                 value,
                 "--output",
                 "symbols.out",
+                "--fail-on-loss",
             ])
             .expect("export arguments parse");
             let Command::Export(args) = cli.command else {
@@ -4235,6 +4282,7 @@ entrypoint = "Plugin.dll"
             assert_eq!(args.format, expected);
             assert_eq!(args.output, Some(PathBuf::from("symbols.out")));
             assert_eq!(args.binary, None);
+            assert!(args.fail_on_loss);
         }
 
         let error =
@@ -4260,6 +4308,20 @@ entrypoint = "Plugin.dll"
             panic!("export command expected");
         };
         assert_eq!(args.binary, Some(PathBuf::from("application.exe")));
+        assert!(!args.fail_on_loss);
+    }
+
+    #[test]
+    fn fail_on_loss_policy_checks_both_loss_domains() {
+        enforce_export_loss_policy(false, 7, 9).expect("policy disabled");
+        enforce_export_loss_policy(true, 0, 0).expect("lossless export");
+
+        let warning_error = enforce_export_loss_policy(true, 2, 0)
+            .expect_err("neutral warning must reject strict export");
+        assert!(warning_error.to_string().contains("neutral warnings: 2"));
+        let target_error = enforce_export_loss_policy(true, 0, 3)
+            .expect_err("target loss must reject strict export");
+        assert!(target_error.to_string().contains("target loss: 3"));
     }
 
     #[test]
@@ -4269,6 +4331,7 @@ entrypoint = "Plugin.dll"
             format: ExportFormat::Json,
             output: None,
             binary: Some(PathBuf::from("application.exe")),
+            fail_on_loss: false,
         })
         .expect_err("non-PDB export must not accept a misleading source binary");
         assert!(error.to_string().contains("only with --format pdb"));
@@ -5185,11 +5248,35 @@ entrypoint = "Plugin.dll"
         )
         .expect("analyze fixture");
 
+        let strict_output = temp.path().join("strict.map");
+        let error = export(ExportArgs {
+            package: package.clone(),
+            format: ExportFormat::Map,
+            output: Some(strict_output.clone()),
+            binary: None,
+            fail_on_loss: true,
+        })
+        .expect_err("lossy target must fail strict export");
+        assert!(error.to_string().contains("--fail-on-loss rejected export"));
+        assert!(error.to_string().contains("neutral warnings:"));
+        assert!(error.to_string().contains("target loss:"));
+        assert!(!strict_output.exists());
+        assert!(
+            fs::read_dir(temp.path())
+                .expect("read export directory")
+                .all(|entry| !entry
+                    .expect("read export directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".resymbol-export-"))
+        );
+
         export(ExportArgs {
             package: package.clone(),
             format: ExportFormat::Json,
             output: None,
             binary: None,
+            fail_on_loss: false,
         })
         .expect("export JSON");
         let json_path = package.with_extension("symbols.json");
@@ -5206,6 +5293,7 @@ entrypoint = "Plugin.dll"
             format: ExportFormat::Json,
             output: None,
             binary: None,
+            fail_on_loss: false,
         })
         .expect_err("existing export must not be overwritten");
         assert!(error.to_string().contains("refusing to overwrite"));
@@ -5219,6 +5307,7 @@ entrypoint = "Plugin.dll"
             format: ExportFormat::Markdown,
             output: None,
             binary: None,
+            fail_on_loss: false,
         })
         .expect("export Markdown report");
         let markdown_path = package.with_extension("symbols.md");
@@ -5231,6 +5320,7 @@ entrypoint = "Plugin.dll"
             format: ExportFormat::Markdown,
             output: None,
             binary: None,
+            fail_on_loss: false,
         })
         .expect_err("existing Markdown export must not be overwritten");
         assert!(error.to_string().contains("refusing to overwrite"));
@@ -5244,6 +5334,7 @@ entrypoint = "Plugin.dll"
             format: ExportFormat::Map,
             output: None,
             binary: None,
+            fail_on_loss: false,
         })
         .expect("export Microsoft-linker-style MAP");
         let map_path = package.with_extension("map");
@@ -5257,6 +5348,7 @@ entrypoint = "Plugin.dll"
             format: ExportFormat::Map,
             output: None,
             binary: None,
+            fail_on_loss: false,
         })
         .expect_err("existing MAP export must not be overwritten");
         assert!(error.to_string().contains("refusing to overwrite"));
@@ -5270,6 +5362,7 @@ entrypoint = "Plugin.dll"
             format: ExportFormat::Pdb,
             output: Some(temp.path().join("missing-source.pdb")),
             binary: None,
+            fail_on_loss: false,
         })
         .expect_err("PDB export requires the exact source PE");
         assert!(error.to_string().contains("requires --binary"));
@@ -5284,6 +5377,7 @@ entrypoint = "Plugin.dll"
             format: ExportFormat::Pdb,
             output: Some(mismatched_output.clone()),
             binary: Some(wrong_binary),
+            fail_on_loss: false,
         })
         .expect_err("PDB export binds the exact PE digest");
         assert!(format!("{error:#}").contains("SHA-256"));
@@ -5297,6 +5391,7 @@ entrypoint = "Plugin.dll"
             format: ExportFormat::Pdb,
             output: Some(short_output.clone()),
             binary: Some(short_binary),
+            fail_on_loss: false,
         })
         .expect_err("PDB export binds the exact PE size before rendering");
         assert!(format!("{error:#}").contains("project describes exactly"));
@@ -5307,6 +5402,7 @@ entrypoint = "Plugin.dll"
             format: ExportFormat::Pdb,
             output: None,
             binary: Some(binary.clone()),
+            fail_on_loss: false,
         })
         .expect("export exact-RSDS public-symbol PDB");
         let pdb_path = package.with_extension("pdb");
@@ -5319,6 +5415,7 @@ entrypoint = "Plugin.dll"
             format: ExportFormat::Pdb,
             output: None,
             binary: Some(binary.clone()),
+            fail_on_loss: false,
         })
         .expect_err("existing PDB export must not be overwritten");
         assert!(error.to_string().contains("refusing to overwrite"));
@@ -5332,6 +5429,7 @@ entrypoint = "Plugin.dll"
             format: ExportFormat::IdaPython,
             output: None,
             binary: None,
+            fail_on_loss: false,
         })
         .expect("export IDA script");
         let ida_script =
@@ -5344,6 +5442,7 @@ entrypoint = "Plugin.dll"
             format: ExportFormat::GhidraJava,
             output: None,
             binary: None,
+            fail_on_loss: false,
         })
         .expect("export Ghidra script");
         let ghidra_path = default_export_path(
@@ -6379,6 +6478,7 @@ entrypoint = "Plugin.dll"
             format: ExportFormat::Json,
             output: Some(output.clone()),
             binary: None,
+            fail_on_loss: false,
         })
         .expect("JSON export accepts schema 3");
         let projection: Value =
@@ -6482,6 +6582,7 @@ entrypoint = "Plugin.dll"
             format: ExportFormat::Json,
             output: Some(output.clone()),
             binary: None,
+            fail_on_loss: false,
         })
         .expect("JSON export accepts schema 4");
         let projection: Value =
@@ -6555,6 +6656,7 @@ entrypoint = "Plugin.dll"
             format: ExportFormat::Json,
             output: Some(output.clone()),
             binary: None,
+            fail_on_loss: false,
         })
         .expect("JSON export accepts schema 5");
         let projection: Value =
@@ -6650,6 +6752,7 @@ entrypoint = "Plugin.dll"
             format: ExportFormat::Json,
             output: Some(output.clone()),
             binary: None,
+            fail_on_loss: false,
         })
         .expect("JSON export accepts schema 6");
         let projection: Value =
@@ -6720,6 +6823,7 @@ entrypoint = "Plugin.dll"
             format: ExportFormat::Json,
             output: Some(output.clone()),
             binary: None,
+            fail_on_loss: false,
         })
         .expect("JSON export accepts schema 7");
         let projection: Value =
@@ -7704,6 +7808,7 @@ entrypoint = "Plugin.dll"
             format: ExportFormat::Json,
             output: Some(output.clone()),
             binary: None,
+            fail_on_loss: false,
         })
         .expect("JSON export accepts schema 11");
         let projection: Value =
@@ -7776,6 +7881,7 @@ entrypoint = "Plugin.dll"
             format: ExportFormat::Json,
             output: Some(output.clone()),
             binary: None,
+            fail_on_loss: false,
         })
         .expect("JSON export accepts schema 10");
         let projection: Value =
@@ -7845,6 +7951,7 @@ entrypoint = "Plugin.dll"
             format: ExportFormat::Json,
             output: Some(output.clone()),
             binary: None,
+            fail_on_loss: false,
         })
         .expect("JSON export accepts schema 9");
         let projection: Value =
@@ -7927,6 +8034,7 @@ entrypoint = "Plugin.dll"
             format: ExportFormat::Json,
             output: Some(output.clone()),
             binary: None,
+            fail_on_loss: false,
         })
         .expect("JSON export accepts schema 8");
         let projection: Value =
