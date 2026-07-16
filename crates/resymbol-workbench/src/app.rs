@@ -4422,7 +4422,7 @@ const fn panel_state(open: bool) -> &'static str {
 
 const fn decision_action_label(action: &DecisionAction) -> &'static str {
     match action {
-        DecisionAction::AcceptPrimary => "Accept",
+        DecisionAction::AcceptPrimary => "Accept Primary",
         DecisionAction::KeepAlias => "Keep as Alias",
         DecisionAction::Reject => "Reject",
         DecisionAction::Annotation { .. } => "Annotation",
