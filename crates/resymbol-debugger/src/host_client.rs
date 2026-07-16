@@ -8,10 +8,9 @@ use std::{marker::PhantomData, rc::Rc};
 use thiserror::Error;
 
 use crate::authorization::{HostRiskVerifier, SandboxOwnershipVerifier};
-use crate::host_codec::{
-    HostCodecError, HostFrame, decode_command_frame, decode_event_frame, encode_command_frame,
-    encode_event_frame,
-};
+use crate::host_codec::{HostCodecError, HostFrame, decode_event_frame, encode_command_frame};
+#[cfg(any(test, feature = "test-support"))]
+use crate::host_codec::{decode_command_frame, encode_event_frame};
 use crate::host_response::{
     DEFAULT_HOST_RESPONSE_LIMITS, HostResponseBatch, HostResponseBudgetError, HostResponseLimits,
     MAX_RESPONSE_FRAMES,
