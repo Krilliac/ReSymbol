@@ -34,7 +34,7 @@ durable review decisions and **Accept**/**Keep as Alias**/**Reject**, PDB/IDA/Gh
 docking, disassembly views, and an interactive debugger bridge remain planned. A portable Windows
 archive is the initial GUI packaging target; broader desktop packaging remains future validation.
 
-The CLI writes package schema 12 and can inspect or export schemas 1 through 11 through explicit
+The CLI writes package schema 13 and can inspect or export schemas 1 through 12 through explicit
 compatibility paths. Schema 1 is migrated in memory by revalidating persisted metadata and
 rebuilding the base graph; schema 2 already contains direct-call and thunk recovery, and schema 3
 adds string/data recovery. Schema 4 adds read-only pointer control flow but predates legacy 24-byte
@@ -43,8 +43,9 @@ thunk-chain discovery. Schema 6 adds that closure but predates TLS callback disc
 callback-based thunk seeding; schema 7 adds TLS callbacks but predates modern delay-import
 recovery; schema 8 adds delay imports but predates load-config GuardCF recovery; schema 9 adds
 GuardCF functions but predates the modern Guard target inventories; schema 10 adds those inventories
-but predates load-config security-anchor recovery; and schema 11 adds those earlier anchors but
-predates XFG/CastGuard storage-anchor recovery. Older packages
+but predates load-config security-anchor recovery; schema 11 adds those earlier anchors but
+predates XFG/CastGuard storage-anchor recovery; and schema 12 adds XFG/CastGuard anchors but
+predates the GuardMemcpy pointer-slot anchor. Older packages
 do not embed executable bytes, so compatibility loading
 cannot reconstruct results that were never recorded. Reanalyzing the exact original binary is
 required for transitive thunk chains in schemas 1 through 5, 24-byte descriptors in schemas 1
@@ -53,25 +54,26 @@ in schemas 1 and 2, TLS callbacks in schemas 1 through 6, delay imports in schem
 GuardCF functions in schemas 1 through 8, Guard address-taken IAT, long-jump, and EH-continuation
 inventories in schemas 1 through 9, load-config security-cookie and GuardCF check/dispatch
 pointer-slot anchors in schemas 1 through 10, XFG and CastGuard storage anchors in schemas 1 through
-11, and
+11, the GuardMemcpy pointer-slot anchor in schemas 1 through 12, and
 all code recovery when starting from
 schema 1. Relabeled schema-6-only
 transitive base-thunk sources are rejected under schema 1-through-5 envelopes; schemas 1 through 6
 also reject schema-7 TLS callback state and callback-only base thunk seeds. Schemas 1 through 7 also
 reject the exact schema-8 base-analysis `delay_imports` inventory key and
-`directories.delay_imports` directory key. Schemas 8 through 12 require that explicit inventory,
+`directories.delay_imports` directory key. Schemas 8 through 13 require that explicit inventory,
 even when empty.
 Schemas 1 through 8 reject schema-9 load-config/GuardCF fields,
-`directories.load_config`, and core `pe-guard-cf-function` claims; schemas 9 through 12 require an explicit
+`directories.load_config`, and core `pe-guard-cf-function` claims; schemas 9 through 13 require an explicit
 `guard_cf_functions` inventory even when empty.
-Schemas 1 through 9 reject schema-10 Guard target table-RVA and inventory fields; schemas 10 through 12 require
+Schemas 1 through 9 reject schema-10 Guard target table-RVA and inventory fields; schemas 10 through 13 require
 explicit address-taken IAT, long-jump, and EH-continuation inventory arrays even when empty.
 Schemas 1 through 10 reject the schema-11 `load_config_security_anchors` base-analysis object;
-schemas 11 and 12 require that object even when all three anchors are absent. Schemas 1 through 11
-reject schema-12 `load_config_xfg_anchors`; schema 12 requires that object even when all four anchors
-are absent.
+schemas 11 through 13 require that object even when all three anchors are absent. Schemas 1 through
+11 reject schema-12 `load_config_xfg_anchors`; schemas 12 and 13 require that object even when all
+four anchors are absent. Schemas 1 through 12 reject schema-13
+`load_config_guard_memcpy_anchor`; schema 13 requires that object even when the anchor is absent.
 
-For every supported package schema, 1 through 12, `resymbol inspect` can optionally accept the exact
+For every supported package schema, 1 through 13, `resymbol inspect` can optionally accept the exact
 original binary and require its size and SHA-256 to match before inspection data reaches stdout;
 failures report on stderr. Human inspection reports the canonical source path and a matched identity
 gate, while JSON remains pure package data. This is an identity check only: it does not rerun
@@ -139,6 +141,13 @@ nonzero preferred-image VAs become checked RVAs. Their full eight-byte ranges fo
 section, header exclusion, load-config disjointness, and mapped-zero-fill policy as the earlier
 anchors, and pairwise disjointness is enforced across both families. ReSymbol does not dereference
 initial values, impose permission requirements, emit claims, or add thunk seeds.
+
+The GuardMemcpy loader slot is now retained in its own always-present schema-13 object. At internal
+structure size 320, ReSymbol reads `GuardMemcpyFunctionPointer`; zero is absent and a nonzero
+preferred-image VA becomes the checked RVA of the full eight-byte loader-managed slot. The slot
+follows the same mapped-section, header exclusion, load-config disjointness, mapped-zero-fill, and
+cross-family pairwise-disjointness policy. ReSymbol does not inspect its initial contents, impose
+permission requirements, emit claims, or add thunk seeds.
 
 A bounded modern PE32+ delay-import slice is now implemented from optional-header data-directory
 entry 13. It accepts an ordered sequence of 32-byte descriptors followed by an all-zero terminator
@@ -253,8 +262,8 @@ The first export checkpoint is implemented as a validated, debugger-neutral proj
 deterministic JSON output, a bounded human-readable Markdown report, PE-only
 Microsoft-linker-style MAP text, an exact-RSDS public-symbol PDB, and standalone IDAPython and
 Ghidra Java import scripts. Markdown is presentation-only rather than a stable interchange schema;
-JSON remains the machine-consumable artifact. New analyses write package schema 12, while export also
-accepts package schemas 1 through 11 through validated compatibility paths. The neutral projection is
+JSON remains the machine-consumable artifact. New analyses write package schema 13, while export also
+accepts package schemas 1 through 12 through validated compatibility paths. The neutral projection is
 independently schema 6; MAP and PDB add no schema fields, and no exporter rewrites its source
 package. Projection schema 5 correlates exact or valid content-interior data-reference targets with
 retained strings while excluding NUL terminators and misaligned UTF-16LE interiors; projection
@@ -263,7 +272,7 @@ existing function-entry and thunk shapes, so no TLS-specific projection field is
 descriptor inventory remains package-only, while delay-IAT control flow reuses the existing import
 target with its slot RVA. GuardCF claims and supported seeded thunks reuse the existing shapes, so
 load-config/GFIDS inventory and suppression evidence remain package-only. The later Guard target
-inventories and both load-config storage-anchor families are also package-only and add no claims, so
+inventories and all three load-config storage-anchor families are also package-only and add no claims, so
 projection schema 6 is unchanged. The scripts
 bind to the exact loaded binary SHA-256, resolve addresses as loaded image base plus RVA, preserve
 user-authored names and existing function bodies, and continue past per-symbol application errors.
@@ -398,8 +407,8 @@ deterministic string-reference correlation, bounded dual-layout MSVC x64 RTTI/vf
 portable package, canonical package encoding, neutral JSON export projection, bounded Markdown
 report, initial MSVC fixture matrix, and related CLI
 portions are implemented. The unfinished parts of the bullets describe the remainder of this
-milestone. Broader load-config/security semantics, including `GuardMemcpyFunctionPointer`,
-`UmaFunctionPointers`, and architecture-specific SafeSEH metadata, remain planned, as do
+milestone. Broader load-config/security semantics, including `UmaFunctionPointers` and
+architecture-specific SafeSEH metadata, remain planned, as do
 names/extents/body recovery beyond the current evidence, broader constants and
 compilers, and resource/coverage benchmarks.
 

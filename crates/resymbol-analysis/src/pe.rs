@@ -15,8 +15,8 @@ use crate::{
     PeControlFlowTarget, PeDataDirectories, PeDataReference, PeDelayImportLibrary, PeDirectCall,
     PeExport, PeExportName, PeGuardAddressTakenIatEntry, PeGuardCfFunction,
     PeGuardEhContinuationTarget, PeGuardLongJumpTarget, PeImport, PeImportLibrary,
-    PeLoadConfigSecurityAnchors, PeLoadConfigXfgAnchors, PeRecoveredString, PeSection, PeThunk,
-    PeTlsCallback, RuntimeFunction,
+    PeLoadConfigGuardMemcpyAnchor, PeLoadConfigSecurityAnchors, PeLoadConfigXfgAnchors,
+    PeRecoveredString, PeSection, PeThunk, PeTlsCallback, RuntimeFunction,
     code_recovery::{
         CodeRecoveryInput, recover_code, validate_code_recovery, validate_data_references,
     },
@@ -70,6 +70,8 @@ const LOAD_CONFIG_GUARD_XFG_TABLE_DISPATCH_POINTER_FIELDS_SIZE_U32: u32 = 304;
 const LOAD_CONFIG_GUARD_XFG_TABLE_DISPATCH_POINTER_OFFSET: usize = 296;
 const LOAD_CONFIG_CAST_GUARD_FAILURE_MODE_FIELDS_SIZE_U32: u32 = 312;
 const LOAD_CONFIG_CAST_GUARD_FAILURE_MODE_OFFSET: usize = 304;
+const LOAD_CONFIG_GUARD_MEMCPY_POINTER_FIELDS_SIZE_U32: u32 = 320;
+const LOAD_CONFIG_GUARD_MEMCPY_POINTER_OFFSET: usize = 312;
 
 const MACHINE_AMD64: u16 = 0x8664;
 const OPTIONAL_MAGIC_PE32_PLUS: u16 = 0x020b;
@@ -239,6 +241,7 @@ struct ParsedLoadConfigMetadata {
     load_config_size: Option<u32>,
     security_anchors: PeLoadConfigSecurityAnchors,
     xfg_anchors: PeLoadConfigXfgAnchors,
+    guard_memcpy_anchor: PeLoadConfigGuardMemcpyAnchor,
     guard_flags: Option<u32>,
     function_table_rva: Option<u32>,
     functions: Vec<PeGuardCfFunction>,
@@ -329,6 +332,7 @@ pub fn analyze_pe(bytes: &[u8]) -> Result<PeAnalysis, AnalysisError> {
         load_config_size,
         security_anchors: load_config_security_anchors,
         xfg_anchors: load_config_xfg_anchors,
+        guard_memcpy_anchor: load_config_guard_memcpy_anchor,
         guard_flags,
         function_table_rva: guard_cf_function_table_rva,
         functions: guard_cf_functions,
@@ -421,6 +425,7 @@ pub fn analyze_pe(bytes: &[u8]) -> Result<PeAnalysis, AnalysisError> {
         load_config_size,
         load_config_security_anchors,
         load_config_xfg_anchors,
+        load_config_guard_memcpy_anchor,
         guard_flags,
         guard_cf_function_table_rva,
         guard_cf_functions,
@@ -1489,7 +1494,8 @@ fn validate_load_config_metadata(
     validate_guard_cf_functions(analysis)?;
 
     let has_security_anchor_state = !analysis.load_config_security_anchors.is_empty()
-        || !analysis.load_config_xfg_anchors.is_empty();
+        || !analysis.load_config_xfg_anchors.is_empty()
+        || !analysis.load_config_guard_memcpy_anchor.is_empty();
     let has_address_taken_iat_state = analysis.guard_address_taken_iat_entry_table_rva.is_some()
         || !analysis.guard_address_taken_iat_entries.is_empty();
     let has_long_jump_state = analysis.guard_long_jump_target_table_rva.is_some()
@@ -1652,6 +1658,7 @@ fn validate_load_config_anchors(
 ) -> Result<(), AnalysisError> {
     let anchors = &analysis.load_config_security_anchors;
     let xfg_anchors = &analysis.load_config_xfg_anchors;
+    let guard_memcpy_anchor = &analysis.load_config_guard_memcpy_anchor;
     if load_config_size < LOAD_CONFIG_SECURITY_COOKIE_FIELDS_SIZE_U32
         && anchors.security_cookie_rva.is_some()
     {
@@ -1714,8 +1721,24 @@ fn validate_load_config_anchors(
             "anchor state exists in a load-config structure too short to contain the CastGuardOsDeterminedFailureMode field",
         );
     }
+    if load_config_size < LOAD_CONFIG_GUARD_MEMCPY_POINTER_FIELDS_SIZE_U32
+        && guard_memcpy_anchor
+            .guard_memcpy_function_pointer_rva
+            .is_some()
+    {
+        return invalid_field(
+            "GuardMemcpy function-pointer slot",
+            "anchor state exists in a load-config structure too short to contain the GuardMemcpyFunctionPointer field",
+        );
+    }
 
-    validate_load_config_anchor_layout(anchors, xfg_anchors, directory, &analysis.sections)
+    validate_load_config_anchor_layout(
+        anchors,
+        xfg_anchors,
+        guard_memcpy_anchor,
+        directory,
+        &analysis.sections,
+    )
 }
 
 fn validate_guard_cf_functions(analysis: &PeAnalysis) -> Result<(), AnalysisError> {
@@ -3375,6 +3398,7 @@ fn parse_load_config_metadata(
         load_config_size: parsed_guard_cf.load_config_size,
         security_anchors: PeLoadConfigSecurityAnchors::default(),
         xfg_anchors: PeLoadConfigXfgAnchors::default(),
+        guard_memcpy_anchor: PeLoadConfigGuardMemcpyAnchor::default(),
         guard_flags: parsed_guard_cf.guard_flags,
         function_table_rva: parsed_guard_cf.function_table_rva,
         functions: parsed_guard_cf.functions,
@@ -3406,9 +3430,17 @@ fn parse_load_config_metadata(
         image_base,
         size_of_image,
     )?;
+    parsed.guard_memcpy_anchor = parse_load_config_guard_memcpy_anchor(
+        reader,
+        directory_offset,
+        load_config_size,
+        image_base,
+        size_of_image,
+    )?;
     validate_load_config_anchor_layout(
         &parsed.security_anchors,
         &parsed.xfg_anchors,
+        &parsed.guard_memcpy_anchor,
         directory,
         sections,
     )?;
@@ -3707,9 +3739,45 @@ fn parse_load_config_xfg_anchors(
     })
 }
 
+fn parse_load_config_guard_memcpy_anchor(
+    reader: &Reader<'_>,
+    directory_offset: usize,
+    load_config_size: u32,
+    image_base: u64,
+    size_of_image: u32,
+) -> Result<PeLoadConfigGuardMemcpyAnchor, AnalysisError> {
+    if load_config_size < LOAD_CONFIG_GUARD_MEMCPY_POINTER_FIELDS_SIZE_U32 {
+        return Ok(PeLoadConfigGuardMemcpyAnchor::default());
+    }
+
+    let field_va = reader.u64(
+        checked_add(
+            directory_offset,
+            LOAD_CONFIG_GUARD_MEMCPY_POINTER_OFFSET,
+            "GuardMemcpy function-pointer field offset",
+        )?,
+        "GuardMemcpyFunctionPointer",
+    )?;
+    let guard_memcpy_function_pointer_rva = if field_va == 0 {
+        None
+    } else {
+        Some(image_va_to_rva(
+            field_va,
+            image_base,
+            size_of_image,
+            "GuardMemcpyFunctionPointer",
+        )?)
+    };
+
+    Ok(PeLoadConfigGuardMemcpyAnchor {
+        guard_memcpy_function_pointer_rva,
+    })
+}
+
 fn validate_load_config_anchor_layout(
     anchors: &PeLoadConfigSecurityAnchors,
     xfg_anchors: &PeLoadConfigXfgAnchors,
+    guard_memcpy_anchor: &PeLoadConfigGuardMemcpyAnchor,
     directory: DataDirectory,
     sections: &[PeSection],
 ) -> Result<(), AnalysisError> {
@@ -3738,6 +3806,10 @@ fn validate_load_config_anchor_layout(
         (
             "CastGuard OS-determined failure-mode storage",
             xfg_anchors.cast_guard_os_determined_failure_mode_rva,
+        ),
+        (
+            "GuardMemcpy function-pointer slot",
+            guard_memcpy_anchor.guard_memcpy_function_pointer_rva,
         ),
     ];
 
