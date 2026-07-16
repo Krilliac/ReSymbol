@@ -6,7 +6,8 @@ use resymbol_core::{
 use resymbol_export::{
     ExportControlFlowTarget, ExportError, ExportProducer, ExportProjection, ExportStringEncoding,
     ExportSubject, MAX_CLASS_MEMBERSHIPS_PER_FUNCTION, MAX_DIRECT_CALLS, MAX_NAME_BYTES,
-    MAX_OUTPUT_NAME_BYTES, MAX_THUNKS, ProjectionValidationError, ProjectionWarningCode,
+    MAX_OUTPUT_NAME_BYTES, MAX_THUNKS, NameSelection, ProjectionValidationError,
+    ProjectionWarningCode,
 };
 
 fn binary() -> BinaryIdentity {
@@ -1783,6 +1784,84 @@ fn negative_zero_confidence_is_canonicalized() {
         .attribution
         .confidence;
     assert_eq!(confidence.to_bits(), 0.0_f64.to_bits());
+}
+
+#[test]
+fn alias_only_names_are_retained_but_never_selected() {
+    let symbol_graph = graph([
+        function_name(0x100, Some(0x20), "StrongAlias", 0.95, true),
+        function_name(0x100, Some(0x20), "EligiblePrimary", 0.20, false),
+    ]);
+    let projection = ExportProjection::from_symbol_graph_with_name_selections(
+        &binary(),
+        0x2_000,
+        &symbol_graph,
+        &[NameSelection::AliasOnly, NameSelection::PrimaryEligible],
+    )
+    .expect("alias-aware projection");
+    let function = &projection.functions[0];
+    assert_eq!(
+        function
+            .selected_name
+            .as_ref()
+            .expect("eligible primary")
+            .source
+            .text,
+        "EligiblePrimary"
+    );
+    assert_eq!(function.alternate_names.len(), 1);
+    assert_eq!(function.alternate_names[0].text, "StrongAlias");
+
+    let alias_only = graph([function_name(0x100, None, "OnlyAlias", 0.95, true)]);
+    let projection = ExportProjection::from_symbol_graph_with_name_selections(
+        &binary(),
+        0x2_000,
+        &alias_only,
+        &[NameSelection::AliasOnly],
+    )
+    .expect("sole alias projection");
+    assert!(projection.functions[0].selected_name.is_none());
+    assert_eq!(projection.functions[0].alternate_names[0].text, "OnlyAlias");
+}
+
+#[test]
+fn alias_only_duplicate_cannot_demote_an_independent_eligible_claim() {
+    let symbol_graph = graph([
+        function_name(0x100, None, "SameName", 0.95, true),
+        function_name(0x100, None, "SameName", 0.20, false),
+    ]);
+    let projection = ExportProjection::from_symbol_graph_with_name_selections(
+        &binary(),
+        0x2_000,
+        &symbol_graph,
+        &[NameSelection::AliasOnly, NameSelection::PrimaryEligible],
+    )
+    .expect("exact-role projection");
+    let function = &projection.functions[0];
+    let selected = function.selected_name.as_ref().expect("eligible duplicate");
+    assert_eq!(selected.source.text, "SameName");
+    assert_eq!(selected.source.attribution.confidence, 0.20);
+    assert!(function.alternate_names.is_empty());
+}
+
+#[test]
+fn alias_selection_metadata_is_positionally_strict() {
+    let names = graph([function_name(0x100, None, "Name", 0.80, true)]);
+    assert!(matches!(
+        ExportProjection::from_symbol_graph_with_name_selections(&binary(), 0x2_000, &names, &[]),
+        Err(ExportError::NameSelectionCountMismatch { .. })
+    ));
+
+    let non_name = graph([boundary(0x100, 0x20, 0.80, true, "boundary")]);
+    assert!(matches!(
+        ExportProjection::from_symbol_graph_with_name_selections(
+            &binary(),
+            0x2_000,
+            &non_name,
+            &[NameSelection::AliasOnly],
+        ),
+        Err(ExportError::AliasOnlyNonNameClaim { index: 0 })
+    ));
 }
 
 #[test]

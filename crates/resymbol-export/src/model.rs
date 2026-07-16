@@ -781,7 +781,11 @@ fn validate_entity_names(
     alternates: &[AttributedText],
     output_names: &mut BTreeSet<String>,
 ) -> Result<(), ProjectionValidationError> {
-    if alternates.len() >= MAX_NAMES_PER_ENTITY {
+    if alternates
+        .len()
+        .checked_add(usize::from(selected.is_some()))
+        .is_none_or(|count| count > MAX_NAMES_PER_ENTITY)
+    {
         return Err(ProjectionValidationError::CollectionLimit {
             collection: "alternate_names",
         });

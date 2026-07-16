@@ -28,7 +28,7 @@ use crate::{
 #[derive(Debug, Default)]
 struct AddressAccumulator<'claims> {
     entry_attribution: Option<ExportAttribution>,
-    names: BTreeMap<String, AttributedText>,
+    names: NameAccumulator,
     declarations: BTreeMap<String, AttributedText>,
     class_memberships: BTreeMap<String, AttributedText>,
     distinct_class_memberships: BTreeSet<&'claims str>,
@@ -41,8 +41,31 @@ type DataReferenceKey = (u64, u64);
 
 #[derive(Debug, Default)]
 struct TypeAccumulator {
-    names: BTreeMap<String, AttributedText>,
+    names: NameAccumulator,
     definitions: BTreeMap<String, AttributedText>,
+}
+
+/// Whether one exact name claim may become the selected debugger-facing name.
+///
+/// Alias-only claims remain represented and attributed, but cannot become the
+/// primary name even when no other name proposal exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameSelection {
+    /// The claim participates in deterministic primary-name selection.
+    PrimaryEligible,
+    /// The claim is retained only as an attributed alternate name.
+    AliasOnly,
+}
+
+#[derive(Debug, Default)]
+struct NameAccumulator {
+    values: BTreeMap<String, NameCandidates>,
+}
+
+#[derive(Debug, Default)]
+struct NameCandidates {
+    primary_eligible: Option<AttributedText>,
+    alias_only: Option<AttributedText>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -132,6 +155,43 @@ impl ExportProjection {
         image_size: u64,
         graph: &SymbolGraph,
     ) -> Result<Self, ExportError> {
+        Self::project_symbol_graph(binary, image_size, graph, None)
+    }
+
+    /// Project a graph while retaining exact alias-only name claims outside
+    /// primary-name selection.
+    ///
+    /// `name_selections` is positionally bound to `graph.claims()` and must
+    /// contain one entry per claim. `AliasOnly` is valid only for name claims.
+    pub fn from_symbol_graph_with_name_selections(
+        binary: &BinaryIdentity,
+        image_size: u64,
+        graph: &SymbolGraph,
+        name_selections: &[NameSelection],
+    ) -> Result<Self, ExportError> {
+        if name_selections.len() != graph.claims().len() {
+            return Err(ExportError::NameSelectionCountMismatch {
+                expected: graph.claims().len(),
+                found: name_selections.len(),
+            });
+        }
+        if let Some((index, _)) = graph.claims().iter().zip(name_selections).enumerate().find(
+            |(_, (claim, selection))| {
+                matches!(selection, NameSelection::AliasOnly)
+                    && !matches!(claim.assertion(), SymbolAssertion::Name { .. })
+            },
+        ) {
+            return Err(ExportError::AliasOnlyNonNameClaim { index });
+        }
+        Self::project_symbol_graph(binary, image_size, graph, Some(name_selections))
+    }
+
+    fn project_symbol_graph(
+        binary: &BinaryIdentity,
+        image_size: u64,
+        graph: &SymbolGraph,
+        name_selections: Option<&[NameSelection]>,
+    ) -> Result<Self, ExportError> {
         graph.validate().map_err(ExportError::InvalidGraph)?;
         if graph.binaries().len() != 1 {
             return Err(ExportError::UnexpectedBinaryCount {
@@ -173,9 +233,12 @@ impl ExportProjection {
         let mut entity_count = 0_usize;
         let mut warnings = WarningAccumulator::new();
 
-        for claim in graph.claims() {
+        for (index, claim) in graph.claims().iter().enumerate() {
+            let name_selection =
+                name_selections.map_or(NameSelection::PrimaryEligible, |values| values[index]);
             project_claim(
                 claim,
+                name_selection,
                 image_size,
                 &mut functions,
                 &mut globals,
@@ -259,6 +322,7 @@ impl ExportProjection {
             value.entry_attribution.is_some()
                 || value.size.is_some()
                 || value.selected_name.is_some()
+                || !value.alternate_names.is_empty()
                 || !value.prototypes.is_empty()
                 || !value.class_memberships.is_empty()
         });
@@ -287,6 +351,7 @@ impl ExportProjection {
 #[allow(clippy::too_many_arguments)]
 fn project_claim<'claims>(
     claim: &'claims SymbolClaim,
+    name_selection: NameSelection,
     image_size: u64,
     functions: &mut BTreeMap<u64, AddressAccumulator<'claims>>,
     globals: &mut BTreeMap<u64, AddressAccumulator<'claims>>,
@@ -372,6 +437,7 @@ fn project_claim<'claims>(
                     let value = address_entry(functions, *rva, entity_count)?;
                     let represented = project_address_assertion(
                         claim.assertion(),
+                        name_selection,
                         *size,
                         attribution.clone(),
                         value,
@@ -407,6 +473,7 @@ fn project_claim<'claims>(
             let value = address_entry(globals, *rva, entity_count)?;
             let _ = project_address_assertion(
                 claim.assertion(),
+                name_selection,
                 *size,
                 attribution,
                 value,
@@ -435,6 +502,7 @@ fn project_claim<'claims>(
             };
             project_type_assertion(
                 claim.assertion(),
+                name_selection,
                 attribution,
                 value,
                 type_subject.expect("validated type subject"),
@@ -712,6 +780,7 @@ fn control_flow_function_rva(target: &ExportControlFlowTarget) -> Option<u64> {
 
 fn project_address_assertion<'claims>(
     assertion: &'claims SymbolAssertion,
+    name_selection: NameSelection,
     subject_size: Option<u64>,
     attribution: ExportAttribution,
     value: &mut AddressAccumulator<'claims>,
@@ -722,13 +791,11 @@ fn project_address_assertion<'claims>(
     let represented = match assertion {
         SymbolAssertion::Name { name } => {
             let represented = valid_text(name, MAX_NAME_BYTES);
-            insert_text(
+            insert_name(
                 &mut value.names,
                 name,
-                MAX_NAME_BYTES,
                 attribution.clone(),
-                MAX_NAMES_PER_ENTITY,
-                "name candidate",
+                name_selection,
                 &subject,
                 warnings,
             )?;
@@ -810,19 +877,18 @@ fn project_address_assertion<'claims>(
 
 fn project_type_assertion(
     assertion: &SymbolAssertion,
+    name_selection: NameSelection,
     attribution: ExportAttribution,
     value: &mut TypeAccumulator,
     subject: ExportSubject,
     warnings: &mut WarningAccumulator,
 ) -> Result<(), ExportError> {
     match assertion {
-        SymbolAssertion::Name { name } => insert_text(
+        SymbolAssertion::Name { name } => insert_name(
             &mut value.names,
             name,
-            MAX_NAME_BYTES,
             attribution,
-            MAX_NAMES_PER_ENTITY,
-            "name candidate",
+            name_selection,
             &subject,
             warnings,
         ),
@@ -852,6 +918,42 @@ fn project_type_assertion(
         }
         _ => warnings.add(ProjectionWarningCode::UnsupportedAssertion, Some(subject)),
     }
+}
+
+fn insert_name(
+    values: &mut NameAccumulator,
+    text: &str,
+    attribution: ExportAttribution,
+    selection: NameSelection,
+    subject: &ExportSubject,
+    warnings: &mut WarningAccumulator,
+) -> Result<(), ExportError> {
+    if !valid_text(text, MAX_NAME_BYTES) {
+        warnings.add(text_warning(text, MAX_NAME_BYTES), Some(subject.clone()))?;
+        return Ok(());
+    }
+    if !values.values.contains_key(text) && values.values.len() == MAX_NAMES_PER_ENTITY {
+        return Err(ExportError::LimitExceeded {
+            resource: "name candidate",
+            limit: MAX_NAMES_PER_ENTITY,
+        });
+    }
+    let candidate = AttributedText {
+        text: text.to_owned(),
+        attribution,
+    };
+    let candidates = values.values.entry(text.to_owned()).or_default();
+    let current = match selection {
+        NameSelection::PrimaryEligible => &mut candidates.primary_eligible,
+        NameSelection::AliasOnly => &mut candidates.alias_only,
+    };
+    if current
+        .as_ref()
+        .is_none_or(|current| candidate_order(&candidate, current).is_lt())
+    {
+        *current = Some(candidate);
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1111,6 +1213,7 @@ fn finish_function(
     )?;
     if entry_attribution.is_none()
         && selected_name.is_none()
+        && alternate_names.is_empty()
         && size.is_none()
         && prototypes.is_empty()
         && class_memberships.is_empty()
@@ -1137,7 +1240,7 @@ fn finish_global(
     let (size, size_attribution) =
         finish_size(&value.sizes, ExportSubject::Global { rva }, warnings)?;
     let (selected_name, alternate_names) = finish_names(value.names);
-    if selected_name.is_none() && size.is_none() {
+    if selected_name.is_none() && alternate_names.is_empty() && size.is_none() {
         return Ok(None);
     }
     Ok(Some(ExportGlobal {
@@ -1152,7 +1255,7 @@ fn finish_global(
 fn finish_type(key: String, value: TypeAccumulator) -> Option<ExportType> {
     let (selected_name, alternate_names) = finish_names(value.names);
     let definitions = finish_texts(value.definitions);
-    if selected_name.is_none() && definitions.is_empty() {
+    if selected_name.is_none() && alternate_names.is_empty() && definitions.is_empty() {
         return None;
     }
     Some(ExportType {
@@ -1163,22 +1266,39 @@ fn finish_type(key: String, value: TypeAccumulator) -> Option<ExportType> {
     })
 }
 
-fn finish_names(
-    values: BTreeMap<String, AttributedText>,
-) -> (Option<ExportName>, Vec<AttributedText>) {
-    let mut values = finish_texts(values);
-    if values.is_empty() {
-        return (None, Vec::new());
+fn finish_names(values: NameAccumulator) -> (Option<ExportName>, Vec<AttributedText>) {
+    let mut eligible = values
+        .values
+        .values()
+        .filter_map(|candidates| candidates.primary_eligible.clone())
+        .collect::<Vec<_>>();
+    eligible.sort_by(candidate_order);
+    let selected = (!eligible.is_empty()).then(|| eligible.remove(0));
+    let selected_text = selected.as_ref().map(|value| value.text.as_str());
+
+    let mut alternates = BTreeMap::<String, AttributedText>::new();
+    for (text, candidates) in values.values {
+        if selected_text == Some(text.as_str()) {
+            continue;
+        }
+        for candidate in [candidates.primary_eligible, candidates.alias_only]
+            .into_iter()
+            .flatten()
+        {
+            if alternates
+                .get(&text)
+                .is_none_or(|current| candidate_order(&candidate, current).is_lt())
+            {
+                alternates.insert(text.clone(), candidate);
+            }
+        }
     }
-    let selected = values.remove(0);
-    let output_name = selected.text.clone();
-    (
-        Some(ExportName {
-            source: selected,
-            output_name,
-        }),
-        values,
-    )
+    let alternates = finish_texts(alternates);
+    let selected = selected.map(|source| ExportName {
+        output_name: source.text.clone(),
+        source,
+    });
+    (selected, alternates)
 }
 
 fn finish_texts(values: BTreeMap<String, AttributedText>) -> Vec<AttributedText> {

@@ -9,15 +9,20 @@ use resymbol_analysis::{AnalysisSession, BinaryAnalysis, SessionValidationError}
 use resymbol_core::{
     BinaryId, BinaryIdentity, ClaimProducer, ClaimProvenance, ClaimValidationError, Confidence,
     Evidence, EvidenceKind, GraphValidationError, SymbolAssertion, SymbolClaim, SymbolGraph,
-    SymbolSubject,
+    SymbolSubject, plugin_api::PluginId,
 };
-use resymbol_export::{ExportError, ExportProjection};
+use resymbol_export::{ExportError, ExportProjection, NameSelection};
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use tempfile::Builder;
 use thiserror::Error;
 
 /// Current schema for a persisted ReSymbol review sidecar.
-pub const REVIEW_LEDGER_SCHEMA_VERSION: u32 = 1;
+pub const REVIEW_LEDGER_SCHEMA_VERSION: u32 = 2;
+
+/// Current domain-separated semantic encoding for exact claim fingerprints.
+pub const REVIEW_CLAIM_FINGERPRINT_VERSION: u32 = 2;
+
+const LEGACY_CLAIM_FINGERPRINT_VERSION: u32 = 1;
 
 /// Maximum retained undo/redo entries in one sidecar.
 pub const MAX_REVIEW_DECISIONS: usize = 262_144;
@@ -34,13 +39,13 @@ const REVIEW_ACCEPT_METHOD: &str = "review.accept";
 
 /// A stable logical key for one exact name claim.
 ///
-/// The SHA-256 is computed over canonical `serde_json` serialization of the
-/// complete validated [`SymbolClaim`]. Struct field order is fixed by the core
-/// schema and evidence artifact maps are ordered, so confidence, evidence, and
-/// provenance drift produces an orphan instead of inheriting an old decision.
-/// Semantic fields remain alongside the fingerprint for display and lookup.
+/// Version 2 hashes a domain-separated, length-prefixed semantic encoding of
+/// the complete validated name claim. The encoding is independent of serde
+/// field order and JSON formatting. Version 1 remains readable and matchable
+/// only for migration of existing sidecars.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ReviewSubject {
+    fingerprint_version: u32,
     claim_sha256: BinaryId,
     symbol: SymbolSubject,
     name: String,
@@ -53,13 +58,19 @@ pub struct ReviewSubject {
 impl ReviewSubject {
     /// Build an exact review key from a name claim.
     pub fn from_name_claim(claim: &SymbolClaim) -> Result<Self, ReviewValidationError> {
+        Self::from_name_claim_with_version(claim, REVIEW_CLAIM_FINGERPRINT_VERSION)
+    }
+
+    fn from_name_claim_with_version(
+        claim: &SymbolClaim,
+        fingerprint_version: u32,
+    ) -> Result<Self, ReviewValidationError> {
         let SymbolAssertion::Name { name } = claim.assertion() else {
             return Err(ReviewValidationError::NotNameClaim);
         };
-        let canonical_claim = serde_json::to_vec(claim)
-            .map_err(ReviewValidationError::ClaimFingerprintSerialization)?;
         let subject = Self {
-            claim_sha256: BinaryId::digest(&canonical_claim),
+            fingerprint_version,
+            claim_sha256: claim_fingerprint(claim, fingerprint_version)?,
             symbol: claim.subject().clone(),
             name: name.clone(),
             producer: claim.provenance().producer.clone(),
@@ -68,6 +79,11 @@ impl ReviewSubject {
         };
         subject.validate()?;
         Ok(subject)
+    }
+
+    #[must_use]
+    pub const fn fingerprint_version(&self) -> u32 {
+        self.fingerprint_version
     }
 
     #[must_use]
@@ -101,6 +117,14 @@ impl ReviewSubject {
     }
 
     fn validate(&self) -> Result<(), ReviewValidationError> {
+        if !matches!(
+            self.fingerprint_version,
+            LEGACY_CLAIM_FINGERPRINT_VERSION | REVIEW_CLAIM_FINGERPRINT_VERSION
+        ) {
+            return Err(ReviewValidationError::UnsupportedFingerprintVersion {
+                found: self.fingerprint_version,
+            });
+        }
         // Reconstruct a harmless claim to reuse the core's canonical subject,
         // assertion, producer, and provenance validation instead of creating a
         // second set of subtly different rules in the UI layer.
@@ -130,6 +154,7 @@ impl ReviewSubject {
 
     fn canonical_key(&self) -> Result<String, ReviewValidationError> {
         let mut key = String::new();
+        push_key_part(&mut key, &self.fingerprint_version.to_string());
         push_key_part(&mut key, self.claim_sha256.as_str());
         match &self.symbol {
             SymbolSubject::Function { binary, rva, size } => {
@@ -209,10 +234,11 @@ impl ReviewSubject {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UncheckedReviewSubject {
+    fingerprint_version: u32,
     claim_sha256: BinaryId,
     symbol: SymbolSubject,
     name: String,
-    producer: ClaimProducer,
+    producer: StrictClaimProducer,
     method: String,
     #[serde(default)]
     run_id: Option<String>,
@@ -225,15 +251,71 @@ impl<'de> Deserialize<'de> for ReviewSubject {
     {
         let value = UncheckedReviewSubject::deserialize(deserializer)?;
         let subject = Self {
+            fingerprint_version: value.fingerprint_version,
             claim_sha256: value.claim_sha256,
             symbol: value.symbol,
             name: value.name,
-            producer: value.producer,
+            producer: value.producer.into_claim_producer(),
             method: value.method,
             run_id: value.run_id,
         };
         subject.validate().map_err(D::Error::custom)?;
         Ok(subject)
+    }
+}
+
+#[derive(Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct LegacyReviewSubject {
+    claim_sha256: BinaryId,
+    symbol: SymbolSubject,
+    name: String,
+    producer: StrictClaimProducer,
+    method: String,
+    #[serde(default)]
+    run_id: Option<String>,
+}
+
+impl LegacyReviewSubject {
+    fn migrate(self) -> Result<ReviewSubject, ReviewValidationError> {
+        let subject = ReviewSubject {
+            fingerprint_version: LEGACY_CLAIM_FINGERPRINT_VERSION,
+            claim_sha256: self.claim_sha256,
+            symbol: self.symbol,
+            name: self.name,
+            producer: self.producer.into_claim_producer(),
+            method: self.method,
+            run_id: self.run_id,
+        };
+        subject.validate()?;
+        Ok(subject)
+    }
+}
+
+#[derive(Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+enum StrictClaimProducer {
+    Core {
+        component: String,
+        version: String,
+    },
+    Plugin {
+        id: PluginId,
+        version: String,
+    },
+    User {
+        #[serde(default)]
+        reviewer: Option<String>,
+    },
+}
+
+impl StrictClaimProducer {
+    fn into_claim_producer(self) -> ClaimProducer {
+        match self {
+            Self::Core { component, version } => ClaimProducer::Core { component, version },
+            Self::Plugin { id, version } => ClaimProducer::Plugin { id, version },
+            Self::User { reviewer } => ClaimProducer::User { reviewer },
+        }
     }
 }
 
@@ -267,6 +349,7 @@ impl DecisionAction {
 /// One immutable entry in a ledger's ordered undo/redo history.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ReviewDecision {
+    transaction_id: u64,
     sequence: u64,
     subject: ReviewSubject,
     action: DecisionAction,
@@ -275,6 +358,11 @@ pub struct ReviewDecision {
 }
 
 impl ReviewDecision {
+    #[must_use]
+    pub const fn transaction_id(&self) -> u64 {
+        self.transaction_id
+    }
+
     #[must_use]
     pub const fn sequence(&self) -> u64 {
         self.sequence
@@ -296,6 +384,13 @@ impl ReviewDecision {
     }
 
     fn validate(&self) -> Result<(), ReviewValidationError> {
+        if self.transaction_id == 0 {
+            return Err(ReviewValidationError::InvalidTransactionId {
+                index: 0,
+                expected: 1,
+                found: 0,
+            });
+        }
         if self.sequence == 0 {
             return Err(ReviewValidationError::InvalidSequence {
                 index: 0,
@@ -319,6 +414,7 @@ impl ReviewDecision {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UncheckedReviewDecision {
+    transaction_id: u64,
     sequence: u64,
     subject: ReviewSubject,
     action: DecisionAction,
@@ -333,12 +429,37 @@ impl<'de> Deserialize<'de> for ReviewDecision {
     {
         let value = UncheckedReviewDecision::deserialize(deserializer)?;
         let decision = Self {
+            transaction_id: value.transaction_id,
             sequence: value.sequence,
             subject: value.subject,
             action: value.action,
             reviewer: value.reviewer,
         };
         decision.validate().map_err(D::Error::custom)?;
+        Ok(decision)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyReviewDecision {
+    sequence: u64,
+    subject: LegacyReviewSubject,
+    action: DecisionAction,
+    #[serde(default)]
+    reviewer: Option<String>,
+}
+
+impl LegacyReviewDecision {
+    fn migrate(self, transaction_id: u64) -> Result<ReviewDecision, ReviewValidationError> {
+        let decision = ReviewDecision {
+            transaction_id,
+            sequence: self.sequence,
+            subject: self.subject.migrate()?,
+            action: self.action,
+            reviewer: self.reviewer,
+        };
+        decision.validate()?;
         Ok(decision)
     }
 }
@@ -415,20 +536,35 @@ impl ReviewLedger {
         self.applied_decision_count < self.history.len()
     }
 
-    /// Undo the most recently applied history entry.
+    /// Undo the most recently applied persisted transaction.
     pub fn undo(&mut self) -> Option<&ReviewDecision> {
-        self.applied_decision_count = self.applied_decision_count.checked_sub(1)?;
+        let last_index = self.applied_decision_count.checked_sub(1)?;
+        let transaction_id = self.history.get(last_index)?.transaction_id;
+        self.applied_decision_count = last_index;
+        while self.applied_decision_count != 0
+            && self.history[self.applied_decision_count - 1].transaction_id == transaction_id
+        {
+            self.applied_decision_count -= 1;
+        }
         self.history.get(self.applied_decision_count)
     }
 
-    /// Reapply the next history entry.
+    /// Reapply the next persisted transaction.
     pub fn redo(&mut self) -> Option<&ReviewDecision> {
-        let decision = self.history.get(self.applied_decision_count)?;
-        self.applied_decision_count += 1;
-        Some(decision)
+        let first_index = self.applied_decision_count;
+        let transaction_id = self.history.get(first_index)?.transaction_id;
+        while self.applied_decision_count < self.history.len()
+            && self.history[self.applied_decision_count].transaction_id == transaction_id
+        {
+            self.applied_decision_count += 1;
+        }
+        self.history.get(first_index)
     }
 
-    /// Append a decision. Recording after undo discards the redo suffix.
+    /// Append one decision as its own transaction.
+    ///
+    /// All validation completes before recording after undo discards the redo
+    /// suffix, so an error never mutates existing history.
     pub fn record(
         &mut self,
         subject: ReviewSubject,
@@ -442,28 +578,104 @@ impl ReviewLedger {
                 found: subject.symbol().binary().clone(),
             });
         }
-        self.history.truncate(self.applied_decision_count);
-        if self.history.len() >= MAX_REVIEW_DECISIONS {
+        if self.applied_decision_count >= MAX_REVIEW_DECISIONS {
             return Err(ReviewValidationError::DecisionLimitExceeded);
         }
-        let sequence = self.history.last().map_or(Ok(1), |decision| {
-            decision
-                .sequence
-                .checked_add(1)
-                .ok_or(ReviewValidationError::SequenceOverflow)
-        })?;
+        let (sequence, transaction_id) = self.next_history_position()?;
         let decision = ReviewDecision {
+            transaction_id,
             sequence,
             subject,
             action,
             reviewer,
         };
         decision.validate()?;
+        validate_transaction(std::slice::from_ref(&decision))?;
+        self.history.truncate(self.applied_decision_count);
         self.history.push(decision);
         self.applied_decision_count = self.history.len();
         self.history
             .last()
             .ok_or(ReviewValidationError::SequenceOverflow)
+    }
+
+    /// Record one disposition and its optional rationale as one undo/redo unit.
+    pub fn record_disposition_with_rationale(
+        &mut self,
+        subject: ReviewSubject,
+        action: DecisionAction,
+        reviewer: Option<String>,
+        rationale: Option<String>,
+    ) -> Result<&ReviewDecision, ReviewValidationError> {
+        self.validate()?;
+        if !action.is_disposition() {
+            return Err(ReviewValidationError::InvalidTransactionShape);
+        }
+        if subject.symbol().binary() != &self.binary_sha256 {
+            return Err(ReviewValidationError::DecisionBinaryMismatch {
+                expected: self.binary_sha256.clone(),
+                found: subject.symbol().binary().clone(),
+            });
+        }
+        let decision_count = if rationale.is_some() { 2 } else { 1 };
+        if self
+            .applied_decision_count
+            .checked_add(decision_count)
+            .is_none_or(|count| count > MAX_REVIEW_DECISIONS)
+        {
+            return Err(ReviewValidationError::DecisionLimitExceeded);
+        }
+        let (sequence, transaction_id) = self.next_history_position()?;
+        let mut decisions = vec![ReviewDecision {
+            transaction_id,
+            sequence,
+            subject: subject.clone(),
+            action,
+            reviewer: reviewer.clone(),
+        }];
+        if let Some(text) = rationale {
+            decisions.push(ReviewDecision {
+                transaction_id,
+                sequence: sequence
+                    .checked_add(1)
+                    .ok_or(ReviewValidationError::SequenceOverflow)?,
+                subject,
+                action: DecisionAction::Annotation { text },
+                reviewer,
+            });
+        }
+        for decision in &decisions {
+            decision.validate()?;
+        }
+        validate_transaction(&decisions)?;
+
+        let first_index = self.applied_decision_count;
+        self.history.truncate(first_index);
+        self.history.extend(decisions);
+        self.applied_decision_count = self.history.len();
+        self.history
+            .get(first_index)
+            .ok_or(ReviewValidationError::SequenceOverflow)
+    }
+
+    fn next_history_position(&self) -> Result<(u64, u64), ReviewValidationError> {
+        let previous = self
+            .applied_decision_count
+            .checked_sub(1)
+            .and_then(|index| self.history.get(index));
+        let sequence = previous.map_or(Ok(1), |decision| {
+            decision
+                .sequence
+                .checked_add(1)
+                .ok_or(ReviewValidationError::SequenceOverflow)
+        })?;
+        let transaction_id = previous.map_or(Ok(1), |decision| {
+            decision
+                .transaction_id
+                .checked_add(1)
+                .ok_or(ReviewValidationError::TransactionOverflow)
+        })?;
+        Ok((sequence, transaction_id))
     }
 
     pub fn accept_primary(
@@ -535,19 +747,10 @@ impl ReviewLedger {
         session.validate().map_err(ReviewError::InvalidSession)?;
         self.validate_for_binary(session.base_analysis().identity())
             .map_err(ReviewError::InvalidLedger)?;
-        let available_keys = session
+        let graph = session
             .combined_symbol_graph()
-            .map_err(ReviewError::InvalidSession)?
-            .claims()
-            .iter()
-            .filter_map(|claim| match claim.assertion() {
-                SymbolAssertion::Name { .. } => Some(ReviewSubject::from_name_claim(claim)),
-                _ => None,
-            })
-            .collect::<Result<Vec<_>, _>>()?
-            .iter()
-            .map(ReviewSubject::canonical_key)
-            .collect::<Result<BTreeSet<_>, _>>()?;
+            .map_err(ReviewError::InvalidSession)?;
+        let available_keys = available_review_keys(&graph)?;
         self.applied_history()
             .iter()
             .filter_map(|decision| {
@@ -582,6 +785,15 @@ impl ReviewLedger {
                 history: self.history.len(),
             });
         }
+        if self.applied_decision_count != 0
+            && self.applied_decision_count < self.history.len()
+            && self.history[self.applied_decision_count - 1].transaction_id
+                == self.history[self.applied_decision_count].transaction_id
+        {
+            return Err(ReviewValidationError::InvalidTransactionCursor {
+                applied: self.applied_decision_count,
+            });
+        }
         for (index, decision) in self.history.iter().enumerate() {
             decision.validate()?;
             let expected = u64::try_from(index)
@@ -601,6 +813,29 @@ impl ReviewLedger {
                     found: decision.subject.symbol().binary().clone(),
                 });
             }
+        }
+        let mut transaction_start = 0_usize;
+        let mut expected_transaction = 1_u64;
+        while transaction_start < self.history.len() {
+            let found = self.history[transaction_start].transaction_id;
+            if found != expected_transaction {
+                return Err(ReviewValidationError::InvalidTransactionId {
+                    index: transaction_start,
+                    expected: expected_transaction,
+                    found,
+                });
+            }
+            let mut transaction_end = transaction_start + 1;
+            while transaction_end < self.history.len()
+                && self.history[transaction_end].transaction_id == found
+            {
+                transaction_end += 1;
+            }
+            validate_transaction(&self.history[transaction_start..transaction_end])?;
+            transaction_start = transaction_end;
+            expected_transaction = expected_transaction
+                .checked_add(1)
+                .ok_or(ReviewValidationError::TransactionOverflow)?;
         }
         Ok(())
     }
@@ -664,11 +899,42 @@ impl ReviewLedger {
         session: &AnalysisSession,
     ) -> Result<Self, ReviewError> {
         session.validate().map_err(ReviewError::InvalidSession)?;
-        let ledger = Self::load(path)?;
+        let mut ledger = Self::load(path)?;
         ledger
             .validate_for_binary(session.base_analysis().identity())
             .map_err(ReviewError::InvalidLedger)?;
+        ledger.upgrade_legacy_subjects(session)?;
         Ok(ledger)
+    }
+
+    fn upgrade_legacy_subjects(&mut self, session: &AnalysisSession) -> Result<(), ReviewError> {
+        let graph = session
+            .combined_symbol_graph()
+            .map_err(ReviewError::InvalidSession)?;
+        let mut migrations = BTreeMap::<String, ReviewSubject>::new();
+        for claim in graph.claims() {
+            if !matches!(claim.assertion(), SymbolAssertion::Name { .. }) {
+                continue;
+            }
+            let legacy = ReviewSubject::from_name_claim_with_version(
+                claim,
+                LEGACY_CLAIM_FINGERPRINT_VERSION,
+            )?;
+            migrations.insert(
+                legacy.canonical_key()?,
+                ReviewSubject::from_name_claim(claim)?,
+            );
+        }
+        for decision in &mut self.history {
+            if decision.subject.fingerprint_version != LEGACY_CLAIM_FINGERPRINT_VERSION {
+                continue;
+            }
+            let key = decision.subject.canonical_key()?;
+            if let Some(subject) = migrations.get(&key) {
+                decision.subject = subject.clone();
+            }
+        }
+        self.validate().map_err(ReviewError::InvalidLedger)
     }
 
     /// Atomically replace a sidecar after flushing its complete new contents.
@@ -700,14 +966,19 @@ impl ReviewLedger {
 
     /// Publish a completely staged sidecar without replacing an existing path.
     ///
-    /// Validation, encoding, flushing, and the encoded-size gate all complete
-    /// before the operating system's create-new publication step. Existing
-    /// files, directories, and links are never replaced or truncated.
+    /// Validation, bounded encoding, flushing, and file synchronization complete
+    /// before `tempfile`'s path-based no-clobber publication. Existing targets
+    /// are not replaced. `persist_noclobber` is not universally atomic and is
+    /// intended for a trusted destination directory that an attacker or
+    /// temporary-file cleaner cannot rewrite while this operation is pending.
+    /// Unix parent-directory metadata is synchronized after publication; a
+    /// synchronization error is reported after the target has become visible
+    /// and does not roll that publication back.
     pub fn save_new(&self, path: impl AsRef<Path>) -> Result<(), ReviewError> {
         let path = path.as_ref();
-        let (temporary, _) = self.stage_sidecar(path)?;
+        let (temporary, parent) = self.stage_sidecar(path)?;
         match temporary.persist_noclobber(path) {
-            Ok(_) => Ok(()),
+            Ok(_) => sync_parent_directory(parent, path),
             Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
                 Err(ReviewError::TargetAlreadyExists {
                     path: path.to_path_buf(),
@@ -725,6 +996,14 @@ impl ReviewLedger {
         &self,
         path: &'a Path,
     ) -> Result<(tempfile::NamedTempFile, &'a Path), ReviewError> {
+        self.stage_sidecar_with_limit(path, MAX_REVIEW_SIDECAR_BYTES)
+    }
+
+    fn stage_sidecar_with_limit<'a>(
+        &self,
+        path: &'a Path,
+        encoded_limit: u64,
+    ) -> Result<(tempfile::NamedTempFile, &'a Path), ReviewError> {
         self.validate().map_err(ReviewError::InvalidLedger)?;
         let parent = path
             .parent()
@@ -740,18 +1019,35 @@ impl ReviewLedger {
                 source,
             })?;
         {
-            let mut writer = BufWriter::new(temporary.as_file_mut());
-            serde_json::to_writer_pretty(&mut writer, self).map_err(|source| {
-                ReviewError::Serialize {
+            let buffered = BufWriter::new(temporary.as_file_mut());
+            let mut writer = CappedWriter::new(buffered, encoded_limit);
+            if let Err(source) = serde_json::to_writer_pretty(&mut writer, self) {
+                if writer.limit_exceeded() {
+                    let _ = writer.into_inner().into_parts();
+                    return Err(ReviewError::SidecarTooLarge {
+                        path: path.to_path_buf(),
+                        limit: encoded_limit,
+                    });
+                }
+                return Err(ReviewError::Serialize {
                     path: path.to_path_buf(),
                     source,
+                });
+            }
+            if let Err(source) = writer.write_all(b"\n") {
+                if writer.limit_exceeded() {
+                    let _ = writer.into_inner().into_parts();
+                    return Err(ReviewError::SidecarTooLarge {
+                        path: path.to_path_buf(),
+                        limit: encoded_limit,
+                    });
                 }
-            })?;
-            writer.write_all(b"\n").map_err(|source| ReviewError::Io {
-                operation: "write",
-                path: path.to_path_buf(),
-                source,
-            })?;
+                return Err(ReviewError::Io {
+                    operation: "write",
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
             writer.flush().map_err(|source| ReviewError::Io {
                 operation: "flush",
                 path: path.to_path_buf(),
@@ -766,21 +1062,6 @@ impl ReviewLedger {
                 path: path.to_path_buf(),
                 source,
             })?;
-        let encoded_size = temporary
-            .as_file()
-            .metadata()
-            .map_err(|source| ReviewError::Io {
-                operation: "inspect temporary file for",
-                path: path.to_path_buf(),
-                source,
-            })?
-            .len();
-        if encoded_size > MAX_REVIEW_SIDECAR_BYTES {
-            return Err(ReviewError::SidecarTooLarge {
-                path: path.to_path_buf(),
-                limit: MAX_REVIEW_SIDECAR_BYTES,
-            });
-        }
         Ok((temporary, parent))
     }
 
@@ -796,25 +1077,9 @@ impl ReviewLedger {
             .combined_symbol_graph()
             .map_err(ReviewError::InvalidSession)?;
 
-        let available_subjects = source_graph
-            .claims()
-            .iter()
-            .filter_map(|claim| match claim.assertion() {
-                SymbolAssertion::Name { .. } => Some(ReviewSubject::from_name_claim(claim)),
-                _ => None,
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let available_keys = available_subjects
-            .iter()
-            .map(ReviewSubject::canonical_key)
-            .collect::<Result<BTreeSet<_>, _>>()?;
-
         let mut dispositions = BTreeMap::<String, &ReviewDecision>::new();
         for decision in self.applied_history() {
             let key = decision.subject.canonical_key()?;
-            if !available_keys.contains(&key) {
-                continue;
-            }
             if decision.action.is_disposition() {
                 dispositions.insert(key, decision);
             }
@@ -824,19 +1089,32 @@ impl ReviewLedger {
         graph
             .insert_binary(session.base_analysis().identity().clone())
             .map_err(ReviewError::InvalidClaim)?;
+        let mut name_selections = Vec::with_capacity(source_graph.claims().len());
+        let mut active_dispositions = BTreeMap::<u64, &ReviewDecision>::new();
         for claim in source_graph.claims() {
-            let rejected = if matches!(claim.assertion(), SymbolAssertion::Name { .. }) {
-                let subject = ReviewSubject::from_name_claim(claim)?;
-                dispositions
-                    .get(&subject.canonical_key()?)
-                    .is_some_and(|decision| matches!(decision.action(), DecisionAction::Reject))
+            let disposition = if matches!(claim.assertion(), SymbolAssertion::Name { .. }) {
+                active_disposition_for_claim(claim, &dispositions)?
             } else {
-                false
+                None
             };
-            if !rejected {
+            if let Some(decision) = disposition {
+                active_dispositions.insert(decision.sequence, decision);
+            }
+            if !disposition
+                .is_some_and(|decision| matches!(decision.action(), DecisionAction::Reject))
+            {
                 graph
                     .submit_claim(claim.clone())
                     .map_err(ReviewError::InvalidGraph)?;
+                name_selections.push(
+                    if disposition.is_some_and(|decision| {
+                        matches!(decision.action(), DecisionAction::KeepAlias)
+                    }) {
+                        NameSelection::AliasOnly
+                    } else {
+                        NameSelection::PrimaryEligible
+                    },
+                );
             }
         }
 
@@ -844,7 +1122,7 @@ impl ReviewLedger {
         // than one still-active acceptance, the latest decision is primary and
         // the original earlier proposals remain as aliases in the source graph.
         let mut accepted_by_entity = BTreeMap::<String, &ReviewDecision>::new();
-        for decision in dispositions.values().copied() {
+        for decision in active_dispositions.values().copied() {
             if !matches!(decision.action(), DecisionAction::AcceptPrimary) {
                 continue;
             }
@@ -862,14 +1140,20 @@ impl ReviewLedger {
             graph
                 .submit_claim(accepted_user_claim(decision)?)
                 .map_err(ReviewError::InvalidGraph)?;
+            name_selections.push(NameSelection::PrimaryEligible);
         }
 
         let image_size = match session.base_analysis() {
             BinaryAnalysis::Pe(analysis) => u64::from(analysis.size_of_image),
             _ => return Err(ReviewError::UnsupportedAnalysisFormat),
         };
-        ExportProjection::from_symbol_graph(session.base_analysis().identity(), image_size, &graph)
-            .map_err(ReviewError::Export)
+        ExportProjection::from_symbol_graph_with_name_selections(
+            session.base_analysis().identity(),
+            image_size,
+            &graph,
+            &name_selections,
+        )
+        .map_err(ReviewError::Export)
     }
 }
 
@@ -879,8 +1163,23 @@ struct UncheckedReviewLedger {
     schema_version: u32,
     binary_sha256: BinaryId,
     binary_size: u64,
-    history: Vec<ReviewDecision>,
+    history: Vec<VersionedUncheckedReviewDecision>,
     applied_decision_count: usize,
+}
+
+struct LegacyUncheckedReviewLedger {
+    schema_version: u32,
+    binary_sha256: BinaryId,
+    binary_size: u64,
+    history: Vec<LegacyReviewDecision>,
+    applied_decision_count: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum VersionedUncheckedReviewDecision {
+    Current(ReviewDecision),
+    Legacy(LegacyReviewDecision),
 }
 
 impl<'de> Deserialize<'de> for ReviewLedger {
@@ -889,16 +1188,147 @@ impl<'de> Deserialize<'de> for ReviewLedger {
         D: Deserializer<'de>,
     {
         let value = UncheckedReviewLedger::deserialize(deserializer)?;
-        let ledger = Self {
-            schema_version: value.schema_version,
-            binary_sha256: value.binary_sha256,
-            binary_size: value.binary_size,
-            history: value.history,
-            applied_decision_count: value.applied_decision_count,
+        let ledger = match value.schema_version {
+            REVIEW_LEDGER_SCHEMA_VERSION => Self {
+                schema_version: value.schema_version,
+                binary_sha256: value.binary_sha256,
+                binary_size: value.binary_size,
+                history: value
+                    .history
+                    .into_iter()
+                    .map(|decision| match decision {
+                        VersionedUncheckedReviewDecision::Current(decision) => Ok(decision),
+                        VersionedUncheckedReviewDecision::Legacy(_) => Err(D::Error::custom(
+                            "review sidecar schema 2 requires transaction and fingerprint metadata",
+                        )),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+                applied_decision_count: value.applied_decision_count,
+            },
+            1 => migrate_legacy_ledger(LegacyUncheckedReviewLedger {
+                schema_version: value.schema_version,
+                binary_sha256: value.binary_sha256,
+                binary_size: value.binary_size,
+                history: value
+                    .history
+                    .into_iter()
+                    .map(|decision| match decision {
+                        VersionedUncheckedReviewDecision::Legacy(decision) => Ok(decision),
+                        VersionedUncheckedReviewDecision::Current(_) => Err(D::Error::custom(
+                            "review sidecar schema 1 cannot contain schema 2 decision metadata",
+                        )),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+                applied_decision_count: value.applied_decision_count,
+            })
+            .map_err(D::Error::custom)?,
+            found => {
+                return Err(D::Error::custom(ReviewValidationError::UnsupportedSchema {
+                    found,
+                }));
+            }
         };
         ledger.validate().map_err(D::Error::custom)?;
         Ok(ledger)
     }
+}
+
+fn migrate_legacy_ledger(
+    value: LegacyUncheckedReviewLedger,
+) -> Result<ReviewLedger, ReviewValidationError> {
+    if value.schema_version != 1 {
+        return Err(ReviewValidationError::UnsupportedSchema {
+            found: value.schema_version,
+        });
+    }
+    if value.applied_decision_count > value.history.len() {
+        return Err(ReviewValidationError::InvalidHistoryCursor {
+            applied: value.applied_decision_count,
+            history: value.history.len(),
+        });
+    }
+
+    let mut applied_decision_count = value.applied_decision_count;
+    let mut history = Vec::with_capacity(value.history.len());
+    let mut legacy = value.history.into_iter().peekable();
+    let mut legacy_index = 0_usize;
+    let mut transaction_id = 1_u64;
+    while let Some(decision) = legacy.next() {
+        // Schema 1 had no transaction marker. The v1 workbench always wrote a
+        // rationale immediately after its disposition with the same subject
+        // and reviewer, which is the only legacy shape grouped during upgrade.
+        let pair_rationale = decision.action.is_disposition()
+            && legacy.peek().is_some_and(|next| {
+                matches!(next.action, DecisionAction::Annotation { .. })
+                    && next.subject == decision.subject
+                    && next.reviewer == decision.reviewer
+            });
+        history.push(decision.migrate(transaction_id)?);
+        legacy_index += 1;
+        if pair_rationale {
+            if applied_decision_count == legacy_index {
+                // Legacy undo could split a UI disposition from its rationale.
+                // Preserve the applied disposition while restoring the rationale
+                // to the same indivisible transaction.
+                applied_decision_count += 1;
+            }
+            history.push(
+                legacy
+                    .next()
+                    .expect("peeked legacy rationale remains present")
+                    .migrate(transaction_id)?,
+            );
+            legacy_index += 1;
+        }
+        transaction_id = transaction_id
+            .checked_add(1)
+            .ok_or(ReviewValidationError::TransactionOverflow)?;
+    }
+
+    Ok(ReviewLedger {
+        schema_version: REVIEW_LEDGER_SCHEMA_VERSION,
+        binary_sha256: value.binary_sha256,
+        binary_size: value.binary_size,
+        history,
+        applied_decision_count,
+    })
+}
+
+fn review_subject_versions(
+    claim: &SymbolClaim,
+) -> Result<[ReviewSubject; 2], ReviewValidationError> {
+    Ok([
+        ReviewSubject::from_name_claim_with_version(claim, LEGACY_CLAIM_FINGERPRINT_VERSION)?,
+        ReviewSubject::from_name_claim(claim)?,
+    ])
+}
+
+fn available_review_keys(graph: &SymbolGraph) -> Result<BTreeSet<String>, ReviewError> {
+    let mut keys = BTreeSet::new();
+    for claim in graph.claims() {
+        if !matches!(claim.assertion(), SymbolAssertion::Name { .. }) {
+            continue;
+        }
+        for subject in review_subject_versions(claim)? {
+            keys.insert(subject.canonical_key()?);
+        }
+    }
+    Ok(keys)
+}
+
+fn active_disposition_for_claim<'a>(
+    claim: &SymbolClaim,
+    dispositions: &BTreeMap<String, &'a ReviewDecision>,
+) -> Result<Option<&'a ReviewDecision>, ReviewError> {
+    let mut active = None;
+    for subject in review_subject_versions(claim)? {
+        if let Some(decision) = dispositions.get(&subject.canonical_key()?).copied() {
+            if active.is_none_or(|current: &ReviewDecision| current.sequence < decision.sequence) {
+                active = Some(decision);
+            }
+        }
+    }
+    Ok(active)
 }
 
 fn accepted_user_claim(decision: &ReviewDecision) -> Result<SymbolClaim, ReviewError> {
@@ -928,6 +1358,268 @@ fn accepted_user_claim(decision: &ReviewDecision) -> Result<SymbolClaim, ReviewE
         },
     )
     .map_err(ReviewError::InvalidClaim)
+}
+
+fn validate_transaction(decisions: &[ReviewDecision]) -> Result<(), ReviewValidationError> {
+    let Some(first) = decisions.first() else {
+        return Err(ReviewValidationError::InvalidTransactionShape);
+    };
+    if decisions.len() > 2
+        || decisions
+            .iter()
+            .any(|decision| decision.transaction_id != first.transaction_id)
+    {
+        return Err(ReviewValidationError::InvalidTransactionShape);
+    }
+    if let [disposition, rationale] = decisions {
+        if !disposition.action.is_disposition()
+            || !matches!(rationale.action, DecisionAction::Annotation { .. })
+            || disposition.subject != rationale.subject
+            || disposition.reviewer != rationale.reviewer
+        {
+            return Err(ReviewValidationError::InvalidTransactionShape);
+        }
+    }
+    Ok(())
+}
+
+fn claim_fingerprint(claim: &SymbolClaim, version: u32) -> Result<BinaryId, ReviewValidationError> {
+    match version {
+        LEGACY_CLAIM_FINGERPRINT_VERSION => serde_json::to_vec(claim)
+            .map(|encoded| BinaryId::digest(&encoded))
+            .map_err(ReviewValidationError::ClaimFingerprintSerialization),
+        REVIEW_CLAIM_FINGERPRINT_VERSION => {
+            semantic_name_claim_encoding(claim).map(|encoded| BinaryId::digest(&encoded))
+        }
+        found => Err(ReviewValidationError::UnsupportedFingerprintVersion { found }),
+    }
+}
+
+fn semantic_name_claim_encoding(claim: &SymbolClaim) -> Result<Vec<u8>, ReviewValidationError> {
+    // This is a persisted protocol, not a convenient serialization. Adding a
+    // semantic SymbolClaim field requires a new fingerprint version and a
+    // parallel encoder; never change the version-2 byte layout in place.
+    claim
+        .validate()
+        .map_err(ReviewValidationError::InvalidReviewSubject)?;
+    let SymbolAssertion::Name { name } = claim.assertion() else {
+        return Err(ReviewValidationError::NotNameClaim);
+    };
+
+    let mut encoded = b"ReSymbol.review.claim\0".to_vec();
+    encode_u32(&mut encoded, REVIEW_CLAIM_FINGERPRINT_VERSION);
+    encode_subject(&mut encoded, claim.subject())?;
+    encode_string(&mut encoded, name)?;
+    encode_confidence(&mut encoded, claim.confidence());
+    encode_provenance(&mut encoded, claim.provenance())?;
+
+    let mut evidence = claim
+        .evidence()
+        .iter()
+        .map(encode_evidence)
+        .collect::<Result<Vec<_>, _>>()?;
+    evidence.sort();
+    encode_length(&mut encoded, evidence.len())?;
+    for item in evidence {
+        encode_bytes(&mut encoded, &item)?;
+    }
+    Ok(encoded)
+}
+
+fn encode_subject(
+    encoded: &mut Vec<u8>,
+    subject: &SymbolSubject,
+) -> Result<(), ReviewValidationError> {
+    match subject {
+        SymbolSubject::Function { binary, rva, size } => {
+            encoded.push(1);
+            encode_string(encoded, binary.as_str())?;
+            encode_u64(encoded, *rva);
+            encode_optional_u64(encoded, *size);
+        }
+        SymbolSubject::Global { binary, rva, size } => {
+            encoded.push(2);
+            encode_string(encoded, binary.as_str())?;
+            encode_u64(encoded, *rva);
+            encode_optional_u64(encoded, *size);
+        }
+        SymbolSubject::Type { binary, key } => {
+            encoded.push(3);
+            encode_string(encoded, binary.as_str())?;
+            encode_string(encoded, key)?;
+        }
+        _ => return Err(ReviewValidationError::UnsupportedSubject),
+    }
+    Ok(())
+}
+
+fn encode_provenance(
+    encoded: &mut Vec<u8>,
+    provenance: &ClaimProvenance,
+) -> Result<(), ReviewValidationError> {
+    match &provenance.producer {
+        ClaimProducer::Core { component, version } => {
+            encoded.push(1);
+            encode_string(encoded, component)?;
+            encode_string(encoded, version)?;
+        }
+        ClaimProducer::Plugin { id, version } => {
+            encoded.push(2);
+            encode_string(encoded, id.as_str())?;
+            encode_string(encoded, version)?;
+        }
+        ClaimProducer::User { reviewer } => {
+            encoded.push(3);
+            encode_optional_string(encoded, reviewer.as_deref())?;
+        }
+        _ => return Err(ReviewValidationError::UnsupportedProducer),
+    }
+    encode_string(encoded, &provenance.method)?;
+    encode_optional_string(encoded, provenance.run_id.as_deref())
+}
+
+fn encode_evidence(evidence: &Evidence) -> Result<Vec<u8>, ReviewValidationError> {
+    let mut encoded = Vec::new();
+    encode_string(&mut encoded, evidence.kind.as_str())?;
+    encode_string(&mut encoded, &evidence.summary)?;
+    match evidence.confidence {
+        Some(confidence) => {
+            encoded.push(1);
+            encode_confidence(&mut encoded, confidence);
+        }
+        None => encoded.push(0),
+    }
+    encode_length(&mut encoded, evidence.artifacts.len())?;
+    for (key, value) in &evidence.artifacts {
+        encode_string(&mut encoded, key)?;
+        encode_string(&mut encoded, value)?;
+    }
+    Ok(encoded)
+}
+
+fn encode_confidence(encoded: &mut Vec<u8>, confidence: Confidence) {
+    let value = confidence.get();
+    let canonical = if value == 0.0 { 0.0 } else { value };
+    encode_u64(encoded, canonical.to_bits());
+}
+
+fn encode_optional_u64(encoded: &mut Vec<u8>, value: Option<u64>) {
+    match value {
+        Some(value) => {
+            encoded.push(1);
+            encode_u64(encoded, value);
+        }
+        None => encoded.push(0),
+    }
+}
+
+fn encode_optional_string(
+    encoded: &mut Vec<u8>,
+    value: Option<&str>,
+) -> Result<(), ReviewValidationError> {
+    match value {
+        Some(value) => {
+            encoded.push(1);
+            encode_string(encoded, value)
+        }
+        None => {
+            encoded.push(0);
+            Ok(())
+        }
+    }
+}
+
+fn encode_string(encoded: &mut Vec<u8>, value: &str) -> Result<(), ReviewValidationError> {
+    encode_bytes(encoded, value.as_bytes())
+}
+
+fn encode_bytes(encoded: &mut Vec<u8>, value: &[u8]) -> Result<(), ReviewValidationError> {
+    encode_length(encoded, value.len())?;
+    encoded.extend_from_slice(value);
+    Ok(())
+}
+
+fn encode_length(encoded: &mut Vec<u8>, length: usize) -> Result<(), ReviewValidationError> {
+    encode_u64(
+        encoded,
+        u64::try_from(length)
+            .map_err(|_| ReviewValidationError::ClaimFingerprintEncodingOverflow)?,
+    );
+    Ok(())
+}
+
+fn encode_u32(encoded: &mut Vec<u8>, value: u32) {
+    encoded.extend_from_slice(&value.to_le_bytes());
+}
+
+fn encode_u64(encoded: &mut Vec<u8>, value: u64) {
+    encoded.extend_from_slice(&value.to_le_bytes());
+}
+
+fn sync_parent_directory(parent: &Path, path: &Path) -> Result<(), ReviewError> {
+    #[cfg(not(unix))]
+    let _ = parent;
+    #[cfg(unix)]
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| ReviewError::Io {
+            operation: "synchronize parent directory for",
+            path: path.to_path_buf(),
+            source,
+        })?;
+    Ok(())
+}
+
+struct CappedWriter<W> {
+    inner: W,
+    written: u64,
+    limit: u64,
+    limit_exceeded: bool,
+}
+
+impl<W> CappedWriter<W> {
+    const fn new(inner: W, limit: u64) -> Self {
+        Self {
+            inner,
+            written: 0,
+            limit,
+            limit_exceeded: false,
+        }
+    }
+
+    const fn limit_exceeded(&self) -> bool {
+        self.limit_exceeded
+    }
+
+    fn into_inner(self) -> W {
+        self.inner
+    }
+}
+
+impl<W: Write> Write for CappedWriter<W> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        let remaining = self.limit.saturating_sub(self.written);
+        if remaining == 0 {
+            self.limit_exceeded = true;
+            return Err(std::io::Error::other("review sidecar size limit exceeded"));
+        }
+        let allowed = usize::try_from(remaining)
+            .unwrap_or(usize::MAX)
+            .min(buffer.len());
+        let written = self.inner.write(&buffer[..allowed])?;
+        self.written = self
+            .written
+            .checked_add(u64::try_from(written).expect("written byte count fits u64"))
+            .ok_or_else(|| std::io::Error::other("review sidecar byte count overflow"))?;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 fn push_key_part(key: &mut String, value: &str) {
@@ -982,6 +1674,8 @@ pub enum ReviewValidationError {
     DecisionLimitExceeded,
     #[error("review history cursor {applied} exceeds history length {history}")]
     InvalidHistoryCursor { applied: usize, history: usize },
+    #[error("review history cursor {applied} splits a persisted transaction")]
+    InvalidTransactionCursor { applied: usize },
     #[error("review decision {index} has sequence {found}, expected {expected}")]
     InvalidSequence {
         index: usize,
@@ -990,10 +1684,26 @@ pub enum ReviewValidationError {
     },
     #[error("review decision sequence overflowed")]
     SequenceOverflow,
+    #[error("review transaction {index} has id {found}, expected {expected}")]
+    InvalidTransactionId {
+        index: usize,
+        expected: u64,
+        found: u64,
+    },
+    #[error("review transaction id overflowed")]
+    TransactionOverflow,
+    #[error(
+        "review transaction must contain one decision or a disposition followed by its rationale"
+    )]
+    InvalidTransactionShape,
     #[error("review subject must refer to a name claim")]
     NotNameClaim,
     #[error("could not serialize a claim for exact review fingerprinting: {0}")]
     ClaimFingerprintSerialization(#[source] serde_json::Error),
+    #[error("review claim fingerprint version {found} is unsupported")]
+    UnsupportedFingerprintVersion { found: u32 },
+    #[error("review claim fingerprint encoding exceeded its integer domain")]
+    ClaimFingerprintEncodingOverflow,
     #[error("review subject uses a symbol kind this version does not support")]
     UnsupportedSubject,
     #[error("review subject uses a producer kind this version does not support")]
@@ -1056,4 +1766,70 @@ pub enum ReviewError {
     UnsupportedAnalysisFormat,
     #[error("could not project reviewed symbols: {0}")]
     Export(#[source] ExportError),
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+
+    use super::*;
+
+    #[test]
+    fn staged_encoding_stops_at_the_configured_limit_before_publication() {
+        let binary = BinaryIdentity {
+            id: BinaryId::digest(b"bounded-review-sidecar"),
+            size: 1,
+            format: resymbol_core::BinaryFormat::Pe,
+            architecture: "x86_64".to_owned(),
+            image_base: 0x0000_0001_4000_0000,
+        };
+        let ledger = ReviewLedger::new(&binary);
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("bounded.review.json");
+
+        assert!(matches!(
+            ledger.stage_sidecar_with_limit(&path, 32),
+            Err(ReviewError::SidecarTooLarge { limit: 32, .. })
+        ));
+        assert!(!path.exists());
+        assert_eq!(
+            std::fs::read_dir(directory.path())
+                .expect("read temporary directory")
+                .count(),
+            0,
+            "failed bounded staging left a temporary file"
+        );
+    }
+
+    #[derive(Default)]
+    struct FlushTrackingWriter {
+        bytes: Vec<u8>,
+        flush_count: usize,
+    }
+
+    impl Write for FlushTrackingWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.bytes.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flush_count += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn capped_writer_reports_max_plus_one_without_flushing() {
+        let mut sink = FlushTrackingWriter::default();
+        {
+            let mut writer = CappedWriter::new(&mut sink, 4);
+            writer
+                .write_all(b"12345")
+                .expect_err("fifth byte exceeds the cap");
+            assert!(writer.limit_exceeded());
+        }
+        assert_eq!(sink.bytes, b"1234");
+        assert_eq!(sink.flush_count, 0);
+    }
 }

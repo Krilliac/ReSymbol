@@ -97,9 +97,8 @@ impl BoundReviewLedger {
             .map_err(|error| ReviewStateError::Binding(error.to_string()))
     }
 
-    /// Apply one exact-name disposition and, when supplied, its rationale as a
-    /// second immutable annotation. A cloned ledger makes the compound edit
-    /// transactional even at history or validation limits.
+    /// Apply one exact-name disposition and its optional rationale as one
+    /// persisted undo/redo transaction.
     pub fn apply_disposition(
         &mut self,
         subject: &ReviewSubject,
@@ -117,24 +116,17 @@ impl BoundReviewLedger {
         let rationale =
             normalized_optional(rationale, MAX_REVIEW_ANNOTATION_BYTES, "review rationale")?;
         let mut next = self.ledger.clone();
-        next.record(subject.clone(), action, reviewer.clone())?;
-        if let Some(rationale) = rationale {
-            next.record(
-                subject.clone(),
-                DecisionAction::Annotation { text: rationale },
-                reviewer,
-            )?;
-        }
+        next.record_disposition_with_rationale(subject.clone(), action, reviewer, rationale)?;
         self.ledger = next;
         Ok(())
     }
 
-    /// Undo one applied history entry without discarding its redo suffix.
+    /// Undo one applied transaction without discarding its redo suffix.
     pub fn undo(&mut self) -> bool {
         self.ledger.undo().is_some()
     }
 
-    /// Reapply one history entry.
+    /// Reapply one persisted transaction.
     pub fn redo(&mut self) -> bool {
         self.ledger.redo().is_some()
     }
@@ -304,6 +296,10 @@ mod tests {
             )
             .expect("reject with rationale");
         assert_eq!(state.ledger().history().len(), 2);
+        assert_eq!(
+            state.ledger().history()[0].transaction_id(),
+            state.ledger().history()[1].transaction_id()
+        );
         assert!(matches!(
             state
                 .ledger()
@@ -312,6 +308,11 @@ mod tests {
             Some(DecisionAction::Reject)
         ));
         assert!(state.is_dirty());
+        assert!(state.undo());
+        assert!(state.ledger().applied_history().is_empty());
+        assert_eq!(state.redo_count(), 2);
+        assert!(state.redo());
+        assert_eq!(state.applied_count(), 2);
     }
 
     #[test]
