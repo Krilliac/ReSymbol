@@ -115,12 +115,13 @@ any schema 1-through-4 payload whose RTTI base records have a missing or null
 post-schema-1 control-flow record; schemas 2 through 5 explicitly reject a deterministic base thunk
 source valid only through schema-6 transitive endpoint seeding. Changing only the envelope label is
 not migration. Schemas 1 through 6 also reject schema-7 TLS callback state and callback-only base
-thunk seeds. Schemas 1 through 7 reject schema-8 delay-import directory and inventory fields;
-schema 8 rejects a payload missing its explicit delay-import inventory marker.
+thunk seeds. Schemas 1 through 7 reject the exact schema-8 base-analysis `delay_imports` inventory
+key and `directories.delay_imports` directory key; schema 8 rejects a payload missing its explicit
+delay-import inventory marker.
 Plugin-supplied exact thunk claims remain independent of the built-in base-analysis seed invariant.
-`inspect --json`, with or without the optional binary gate, emits only package JSON. For schema 1 it
-preserves the validated original representation rather than placing the migrated current payload
-beneath a legacy schema label.
+`inspect --json`, with or without the optional binary gate, emits only package JSON. For every
+legacy schema 1 through 7 it preserves the validated original representation rather than placing
+the migrated current payload beneath a legacy schema label.
 
 ## Current `AnalysisSession` payload
 
@@ -146,10 +147,10 @@ The base analysis includes:
 - COFF and optional-header fields used by analysis;
 - bounded section, conventional-import, modern delay-import, export, exception-directory, and
   TLS-directory records;
-- a separate ordered delay-import inventory retaining the DLL name,
-  descriptor/name/HMOD/IAT/INT base RVAs, optional BIAT/UIAT base RVAs, per-entry lookup/IAT RVAs
-  and names or ordinals, and the timestamp, but not raw array contents; schema 8 always serializes
-  this inventory, including an empty array, as an explicit compatibility marker;
+- a separate ordered delay-import inventory retaining the DLL name, descriptor RVA and exact
+  attributes value, name/HMOD/IAT/INT base RVAs, optional BIAT/UIAT base RVAs, per-entry lookup/IAT
+  RVAs and hints/names or ordinals, and the timestamp, but not raw array contents; schema 8 always
+  serializes this inventory, including an empty array, as an explicit compatibility marker;
 - x64 `RUNTIME_FUNCTION` entries as evidence-backed candidate function boundaries;
 - up to 4,096 ordered PE32+ TLS callback entries with duplicates preserved, their callback-table
   RVA, and an independent partial-scan flag;
@@ -220,12 +221,13 @@ Every active descriptor must carry nonzero name, module-handle (HMOD), delay-IAT
 The complete declared descriptor range, each consumed descriptor and string, HMOD storage, paired
 64-bit INT/IAT slots and terminators, and optional bound-IAT (BIAT) or unload-IAT (UIAT) arrays must
 be fully file-backed. The HMOD slot's initial bytes and section permissions remain opaque. INT, IAT,
-and each present BIAT or UIAT must be pairwise disjoint and terminate at the same entry index. BIAT
-payload values are otherwise opaque, while the complete UIAT must byte-match the original delay
-IAT. Names and ordinals are decoded from the INT. The package preserves descriptor and entry order,
-the DLL name,
-descriptor/name/HMOD/IAT/INT base RVAs, optional BIAT/UIAT base RVAs, each entry's lookup/IAT RVAs
-and name or ordinal, and the timestamp. It does not serialize raw INT/IAT/BIAT/UIAT array contents.
+and each present BIAT or UIAT must be pairwise disjoint. Each present BIAT or UIAT must have a zero
+slot at the paired INT/IAT entry count. BIAT payload values before that required slot are otherwise
+opaque, including whether any is zero, while the complete UIAT must byte-match the original delay
+IAT. Names, hints, and ordinals are decoded from the INT. The package preserves descriptor and entry
+order, the DLL name, descriptor RVA and exact attributes value, name/HMOD/IAT/INT base RVAs,
+optional BIAT/UIAT base RVAs, each entry's lookup/IAT RVAs and hint/name or ordinal, and the
+timestamp. It does not serialize raw INT/IAT/BIAT/UIAT array contents.
 
 Conventional and delay imports share aggregate ceilings of 4,096 libraries, 65,536 symbols, and
 16 MiB of name bytes. Malformation, conflicting table structure, or exhaustion of any shared limit

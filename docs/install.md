@@ -234,12 +234,13 @@ form, zero, and unknown attribute bits despite ambiguity in the generic PE table
 Each active descriptor must provide nonzero, fully file-backed name, module-handle (HMOD),
 delay-IAT, and delay-INT RVAs; HMOD contents and section permissions remain opaque. Its paired
 null-terminated 64-bit INT/IAT arrays and optional nonzero bound-IAT (BIAT) and unload-IAT (UIAT)
-arrays must also be fully backed and pairwise disjoint. Each present BIAT or UIAT must terminate at
-the paired INT/IAT entry count. BIAT payload values are otherwise opaque, while the complete UIAT
-must byte-match the original delay IAT. The separate package inventory preserves descriptor and
-entry order, the DLL name,
-descriptor/name/HMOD/IAT/INT base RVAs, optional BIAT/UIAT base RVAs, each entry's lookup/IAT RVAs
-and name or ordinal, and the timestamp; it does not serialize raw INT/IAT/BIAT/UIAT array contents.
+arrays must also be fully backed and pairwise disjoint. Each present BIAT or UIAT must have a zero
+slot at the paired INT/IAT entry count. BIAT payload values before that required slot are otherwise
+opaque, including whether any is zero, while the complete UIAT must byte-match the original delay
+IAT. The separate package inventory preserves descriptor and entry order, the DLL name, descriptor
+RVA and exact attributes value, name/HMOD/IAT/INT base RVAs, optional BIAT/UIAT base RVAs, each
+entry's lookup/IAT RVAs and hint/name or ordinal, and the timestamp; it does not serialize raw
+INT/IAT/BIAT/UIAT array contents.
 Malformation and shared-budget exhaustion are hard errors, never partial delay-import results.
 Delay-IAT slots feed the existing `ImportIat` call/thunk target and outrank
 read-only function-pointer fallback; the richer inventory is not added to the neutral projection.
@@ -262,9 +263,9 @@ envelope is rejected, as is placing an RTTI base record with
 a missing or null `class_hierarchy_descriptor_rva` beneath any schema 1-through-4 envelope. A
 schema 1-through-5 envelope also cannot contain a deterministic base thunk source that depends on
 schema-6 transitive endpoint seeding. Schemas 1 through 6 also reject schema-7 TLS callback state
-and callback-only base thunk seeds. Schemas 1 through 7 reject schema-8 delay-import directory and
-inventory fields. Schema 8 always serializes the delay-import inventory, even when empty, and
-rejects a payload missing that marker.
+and callback-only base thunk seeds. Schemas 1 through 7 reject the exact schema-8 base-analysis
+`delay_imports` inventory key and `directories.delay_imports` directory key. Schema 8 always
+serializes the delay-import inventory, even when empty, and rejects a payload missing that marker.
 
 Export a package to a specific destination with `--output`:
 

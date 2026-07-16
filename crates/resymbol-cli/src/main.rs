@@ -539,14 +539,14 @@ struct LoadedAnalysisPackage {
     rtti_recovery_availability: RttiRecoveryAvailability,
     tls_callback_availability: TlsCallbackAvailability,
     delay_import_availability: DelayImportAvailability,
-    schema1_source: Option<ResymPackage<Value>>,
+    legacy_inspection_source: Option<ResymPackage<Value>>,
 }
 
 impl LoadedAnalysisPackage {
     fn to_pretty_inspection_json(&self) -> Result<String> {
-        match &self.schema1_source {
+        match &self.legacy_inspection_source {
             Some(source) => serde_json::to_string_pretty(source)
-                .context("cannot serialize validated schema-v1 package as JSON"),
+                .context("cannot serialize validated legacy package as JSON"),
             None => serde_json::to_string_pretty(&self.package)
                 .context("cannot serialize validated package as JSON"),
         }
@@ -555,7 +555,7 @@ impl LoadedAnalysisPackage {
 
 fn read_analysis_package(
     path: &Path,
-    preserve_schema1_source: bool,
+    preserve_legacy_inspection_source: bool,
 ) -> Result<LoadedAnalysisPackage> {
     let package: ResymPackage<Value> =
         read_file_with_options(path, analysis_package_read_options())?;
@@ -596,7 +596,9 @@ fn read_analysis_package(
         DELAY_IMPORT_SCHEMA_VERSION => DelayImportAvailability::Recorded,
         _ => bail!("unsupported analysis package schema {schema_version}"),
     };
-    let schema1_source = (preserve_schema1_source && schema_version == 1).then(|| package.clone());
+    let legacy_inspection_source = (preserve_legacy_inspection_source
+        && schema_version < CURRENT_SCHEMA_VERSION)
+        .then(|| package.clone());
     match schema_version.cmp(&DELAY_IMPORT_SCHEMA_VERSION) {
         std::cmp::Ordering::Equal => require_v8_delay_import_marker(package.payload())?,
         std::cmp::Ordering::Less => {
@@ -640,7 +642,7 @@ fn read_analysis_package(
         rtti_recovery_availability,
         tls_callback_availability,
         delay_import_availability,
-        schema1_source,
+        legacy_inspection_source,
     })
 }
 
@@ -4466,6 +4468,32 @@ entrypoint = "Plugin.dll"
             });
     }
 
+    fn assert_legacy_inspection_json_preserved_and_reopens(
+        loaded: &LoadedAnalysisPackage,
+        expected: &Value,
+        root: &Path,
+    ) {
+        let schema_version = expected["schema_version"]
+            .as_u64()
+            .expect("legacy schema version is an integer");
+        assert!(loaded.legacy_inspection_source.is_some());
+        let json = loaded
+            .to_pretty_inspection_json()
+            .expect("serialize the validated legacy source representation");
+        let inspected: Value =
+            serde_json::from_str(&json).expect("legacy inspection JSON is valid");
+        assert_eq!(
+            &inspected, expected,
+            "schema {schema_version} inspection must preserve the validated legacy document exactly"
+        );
+
+        let inspection_path = root.join(format!("schema-v{schema_version}-inspection.resym"));
+        fs::write(&inspection_path, json).expect("write legacy inspection JSON for reopening");
+        let reopened = read_analysis_package(&inspection_path, false)
+            .expect("legacy inspection JSON must remain a valid analysis package");
+        assert_eq!(u64::from(reopened.package.schema_version()), schema_version);
+    }
+
     fn schema_v1_package_skeleton() -> (Value, BinaryId) {
         let base_analysis = analyze_bytes(&pe_fixture()).expect("analyze PE fixture");
         let binary = base_analysis.identity().id.clone();
@@ -4572,6 +4600,7 @@ entrypoint = "Plugin.dll"
         let loaded = read_analysis_package(&package_path, true)
             .expect("read current package before binary verification");
         assert_eq!(loaded.package.schema_version(), CURRENT_SCHEMA_VERSION);
+        assert!(loaded.legacy_inspection_source.is_none());
         assert_eq!(
             loaded.code_recovery_availability,
             CodeRecoveryAvailability::Recorded
@@ -5077,7 +5106,7 @@ entrypoint = "Plugin.dll"
             decoded.delay_import_availability,
             DelayImportAvailability::Unavailable(2)
         );
-        assert!(decoded.schema1_source.is_none());
+        assert_legacy_inspection_json_preserved_and_reopens(&decoded, &value, temp.path());
         let BinaryAnalysis::Pe(pe) = decoded.package.payload().base_analysis() else {
             panic!("PE analysis expected");
         };
@@ -5166,16 +5195,7 @@ entrypoint = "Plugin.dll"
             decoded.delay_import_availability,
             DelayImportAvailability::Unavailable(3)
         );
-        assert!(decoded.schema1_source.is_none());
-        assert_eq!(
-            serde_json::from_str::<Value>(
-                &decoded
-                    .to_pretty_inspection_json()
-                    .expect("serialize decoded schema-v3 representation")
-            )
-            .expect("inspection JSON is valid")["schema_version"],
-            3
-        );
+        assert_legacy_inspection_json_preserved_and_reopens(&decoded, &value, temp.path());
 
         inspect(InspectArgs {
             package: path.clone(),
@@ -5268,7 +5288,7 @@ entrypoint = "Plugin.dll"
             decoded.delay_import_availability,
             DelayImportAvailability::Unavailable(4)
         );
-        assert!(decoded.schema1_source.is_none());
+        assert_legacy_inspection_json_preserved_and_reopens(&decoded, &value, temp.path());
         let BinaryAnalysis::Pe(decoded_pe) = decoded.package.payload().base_analysis() else {
             panic!("PE analysis expected");
         };
@@ -5346,6 +5366,7 @@ entrypoint = "Plugin.dll"
             decoded.delay_import_availability,
             DelayImportAvailability::Unavailable(5)
         );
+        assert_legacy_inspection_json_preserved_and_reopens(&decoded, &value, temp.path());
         let BinaryAnalysis::Pe(pe) = decoded.package.payload().base_analysis() else {
             panic!("PE analysis expected");
         };
@@ -5438,6 +5459,7 @@ entrypoint = "Plugin.dll"
             decoded.delay_import_availability,
             DelayImportAvailability::Unavailable(6)
         );
+        assert_legacy_inspection_json_preserved_and_reopens(&decoded, &value, temp.path());
         let BinaryAnalysis::Pe(pe) = decoded.package.payload().base_analysis() else {
             panic!("PE analysis expected");
         };
@@ -5464,7 +5486,7 @@ entrypoint = "Plugin.dll"
                 .expect("projection JSON is valid");
         assert_eq!(
             projection["schema_version"], 6,
-            "package schema 8 must not change debugger projection schema 6"
+            "package schema 6 must not change debugger projection schema 6"
         );
     }
 
@@ -5509,6 +5531,7 @@ entrypoint = "Plugin.dll"
             decoded.delay_import_availability,
             DelayImportAvailability::Unavailable(7)
         );
+        assert_legacy_inspection_json_preserved_and_reopens(&decoded, &value, temp.path());
         let BinaryAnalysis::Pe(pe) = decoded.package.payload().base_analysis() else {
             panic!("PE analysis expected");
         };

@@ -152,11 +152,13 @@ zero, and unknown attribute bits despite ambiguity in the generic PE table docum
 active descriptor must provide nonzero, fully file-backed name, module-handle (HMOD), delay-IAT,
 and delay-INT RVAs. HMOD bytes and section permissions remain opaque to this static-analysis slice.
 The paired 64-bit INT/IAT arrays must be fully backed and end together with null entries. INT, IAT,
-and each present bound-IAT (BIAT) or unload-IAT (UIAT) must be pairwise disjoint; BIAT entries remain
-opaque beyond backing and their matching terminator, while the complete UIAT must byte-match the
-original delay IAT. Names and ordinals are decoded from the INT. The separate package inventory
-preserves descriptor and entry order, the DLL name, descriptor/name/HMOD/IAT/INT base RVAs,
-optional BIAT/UIAT base RVAs, each entry's lookup/IAT RVAs and name or ordinal, and the timestamp;
+and each present bound-IAT (BIAT) or unload-IAT (UIAT) must be pairwise disjoint. Each present BIAT
+or UIAT must have a zero slot at the paired INT/IAT entry count. BIAT payload values before that
+required slot remain opaque, including whether any is zero, while the complete UIAT must byte-match
+the original delay IAT. Names, hints, and ordinals are decoded from the INT. The separate package
+inventory preserves descriptor and entry order, the DLL name, descriptor RVA and exact attributes
+value, name/HMOD/IAT/INT base RVAs, optional BIAT/UIAT base RVAs, each entry's lookup/IAT RVAs and
+hint/name or ordinal, and the timestamp;
 it does not serialize raw INT/IAT/BIAT/UIAT array contents. Conventional and delay imports share
 aggregate limits of 4,096 libraries, 65,536 symbols, and 16 MiB of name bytes. A
 malformed record or exceeded limit fails analysis; delay-import parsing never publishes a partial
@@ -298,7 +300,8 @@ containing an RTTI base record whose `class_hierarchy_descriptor_rva` is missing
 rejected rather than treated as a relabeled legacy package. A schema 1-through-5 envelope likewise
 cannot contain a base thunk source that is valid only through schema-6 transitive endpoint seeding.
 Schemas 1 through 6 likewise cannot contain schema-7 TLS callback records or callback-only base
-thunk seeds. Schemas 1 through 7 cannot contain schema-8 delay-import directory or inventory fields.
+thunk seeds. Schemas 1 through 7 cannot contain the exact schema-8 base-analysis `delay_imports`
+inventory key or `directories.delay_imports` directory key.
 Conversely, schema 8 always serializes its `delay_imports` inventory, including an empty array, and
 rejects a payload missing that marker so a schema-7 package cannot be upgraded by relabeling alone.
 

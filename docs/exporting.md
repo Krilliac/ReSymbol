@@ -180,10 +180,11 @@ existing per-hop relationship. No TLS-specific field is added to neutral project
 callbacks seed only the first-instruction thunk check rather than a body sweep.
 
 The ordered delay-import descriptors and inventory likewise remain package-only. That inventory
-retains the DLL name, descriptor/name/HMOD/IAT/INT base RVAs, optional BIAT/UIAT base RVAs, each
-entry's lookup/IAT RVAs and name or ordinal, and the timestamp, but not raw INT/IAT/BIAT/UIAT array
-contents. Delay-IAT slots still participate in projected control flow through the existing import
-target containing the slot RVA. Conventional and delay-IAT membership both outrank read-only
+retains the DLL name, descriptor RVA and exact attributes value, name/HMOD/IAT/INT base RVAs,
+optional BIAT/UIAT base RVAs, each entry's lookup/IAT RVAs and hint/name or ordinal, and the
+timestamp, but not raw INT/IAT/BIAT/UIAT array contents. Delay-IAT slots still participate in
+projected control flow through the existing import target containing the slot RVA. Conventional and
+delay-IAT membership both outrank read-only
 function-pointer fallback; no delay-import-specific field or target is added to neutral projection
 schema 6.
 

@@ -27,8 +27,9 @@ in schemas 1 and 2, TLS callbacks in schemas 1 through 6, delay imports in schem
 all code recovery when starting from
 schema 1. Relabeled schema-6-only
 transitive base-thunk sources are rejected under schema 1-through-5 envelopes; schemas 1 through 6
-also reject schema-7 TLS callback state and callback-only base thunk seeds.
-Schemas 1 through 7 also reject schema-8 delay-import directory and inventory fields.
+also reject schema-7 TLS callback state and callback-only base thunk seeds. Schemas 1 through 7 also
+reject the exact schema-8 base-analysis `delay_imports` inventory key and
+`directories.delay_imports` directory key.
 
 For every supported package schema, 1 through 8, `resymbol inspect` can optionally accept the exact
 original binary and require its size and SHA-256 to match before inspection data reaches stdout;
@@ -63,12 +64,13 @@ attributes value is exactly the modern RVA-form `dlattrRva` (`1`); the legacy VA
 unknown bits are rejected despite ambiguity in the generic PE table documentation. Each active
 descriptor has nonzero name, module-handle (HMOD), delay-IAT, and delay-INT RVAs; HMOD contents and
 permissions stay opaque. Paired null-terminated 64-bit INT/IAT arrays and optional bound-IAT (BIAT)
-and unload-IAT (UIAT) arrays must be fully backed, pairwise disjoint, and terminate at the same entry
-count. BIAT payload values are otherwise opaque, while the complete UIAT must byte-match the
-original delay IAT. The package separately preserves descriptor and entry
-order, the DLL name, descriptor/name/HMOD/IAT/INT base RVAs, optional BIAT/UIAT base RVAs, each
-entry's lookup/IAT RVAs and name or ordinal, and the timestamp. It does not serialize raw
-INT/IAT/BIAT/UIAT array contents. Conventional and delay imports share ceilings of 4,096
+and unload-IAT (UIAT) arrays must be fully backed and pairwise disjoint. Each present BIAT or UIAT
+must have a zero slot at the paired INT/IAT entry count. BIAT payload values before that required
+slot are otherwise opaque, including whether any is zero, while the complete UIAT must byte-match
+the original delay IAT. The package separately preserves descriptor and entry order, the DLL name,
+descriptor RVA and exact attributes value, name/HMOD/IAT/INT base RVAs, optional BIAT/UIAT base
+RVAs, each entry's lookup/IAT RVAs and hint/name or ordinal, and the timestamp. It does not serialize
+raw INT/IAT/BIAT/UIAT array contents. Conventional and delay imports share ceilings of 4,096
 libraries, 65,536 symbols, and 16 MiB of names; malformed input or budget exhaustion is a hard
 analysis error rather than a partial prefix. Delay-IAT slots join conventional IAT slots for the
 existing `ImportIat` call/thunk target and take precedence over read-only function-pointer fallback.

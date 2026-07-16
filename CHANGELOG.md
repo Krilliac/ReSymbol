@@ -62,12 +62,13 @@ prereleases; breaking changes remain explicit.
   ReSymbol accepts only ordered, null-terminated 32-byte RVA-form descriptors with all-zero declared
   tail padding whose attributes are
   exactly `dlattrRva` (`1`), explicitly rejecting the legacy VA form and unknown bits despite the
-  generic PE table's ambiguity. The ordered package inventory retains the DLL name,
-  descriptor/name/HMOD/IAT/INT base RVAs, optional BIAT/UIAT base RVAs, per-entry lookup/IAT RVAs
-  and names or ordinals, and the timestamp, but not raw array contents. HMOD contents and permissions
-  remain opaque. INT/IAT and optional BIAT/UIAT arrays must be pairwise disjoint and terminate at the
-  same entry index; BIAT values are otherwise opaque, while the complete UIAT must byte-match the
-  original delay IAT. Every consumed descriptor, table, slot,
+  generic PE table's ambiguity. The ordered package inventory retains the DLL name, descriptor RVA
+  and exact attributes value, name/HMOD/IAT/INT base RVAs, optional BIAT/UIAT base RVAs, per-entry
+  lookup/IAT RVAs and hints/names or ordinals, and the timestamp, but not raw array contents. HMOD
+  contents and permissions remain opaque. INT/IAT and optional BIAT/UIAT arrays must be pairwise
+  disjoint. Each present BIAT or UIAT must have a zero slot at the paired INT/IAT entry count; BIAT
+  payload values before that slot are otherwise opaque, including whether any is zero, while the
+  complete UIAT must byte-match the original delay IAT. Every consumed descriptor, table, slot,
   and string must be fully file-backed. Conventional and delay imports share limits of 4,096 libraries,
   65,536 symbols, and 16 MiB of names; malformed input or any exhausted limit is a hard analysis
   error rather than a partial result. Delay-IAT slots join conventional IAT slots for existing
@@ -244,8 +245,9 @@ schema versions independently.
   relabeled schema-5 semantics, and rejects a schema 1-through-5 envelope containing a base thunk
   source that depends on schema-6 transitive endpoint seeding, and rejects schema 1-through-6
   envelopes containing schema-7 TLS callback state or callback-only base thunk seeds. It also
-  rejects schema 1-through-7 envelopes containing schema-8 delay-import directory or inventory
-  fields. Changing only the envelope label is never migration.
+  rejects schema 1-through-7 envelopes containing the exact schema-8 base-analysis `delay_imports`
+  inventory key or `directories.delay_imports` directory key. Changing only the envelope label is
+  never migration.
 - Package schema 8 and neutral projection schema 6 are independent version domains. Generic
   package readers still require an explicit compatibility range and application-defined payload
   migration to accept an older schema.

@@ -402,10 +402,10 @@ submission. `AnalysisRequest.BaseAnalysis` contains the detached canonical base 
 `symbols.read` was granted; without that permission it is `null`.
 Package schema 7 adds the TLS directory, callback-table RVA, ordered callback records, and partial
 flag to that detached JSON object. Package schema 8 adds the separate ordered modern delay-import
-directory and inventory: the DLL name, descriptor/name/HMOD/IAT/INT base RVAs, optional BIAT/UIAT
-base RVAs, each entry's lookup/IAT RVAs and name or ordinal, and the timestamp. Raw array contents
-are not serialized. Those fields are additive data, not a new managed SDK type or plugin assertion;
-the plugin API remains unchanged.
+directory and inventory: the DLL name, descriptor RVA and exact attributes value,
+name/HMOD/IAT/INT base RVAs, optional BIAT/UIAT base RVAs, each entry's lookup/IAT RVAs and
+hint/name or ordinal, and the timestamp. Raw array contents are not serialized. Those fields are
+additive data, not a new managed SDK type or plugin assertion; the plugin API remains unchanged.
 
 #### Managed plugin author quickstart
 

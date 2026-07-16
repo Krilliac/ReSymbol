@@ -132,12 +132,13 @@ whose attributes value is exactly `dlattrRva` (`1`) and rejects the legacy VA fo
 unknown bits despite ambiguity in the generic PE table documentation. Each active descriptor has
 nonzero name, module-handle (HMOD), delay-IAT, and delay-INT RVAs; HMOD contents and permissions stay
 opaque. Its paired null-terminated 64-bit INT/IAT arrays and any nonzero optional bound-IAT (BIAT) or
-unload-IAT (UIAT) array must be fully file-backed, pairwise disjoint, and terminate at the same entry
-count. BIAT payload values are otherwise opaque, while the complete UIAT must byte-match the
-original delay IAT. The deterministic package inventory preserves
-descriptor and entry order, the DLL name, descriptor/name/HMOD/IAT/INT base RVAs, optional
-BIAT/UIAT base RVAs, each entry's lookup/IAT RVAs and name or ordinal, and the timestamp. It does
-not serialize raw INT/IAT/BIAT/UIAT array contents.
+unload-IAT (UIAT) array must be fully file-backed and pairwise disjoint. Each present BIAT or UIAT
+must have a zero slot at the paired INT/IAT entry count. BIAT payload values before that required
+slot are otherwise opaque, including whether any is zero, while the complete UIAT must byte-match
+the original delay IAT. The deterministic package inventory preserves descriptor and entry order,
+the DLL name, descriptor RVA and exact attributes value, name/HMOD/IAT/INT base RVAs, optional
+BIAT/UIAT base RVAs, each entry's lookup/IAT RVAs and hint/name or ordinal, and the timestamp. It
+does not serialize raw INT/IAT/BIAT/UIAT array contents.
 
 Conventional and delay imports consume shared ceilings of 4,096 libraries, 65,536 symbols, and
 16 MiB of names. Structural failure or budget exhaustion rejects the analysis instead of retaining
@@ -571,14 +572,15 @@ All schemas 1 through 4 are semantically gated against relabeled schema-5 base-c
 base thunk source that is valid only under schema-6 transitive endpoint seeding.
 Schemas 1 through 6 reject schema-7 TLS fields, core `pe-tls-callback` claims, and callback-only
 base thunk seeds rather than accepting a relabeled package.
-Schemas 1 through 7 likewise reject schema-8 delay-import directory and inventory fields. Current
-schema 8 always serializes the delay-import inventory, including an empty array, and rejects a
-payload missing that marker so relabeling alone cannot upgrade a legacy package.
+Schemas 1 through 7 likewise reject the exact schema-8 base-analysis `delay_imports` inventory key
+and `directories.delay_imports` directory key. Current schema 8 always serializes the delay-import
+inventory, including an empty array, and rejects a payload missing that marker so relabeling alone
+cannot upgrade a legacy package.
 The independently versioned debugger-neutral projection is schema 6; its string-reference
 correlation and exact per-hop thunk relationships are derived from already validated claims and
-therefore do not require a projection-schema change or legacy package rewrite. The equal numeric
-versions do not couple these two compatibility domains. Package schema 8 also leaves the plugin
-API and external wire protocol 1.0 unchanged. Plugins with `symbols.read` can observe the additive
+therefore do not require a projection-schema change or legacy package rewrite. Package schema 8 and
+neutral projection schema 6 remain independent compatibility domains. Package schema 8 also leaves
+the plugin API and external wire protocol 1.0 unchanged. Plugins with `symbols.read` can observe the
 TLS and delay-import fields in detached base-analysis JSON; plugins without that permission receive
 no base analysis.
 
