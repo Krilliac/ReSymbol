@@ -24,7 +24,18 @@ pub enum HostRiskOperation {
 
 /// Host-local approval grant. Register this on the owning session worker only
 /// after the UI has approved the exact operation and target.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// The lease intentionally does not implement [`Clone`]. Moving it into the
+/// session worker transfers its one-use authority; duplicating it would create
+/// two independently consumable grants with the same identifier.
+///
+/// ```compile_fail
+/// use resymbol_debugger::HostRiskLease;
+///
+/// fn require_clone<T: Clone>() {}
+/// require_clone::<HostRiskLease>();
+/// ```
+#[derive(Debug, PartialEq, Eq)]
 pub struct HostRiskLease {
     id: HostRiskLeaseId,
     session_id: SessionId,
@@ -128,7 +139,18 @@ impl SandboxOwnershipBinding {
 
 /// Host-local, provider-issued one-use grant. It is intentionally not Serde;
 /// only its unpredictable identifier crosses the command protocol.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// The lease intentionally does not implement [`Clone`]. Moving it into the
+/// session worker transfers its one-use authority while the cloneable binding
+/// remains ordinary evidence after successful consumption.
+///
+/// ```compile_fail
+/// use resymbol_debugger::SandboxOwnershipLease;
+///
+/// fn require_clone<T: Clone>() {}
+/// require_clone::<SandboxOwnershipLease>();
+/// ```
+#[derive(Debug, PartialEq, Eq)]
 pub struct SandboxOwnershipLease {
     id: SandboxOwnershipLeaseId,
     binding: SandboxOwnershipBinding,
@@ -153,5 +175,59 @@ impl SandboxOwnershipLease {
     #[must_use]
     pub fn into_binding(self) -> SandboxOwnershipBinding {
         self.binding
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::identity::{HostRiskLeaseId, SandboxOwnershipLeaseId};
+    use crate::protocol::{ProcessId, ProcessStartKey};
+
+    fn assert_clone<T: Clone>() {}
+
+    #[test]
+    fn lease_inputs_remain_cloneable_without_cloning_authority() {
+        assert_clone::<HostRiskLeaseId>();
+        assert_clone::<SandboxOwnershipLeaseId>();
+        assert_clone::<HostRiskOperation>();
+        assert_clone::<SandboxOwnershipBinding>();
+    }
+
+    #[test]
+    fn one_use_lease_apis_preserve_move_based_registration_inputs() {
+        let session_id = SessionId::new(7).expect("session id");
+        let risk_id = HostRiskLeaseId::new("a".repeat(64)).expect("host-risk lease id");
+        let binary_id = BinaryId::digest(b"approved target");
+        let risk = HostRiskLease::new(
+            risk_id.clone(),
+            session_id,
+            HostRiskOperation::Launch {
+                binary_id: binary_id.clone(),
+            },
+        );
+        assert_eq!(risk.id(), &risk_id);
+        assert_eq!(risk.session_id(), session_id);
+        assert_eq!(risk.operation(), &HostRiskOperation::Launch { binary_id });
+
+        let binding = SandboxOwnershipBinding::new(
+            session_id,
+            ProcessIdentity {
+                process_id: ProcessId::new(42).expect("process id"),
+                start_key: ProcessStartKey::new(11).expect("process start key"),
+                binary_id: BinaryId::digest(b"owned target"),
+            },
+            AttachMode::Debug,
+            SandboxProviderSelection::LocalAppContainer,
+            PolicyDigest::new("b".repeat(64)).expect("policy digest"),
+            ProvisioningEpoch::new("c".repeat(64)).expect("provisioning epoch"),
+        );
+        let ownership_id =
+            SandboxOwnershipLeaseId::new("d".repeat(64)).expect("ownership lease id");
+        let ownership = SandboxOwnershipLease::new(ownership_id.clone(), binding.clone());
+        assert_eq!(ownership.id(), &ownership_id);
+        assert_eq!(ownership.binding(), &binding);
+        assert_eq!(ownership.into_binding(), binding);
     }
 }
