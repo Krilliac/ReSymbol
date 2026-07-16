@@ -113,6 +113,13 @@ impl MainTab {
             Self::Exports => "Exports",
         }
     }
+
+    const fn workflow_stage(self) -> WorkflowStage {
+        match self {
+            Self::Exports => WorkflowStage::Export,
+            _ => WorkflowStage::Review,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1704,12 +1711,12 @@ impl WorkbenchApp {
         }
         self.review_orphaned_decisions = updated_orphaned_decisions;
         self.project = Some(project);
-        self.stage = WorkflowStage::Review;
         self.main_tab = if reviews_still_bound {
             previous_main_tab
         } else {
             MainTab::Overview
         };
+        self.stage = self.main_tab.workflow_stage();
         if protection_requires_review {
             self.activity_tab = ActivityTab::Warnings;
             self.log(
@@ -5383,7 +5390,7 @@ fn bounded_message(mut message: String) -> String {
 
 #[cfg(test)]
 mod close_safety_tests {
-    use super::{close_requires_confirmation, review_save_requires_dialog};
+    use super::{MainTab, WorkflowStage, close_requires_confirmation, review_save_requires_dialog};
     use std::path::Path;
 
     #[test]
@@ -5407,5 +5414,17 @@ mod close_safety_tests {
         assert!(review_save_requires_dialog(existing.path(), None));
         let new_path = directory.path().join("new-project.review.json");
         assert!(!review_save_requires_dialog(&new_path, None,));
+    }
+
+    #[test]
+    fn retained_main_tabs_map_to_a_consistent_workflow_stage() {
+        for tab in MainTab::ALL {
+            let expected = if tab == MainTab::Exports {
+                WorkflowStage::Export
+            } else {
+                WorkflowStage::Review
+            };
+            assert_eq!(tab.workflow_stage(), expected);
+        }
     }
 }
