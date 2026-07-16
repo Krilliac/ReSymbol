@@ -1,7 +1,8 @@
 # Workbench visual captures
 
-ReSymbol keeps four deterministic review views for the checked-in symbolized MSVC fixture:
-**Overview**, **Functions**, **Reconstruction Graph**, and **Address Space**. The capture path builds
+ReSymbol's deterministic capture workflow covers five review views for the checked-in symbolized MSVC fixture:
+**Overview**, **Functions**, **Reconstruction Graph**, **Address Space**, and the non-executing
+**Debugger / Sandbox Readiness** surface. The capture path builds
 the workbench with its opt-in `screenshot` feature, disables persisted window state and animation,
 sets a fixed native viewport and UI zoom, waits for the workbench panels to settle, and then
 uses egui's next-frame screenshot event. Every PNG must be exactly 1440x900 pixels.
@@ -14,7 +15,7 @@ On Windows, regenerate the views with:
 
 The default output directory is `docs/images`. Use `-OutputDirectory <path>` for disposable review
 artifacts or `-SkipBuild` after explicitly building
-`resymbol-workbench --features screenshot --bin resymbol-workbench`. Each run writes the four PNGs
+`resymbol-workbench --features screenshot --bin resymbol-workbench`. Each run writes the five PNGs
 and `capture-manifest.json`, which records dimensions, byte sizes, and SHA-256 hashes for the input
 fixture and outputs.
 

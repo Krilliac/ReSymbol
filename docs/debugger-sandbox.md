@@ -78,6 +78,22 @@ Deterministic fake backends exercise ready, unavailable, missing-capability, and
 paths without touching the host. Production provisioning and runtime attestation remain separate
 subsystems.
 
+### Workbench readiness surface
+
+The Workbench **Debugger / Sandbox** tab combines provider discovery with only the active project's
+validated SHA-256, size, exact-source state, and bounded static protection summary. The selected
+Local AppContainer, Windows Sandbox, or Hyper-V request is submitted to the existing single
+application-service worker with a monotonic operation identifier. Results are accepted only when
+the operation, exact project evidence snapshot, and selected provider still match; changing the
+project, verifying source bytes, or choosing another provider makes an older result stale.
+
+The surface shows the exact provider, requested boundary and policy properties, typed readiness
+reason, and every unresolved prerequisite. It never opens, attaches, launches, or resumes a target;
+creates a profile or VM; activates a provider; fabricates an attestation; or substitutes another
+provider. Even `ready-for-provisioning-attempt` is explicitly presented as a preflight observation,
+not a containment guarantee. The `tab debugger-sandbox` companion-console command only navigates to
+this same non-executing surface.
+
 ## Target modes
 
 Target selection is explicit and capability-reported:
