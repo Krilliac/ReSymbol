@@ -30,8 +30,13 @@ use rustix::{
 use std::os::unix::process::CommandExt as _;
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
+#[cfg(target_os = "macos")]
+use std::time::Duration;
 #[cfg(windows)]
 use win32job::{ExtendedLimitInfo, Job};
+
+#[cfg(target_os = "macos")]
+const MACOS_EXIT_CONFIRMATION_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// A direct child process whose descendants share an OS containment boundary.
 ///
@@ -317,7 +322,13 @@ impl ContainedChild {
         match self.terminate_containment_group() {
             Ok(()) => Ok(()),
             Err(error) if error.raw_os_error() == Some(Errno::PERM.raw_os_error()) => {
-                match self.exit_observation.try_observe_exit() {
+                // XNU can expose the zombie-only group result just before the registered kqueue
+                // event becomes readable. Wait only at this evidence boundary; a live or
+                // inaccessible process still returns the original EPERM after the fixed deadline.
+                match self
+                    .exit_observation
+                    .try_observe_exit_for(MACOS_EXIT_CONFIRMATION_TIMEOUT)
+                {
                     Ok(true) => self.reap_observed_direct_child().map(|_| ()),
                     Ok(false) => Err(error),
                     Err(observation_error) => Err(io::Error::new(
@@ -447,10 +458,14 @@ impl MacOsExitObservation {
     }
 
     fn try_observe_exit(&mut self) -> io::Result<bool> {
+        self.try_observe_exit_for(Duration::ZERO)
+    }
+
+    fn try_observe_exit_for(&mut self, timeout: Duration) -> io::Result<bool> {
         match self {
             Self::Observed => Ok(true),
             Self::Watching(watcher) => {
-                let observed = watcher.try_observe_exit()?;
+                let observed = watcher.try_observe_exit_for(timeout)?;
                 if observed {
                     *self = Self::Observed;
                 }
@@ -480,8 +495,8 @@ struct MacOsExitWatcher {
 
 #[cfg(target_os = "macos")]
 impl MacOsExitWatcher {
-    fn try_observe_exit(&self) -> io::Result<bool> {
-        match self.watcher.poll(None) {
+    fn try_observe_exit_for(&self, timeout: Duration) -> io::Result<bool> {
+        match self.watcher.poll(Some(timeout)) {
             None => Ok(false),
             Some(event) => classify_macos_exit_event(self.pid, event),
         }
@@ -763,6 +778,23 @@ mod tests {
             assert_eq!(child.wait()?.code(), Some(41));
             child.terminate()?;
         }
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_bounded_exit_confirmation_rejects_a_live_child() -> io::Result<()> {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 1"]);
+        let mut child = ContainedChild::spawn(&mut command)?;
+
+        assert!(
+            !child
+                .exit_observation
+                .try_observe_exit_for(Duration::from_millis(25))?
+        );
+        child.terminate()?;
+        let _ = child.wait()?;
         Ok(())
     }
 
