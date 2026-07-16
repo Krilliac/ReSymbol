@@ -321,7 +321,7 @@ fn validate_and_measure(
                     section: symbol.section,
                     section_count: section_headers.len(),
                 })?;
-        let section_size = u32_at(section, 8).max(u32_at(section, 16));
+        let section_size = loaded_section_size(section);
         if symbol.offset >= section_size {
             return Err(PdbStreamError::SymbolOutsideSection {
                 symbol: index,
@@ -559,7 +559,7 @@ fn build_dbi_stream(
     push_u16(&mut output, descriptor_count);
     for (index, header) in section_headers.iter().enumerate() {
         let characteristics = u32_at(header, 36);
-        let mapped_size = u32_at(header, 8).max(u32_at(header, 16));
+        let mapped_size = loaded_section_size(header);
         push_section_map_entry(
             &mut output,
             section_map_flags(characteristics),
@@ -900,6 +900,15 @@ fn u32_at(bytes: &[u8], offset: usize) -> u32 {
     ])
 }
 
+fn loaded_section_size(header: &[u8; 40]) -> u32 {
+    let virtual_size = u32_at(header, 8);
+    if virtual_size == 0 {
+        u32_at(header, 16)
+    } else {
+        virtual_size
+    }
+}
+
 fn push_u16(output: &mut Vec<u8>, value: u16) {
     output.extend_from_slice(&value.to_le_bytes());
 }
@@ -1057,10 +1066,10 @@ mod tests {
         assert_eq!(read_u16(dbi, map + 2), 3);
         assert_eq!(read_u16(dbi, map + 4), 0x10d); // RX, 32-bit, selector.
         assert_eq!(read_u16(dbi, map + 10), 1);
-        assert_eq!(read_u32(dbi, map + 20), 0x400);
+        assert_eq!(read_u32(dbi, map + 20), 0x321);
         assert_eq!(read_u16(dbi, map + 24), 0x10b); // RW, 32-bit, selector.
         assert_eq!(read_u16(dbi, map + 30), 2);
-        assert_eq!(read_u32(dbi, map + 40), 0x200);
+        assert_eq!(read_u32(dbi, map + 40), 0x80);
         assert_eq!(read_u16(dbi, map + 44), 0x208); // Absolute descriptor.
         assert_eq!(read_u16(dbi, map + 50), 3);
         assert_eq!(read_u32(dbi, map + 60), u32::MAX);
@@ -1084,6 +1093,24 @@ mod tests {
             expected.extend_from_slice(section);
         }
         assert_eq!(stream(&streams, STREAM_SECTION_HEADERS), expected);
+    }
+
+    #[test]
+    fn section_extents_exclude_raw_padding_and_keep_zero_virtual_size_fallback() {
+        let raw_padding = section(b".rawpad", 0x100, 0x200, IMAGE_SCN_MEM_READ);
+        assert_eq!(loaded_section_size(&raw_padding), 0x100);
+
+        let zero_virtual = section(b".legacy", 0, 0x200, IMAGE_SCN_MEM_READ);
+        assert_eq!(loaded_section_size(&zero_virtual), 0x200);
+
+        let last_fallback_byte = PdbPublicSymbol {
+            name: "fallback_end",
+            section: 1,
+            offset: 0x1ff,
+            is_function: false,
+        };
+        build_logical_streams(GUID, 1, 0x8664, &[zero_virtual], &[last_fallback_byte])
+            .expect("zero VirtualSize uses the raw-size fallback");
     }
 
     #[test]
@@ -1289,14 +1316,14 @@ mod tests {
                 PdbPublicSymbol {
                     name: "valid",
                     section: 1,
-                    offset: 0x400,
+                    offset: 0x321,
                     is_function: true,
                 },
                 PdbStreamError::SymbolOutsideSection {
                     symbol: 0,
                     section: 1,
-                    offset: 0x400,
-                    section_size: 0x400,
+                    offset: 0x321,
+                    section_size: 0x321,
                 },
             ),
         ] {
