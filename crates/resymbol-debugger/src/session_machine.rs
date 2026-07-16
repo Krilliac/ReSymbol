@@ -1713,12 +1713,12 @@ mod tests {
         let (lease, verifier) = issuer
             .issue(session_id(), provisioning_epoch(), operation)
             .expect("host-risk grant");
-        let mut machine = machine();
-        machine
+        let mut host_machine = machine();
+        host_machine
             .register_host_risk_lease(lease)
             .expect("first registration");
         assert_eq!(
-            machine.register_host_risk_verifier(verifier),
+            host_machine.register_host_risk_verifier(verifier),
             Err(SessionMachineError::DuplicateAuthorizationLease)
         );
 
@@ -1732,12 +1732,12 @@ mod tests {
         );
         let mut issuer = SandboxOwnershipLeaseIssuer::new().expect("sandbox ownership issuer");
         let (lease, verifier) = issuer.issue(binding).expect("sandbox ownership grant");
-        let mut machine = machine();
-        machine
+        let mut ownership_machine = machine();
+        ownership_machine
             .register_sandbox_ownership_lease(lease)
             .expect("first registration");
         assert_eq!(
-            machine.register_sandbox_ownership_verifier(verifier),
+            ownership_machine.register_sandbox_ownership_verifier(verifier),
             Err(SessionMachineError::DuplicateAuthorizationLease)
         );
     }
