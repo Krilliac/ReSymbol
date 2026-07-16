@@ -3068,6 +3068,7 @@ dependencies = [
  "kqueue",
  "resymbol-core",
  "resymbol-plugin-state",
+ "resymbol-windows-process",
  "rustix 1.1.4",
  "semver",
  "serde",
@@ -3076,7 +3077,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "wasmtime",
- "win32job",
 ]
 
 [[package]]
@@ -3089,6 +3089,14 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "resymbol-windows-process"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "tempfile",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4416,16 +4424,6 @@ dependencies = [
  "log",
  "thiserror 2.0.18",
  "web-sys",
-]
-
-[[package]]
-name = "win32job"
-version = "2.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8c6a6724ccfbf34154a8691bd868b0fcd2be2ca3f7b47b32614654f1a01b191c"
-dependencies = [
- "thiserror 1.0.69",
- "windows",
 ]
 
 [[package]]

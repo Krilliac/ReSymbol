@@ -11,6 +11,7 @@ members = [
     "crates/resymbol-plugin-api",
     "crates/resymbol-plugin-runtime",
     "crates/resymbol-plugin-state",
+    "crates/resymbol-windows-process",
     "crates/resymbol-workbench",
 ]
 resolver = "3"

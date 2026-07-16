@@ -2,7 +2,7 @@ use std::{
     env, fs,
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
-    process::{Command, ExitStatus, Stdio},
+    process::ExitStatus,
     sync::{Arc, Mutex, mpsc},
     thread,
     time::{Duration, Instant},
@@ -16,7 +16,7 @@ use resymbol_core::{
 use crate::{
     ExternalProcessRequest, PluginExecution, PluginRuntimeError, ProcessDiagnostics, RuntimeLimits,
     StreamKind,
-    process_tree::ContainedChild,
+    process_tree::{ContainedChild, ContainedCommand},
     wire::{encode_input, parse_output},
 };
 
@@ -66,13 +66,11 @@ impl ExternalProcessHost {
                 "request_timeout is too large for the platform clock",
             ))?;
 
-        let mut command = Command::new(entrypoint);
+        let mut command = ContainedCommand::new(entrypoint);
         command
             .args(args)
             .current_dir(plugin_root)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .piped_standard_io()
             .env_clear();
         preserve_operating_system_environment(&mut command);
 
@@ -176,7 +174,7 @@ pub(crate) fn resolve_entrypoint(
     Ok((canonical_entrypoint, canonical_root))
 }
 
-pub(crate) fn preserve_operating_system_environment(command: &mut Command) {
+pub(crate) fn preserve_operating_system_environment(command: &mut ContainedCommand) {
     // These variables can be required by Windows process initialization and
     // temporary-directory APIs. User credentials and arbitrary host variables
     // are deliberately not inherited.

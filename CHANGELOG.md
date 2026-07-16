@@ -89,9 +89,10 @@ prereleases; breaking changes remain explicit.
 - Added executable-plugin process-tree lifecycle containment. External, native, and managed launches
   own descendants through POSIX process groups or Windows Job Objects and terminate the owned tree
   on direct-child completion, deadline, stdout/stderr capture failure, or runtime drop. This is not
-  filesystem, network, or authority sandboxing: Windows retains a narrow spawn-to-Job-assignment
-  escape race, and a hostile POSIX plugin/helper or descendant can deliberately leave its process
-  group or session.
+  filesystem, network, or authority sandboxing. Windows creates each child atomically inside a
+  preconfigured kill-on-close Job, restricts inheritance to the exact standard-stream handles,
+  verifies membership before returning, and has no spawn-then-assign fallback. A hostile POSIX
+  plugin/helper or descendant can still deliberately leave its process group or session.
 - Added bounded modern MSVC x64 Rev1 RTTI and vftable discovery, including validated stored type
   names, base-class records, virtual-slot targets, vftable names, and attributed function-to-class
   relationships. Base-class arrays may mix the legacy 24-byte descriptor with the 28-byte

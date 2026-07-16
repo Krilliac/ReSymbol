@@ -3,7 +3,6 @@ use std::{
     fs::{self, File},
     io::Read as _,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -19,7 +18,7 @@ use crate::{
     ExternalProcessRequest, PluginExecution, PluginMethod, PluginRuntimeError, ProcessDiagnostics,
     RuntimeLimits,
     host::{preserve_operating_system_environment, run_child_observing_stderr},
-    process_tree::ContainedChild,
+    process_tree::{ContainedChild, ContainedCommand},
     wire::encode_input,
 };
 
@@ -280,16 +279,14 @@ impl ManagedProcessHost {
             });
         }
 
-        let mut command = Command::new(&helper);
+        let mut command = ContainedCommand::new(&helper);
         command
             .arg("--plugin-root")
             .arg(&plugin_root)
             .arg("--binary")
             .arg(&exact_binary)
             .current_dir(&plugin_root)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .piped_standard_io()
             .env_clear()
             .env("DOTNET_BUNDLE_EXTRACT_BASE_DIR", extraction_base.path());
         preserve_operating_system_environment(&mut command);
