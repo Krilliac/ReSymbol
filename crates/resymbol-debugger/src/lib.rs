@@ -5,6 +5,7 @@
 //! exchanges only the bounded commands and events defined here.
 
 mod address_space;
+mod authorization;
 mod host_client;
 mod host_codec;
 mod host_response;
@@ -20,6 +21,9 @@ pub use address_space::{
     AddressRange, FileBacking, MemoryAccess, RelativeAddress, StaticAddressSpace,
     StaticAddressSpaceError, StaticRegion, StaticRegionKind,
 };
+pub use authorization::{
+    HostRiskLease, HostRiskOperation, SandboxOwnershipBinding, SandboxOwnershipLease,
+};
 pub use host_client::{
     ClientConnectionState, CommandReceipt, DebugHostClient, DebugHostClientError,
     HostFrameExchange, HostTransportError, InMemoryDebugHost, MAX_PENDING_COMMANDS,
@@ -33,7 +37,10 @@ pub use host_response::{
     HostResponseBudgetError, HostResponseFramePermit, HostResponseLimits, MAX_RESPONSE_BYTES,
     MAX_RESPONSE_FRAME_BYTES, MAX_RESPONSE_FRAMES,
 };
-pub use identity::SessionIdError;
+pub use identity::{
+    HostRiskLeaseId, HostRiskLeaseIdError, ProvisioningEpoch, ProvisioningEpochError,
+    SandboxOwnershipLeaseId, SandboxOwnershipLeaseIdError, SessionIdError,
+};
 pub use protection::{
     EvidenceStrength, ProtectionEvidence, ProtectionFinding, ProtectionKind, ProtectionReport,
     ProtectionScanError, ProtectionSeverity, scan_pe_protections,
@@ -46,9 +53,9 @@ pub use protocol::{
     EventSequenceCursor, ExecutionToken, HardwareAccess, LaunchEnvironment, LaunchTarget,
     LiveToken, MAX_CAPABILITY_STATUSES, MAX_LAUNCH_ARGUMENT_BYTES, MAX_LAUNCH_ARGUMENTS,
     MAX_MEMORY_READ_BYTES, MAX_MEMORY_WRITE_BYTES, MAX_REASON_BYTES, MemoryAddress, OfflineTarget,
-    ProcessId, ProtocolValidationError, ProtocolVersion, ReadViewToken, RunId, RunToken, SessionId,
-    SessionState, SessionStateKind, SnapshotId, StateGeneration, StateToken, StepKind, StopId,
-    StopReason, StopToken, ThreadId,
+    ProcessId, ProcessIdentity, ProcessStartKey, ProtocolValidationError, ProtocolVersion,
+    ReadViewToken, RunId, RunToken, SessionId, SessionState, SessionStateKind, SnapshotId,
+    StateGeneration, StateToken, StepKind, StopId, StopReason, StopToken, ThreadId,
 };
 pub use provider_probe::{
     MAX_PROBE_GUARANTEES, MAX_PROBE_REQUIREMENTS, ProviderProbeObservation,
@@ -63,11 +70,14 @@ pub use sandbox::{
     CleanupResidualKind, DiagnosticText, DifferencingDiskId, DynamicCodeProfile,
     ExpectedSandboxAttestation, HelperBuildId, IsolationBoundary, PolicyDigest, PolicyDigestError,
     PolicyValidationError, ProcessMitigationProfile, ProviderUnavailable,
-    ProviderUnavailableReason, ResourceLimitError, RiskAcknowledgementId,
-    SANDBOX_POLICY_DIGEST_VERSION, SandboxAttestation, SandboxCleanupReceipt, SandboxFailure,
-    SandboxFailureKind, SandboxFailureStage, SandboxGuarantee, SandboxLifecycleEvent,
-    SandboxLifecycleState, SandboxMachine, SandboxMachineError, SandboxNetworkMode, SandboxPolicy,
-    SandboxProviderDescriptor, SandboxProviderSelection, SandboxResourceLimits, SealedImageDigest,
-    SealedImageDigestError, SealedImageId, VmIsolationIdentity, Win32kProfile,
+    ProviderUnavailableReason, ResourceLimitError, SANDBOX_POLICY_DIGEST_VERSION,
+    SandboxAttestation, SandboxCleanupReceipt, SandboxFailure, SandboxFailureKind,
+    SandboxFailureStage, SandboxGuarantee, SandboxLifecycleEvent, SandboxLifecycleState,
+    SandboxMachine, SandboxMachineError, SandboxNetworkMode, SandboxPolicy,
+    SandboxPolicyApprovalId, SandboxProviderDescriptor, SandboxProviderSelection,
+    SandboxResourceLimits, SealedImageDigest, SealedImageDigestError, SealedImageId,
+    VmIsolationIdentity, Win32kProfile,
 };
-pub use session_machine::{SessionMachine, SessionMachineError};
+pub use session_machine::{
+    MAX_REGISTERED_AUTHORIZATION_LEASES, SessionMachine, SessionMachineError,
+};

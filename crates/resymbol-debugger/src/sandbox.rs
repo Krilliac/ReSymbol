@@ -7,7 +7,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
-use crate::identity::SessionId;
+use crate::identity::{ProvisioningEpoch, SessionId};
 
 const MAX_PROVIDER_ID_BYTES: usize = 96;
 const MAX_ACK_ID_BYTES: usize = 128;
@@ -95,8 +95,8 @@ macro_rules! bounded_identifier {
 
 bounded_identifier!(ProviderId, "provider id", MAX_PROVIDER_ID_BYTES);
 bounded_identifier!(
-    RiskAcknowledgementNonce,
-    "risk acknowledgement id",
+    SandboxPolicyApprovalNonce,
+    "sandbox policy approval id",
     MAX_ACK_ID_BYTES
 );
 bounded_identifier!(HelperBuildId, "helper build id", MAX_BUILD_ID_BYTES);
@@ -106,16 +106,16 @@ bounded_identifier!(DifferencingDiskId, "differencing disk id", MAX_VM_ID_BYTES)
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct RiskAcknowledgementId {
+pub struct SandboxPolicyApprovalId {
     session_id: SessionId,
-    nonce: RiskAcknowledgementNonce,
+    nonce: SandboxPolicyApprovalNonce,
 }
 
-impl RiskAcknowledgementId {
+impl SandboxPolicyApprovalId {
     pub fn new(session_id: SessionId, nonce: impl Into<String>) -> Result<Self, BoundedValueError> {
         Ok(Self {
             session_id,
-            nonce: RiskAcknowledgementNonce::new(nonce)?,
+            nonce: SandboxPolicyApprovalNonce::new(nonce)?,
         })
     }
 
@@ -525,7 +525,9 @@ pub enum ResourceLimitError {
 #[serde(deny_unknown_fields)]
 pub struct SandboxPolicy {
     pub session_id: SessionId,
-    pub risk_acknowledgement: RiskAcknowledgementId,
+    /// Audit identity for the exact policy digest. This is not a host-execution
+    /// authorization; live host operations require a registered one-use lease.
+    pub policy_approval: SandboxPolicyApprovalId,
     pub provider: SandboxProviderSelection,
     pub required_boundary: IsolationBoundary,
     pub required_guarantees: BTreeSet<SandboxGuarantee>,
@@ -546,8 +548,8 @@ impl SandboxPolicy {
         if !self.rollback_on_close {
             return Err(PolicyValidationError::RollbackRequired);
         }
-        if self.risk_acknowledgement.session_id() != self.session_id {
-            return Err(PolicyValidationError::AcknowledgementSessionMismatch);
+        if self.policy_approval.session_id() != self.session_id {
+            return Err(PolicyValidationError::ApprovalSessionMismatch);
         }
         if let SandboxProviderSelection::Registered { descriptor } = &self.provider {
             descriptor.validate()?;
@@ -643,7 +645,7 @@ impl SandboxPolicy {
         canonical.u16(SANDBOX_POLICY_DIGEST_VERSION);
         canonical.text(binary_id.as_str());
         canonical.u64(self.session_id.get());
-        canonical.text(self.risk_acknowledgement.nonce.as_str());
+        canonical.text(self.policy_approval.nonce.as_str());
         canonical.provider(&self.provider);
         canonical.boundary(self.required_boundary);
         canonical.guarantees(&self.required_guarantees);
@@ -734,8 +736,8 @@ pub enum PolicyValidationError {
     Resource(#[from] ResourceLimitError),
     #[error("rollback on close is mandatory")]
     RollbackRequired,
-    #[error("risk acknowledgement belongs to another session")]
-    AcknowledgementSessionMismatch,
+    #[error("sandbox policy approval belongs to another session")]
+    ApprovalSessionMismatch,
     #[error("selected provider cannot satisfy the required isolation boundary")]
     ProviderBoundaryMismatch,
     #[error("local AppContainer v1 does not provide isolated network simulation")]
@@ -767,6 +769,7 @@ pub enum PolicyValidationError {
 pub struct ExpectedSandboxAttestation {
     pub binary_id: BinaryId,
     pub session_id: SessionId,
+    pub provisioning_epoch: ProvisioningEpoch,
     pub policy_digest: PolicyDigest,
     pub provider: SandboxProviderSelection,
     pub boundary: IsolationBoundary,
@@ -782,11 +785,13 @@ impl ExpectedSandboxAttestation {
         binary_id: BinaryId,
         policy: &SandboxPolicy,
         helper_build: HelperBuildId,
+        provisioning_epoch: ProvisioningEpoch,
     ) -> Result<Self, PolicyValidationError> {
         let policy_digest = policy.digest(&binary_id)?;
         Ok(Self {
             binary_id,
             session_id: policy.session_id,
+            provisioning_epoch,
             policy_digest,
             provider: policy.provider.clone(),
             boundary: policy.required_boundary,
@@ -803,6 +808,9 @@ impl ExpectedSandboxAttestation {
         }
         if self.session_id != actual.session_id {
             return Err(AttestationMismatch::Session);
+        }
+        if self.provisioning_epoch != actual.provisioning_epoch {
+            return Err(AttestationMismatch::ProvisioningEpoch);
         }
         if self.policy_digest != actual.policy_digest {
             return Err(AttestationMismatch::PolicyDigest);
@@ -834,6 +842,7 @@ impl ExpectedSandboxAttestation {
 pub struct SandboxAttestation {
     pub binary_id: BinaryId,
     pub session_id: SessionId,
+    pub provisioning_epoch: ProvisioningEpoch,
     pub policy_digest: PolicyDigest,
     pub provider: SandboxProviderSelection,
     pub boundary: IsolationBoundary,
@@ -850,6 +859,8 @@ pub enum AttestationMismatch {
     BinaryIdentity,
     #[error("sandbox session attestation mismatch")]
     Session,
+    #[error("sandbox provisioning epoch attestation mismatch")]
+    ProvisioningEpoch,
     #[error("policy digest attestation mismatch")]
     PolicyDigest,
     #[error("provider attestation mismatch")]
@@ -1006,6 +1017,7 @@ pub struct CleanupResidual {
 pub struct SandboxCleanupReceipt {
     pub receipt_id: CleanupReceiptId,
     pub session_id: SessionId,
+    pub provisioning_epoch: ProvisioningEpoch,
     pub provider: SandboxProviderSelection,
     pub policy_digest: PolicyDigest,
     pub outcome: CleanupOutcome,
@@ -1031,6 +1043,7 @@ impl SandboxCleanupReceipt {
         expected: &ExpectedSandboxAttestation,
     ) -> Result<(), CleanupReceiptError> {
         if self.session_id != expected.session_id
+            || self.provisioning_epoch != expected.provisioning_epoch
             || self.provider != expected.provider
             || self.policy_digest != expected.policy_digest
         {
@@ -1314,6 +1327,10 @@ mod tests {
         pe.identity.id
     }
 
+    fn provisioning_epoch() -> ProvisioningEpoch {
+        ProvisioningEpoch::new("e".repeat(64)).expect("provisioning epoch")
+    }
+
     fn local_guarantees() -> BTreeSet<SandboxGuarantee> {
         [
             SandboxGuarantee::FileSystemRedirection,
@@ -1332,7 +1349,7 @@ mod tests {
     fn local_policy() -> SandboxPolicy {
         let session_id = SessionId::new(1).expect("session id");
         SandboxPolicy {
-            risk_acknowledgement: RiskAcknowledgementId::new(session_id, "ack-1")
+            policy_approval: SandboxPolicyApprovalId::new(session_id, "ack-1")
                 .expect("acknowledgement"),
             session_id,
             provider: SandboxProviderSelection::LocalAppContainer,
@@ -1407,12 +1424,12 @@ mod tests {
         );
 
         let mut policy = local_policy();
-        policy.risk_acknowledgement =
-            RiskAcknowledgementId::new(SessionId::new(2).expect("other session"), "ack-2")
+        policy.policy_approval =
+            SandboxPolicyApprovalId::new(SessionId::new(2).expect("other session"), "ack-2")
                 .expect("acknowledgement");
         assert_eq!(
             policy.validate(),
-            Err(PolicyValidationError::AcknowledgementSessionMismatch)
+            Err(PolicyValidationError::ApprovalSessionMismatch)
         );
     }
 
@@ -1440,6 +1457,7 @@ mod tests {
             binary_id(),
             &local_policy(),
             HelperBuildId::new("helper-1.0.0+abc").expect("helper build"),
+            provisioning_epoch(),
         )
         .expect("expected attestation")
     }
@@ -1448,6 +1466,7 @@ mod tests {
         SandboxAttestation {
             binary_id: expected.binary_id.clone(),
             session_id: expected.session_id,
+            provisioning_epoch: expected.provisioning_epoch.clone(),
             policy_digest: expected.policy_digest.clone(),
             provider: expected.provider.clone(),
             boundary: expected.boundary,
@@ -1462,6 +1481,7 @@ mod tests {
         SandboxCleanupReceipt {
             receipt_id: CleanupReceiptId::new("receipt-1").expect("receipt id"),
             session_id: expected.session_id,
+            provisioning_epoch: expected.provisioning_epoch.clone(),
             provider: expected.provider.clone(),
             policy_digest: expected.policy_digest.clone(),
             outcome: CleanupOutcome::Complete,
@@ -1483,7 +1503,7 @@ mod tests {
         let session_id = SessionId::new(7).expect("session id");
         SandboxPolicy {
             session_id,
-            risk_acknowledgement: RiskAcknowledgementId::new(session_id, "vm-ack")
+            policy_approval: SandboxPolicyApprovalId::new(session_id, "vm-ack")
                 .expect("acknowledgement"),
             provider: SandboxProviderSelection::HyperV,
             required_boundary: IsolationBoundary::Hypervisor,
@@ -1550,6 +1570,38 @@ mod tests {
         assert_eq!(
             expected.validate_exact(&changed),
             Err(AttestationMismatch::HelperBuild)
+        );
+    }
+
+    #[test]
+    fn prior_provisioning_evidence_cannot_replay_into_an_identical_policy() {
+        let policy = local_policy();
+        let binary = binary_id();
+        let helper = HelperBuildId::new("helper-1.0.0+abc").expect("helper build");
+        let prior = ExpectedSandboxAttestation::from_policy(
+            binary.clone(),
+            &policy,
+            helper.clone(),
+            ProvisioningEpoch::new("1".repeat(64)).expect("prior epoch"),
+        )
+        .expect("prior expected attestation");
+        let prior_attestation = actual_from(&prior);
+        let prior_cleanup = complete_receipt(&prior);
+
+        let current = ExpectedSandboxAttestation::from_policy(
+            binary,
+            &policy,
+            helper,
+            ProvisioningEpoch::new("2".repeat(64)).expect("current epoch"),
+        )
+        .expect("current expected attestation");
+        assert_eq!(
+            current.validate_exact(&prior_attestation),
+            Err(AttestationMismatch::ProvisioningEpoch)
+        );
+        assert_eq!(
+            prior_cleanup.validate_against(&current),
+            Err(CleanupReceiptError::BindingMismatch)
         );
     }
 
@@ -1653,6 +1705,7 @@ mod tests {
             binary_id(),
             &policy,
             HelperBuildId::new("helper-vm").expect("helper build"),
+            provisioning_epoch(),
         )
         .expect("expected attestation");
         let mut actual = actual_from(&expected);

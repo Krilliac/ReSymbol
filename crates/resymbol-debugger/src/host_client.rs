@@ -7,6 +7,7 @@ use std::{marker::PhantomData, rc::Rc};
 
 use thiserror::Error;
 
+use crate::authorization::{HostRiskLease, SandboxOwnershipLease};
 use crate::host_codec::{
     HostCodecError, HostFrame, decode_command_frame, decode_event_frame, encode_command_frame,
     encode_event_frame,
@@ -19,6 +20,7 @@ use crate::host_wire::{
     EndpointRole, FrameSequence, HandshakeError, HandshakeMachine, HandshakeState,
     ProtocolVersion as WireProtocolVersion, WireError,
 };
+use crate::identity::ProvisioningEpoch;
 use crate::protocol::{
     CapabilityAvailability, CapabilityReport, CapabilityStatus, CapabilityUnavailableCode,
     CommandEnvelope, CommandId, CommandOutcome, DebugCapability, DebugCommand, DebugEvent,
@@ -796,6 +798,7 @@ pub enum DebugHostClientError {
 /// attach processes, launch targets, or claim platform capabilities.
 pub struct InMemoryDebugHost {
     handshake: HandshakeMachine,
+    provisioning_epoch: ProvisioningEpoch,
     helper_build: HelperBuildId,
     machine: Option<SessionMachine>,
     last_command_id: Option<CommandId>,
@@ -812,6 +815,7 @@ impl InMemoryDebugHost {
     pub fn new(
         host_build: impl Into<String>,
         expected_controller_build: impl Into<String>,
+        provisioning_epoch: ProvisioningEpoch,
         helper_build: HelperBuildId,
     ) -> Result<Self, HandshakeError> {
         Ok(Self {
@@ -820,6 +824,7 @@ impl InMemoryDebugHost {
                 host_build,
                 expected_controller_build,
             )?,
+            provisioning_epoch,
             helper_build,
             machine: None,
             last_command_id: None,
@@ -831,6 +836,28 @@ impl InMemoryDebugHost {
             backend_error_after: None,
             disconnected: false,
         })
+    }
+
+    /// Registers a host-risk lease through the trusted host seam before its
+    /// matching `Open` command arrives. Command frames cannot call this API.
+    pub fn register_host_risk_lease(
+        &mut self,
+        lease: HostRiskLease,
+    ) -> Result<(), SessionMachineError> {
+        let session_id = lease.session_id();
+        self.prepare_session_machine(session_id)?
+            .register_host_risk_lease(lease)
+    }
+
+    /// Registers a provider-authenticated sandbox ownership lease through the
+    /// trusted host seam before its matching `Open` command arrives.
+    pub fn register_sandbox_ownership_lease(
+        &mut self,
+        lease: SandboxOwnershipLease,
+    ) -> Result<(), SessionMachineError> {
+        let session_id = lease.binding().session_id();
+        self.prepare_session_machine(session_id)?
+            .register_sandbox_ownership_lease(lease)
     }
 
     /// Disconnect before the first exchange after `count` successful exchanges.
@@ -941,7 +968,11 @@ impl InMemoryDebugHost {
                     "first command for a session must be open",
                 ));
             }
-            self.machine = Some(SessionMachine::new(session_id, self.helper_build.clone()));
+            self.machine = Some(SessionMachine::new(
+                session_id,
+                self.provisioning_epoch.clone(),
+                self.helper_build.clone(),
+            ));
         }
         if self
             .machine
@@ -1118,8 +1149,10 @@ impl InMemoryDebugHost {
                 if target.mode == crate::protocol::AttachMode::ObserveReadOnly =>
             {
                 let process_id = match target.scope {
-                    crate::protocol::AttachScope::Host { process_id, .. }
-                    | crate::protocol::AttachScope::OwnedSandbox { process_id, .. } => process_id,
+                    crate::protocol::AttachScope::Host { process, .. }
+                    | crate::protocol::AttachScope::OwnedSandbox { process, .. } => {
+                        process.process_id
+                    }
                 };
                 let state = self
                     .machine_mut()?
@@ -1321,6 +1354,30 @@ impl InMemoryDebugHost {
             .as_mut()
             .ok_or_else(|| HostTransportError::protocol("no active session reducer"))
     }
+
+    fn prepare_session_machine(
+        &mut self,
+        session_id: SessionId,
+    ) -> Result<&mut SessionMachine, SessionMachineError> {
+        let replace = self.machine.as_ref().is_none_or(|machine| {
+            machine.state().kind() == SessionStateKind::Closed && machine.session_id() != session_id
+        });
+        if replace {
+            self.machine = Some(SessionMachine::new(
+                session_id,
+                self.provisioning_epoch.clone(),
+                self.helper_build.clone(),
+            ));
+        }
+        let machine = self
+            .machine
+            .as_mut()
+            .expect("session reducer was initialized above");
+        if machine.session_id() != session_id {
+            return Err(SessionMachineError::SessionBindingMismatch);
+        }
+        Ok(machine)
+    }
 }
 
 impl HostFrameExchange for InMemoryDebugHost {
@@ -1365,6 +1422,7 @@ fn exact_attestation(expected: &ExpectedSandboxAttestation) -> SandboxAttestatio
     SandboxAttestation {
         binary_id: expected.binary_id.clone(),
         session_id: expected.session_id,
+        provisioning_epoch: expected.provisioning_epoch.clone(),
         policy_digest: expected.policy_digest.clone(),
         provider: expected.provider.clone(),
         boundary: expected.boundary,
@@ -1385,6 +1443,7 @@ fn complete_cleanup_receipt(expected: &ExpectedSandboxAttestation) -> SandboxCle
         receipt_id: CleanupReceiptId::new(format!("fake-cleanup-{}", expected.session_id.get()))
             .expect("bounded fake cleanup receipt id"),
         session_id: expected.session_id,
+        provisioning_epoch: expected.provisioning_epoch.clone(),
         provider: expected.provider.clone(),
         policy_digest: expected.policy_digest.clone(),
         outcome: CleanupOutcome::Complete,
@@ -1410,15 +1469,18 @@ mod tests {
     use resymbol_core::BinaryId;
 
     use super::*;
+    use crate::authorization::{HostRiskOperation, SandboxOwnershipBinding};
     use crate::host_response::{MAX_RESPONSE_BYTES, MAX_RESPONSE_FRAME_BYTES};
     use crate::host_wire::{ControlBody, FrameHeader, MessageKind};
+    use crate::identity::{HostRiskLeaseId, SandboxOwnershipLeaseId};
     use crate::protocol::{
-        LaunchEnvironment, LaunchTarget, MAX_MEMORY_READ_BYTES, MemoryAddress, OfflineTarget,
-        ReadViewToken,
+        AttachMode, AttachScope, AttachTarget, LaunchEnvironment, LaunchTarget,
+        MAX_MEMORY_READ_BYTES, MemoryAddress, OfflineTarget, ProcessId, ProcessIdentity,
+        ProcessStartKey, ReadViewToken,
     };
     use crate::sandbox::{
-        ChildProcessProfile, DynamicCodeProfile, ProcessMitigationProfile, RiskAcknowledgementId,
-        SandboxGuarantee, SandboxNetworkMode, SandboxPolicy, SandboxProviderSelection,
+        ChildProcessProfile, DynamicCodeProfile, ProcessMitigationProfile, SandboxGuarantee,
+        SandboxNetworkMode, SandboxPolicy, SandboxPolicyApprovalId, SandboxProviderSelection,
         SandboxResourceLimits, Win32kProfile,
     };
 
@@ -1430,8 +1492,18 @@ mod tests {
         HelperBuildId::new("fake-helper-1.0.0+test").expect("helper build")
     }
 
+    fn provisioning_epoch() -> ProvisioningEpoch {
+        ProvisioningEpoch::new("9".repeat(64)).expect("provisioning epoch")
+    }
+
     fn host() -> InMemoryDebugHost {
-        InMemoryDebugHost::new("host/build-4", "controller/build-7", helper_build()).unwrap()
+        InMemoryDebugHost::new(
+            "host/build-4",
+            "controller/build-7",
+            provisioning_epoch(),
+            helper_build(),
+        )
+        .unwrap()
     }
 
     fn client(host: InMemoryDebugHost) -> DebugHostClient<InMemoryDebugHost> {
@@ -1660,7 +1732,7 @@ mod tests {
         .collect();
         SandboxPolicy {
             session_id,
-            risk_acknowledgement: RiskAcknowledgementId::new(session_id, "fake-sandbox-ack")
+            policy_approval: SandboxPolicyApprovalId::new(session_id, "fake-sandbox-ack")
                 .expect("acknowledgement"),
             provider: SandboxProviderSelection::LocalAppContainer,
             required_boundary: IsolationBoundary::UserMode,
@@ -1820,6 +1892,87 @@ mod tests {
         );
         client.release_closed_session().unwrap();
         client.disconnect().unwrap();
+    }
+
+    #[test]
+    fn trusted_host_registration_makes_exact_host_risk_lease_usable() {
+        let binary_id = BinaryId::digest(b"approved host sample");
+        let risk_lease = HostRiskLeaseId::new("a".repeat(64)).expect("host-risk lease id");
+        let mut fake = host();
+        fake.register_host_risk_lease(HostRiskLease::new(
+            risk_lease.clone(),
+            session_id(),
+            HostRiskOperation::Launch {
+                binary_id: binary_id.clone(),
+            },
+        ))
+        .expect("trusted host registration");
+
+        let mut client = client(fake);
+        client.begin_session(session_id()).unwrap();
+        let opened = client
+            .submit(DebugCommand::Open(DebugTargetRequest::Launch(
+                LaunchTarget {
+                    binary_id,
+                    executable: PathBuf::from("sample.exe"),
+                    arguments: Vec::new(),
+                    working_directory: None,
+                    environment: LaunchEnvironment::Host { risk_lease },
+                    stop_before_entry: true,
+                },
+            )))
+            .unwrap();
+        assert_eq!(opened.outcome, CommandOutcome::Succeeded);
+        assert_eq!(
+            client.session_state().map(SessionState::kind),
+            Some(SessionStateKind::Stopped)
+        );
+    }
+
+    #[test]
+    fn trusted_host_registration_makes_exact_sandbox_ownership_lease_usable() {
+        let binary_id = BinaryId::digest(b"owned sandbox sample");
+        let process = ProcessIdentity {
+            process_id: ProcessId::new(77).expect("process id"),
+            start_key: ProcessStartKey::new(88).expect("process start key"),
+            binary_id: binary_id.clone(),
+        };
+        let policy = sandbox_policy();
+        let binding = SandboxOwnershipBinding::new(
+            session_id(),
+            process.clone(),
+            AttachMode::ObserveReadOnly,
+            policy.provider.clone(),
+            policy.digest(&binary_id).expect("policy digest"),
+            provisioning_epoch(),
+        );
+        let ownership_lease =
+            SandboxOwnershipLeaseId::new("b".repeat(64)).expect("ownership lease id");
+        let mut fake = host();
+        fake.register_sandbox_ownership_lease(SandboxOwnershipLease::new(
+            ownership_lease.clone(),
+            binding,
+        ))
+        .expect("trusted provider registration");
+
+        let mut client = client(fake);
+        client.begin_session(session_id()).unwrap();
+        let opened = client
+            .submit(DebugCommand::Open(DebugTargetRequest::Attach(
+                AttachTarget {
+                    scope: AttachScope::OwnedSandbox {
+                        process,
+                        ownership_lease,
+                    },
+                    mode: AttachMode::ObserveReadOnly,
+                },
+            )))
+            .unwrap();
+        assert_eq!(opened.outcome, CommandOutcome::Succeeded);
+        assert_eq!(
+            client.session_state().map(SessionState::kind),
+            Some(SessionStateKind::Observing)
+        );
     }
 
     #[test]

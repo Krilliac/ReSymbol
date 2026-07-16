@@ -58,6 +58,14 @@ address-space construction and protection assessment parse bytes without loading
 backend-neutral command, event, wire, policy, attestation, and cleanup types define checks that later
 processes must enforce; serializing those types does not create containment.
 
+The live-operation contract accepts only one-use lease identifiers registered locally by the trusted
+session worker. Host launch leases bind the exact binary; host attach leases bind PID, a trusted
+process-start key, executable identity, and attach mode; sandbox-ownership leases additionally bind provider,
+policy digest, and a fresh provisioning epoch. Attestation and cleanup evidence carry that same epoch
+to reject replay across otherwise identical provisioning attempts. Identifier constructors validate
+shape, not randomness: production hosts must generate lease IDs and epochs with a cryptographically
+secure source and must never expose grant registration to untrusted command senders.
+
 There is currently no shipped AppContainer launcher, debugger-host process, Hyper-V guest agent, or
 verified cleanup journal. Do not execute a hostile sample through the current workbench. Use a
 separately administered disposable virtual machine with host integration and networking disabled
