@@ -502,10 +502,11 @@ Windows Job Object. The shared runner terminates the whole owned tree when the d
 completes, a deadline expires, a stdout/stderr capture worker fails, or the runtime guard drops.
 This is a lifecycle boundary, not an authority boundary. Linux `waitid(WNOWAIT)` and a macOS kqueue
 `NOTE_EXIT` observer keep an exited group leader unreaped until the group is terminated, preventing
-process-group identifier reuse during normal cleanup. Windows uses a safe Rust wrapper to assign the
-child to its Job Object immediately after spawn, while retaining a narrow pre-assignment escape race.
-A hostile POSIX plugin/helper or descendant can deliberately leave its process group or session and
-escape later group termination.
+process-group identifier reuse during normal cleanup. Windows creates the child atomically inside a
+preconfigured kill-on-close Job through a narrow `STARTUPINFOEX` native boundary, allows inheritance
+of only the exact standard-stream handles, verifies Job membership, and has no post-spawn assignment
+fallback. A hostile POSIX plugin/helper or descendant can deliberately leave its process group or
+session and escape later group termination.
 
 Process separation contains ordinary crashes, not authority. External, native, and managed child
 code still has the ambient filesystem, network, credential, and process access of the account

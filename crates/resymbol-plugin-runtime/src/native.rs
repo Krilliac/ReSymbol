@@ -2,7 +2,6 @@ use std::{
     fs::{self, File},
     io::Read as _,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
     time::Instant,
 };
 
@@ -17,7 +16,7 @@ use sha2::{Digest as _, Sha256};
 use crate::{
     ExternalProcessRequest, PluginExecution, PluginRuntimeError, RuntimeLimits,
     host::{preserve_operating_system_environment, run_child_observing_stderr},
-    process_tree::ContainedChild,
+    process_tree::{ContainedChild, ContainedCommand},
     wire::encode_input,
 };
 
@@ -234,16 +233,14 @@ impl NativeProcessHost {
                 "request_timeout is too large for the platform clock",
             ))?;
 
-        let mut command = Command::new(&helper);
+        let mut command = ContainedCommand::new(&helper);
         command
             .arg("--plugin-root")
             .arg(&plugin_root)
             .arg("--binary")
             .arg(&exact_binary)
             .current_dir(&plugin_root)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .piped_standard_io()
             .env_clear();
         preserve_operating_system_environment(&mut command);
         let child = ContainedChild::spawn(&mut command).map_err(|error| {

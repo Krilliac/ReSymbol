@@ -25,7 +25,7 @@ rustix = { version = "=1.1.4", features = ["process"] }
 kqueue = "=1.2.0"
 
 [target.'cfg(windows)'.dependencies]
-win32job = "=2.0.3"
+resymbol-windows-process = { path = "../resymbol-windows-process" }
 
 [dev-dependencies]
 semver = "1.0.26"

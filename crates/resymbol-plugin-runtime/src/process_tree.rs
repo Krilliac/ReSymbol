@@ -7,16 +7,21 @@
 //! attempted. XNU's zombie-only `EPERM` exception is resolved by relinquishing
 //! destructive authority, reaping the leader, and accepting only an `ESRCH`
 //! signal-zero proof that the group is absent.
-//! Windows children are assigned to a kill-on-close Job Object.
-//! Windows' ordinary [`Command::spawn`] API cannot create a process already
-//! suspended inside a job, so there is an unavoidable spawn-to-assignment race
-//! in which a very short-lived child could create an uncontained descendant.
+//! Windows children are created atomically inside a preconfigured kill-on-close
+//! Job Object. A `STARTUPINFOEX` handle allow-list restricts inheritance to the
+//! three configured standard streams; there is no spawn-then-assign fallback.
 
-use std::io;
-use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus};
+use std::{ffi::OsStr, io, path::Path, process::ExitStatus};
+
+#[cfg(not(windows))]
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 
 #[cfg(target_os = "macos")]
 use kqueue::{Event, EventData, EventFilter, FilterFlag, Ident, Proc, Watcher};
+#[cfg(windows)]
+use resymbol_windows_process::{
+    ContainedChild as PlatformChild, ContainedCommand as PlatformCommand, Stdio as PlatformStdio,
+};
 #[cfg(target_os = "macos")]
 use rustix::process::test_kill_process_group;
 #[cfg(target_os = "linux")]
@@ -28,15 +33,99 @@ use rustix::{
 };
 #[cfg(unix)]
 use std::os::unix::process::CommandExt as _;
-#[cfg(windows)]
-use std::os::windows::io::AsRawHandle;
 #[cfg(target_os = "macos")]
 use std::time::Duration;
+
+#[cfg(not(windows))]
+type PlatformChild = Child;
+#[cfg(not(windows))]
+type PlatformCommand = Command;
 #[cfg(windows)]
-use win32job::{ExtendedLimitInfo, Job};
+type PlatformStdin = std::fs::File;
+#[cfg(not(windows))]
+type PlatformStdin = ChildStdin;
+#[cfg(windows)]
+type PlatformStdout = std::fs::File;
+#[cfg(not(windows))]
+type PlatformStdout = ChildStdout;
+#[cfg(windows)]
+type PlatformStderr = std::fs::File;
+#[cfg(not(windows))]
+type PlatformStderr = ChildStderr;
 
 #[cfg(target_os = "macos")]
 const MACOS_EXIT_CONFIRMATION_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Small cross-platform command surface used by contained plugin launches.
+///
+/// On Unix this delegates to `std::process::Command`. On Windows it records the
+/// exact launch inputs needed by the native atomic Job-at-creation boundary.
+/// Arbitrary inherited handles and raw command-line fragments are intentionally
+/// outside this internal API.
+#[derive(Debug)]
+pub(crate) struct ContainedCommand {
+    inner: PlatformCommand,
+}
+
+impl ContainedCommand {
+    pub(crate) fn new(program: impl AsRef<OsStr>) -> Self {
+        Self {
+            inner: PlatformCommand::new(program),
+        }
+    }
+
+    pub(crate) fn arg(&mut self, argument: impl AsRef<OsStr>) -> &mut Self {
+        self.inner.arg(argument);
+        self
+    }
+
+    pub(crate) fn args<I, S>(&mut self, arguments: I) -> &mut Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        self.inner.args(arguments);
+        self
+    }
+
+    pub(crate) fn current_dir(&mut self, directory: impl AsRef<Path>) -> &mut Self {
+        self.inner.current_dir(directory);
+        self
+    }
+
+    pub(crate) fn env_clear(&mut self) -> &mut Self {
+        self.inner.env_clear();
+        self
+    }
+
+    pub(crate) fn env(&mut self, key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> &mut Self {
+        self.inner.env(key, value);
+        self
+    }
+
+    pub(crate) fn piped_standard_io(&mut self) -> &mut Self {
+        #[cfg(windows)]
+        self.inner
+            .stdin(PlatformStdio::piped())
+            .stdout(PlatformStdio::piped())
+            .stderr(PlatformStdio::piped());
+        #[cfg(not(windows))]
+        self.inner
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        self
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn null_standard_io(&mut self) -> &mut Self {
+        self.inner
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        self
+    }
+}
 
 /// A direct child process whose descendants share an OS containment boundary.
 ///
@@ -44,7 +133,7 @@ const MACOS_EXIT_CONFIRMATION_TIMEOUT: Duration = Duration::from_millis(250);
 /// group leader on Unix), not an aggregate status for its descendants.
 #[derive(Debug)]
 pub(crate) struct ContainedChild {
-    child: Child,
+    child: PlatformChild,
     direct_child_status: Option<ExitStatus>,
     #[cfg(unix)]
     process_group: Option<Pid>,
@@ -52,17 +141,15 @@ pub(crate) struct ContainedChild {
     exit_observation: MacOsExitObservation,
     #[cfg(target_os = "macos")]
     terminal_containment_error: Option<MacOsContainmentError>,
-    #[cfg(windows)]
-    job: Option<Job>,
 }
 
 impl ContainedChild {
     /// Spawns `command` inside a new process-tree containment boundary.
-    pub(crate) fn spawn(command: &mut Command) -> io::Result<Self> {
+    pub(crate) fn spawn(command: &mut ContainedCommand) -> io::Result<Self> {
         #[cfg(unix)]
         {
-            command.process_group(0);
-            let child = command.spawn()?;
+            command.inner.process_group(0);
+            let child = command.inner.spawn()?;
             let process_group = Pid::from_child(&child);
             #[cfg(target_os = "macos")]
             let (child, exit_observation) = {
@@ -101,25 +188,11 @@ impl ContainedChild {
 
         #[cfg(windows)]
         {
-            let mut limits = ExtendedLimitInfo::new();
-            limits.limit_kill_on_job_close();
-            let job = Job::create_with_limit_info(&limits)
-                .map_err(|error| job_error("failed to create process Job Object", error))?;
-
-            // `Command::spawn` cannot start the child suspended and atomically
-            // assign it to the job through safe std APIs. Keep this interval as
-            // short as possible; see the module-level race documentation.
-            let mut child = command.spawn()?;
-            if let Err(error) = job.assign_process(child.as_raw_handle() as isize) {
-                let kill_error = child.kill().err();
-                let wait_error = child.wait().err();
-                return Err(job_assignment_error(error, kill_error, wait_error));
-            }
+            let child = command.inner.spawn()?;
 
             Ok(Self {
                 child,
                 direct_child_status: None,
-                job: Some(job),
             })
         }
     }
@@ -131,18 +204,39 @@ impl ContainedChild {
     }
 
     /// Takes ownership of the direct child's piped standard input, if present.
-    pub(crate) fn take_stdin(&mut self) -> Option<ChildStdin> {
-        self.child.stdin.take()
+    pub(crate) fn take_stdin(&mut self) -> Option<PlatformStdin> {
+        #[cfg(windows)]
+        {
+            self.child.take_stdin()
+        }
+        #[cfg(not(windows))]
+        {
+            self.child.stdin.take()
+        }
     }
 
     /// Takes ownership of the direct child's piped standard output, if present.
-    pub(crate) fn take_stdout(&mut self) -> Option<ChildStdout> {
-        self.child.stdout.take()
+    pub(crate) fn take_stdout(&mut self) -> Option<PlatformStdout> {
+        #[cfg(windows)]
+        {
+            self.child.take_stdout()
+        }
+        #[cfg(not(windows))]
+        {
+            self.child.stdout.take()
+        }
     }
 
     /// Takes ownership of the direct child's piped standard error, if present.
-    pub(crate) fn take_stderr(&mut self) -> Option<ChildStderr> {
-        self.child.stderr.take()
+    pub(crate) fn take_stderr(&mut self) -> Option<PlatformStderr> {
+        #[cfg(windows)]
+        {
+            self.child.take_stderr()
+        }
+        #[cfg(not(windows))]
+        {
+            self.child.stderr.take()
+        }
     }
 
     /// Polls the direct child without waiting for descendants.
@@ -378,8 +472,7 @@ impl ContainedChild {
         #[cfg(windows)]
         let containment_result = {
             // Closing the final job handle applies JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.
-            drop(self.job.take());
-            Ok(())
+            self.child.terminate_tree()
         };
 
         // A hostile POSIX leader can join another process group before the
@@ -562,7 +655,7 @@ fn require_macos_process_group_absent(result: rustix::io::Result<()>) -> io::Res
     }
 }
 
-fn terminate_direct_child(child: &mut Child) -> io::Result<()> {
+fn terminate_direct_child(child: &mut PlatformChild) -> io::Result<()> {
     match child.kill() {
         Ok(()) => Ok(()),
         Err(error)
@@ -612,41 +705,9 @@ fn macos_exit_watcher_setup_error(
     io::Error::new(error.kind(), message)
 }
 
-#[cfg(windows)]
-fn job_error(context: &str, error: win32job::JobError) -> io::Error {
-    let error: io::Error = error.into();
-    io::Error::new(error.kind(), format!("{context}: {error}"))
-}
-
-#[cfg(windows)]
-fn job_assignment_error(
-    error: win32job::JobError,
-    kill_error: Option<io::Error>,
-    wait_error: Option<io::Error>,
-) -> io::Error {
-    let error: io::Error = error.into();
-    let mut message = format!("failed to assign child process to Job Object: {error}");
-    append_cleanup_errors(&mut message, kill_error, wait_error);
-    io::Error::new(error.kind(), message)
-}
-
-#[cfg(windows)]
-fn append_cleanup_errors(
-    message: &mut String,
-    kill_error: Option<io::Error>,
-    wait_error: Option<io::Error>,
-) {
-    if let Some(error) = kill_error {
-        message.push_str(&format!("; direct-child kill also failed: {error}"));
-    }
-    if let Some(error) = wait_error {
-        message.push_str(&format!("; direct-child reap also failed: {error}"));
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::ContainedChild;
+    use super::{ContainedChild, ContainedCommand};
     #[cfg(target_os = "macos")]
     use super::{classify_macos_exit_event, require_macos_process_group_absent};
     #[cfg(target_os = "macos")]
@@ -654,7 +715,6 @@ mod tests {
     #[cfg(target_os = "macos")]
     use rustix::io::Errno;
     use std::io;
-    use std::process::{Command, Stdio};
     #[cfg(target_os = "macos")]
     use std::thread;
     #[cfg(target_os = "macos")]
@@ -678,10 +738,7 @@ mod tests {
     #[test]
     fn takes_each_configured_pipe_once() -> io::Result<()> {
         let mut command = exit_command(0);
-        command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        command.piped_standard_io();
         let mut child = ContainedChild::spawn(&mut command)?;
 
         assert!(child.take_stdin().is_some());
@@ -784,7 +841,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_bounded_exit_confirmation_rejects_a_live_child() -> io::Result<()> {
-        let mut command = Command::new("sh");
+        let mut command = ContainedCommand::new("sh");
         command.args(["-c", "sleep 1"]);
         let mut child = ContainedChild::spawn(&mut command)?;
 
@@ -811,7 +868,7 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&marker);
 
-        let mut command = Command::new("sh");
+        let mut command = ContainedCommand::new("sh");
         command
             .args([
                 "-c",
@@ -819,9 +876,7 @@ mod tests {
                 "resymbol-process-tree",
             ])
             .arg(&marker)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .null_standard_io();
         let mut child = ContainedChild::spawn(&mut command)?;
         assert!(child.wait()?.success());
 
@@ -872,15 +927,24 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn exit_command(code: u8) -> Command {
-        let mut command = Command::new("sh");
+    fn exit_command(code: u8) -> ContainedCommand {
+        let mut command = ContainedCommand::new("sh");
         command.arg("-c").arg(format!("exit {code}"));
         command
     }
 
     #[cfg(windows)]
-    fn exit_command(code: u8) -> Command {
-        let mut command = Command::new("cmd.exe");
+    fn exit_command(code: u8) -> ContainedCommand {
+        let command_interpreter = std::env::var_os("COMSPEC")
+            .map(std::path::PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .or_else(|| {
+                std::env::var_os("SystemRoot")
+                    .map(std::path::PathBuf::from)
+                    .map(|root| root.join("System32").join("cmd.exe"))
+            })
+            .expect("Windows tests require an exact command-interpreter path");
+        let mut command = ContainedCommand::new(command_interpreter);
         command.args(["/D", "/S", "/C"]).arg(format!("exit {code}"));
         command
     }
