@@ -37,7 +37,7 @@ Commands:
   help
   status
   open <path>
-  tab <overview|functions|types|relationships|graph|exports>
+  tab <overview|functions|types|relationships|graph|address-space|exports>
   focus <0xRVA|decimal>
   theme <graphite|light|ida|classic>
   panel <left|right|bottom> <show|hide|toggle>
@@ -91,16 +91,18 @@ pub enum ConsoleTab {
     Types,
     Relationships,
     Graph,
+    AddressSpace,
     Exports,
 }
 
 impl ConsoleTab {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Overview,
         Self::Functions,
         Self::Types,
         Self::Relationships,
         Self::Graph,
+        Self::AddressSpace,
         Self::Exports,
     ];
 
@@ -112,6 +114,7 @@ impl ConsoleTab {
             Self::Types => "types",
             Self::Relationships => "relationships",
             Self::Graph => "graph",
+            Self::AddressSpace => "address-space",
             Self::Exports => "exports",
         }
     }
@@ -272,7 +275,7 @@ pub fn parse_command(input: &str) -> Result<ConsoleCommand, String> {
             expect_arity(
                 &tokens,
                 1,
-                "tab <overview|functions|types|relationships|graph|exports>",
+                "tab <overview|functions|types|relationships|graph|address-space|exports>",
             )?;
             Ok(ConsoleCommand::Tab(parse_tab(&tokens[1])?))
         }
@@ -524,9 +527,10 @@ fn parse_tab(value: &str) -> Result<ConsoleTab, String> {
         "types" => Ok(ConsoleTab::Types),
         "relationships" => Ok(ConsoleTab::Relationships),
         "graph" => Ok(ConsoleTab::Graph),
+        "address-space" | "memory-map" => Ok(ConsoleTab::AddressSpace),
         "exports" => Ok(ConsoleTab::Exports),
         _ => Err(format!(
-            "invalid tab `{value}`; expected overview, functions, types, relationships, graph, or exports"
+            "invalid tab `{value}`; expected overview, functions, types, relationships, graph, address-space, or exports"
         )),
     }
 }
@@ -635,6 +639,14 @@ mod tests {
                 ConsoleCommand::Open(PathBuf::from("sample.exe")),
             ),
             ("tab graph", ConsoleCommand::Tab(ConsoleTab::Graph)),
+            (
+                "tab address-space",
+                ConsoleCommand::Tab(ConsoleTab::AddressSpace),
+            ),
+            (
+                "tab memory-map",
+                ConsoleCommand::Tab(ConsoleTab::AddressSpace),
+            ),
             ("focus 0x401000", ConsoleCommand::Focus(0x401000)),
             (
                 "theme classic",
@@ -795,6 +807,12 @@ mod tests {
         let encoded = serde_json::to_string(&command).expect("serialize command");
         let decoded: ConsoleCommand = serde_json::from_str(&encoded).expect("deserialize command");
         assert_eq!(decoded, command);
+
+        let address_space = ConsoleCommand::Tab(ConsoleTab::AddressSpace);
+        let encoded = serde_json::to_string(&address_space).expect("serialize address-space tab");
+        let decoded: ConsoleCommand =
+            serde_json::from_str(&encoded).expect("deserialize address-space tab");
+        assert_eq!(decoded, address_space);
 
         let frame = ConsoleToHostFrame::Fatal("startup failed".to_owned());
         let encoded = serde_json::to_string(&frame).expect("serialize frame");

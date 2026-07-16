@@ -1,0 +1,21 @@
+[package]
+name = "resymbol-debugger"
+description = "Backend-neutral debugger protocol and static address-space intelligence for ReSymbol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+resymbol-analysis = { path = "../resymbol-analysis" }
+resymbol-core = { path = "../resymbol-core" }
+serde = { version = "1.0.219", features = ["derive"] }
+thiserror = "2.0.12"
+
+[dev-dependencies]
+serde_json = "1.0.140"
+
+[lints]
+workspace = true

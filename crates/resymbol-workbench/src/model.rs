@@ -12,9 +12,15 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use resymbol_analysis::{AnalysisError, AnalysisSession, SessionValidationError, analyze_bytes};
+use resymbol_analysis::{
+    AnalysisError, AnalysisSession, BinaryAnalysis, SessionValidationError, analyze_bytes,
+};
 use resymbol_core::{
     BinaryId, ClaimProducer, ControlFlowTarget, SymbolAssertion, SymbolClaim, SymbolSubject,
+};
+use resymbol_debugger::{
+    ProtectionReport, ProtectionScanError, StaticAddressSpace, StaticAddressSpaceError,
+    scan_pe_protections,
 };
 use resymbol_export::{
     AttributedText, ExportAttribution, ExportBinaryFormat, ExportError, ExportFunction,
@@ -206,6 +212,8 @@ pub struct LoadedProject {
     pub identity: ProjectIdentity,
     pub package: ResymPackage<AnalysisSession>,
     pub projection: ExportProjection,
+    pub static_address_space: StaticAddressSpace,
+    pub protection_report: ProtectionReport,
     pub functions: Vec<FunctionRow>,
     function_details: Vec<FunctionDetail>,
 }
@@ -241,6 +249,11 @@ impl LoadedProject {
     ) -> Result<Self, ModelError> {
         let path = path.into();
         let base_analysis = analyze_bytes(bytes)?;
+        let static_address_space = StaticAddressSpace::from_analysis(&base_analysis)?;
+        let protection_report = match &base_analysis {
+            BinaryAnalysis::Pe(analysis) => scan_pe_protections(analysis, bytes)?,
+            _ => return Err(ModelError::UnsupportedStaticAssessment),
+        };
         let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())?;
         let combined_graph = session.combined_symbol_graph()?;
         let projection = ExportProjection::from_session(&session)?;
@@ -270,6 +283,8 @@ impl LoadedProject {
             identity,
             package,
             projection,
+            static_address_space,
+            protection_report,
             functions,
             function_details,
         })
@@ -634,6 +649,12 @@ pub enum ModelError {
     Package(#[from] PackageError),
     #[error("export projection failed: {0}")]
     Export(#[from] ExportError),
+    #[error("static address-space analysis failed: {0}")]
+    StaticAddressSpace(#[from] StaticAddressSpaceError),
+    #[error("protection assessment failed: {0}")]
+    Protection(#[from] ProtectionScanError),
+    #[error("this binary format has no workbench protection assessment")]
+    UnsupportedStaticAssessment,
 }
 
 #[cfg(test)]
@@ -742,6 +763,11 @@ mod tests {
             .expect("fixture model");
 
         assert_eq!(&project.identity.sha256, project.package.binary_sha256());
+        assert_eq!(
+            project.static_address_space.binary_id,
+            project.identity.sha256
+        );
+        assert_eq!(project.protection_report.binary_id, project.identity.sha256);
         project
             .package
             .ensure_payload_binding()
