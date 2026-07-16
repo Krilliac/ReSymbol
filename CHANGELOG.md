@@ -399,9 +399,8 @@ schema versions independently.
   attaches additionally bind provider, policy digest, and provisioning epoch. Attestation and
   cleanup receipts carry that fresh epoch, rejecting evidence replay from an otherwise identical
   earlier provisioning instance. These remain contracts for future providers, not shipped process
-  execution or containment. The unreleased debugger host/typed-command protocol advances from 1.0
-  to 1.1 so older payload shapes fail typed validation before dispatch instead of being interpreted
-  ambiguously.
+  execution or containment. The debugger-host typed-command protocol is now 1.2, so older
+  payload shapes fail typed validation before dispatch instead of being interpreted ambiguously.
 - The default WASM invocation accepts a component up to 64 MiB, enforces a 256 MiB linear-memory
   store limit, 100,000,000 fuel, a 2 MiB WebAssembly stack, one memory, two tables, 32 instances,
   and a 100,000-element table limit. It has a 30-second epoch deadline, permits at most 4,096

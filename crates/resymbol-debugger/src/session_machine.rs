@@ -406,8 +406,9 @@ impl SessionMachine {
         Ok(&self.state)
     }
 
-    /// Restores visible state after an exact, effect-free remote rejection
-    /// without restoring command IDs, token allocation, or one-use authority.
+    /// Restores the exact pre-command state token after an effect-free remote
+    /// rejection, without restoring command IDs, run/stop watermarks, or
+    /// one-use authority. The next visible state generation remains contiguous.
     pub fn reject_remote_command(
         &mut self,
         checkpoint: RemoteCommandCheckpoint,

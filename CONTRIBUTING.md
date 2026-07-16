@@ -23,8 +23,8 @@ toolchain automatically.
 ```console
 git clone https://github.com/Krilliac/ReSymbol.git
 cd ReSymbol
-cargo build --workspace
-cargo test --workspace --all-features
+cargo build --locked --workspace
+cargo test --locked --workspace --all-features
 ```
 
 The .NET 8 SDK is optional and is needed only for managed SDK or host development. Plugins written
@@ -37,14 +37,16 @@ Run the checks relevant to your change before opening a pull request:
 
 ```console
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+cargo test --locked --workspace --all-features
 ```
 
 When managed projects are present, also run:
 
 ```console
-dotnet build --configuration Release
+dotnet restore sdk/dotnet/ReSymbol.ManagedHost.Tests/ReSymbol.ManagedHost.Tests.csproj --nologo
+dotnet build sdk/dotnet/ReSymbol.ManagedHost.Tests/ReSymbol.ManagedHost.Tests.csproj --configuration Release --no-restore --nologo -warnaserror -m:1
+dotnet run --project sdk/dotnet/ReSymbol.ManagedHost.Tests/ReSymbol.ManagedHost.Tests.csproj --configuration Release --no-build
 ```
 
 CI repeats Rust checks on Linux, Windows, and macOS and validates managed projects separately.
@@ -104,4 +106,3 @@ when independent concerns make review difficult.
 By submitting a contribution, you agree that it may be distributed under the terms of both the MIT
 License and the Apache License 2.0, at the recipient's option, unless you clearly state otherwise
 before the contribution is accepted.
-

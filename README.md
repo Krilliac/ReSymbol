@@ -558,10 +558,10 @@ with a GNU native helper built on Ubuntu 22.04 for glibc 2.35 or newer so it can
 The Rust workspace uses the pinned Rust 1.86 toolchain in `rust-toolchain.toml`:
 
 ```console
-cargo build --workspace
-cargo test --workspace --all-features
+cargo build --locked --workspace
+cargo test --locked --workspace --all-features
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 ```
 
 Rust is the only required toolchain for the core workspace; x86-64 decoding uses a pure-Rust crate

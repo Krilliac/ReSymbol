@@ -18,7 +18,7 @@ ReSymbol currently implements the non-executing foundation for debugger and sand
   every unsupported operation, and never fabricates target, attestation, or cleanup evidence;
 - a production, in-process `OfflineImageDebugHost` that freezes an identity-checked image snapshot,
   advertises only offline analysis, and serves bounded reads from exact canonical file-backed image
-  ranges without opening or executing a target; and
+  ranges without opening a process or executing target code; and
 - sandbox policy, attestation, failure, lifecycle, resource-limit, and cleanup-receipt data models.
 
 The debugger crate also exposes a bounded provider-readiness service. It is discovery only: it
@@ -214,21 +214,23 @@ The current seam is intentionally narrow:
   must contain exactly one command result and only events correlated to that command;
 - session generations and stop/run identifiers must advance exactly through the command-specific
   reducer path; non-transition events carry the exact current state token, and memory/breakpoint
-  evidence must match the request. Policy and discovery failures can roll back only before the
-  command-state transition and without operation evidence. A resource-retaining sandbox rejection
-  must follow its exact command-state transition, match the command/stage/kind/reducer phase, bind
-  the full launch or inherited-attach context, and end in one exact `Failed` state while cleanup
-  ownership remains held. A cleanup-stage retained rejection additionally requires exactly one
-  validated `CleanupAttemptFailed` event carrying its incomplete receipt. Every rejected command
-  still consumes its command identifier and any presented one-use authority;
-- audited controller and host implementations, including external helper/provider crates, use a
-  public-but-opaque, move-only remote-command transaction ticket bound to the exact reducer
-  instance, command ID, and post-accept state. Exactly one transaction may be active. Dropping or
-  forgetting its ticket leaves that reducer permanently pending and fail-closed; it never implies
-  rollback. An effect-free rejection restores only ordinary visible state, while a host must
-  validate the complete remote evidence before explicitly committing successful or
-  cleanup-required effects. Stale, foreign, mismatched, already-resolved, and post-effect rollback
-  attempts fail closed; command, run/stop, and one-use authorization watermarks remain consumed;
+  evidence must match the request. Policy and discovery failures can roll back only before any
+  command-state event or operation evidence is observed, from the exact accepted Opening or
+  Provisioning post-state. A resource-retaining sandbox rejection must follow its exact
+  command-state transition, match the command/stage/kind/reducer phase, bind the full launch or
+  inherited-attach context, and end in one exact `Failed` state while cleanup ownership remains
+  held. A cleanup-stage retained rejection additionally requires exactly one validated
+  `CleanupAttemptFailed` event carrying its incomplete receipt. Every rejected command still
+  consumes its command identifier and any presented one-use authority;
+- the audited controller and host-client path uses a public-but-opaque, move-only remote-command
+  transaction ticket bound to the exact reducer instance, command ID, and post-accept state; future
+  external helper or provider crates must preserve the same contract. Exactly one transaction may
+  be active. Dropping or forgetting its ticket leaves that reducer permanently pending and
+  fail-closed; it never implies rollback. An effect-free rejection restores the exact pre-command
+  state token, so the next visible state generation remains wire-contiguous. A host must validate
+  the complete remote evidence before explicitly committing successful or cleanup-required
+  effects. Stale, foreign, mismatched, already-resolved, and post-effect rollback attempts fail
+  closed; command, run/stop, and one-use authorization watermarks remain consumed;
 - failure, attestation, and cleanup events are bound both to the outer event session and to the
   reducer's exact binary or inherited process, policy, provider, helper build, provisioning epoch,
   and cleanup expectation before failure can be retained or `Closed` can be accepted and released;

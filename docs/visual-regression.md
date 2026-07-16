@@ -31,9 +31,9 @@ reviewable in source control, but they are not automated pixel-equivalence thres
 
 When intentionally updating the references, run the script with its default output directory,
 inspect all five full-size images for layout, clipping, stale/duplicate-widget warnings, incorrect
-state, and accidental hover styling, then review the manifest hashes and commit the five PNGs plus
-the manifest as one set. An individual image or manifest-only update is not a complete reference
-refresh.
+state, and accidental hover styling, then review the manifest hashes and commit the manifest plus
+every PNG whose bytes changed. A manually replaced individual image or manifest-only edit is not a
+complete reference refresh; byte-identical regenerated images do not need new Git objects.
 
 The Windows visual-review workflow runs for relevant crate, fixture, capture-tool, and Rust
 dependency changes. It regenerates the same five views into a temporary directory, validates PNG
