@@ -200,12 +200,15 @@ pub enum HandshakeState {
     Failed,
 }
 
-/// Directional challenge/response authentication for one frame exchange.
+/// Directional nonce, role, version, and build-identity binding for one frame exchange.
 ///
 /// The machine deliberately owns no transport. Each side has an independent
 /// frame sequence, so the initial `Hello` and `HelloAck` are both sequence one.
 /// Any validation failure is terminal: callers must discard the channel rather
 /// than attempting to recover on bytes whose identity is no longer trusted.
+/// This handshake detects reflection, replay, downgrade, and accidental peer
+/// mismatch; it is not cryptographic peer authentication. A platform adapter
+/// must separately authenticate the transport and the helper it created.
 #[derive(Debug)]
 pub struct HandshakeMachine {
     role: EndpointRole,
@@ -850,7 +853,7 @@ pub enum HandshakeError {
     PeerRoleMismatch,
     #[error("handshake peer direction does not match its endpoint role")]
     PeerDirectionMismatch,
-    #[error("handshake peer build identity does not match the pinned identity")]
+    #[error("handshake peer build identity does not match the expected identity")]
     PeerBuildIdentityMismatch,
     #[error("handshake acknowledgement nonce does not match the challenge")]
     NonceMismatch,

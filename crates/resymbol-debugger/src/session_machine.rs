@@ -127,12 +127,11 @@ impl SessionMachine {
                 if let Some(sandbox) = self.sandbox.as_mut() {
                     sandbox.mark_running()?;
                 }
-                self.state = SessionState::Running { token: run };
+                self.transition_to(SessionState::Running { token: run })?;
             }
             DebugCommand::Pause { .. } => {
-                self.state = SessionState::Pausing {
-                    token: self.next_state_token()?,
-                };
+                let next = self.next_state_token()?;
+                self.transition_to(SessionState::Pausing { token: next })?;
             }
             DebugCommand::WriteMemory { .. }
             | DebugCommand::SetBreakpoint { .. }
@@ -147,16 +146,15 @@ impl SessionMachine {
                 ) {
                     return Err(SessionMachineError::SandboxDetachForbidden);
                 }
-                self.state = SessionState::Detached {
-                    token: self.next_state_token()?,
-                };
+                let next = self.next_state_token()?;
+                self.transition_to(SessionState::Detached { token: next })?;
             }
             DebugCommand::Terminate { .. } | DebugCommand::Close { .. } => {
                 let next = self.next_state_token()?;
                 if let Some(sandbox) = self.sandbox.as_mut() {
                     sandbox.begin_cleanup()?;
                 }
-                self.state = SessionState::Closing { token: next };
+                self.transition_to(SessionState::Closing { token: next })?;
             }
         }
         Ok(&self.state)
@@ -174,7 +172,7 @@ impl SessionMachine {
             .as_mut()
             .ok_or(SessionMachineError::SandboxNotPending)?
             .target_created_suspended()?;
-        self.state = SessionState::AwaitingAttestation { token: next };
+        self.transition_to(SessionState::AwaitingAttestation { token: next })?;
         Ok(&self.state)
     }
 
@@ -194,7 +192,7 @@ impl SessionMachine {
             .ok_or(SessionMachineError::SandboxNotPending)?
             .accept_attestation(actual)?;
         self.execution_gate = ExecutionGate::SandboxAccepted;
-        self.state = SessionState::AttestationAccepted { token: next };
+        self.transition_to(SessionState::AttestationAccepted { token: next })?;
         Ok(&self.state)
     }
 
@@ -202,9 +200,8 @@ impl SessionMachine {
         self.require_open_target("complete offline open", |target| {
             matches!(target, DebugTargetRequest::Offline(_))
         })?;
-        self.state = SessionState::Offline {
-            token: self.next_state_token()?,
-        };
+        let next = self.next_state_token()?;
+        self.transition_to(SessionState::Offline { token: next })?;
         Ok(&self.state)
     }
 
@@ -212,9 +209,8 @@ impl SessionMachine {
         self.require_open_target("complete dump open", |target| {
             matches!(target, DebugTargetRequest::Dump(_))
         })?;
-        self.state = SessionState::Dump {
-            token: self.next_state_token()?,
-        };
+        let next = self.next_state_token()?;
+        self.transition_to(SessionState::Dump { token: next })?;
         Ok(&self.state)
     }
 
@@ -228,10 +224,11 @@ impl SessionMachine {
                 DebugTargetRequest::Attach(target) if target.mode == AttachMode::ObserveReadOnly
             )
         })?;
-        self.state = SessionState::Observing {
-            token: self.next_state_token()?,
+        let next = self.next_state_token()?;
+        self.transition_to(SessionState::Observing {
+            token: next,
             process_id,
-        };
+        })?;
         Ok(&self.state)
     }
 
@@ -266,11 +263,11 @@ impl SessionMachine {
         }
         let next = self.next_state_token()?;
         let stop = self.allocate_stop_token(next)?;
-        self.state = SessionState::Stopped {
+        self.transition_to(SessionState::Stopped {
             token: stop,
             reason,
             thread_id,
-        };
+        })?;
         Ok(&self.state)
     }
 
@@ -288,10 +285,10 @@ impl SessionMachine {
         if let Some(sandbox) = self.sandbox.as_mut() {
             sandbox.begin_cleanup()?;
         }
-        self.state = SessionState::Exited {
+        self.transition_to(SessionState::Exited {
             token: next,
             exit_code,
-        };
+        })?;
         Ok(&self.state)
     }
 
@@ -317,10 +314,10 @@ impl SessionMachine {
             sandbox.mark_failed()?;
             sandbox.begin_cleanup()?;
         }
-        self.state = SessionState::Failed {
+        self.transition_to(SessionState::Failed {
             token: next,
             message,
-        };
+        })?;
         Ok(&self.state)
     }
 
@@ -340,7 +337,7 @@ impl SessionMachine {
             (None, Some(_)) => return Err(SessionMachineError::UnexpectedCleanupReceipt),
             (None, None) => {}
         }
-        self.state = SessionState::Closed { token: next };
+        self.transition_to(SessionState::Closed { token: next })?;
         Ok(&self.state)
     }
 
@@ -388,10 +385,10 @@ impl SessionMachine {
         self.execution_gate = gate;
         self.sandbox = sandbox.take();
         self.target = Some(target.clone());
-        self.state = SessionState::Opening {
+        self.transition_to(SessionState::Opening {
             token: next,
             target,
-        };
+        })?;
         Ok(())
     }
 
@@ -407,11 +404,17 @@ impl SessionMachine {
         };
         let next = self.next_state_token()?;
         let stop = self.allocate_stop_token(next)?;
-        self.state = SessionState::Stopped {
+        self.transition_to(SessionState::Stopped {
             token: stop,
             reason,
             thread_id,
-        };
+        })?;
+        Ok(())
+    }
+
+    fn transition_to(&mut self, next: SessionState) -> Result<(), SessionMachineError> {
+        self.state.validate_successor(&next)?;
+        self.state = next;
         Ok(())
     }
 
