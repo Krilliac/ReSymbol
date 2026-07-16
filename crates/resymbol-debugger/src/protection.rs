@@ -287,12 +287,7 @@ fn scan_sections(
     for (index, section) in analysis.sections.iter().enumerate() {
         let table_index = u32::try_from(index)
             .map_err(|_| ProtectionScanError::SectionIndexConversion { index })?;
-        let span = section_region(layout, table_index)
-            .and_then(|region| match &region.kind {
-                StaticRegionKind::Section { loaded_size, .. } => u32::try_from(*loaded_size).ok(),
-                _ => None,
-            })
-            .unwrap_or(0);
+        let span = section.loaded_size();
         let evidence = || ProtectionEvidence::Section {
             table_index,
             name: section.name.clone(),
@@ -329,7 +324,10 @@ fn scan_sections(
         }
 
         if executable {
-            if let Some((sample_bytes, entropy)) = section_entropy(section, bytes)? {
+            let initialized_size = u64::from(section.file_backed_size());
+            if let Some((sample_bytes, entropy)) =
+                section_entropy(section, bytes, initialized_size)?
+            {
                 if entropy >= HIGH_ENTROPY_MILLIBITS {
                     let corroborated = packer.is_some() || writable;
                     findings.push(ProtectionFinding {
@@ -544,13 +542,14 @@ fn packer_section_assessment(
 fn section_entropy(
     section: &PeSection,
     bytes: &[u8],
+    initialized_size: u64,
 ) -> Result<Option<(u32, u16)>, ProtectionScanError> {
-    let raw_size = usize::try_from(section.raw_data_size).map_err(|_| {
+    let initialized_size = usize::try_from(initialized_size).map_err(|_| {
         ProtectionScanError::SectionRangeConversion {
             section: section.name.clone(),
         }
     })?;
-    if raw_size < MIN_ENTROPY_SAMPLE_BYTES {
+    if initialized_size < MIN_ENTROPY_SAMPLE_BYTES {
         return Ok(None);
     }
     let offset = usize::try_from(section.raw_data_offset).map_err(|_| {
@@ -558,7 +557,7 @@ fn section_entropy(
             section: section.name.clone(),
         }
     })?;
-    let sample_size = raw_size.min(MAX_ENTROPY_SAMPLE_BYTES);
+    let sample_size = initialized_size.min(MAX_ENTROPY_SAMPLE_BYTES);
     let end = offset.checked_add(sample_size).ok_or_else(|| {
         ProtectionScanError::SectionRangeOverflow {
             section: section.name.clone(),
@@ -598,18 +597,6 @@ fn entropy_millibits(bytes: &[u8]) -> u16 {
         })
         .sum::<f64>();
     (entropy * 1000.0).round().clamp(0.0, 8000.0) as u16
-}
-
-fn section_region(layout: &StaticAddressSpace, table_index: u32) -> Option<&StaticRegion> {
-    layout.regions().iter().find(|region| {
-        matches!(
-            &region.kind,
-            StaticRegionKind::Section {
-                table_index: actual,
-                ..
-            } if *actual == table_index
-        )
-    })
 }
 
 fn section_table_index(region: &StaticRegion) -> Option<u32> {
@@ -760,6 +747,34 @@ mod tests {
                 | ProtectionKind::EntryPointNonExecutableSection
                 | ProtectionKind::EntryPointWithoutFileBacking
         )));
+    }
+
+    #[test]
+    fn entropy_scan_ignores_unmapped_raw_section_padding() {
+        let mut pe = fixture_analysis();
+        pe.size_of_headers = 0x400;
+        pe.size_of_image = 0x3000;
+        pe.section_alignment = 0x1000;
+        pe.file_alignment = 0x200;
+        pe.entry_point_rva = 0;
+        pe.coff.number_of_sections = 1;
+        pe.sections = vec![text_section(0x1000, 0x10_0000)];
+
+        let layout = StaticAddressSpace::from_validated_pe(&pe).expect("canonical static layout");
+        let mut bytes = vec![0_u8; 0x10_0400];
+        for (index, byte) in bytes[0x1400..].iter_mut().enumerate() {
+            *byte = (index % 251) as u8;
+        }
+        assert!(entropy_millibits(&bytes[0x400..]) >= HIGH_ENTROPY_MILLIBITS);
+
+        let mut findings = Vec::new();
+        scan_sections(&pe, &bytes, &layout, &mut findings).expect("section scan");
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.kind != ProtectionKind::HighEntropyExecutableSection),
+            "raw alignment bytes outside VirtualSize are not executable content"
+        );
     }
 
     #[test]

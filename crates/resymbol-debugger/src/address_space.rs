@@ -1,5 +1,3 @@
-use std::cmp;
-
 use resymbol_analysis::{AnalysisError, BinaryAnalysis, PeAnalysis};
 use resymbol_core::BinaryId;
 use serde::Serialize;
@@ -235,11 +233,7 @@ impl StaticAddressSpace {
 
         for (table_index, section) in sections {
             let start = u64::from(section.virtual_address);
-            let loaded_size = u64::from(if section.virtual_size == 0 {
-                section.raw_data_size
-            } else {
-                section.virtual_size
-            });
+            let loaded_size = u64::from(section.loaded_size());
             if loaded_size == 0 {
                 continue;
             }
@@ -268,7 +262,7 @@ impl StaticAddressSpace {
             let table_index = u32::try_from(table_index).map_err(|_| {
                 StaticAddressSpaceError::SectionIndexOverflow { index: table_index }
             })?;
-            let initialized_size = cmp::min(u64::from(section.raw_data_size), loaded_size);
+            let initialized_size = u64::from(section.file_backed_size());
             let file_backing = (initialized_size != 0).then_some(FileBacking {
                 offset: u64::from(section.raw_data_offset),
                 size: initialized_size,
