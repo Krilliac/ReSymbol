@@ -21,6 +21,7 @@ TestResults/
 compile_commands.json
 CMakeFiles/
 CMakeCache.txt
+*.obj
 
 # Python test tooling
 __pycache__/
