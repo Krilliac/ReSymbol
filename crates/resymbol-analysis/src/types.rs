@@ -383,6 +383,35 @@ pub struct PeSection {
     pub characteristics: u32,
 }
 
+impl PeSection {
+    /// Number of bytes contributed to the loaded image before section-alignment padding.
+    ///
+    /// PE images use `SizeOfRawData` only when `VirtualSize` is zero. A nonzero
+    /// `VirtualSize` is authoritative even when the raw file record is larger.
+    #[must_use]
+    pub const fn loaded_size(&self) -> u32 {
+        if self.virtual_size == 0 {
+            self.raw_data_size
+        } else {
+            self.virtual_size
+        }
+    }
+
+    /// Loaded prefix initialized from the section's raw file data.
+    ///
+    /// Raw file-alignment padding beyond the loaded span is never exposed as
+    /// initialized memory, while a virtual tail beyond the raw span is zero-fill.
+    #[must_use]
+    pub const fn file_backed_size(&self) -> u32 {
+        let loaded_size = self.loaded_size();
+        if self.raw_data_size < loaded_size {
+            self.raw_data_size
+        } else {
+            loaded_size
+        }
+    }
+}
+
 /// One imported library and its null-terminated thunk table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeImportLibrary {

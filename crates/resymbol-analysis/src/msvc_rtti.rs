@@ -148,7 +148,7 @@ pub(crate) fn parse_msvc_rtti(
 
     'sections: for (section, section_scan_bytes) in scan_plan {
         let section_start = section.virtual_address;
-        let Some(section_end) = section_start.checked_add(section.raw_data_size) else {
+        let Some(section_end) = section_start.checked_add(section.file_backed_size()) else {
             return Err(AnalysisError::ArithmeticOverflow(
                 "MSVC RTTI scan section range",
             ));
@@ -288,7 +288,7 @@ fn build_scan_plan(
     let mut total_bytes = 0_u64;
     for section in &eligible {
         total_bytes = total_bytes
-            .checked_add(u64::from(section.raw_data_size))
+            .checked_add(u64::from(section.file_backed_size()))
             .ok_or(AnalysisError::ArithmeticOverflow(
                 "MSVC RTTI scan byte count",
             ))?;
@@ -300,7 +300,7 @@ fn build_scan_plan(
         if remaining < u64::from(POINTER_SIZE) {
             break;
         }
-        let prefix = u64::from(section.raw_data_size).min(remaining);
+        let prefix = u64::from(section.file_backed_size()).min(remaining);
         remaining -= prefix;
         let prefix = u32::try_from(prefix)
             .map_err(|_| AnalysisError::IntegerConversion("MSVC RTTI scan section size"))?;
@@ -1046,7 +1046,7 @@ fn demangle_rtti_type_name(decorated: &str) -> Option<String> {
 fn is_scan_section(section: &PeSection) -> bool {
     is_type_descriptor_section(section)
         && section.characteristics & IMAGE_SCN_MEM_WRITE == 0
-        && section.raw_data_size >= POINTER_SIZE
+        && section.file_backed_size() >= POINTER_SIZE
 }
 
 fn is_type_descriptor_section(section: &PeSection) -> bool {
@@ -1143,7 +1143,7 @@ fn section_range_is_backed(
     };
     sections.iter().any(|section| {
         let start = u64::from(section.virtual_address);
-        let Some(backed_end) = start.checked_add(u64::from(section.raw_data_size)) else {
+        let Some(backed_end) = start.checked_add(u64::from(section.file_backed_size())) else {
             return false;
         };
         section_is_eligible(section) && u64::from(rva) >= start && end <= backed_end
@@ -1286,7 +1286,7 @@ fn require_backed(
     } else {
         analysis.sections.iter().any(|section| {
             let start = u64::from(section.virtual_address);
-            let backed_end = start.saturating_add(u64::from(section.raw_data_size));
+            let backed_end = start.saturating_add(u64::from(section.file_backed_size()));
             u64::from(rva) >= start && end <= backed_end
         })
     };

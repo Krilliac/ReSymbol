@@ -1,5 +1,4 @@
 use std::{
-    cmp,
     collections::{BTreeMap, BTreeSet},
     str,
 };
@@ -32,6 +31,9 @@ const PE_AND_COFF_HEADER_SIZE_U64: u64 = 24;
 const OPTIONAL_HEADER_MIN_SIZE: usize = 112;
 const SECTION_HEADER_SIZE: usize = 40;
 const SECTION_HEADER_SIZE_U64: u64 = 40;
+const X64_PAGE_SIZE: u32 = 0x1000;
+const MIN_STANDARD_FILE_ALIGNMENT: u32 = 0x200;
+const MAX_FILE_ALIGNMENT: u32 = 0x1_0000;
 const DATA_DIRECTORY_SIZE: usize = 8;
 const DEBUG_DIRECTORY_ENTRY_SIZE: usize = 28;
 const DEBUG_DIRECTORY_ENTRY_SIZE_U32: u32 = 28;
@@ -686,12 +688,12 @@ pub(crate) fn validate_pe_analysis(analysis: &PeAnalysis) -> Result<(), Analysis
     {
         return invalid_field("PE image sizes", "header and image sizes are inconsistent");
     }
-    if analysis.section_alignment == 0 || analysis.file_alignment == 0 {
-        return invalid_field(
-            "PE alignment",
-            "section and file alignment must be non-zero",
-        );
-    }
+    validate_image_alignment(
+        analysis.section_alignment,
+        analysis.file_alignment,
+        analysis.size_of_image,
+        analysis.size_of_headers,
+    )?;
     if analysis.entry_point_rva != 0 && analysis.entry_point_rva >= analysis.size_of_image {
         return invalid_field("entry-point RVA", "lies outside the declared image");
     }
@@ -797,7 +799,13 @@ pub(crate) fn validate_pe_analysis(analysis: &PeAnalysis) -> Result<(), Analysis
                 format!("section {index} does not match its exact raw name bytes"),
             );
         }
-        let virtual_span = cmp::max(section.virtual_size, section.raw_data_size);
+        validate_section_alignment(
+            index,
+            section,
+            analysis.section_alignment,
+            analysis.file_alignment,
+        )?;
+        let virtual_span = section.loaded_size();
         let virtual_end = u64::from(section.virtual_address)
             .checked_add(u64::from(virtual_span))
             .ok_or(AnalysisError::ArithmeticOverflow("section virtual range"))?;
@@ -2475,7 +2483,7 @@ fn model_rva_is_backed(analysis: &PeAnalysis, rva: u32, size: u32) -> bool {
     }
     analysis.sections.iter().any(|section| {
         let start = u64::from(section.virtual_address);
-        let backed_end = start.saturating_add(u64::from(section.raw_data_size));
+        let backed_end = start.saturating_add(u64::from(section.file_backed_size()));
         u64::from(rva) >= start && end <= backed_end
     })
 }
@@ -2558,15 +2566,15 @@ fn parse_headers(reader: &Reader<'_>) -> Result<ParsedHeaders, AnalysisError> {
     if size_of_headers == 0 {
         return invalid_field("size of headers", "must be non-zero");
     }
-    if section_alignment == 0 || file_alignment == 0 {
-        return invalid_field(
-            "PE alignment",
-            "section and file alignment must be non-zero",
-        );
-    }
     if size_of_headers > size_of_image {
         return invalid_field("size of headers", "must not exceed the declared image size");
     }
+    validate_image_alignment(
+        section_alignment,
+        file_alignment,
+        size_of_image,
+        size_of_headers,
+    )?;
     if entry_point_rva >= size_of_image && entry_point_rva != 0 {
         return invalid_field("entry-point RVA", "lies outside the declared image");
     }
@@ -2677,7 +2685,17 @@ fn parse_headers(reader: &Reader<'_>) -> Result<ParsedHeaders, AnalysisError> {
         let raw_data_offset = reader.u32(offset + 20, "section raw-data offset")?;
         let characteristics = reader.u32(offset + 36, "section characteristics")?;
 
-        let virtual_span = cmp::max(virtual_size, raw_data_size);
+        let section = PeSection {
+            name: display_section_name(&raw_name),
+            raw_name,
+            virtual_address,
+            virtual_size,
+            raw_data_offset,
+            raw_data_size,
+            characteristics,
+        };
+        validate_section_alignment(index, &section, section_alignment, file_alignment)?;
+        let virtual_span = section.loaded_size();
         let virtual_end =
             virtual_address
                 .checked_add(virtual_span)
@@ -2710,15 +2728,7 @@ fn parse_headers(reader: &Reader<'_>) -> Result<ParsedHeaders, AnalysisError> {
             }
         }
 
-        sections.push(PeSection {
-            name: display_section_name(&raw_name),
-            raw_name,
-            virtual_address,
-            virtual_size,
-            raw_data_offset,
-            raw_data_size,
-            characteristics,
-        });
+        sections.push(section);
     }
     validate_section_overlaps(&sections)?;
 
@@ -5489,7 +5499,7 @@ fn file_backed_executable_section_for_rva<'a>(
         return None;
     }
     let delta = rva.checked_sub(section.virtual_address)?;
-    if delta >= section.raw_data_size {
+    if delta >= section.file_backed_size() {
         return None;
     }
     let file_offset = u64::from(section.raw_data_offset).checked_add(u64::from(delta))?;
@@ -5499,7 +5509,7 @@ fn file_backed_executable_section_for_rva<'a>(
 pub(crate) fn section_for_rva(rva: u32, sections: &[PeSection]) -> Option<(usize, &PeSection)> {
     sections.iter().enumerate().find(|(_, section)| {
         let start = u64::from(section.virtual_address);
-        let size = u64::from(cmp::max(section.virtual_size, section.raw_data_size));
+        let size = u64::from(section.loaded_size());
         let end = start.saturating_add(size);
         (start..end).contains(&u64::from(rva))
     })
@@ -5517,7 +5527,7 @@ fn section_for_rva_range(
     let end = start.checked_add(u64::from(size))?;
     sections.iter().enumerate().find(|(_, section)| {
         let section_start = u64::from(section.virtual_address);
-        let section_size = u64::from(cmp::max(section.virtual_size, section.raw_data_size));
+        let section_size = u64::from(section.loaded_size());
         let section_end = section_start.saturating_add(section_size);
         start >= section_start && end <= section_end
     })
@@ -5554,7 +5564,7 @@ impl<'a> RvaMap<'a> {
         for section in self.sections {
             let section_start = u64::from(section.virtual_address);
             let backed_end = section_start
-                .checked_add(u64::from(section.raw_data_size))
+                .checked_add(u64::from(section.file_backed_size()))
                 .ok_or(AnalysisError::ArithmeticOverflow(
                     "section-backed RVA range",
                 ))?;
@@ -5627,7 +5637,8 @@ impl<'a> RvaMap<'a> {
         }
         for section in self.sections {
             let start = u64::from(section.virtual_address);
-            let end = start.checked_add(u64::from(section.raw_data_size)).ok_or(
+            let file_backed_size = section.file_backed_size();
+            let end = start.checked_add(u64::from(file_backed_size)).ok_or(
                 AnalysisError::ArithmeticOverflow("section-backed RVA range"),
             )?;
             if u64::from(rva) >= start && u64::from(rva) < end {
@@ -5636,7 +5647,7 @@ impl<'a> RvaMap<'a> {
                     .checked_add(delta)
                     .ok_or(AnalysisError::ArithmeticOverflow("string file offset"))?;
                 let raw_end = u64::from(section.raw_data_offset)
-                    .checked_add(u64::from(section.raw_data_size))
+                    .checked_add(u64::from(file_backed_size))
                     .ok_or(AnalysisError::ArithmeticOverflow("section raw range"))?;
                 let offset = usize::try_from(offset)
                     .map_err(|_| AnalysisError::IntegerConversion("string file offset"))?;
@@ -5816,13 +5827,100 @@ fn invalid_field<T>(field: &'static str, reason: impl Into<String>) -> Result<T,
     })
 }
 
+fn validate_image_alignment(
+    section_alignment: u32,
+    file_alignment: u32,
+    size_of_image: u32,
+    size_of_headers: u32,
+) -> Result<(), AnalysisError> {
+    if !section_alignment.is_power_of_two() {
+        return invalid_field("section alignment", "must be a non-zero power of two");
+    }
+    if !file_alignment.is_power_of_two() {
+        return invalid_field("file alignment", "must be a non-zero power of two");
+    }
+    if section_alignment < file_alignment {
+        return invalid_field(
+            "section alignment",
+            "must be greater than or equal to file alignment",
+        );
+    }
+    if !(MIN_STANDARD_FILE_ALIGNMENT..=MAX_FILE_ALIGNMENT).contains(&file_alignment) {
+        return invalid_field(
+            "file alignment",
+            format!("must be between {MIN_STANDARD_FILE_ALIGNMENT:#x} and {MAX_FILE_ALIGNMENT:#x}"),
+        );
+    }
+    if section_alignment < X64_PAGE_SIZE && file_alignment != section_alignment {
+        return invalid_field(
+            "file alignment",
+            "must equal section alignment for sub-page images",
+        );
+    }
+    if size_of_image % section_alignment != 0 {
+        return invalid_field("size of image", "must be aligned to section alignment");
+    }
+    if size_of_headers % file_alignment != 0 {
+        return invalid_field("size of headers", "must be aligned to file alignment");
+    }
+    Ok(())
+}
+
+fn validate_section_alignment(
+    index: usize,
+    section: &PeSection,
+    section_alignment: u32,
+    file_alignment: u32,
+) -> Result<(), AnalysisError> {
+    if section.loaded_size() != 0 && section.virtual_address % section_alignment != 0 {
+        return invalid_field(
+            "section virtual alignment",
+            format!(
+                "section {index} VirtualAddress {:#x} is not aligned to SectionAlignment {section_alignment:#x}",
+                section.virtual_address
+            ),
+        );
+    }
+    if section.raw_data_size != 0 && section.raw_data_size % file_alignment != 0 {
+        return invalid_field(
+            "section raw-data alignment",
+            format!(
+                "section {index} SizeOfRawData {:#x} is not aligned to FileAlignment {file_alignment:#x}",
+                section.raw_data_size
+            ),
+        );
+    }
+    if section.raw_data_offset != 0 && section.raw_data_offset % file_alignment != 0 {
+        return invalid_field(
+            "section raw-data alignment",
+            format!(
+                "section {index} PointerToRawData {:#x} is not aligned to FileAlignment {file_alignment:#x}",
+                section.raw_data_offset
+            ),
+        );
+    }
+    if section_alignment < X64_PAGE_SIZE
+        && section.raw_data_size != 0
+        && section.raw_data_offset != section.virtual_address
+    {
+        return invalid_field(
+            "sub-page section layout",
+            format!(
+                "section {index} PointerToRawData {:#x} must equal VirtualAddress {:#x}",
+                section.raw_data_offset, section.virtual_address
+            ),
+        );
+    }
+    Ok(())
+}
+
 fn validate_section_overlaps(sections: &[PeSection]) -> Result<(), AnalysisError> {
     for first in 0..sections.len() {
         for second in first + 1..sections.len() {
             let left = &sections[first];
             let right = &sections[second];
-            let left_virtual_size = cmp::max(left.virtual_size, left.raw_data_size);
-            let right_virtual_size = cmp::max(right.virtual_size, right.raw_data_size);
+            let left_virtual_size = left.loaded_size();
+            let right_virtual_size = right.loaded_size();
             if ranges_overlap(
                 u64::from(left.virtual_address),
                 u64::from(left_virtual_size),
@@ -5903,4 +6001,172 @@ fn push_hex_byte(output: &mut String, byte: u8) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     output.push(char::from(HEX[usize::from(byte >> 4)]));
     output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+}
+
+#[cfg(test)]
+mod section_layout_tests {
+    use super::*;
+
+    fn section(
+        virtual_address: u32,
+        virtual_size: u32,
+        raw_data_offset: u32,
+        raw_data_size: u32,
+    ) -> PeSection {
+        PeSection {
+            name: ".test".to_owned(),
+            raw_name: *b".test\0\0\0",
+            virtual_address,
+            virtual_size,
+            raw_data_offset,
+            raw_data_size,
+            characteristics: IMAGE_SCN_MEM_EXECUTE,
+        }
+    }
+
+    #[test]
+    fn raw_alignment_padding_is_neither_loaded_nor_file_backed() {
+        let sections = [section(0x1000, 0x801, 0x200, 0xa00)];
+        assert_eq!(sections[0].loaded_size(), 0x801);
+        assert_eq!(sections[0].file_backed_size(), 0x801);
+
+        assert!(section_for_rva(0x1800, &sections).is_some());
+        assert!(section_for_rva(0x1801, &sections).is_none());
+        assert!(section_for_rva_range(0x1800, 1, &sections).is_some());
+        assert!(section_for_rva_range(0x1801, 1, &sections).is_none());
+
+        let bytes = vec![0_u8; 0xc00];
+        let mapper = RvaMap::new(&bytes, 0x200, &sections);
+        assert!(mapper.is_backed(0x1800, 1));
+        assert!(!mapper.is_backed(0x1801, 1));
+        assert_eq!(
+            mapper
+                .contiguous_bytes(0x1800, "last initialized byte")
+                .expect("last loaded byte is initialized")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn zero_virtual_size_falls_back_to_the_raw_size() {
+        let sections = [section(0x1000, 0, 0x200, 0xa00)];
+        assert_eq!(sections[0].loaded_size(), 0xa00);
+        assert_eq!(sections[0].file_backed_size(), 0xa00);
+
+        assert!(section_for_rva(0x19ff, &sections).is_some());
+        assert!(section_for_rva(0x1a00, &sections).is_none());
+        let bytes = vec![0_u8; 0xc00];
+        let mapper = RvaMap::new(&bytes, 0x200, &sections);
+        assert!(mapper.is_backed(0x19ff, 1));
+        assert!(!mapper.is_backed(0x1a00, 1));
+    }
+
+    #[test]
+    fn virtual_zero_fill_is_loaded_but_not_file_backed() {
+        let sections = [section(0x1000, 0xa00, 0x200, 0x801)];
+        assert_eq!(sections[0].loaded_size(), 0xa00);
+        assert_eq!(sections[0].file_backed_size(), 0x801);
+
+        assert!(section_for_rva(0x1900, &sections).is_some());
+        let bytes = vec![0_u8; 0xa01];
+        let mapper = RvaMap::new(&bytes, 0x200, &sections);
+        assert!(!mapper.is_backed(0x1900, 1));
+    }
+
+    #[test]
+    fn overlap_checks_use_loaded_spans_not_raw_padding() {
+        let mut sections = [
+            section(0x1000, 0x801, 0x200, 0x1200),
+            section(0x2000, 0x100, 0x1400, 0x200),
+        ];
+        for (index, section) in sections.iter().enumerate() {
+            validate_section_alignment(index, section, 0x1000, 0x200)
+                .expect("standard section placement is aligned");
+        }
+        validate_section_overlaps(&sections)
+            .expect("raw alignment padding does not overlap in virtual memory");
+
+        sections[0].virtual_size = 0x1001;
+        assert!(matches!(
+            validate_section_overlaps(&sections),
+            Err(AnalysisError::OverlappingSections {
+                first: 0,
+                second: 1,
+                space: "virtual"
+            })
+        ));
+
+        sections[0].virtual_size = 0;
+        assert!(matches!(
+            validate_section_overlaps(&sections),
+            Err(AnalysisError::OverlappingSections {
+                first: 0,
+                second: 1,
+                space: "virtual"
+            })
+        ));
+    }
+
+    #[test]
+    fn accepts_standard_and_sub_page_section_placement() {
+        validate_image_alignment(0x1000, 0x200, 0x3000, 0x200)
+            .expect("standard PE image alignment");
+        validate_section_alignment(0, &section(0x1000, 0x801, 0x200, 0xa00), 0x1000, 0x200)
+            .expect("standard PE section alignment");
+
+        validate_image_alignment(0x200, 0x200, 0x2000, 0x200)
+            .expect("sub-page image uses identical alignments");
+        validate_section_alignment(0, &section(0x400, 0x180, 0x400, 0x200), 0x200, 0x200)
+            .expect("sub-page section has matching RVA and file offset");
+    }
+
+    #[test]
+    fn rejects_invalid_image_alignment_contracts() {
+        assert!(validate_image_alignment(0x1800, 0x200, 0x3000, 0x200).is_err());
+        assert!(validate_image_alignment(0x1000, 0x180, 0x3000, 0x200).is_err());
+        assert!(validate_image_alignment(0x200, 0x400, 0x2000, 0x400).is_err());
+        assert!(validate_image_alignment(0x400, 0x200, 0x2000, 0x200).is_err());
+        assert!(validate_image_alignment(0x1000, 0x200, 0x2800, 0x200).is_err());
+        assert!(validate_image_alignment(0x1000, 0x200, 0x3000, 0x300).is_err());
+    }
+
+    #[test]
+    fn rejects_misaligned_or_inconsistent_section_placement() {
+        let misaligned_virtual = section(0x1800, 0x801, 0x200, 0xa00);
+        assert!(matches!(
+            validate_section_alignment(0, &misaligned_virtual, 0x1000, 0x200),
+            Err(AnalysisError::InvalidField {
+                field: "section virtual alignment",
+                ..
+            })
+        ));
+
+        let misaligned_raw_size = section(0x1000, 0x801, 0x200, 0xa01);
+        assert!(matches!(
+            validate_section_alignment(0, &misaligned_raw_size, 0x1000, 0x200),
+            Err(AnalysisError::InvalidField {
+                field: "section raw-data alignment",
+                ..
+            })
+        ));
+
+        let misaligned_raw_offset = section(0x1000, 0x801, 0x201, 0xa00);
+        assert!(matches!(
+            validate_section_alignment(0, &misaligned_raw_offset, 0x1000, 0x200),
+            Err(AnalysisError::InvalidField {
+                field: "section raw-data alignment",
+                ..
+            })
+        ));
+
+        let sub_page_offset_mismatch = section(0x400, 0x180, 0x600, 0x200);
+        assert!(matches!(
+            validate_section_alignment(0, &sub_page_offset_mismatch, 0x200, 0x200),
+            Err(AnalysisError::InvalidField {
+                field: "sub-page section layout",
+                ..
+            })
+        ));
+    }
 }

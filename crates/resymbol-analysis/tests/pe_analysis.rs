@@ -6624,7 +6624,6 @@ fn legacy_base_class_descriptor_requires_exactly_24_backed_bytes() {
 
     let mut truncated = last_backed_legacy_base_class_rtti_fixture();
     put_u32(&mut truncated, SECTION_OFFSET + 40 + 8, 0x3ff);
-    put_u32(&mut truncated, SECTION_OFFSET + 40 + 16, 0x3ff);
     let analysis = analyze_pe(&truncated).expect("truncated RTTI candidates are skipped safely");
     assert!(analysis.msvc_rtti_vftables.is_empty());
 
