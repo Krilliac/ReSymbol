@@ -3956,8 +3956,10 @@ mod tests {
                 DiagnosticText::new("inherited open failed").expect("detail"),
             )
             .expect("inherited failure");
-        let mut evidence = ResponseEvidence::default();
-        evidence.command_state_observed = true;
+        let evidence = ResponseEvidence {
+            command_state_observed: true,
+            ..ResponseEvidence::default()
+        };
         validate_sandbox_failure_phase(&envelope, &reducer, &failure, &evidence, false)
             .expect("exact inherited open runtime phase");
         assert!(matches!(
