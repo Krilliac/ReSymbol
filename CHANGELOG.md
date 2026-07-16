@@ -8,6 +8,14 @@ prereleases; breaking changes remain explicit.
 
 ### Added
 
+- Added the backend-neutral `resymbol-debugger` foundation without enabling target execution. The
+  crate provides an exact-identity static PE address-space partition, bounded protection indicators,
+  capability- and token-carrying debugger commands/events, compare-before-write contracts, a
+  length-bounded helper wire format, and fail-closed sandbox policy, attestation, lifecycle, and
+  cleanup records. The workbench now exposes the preferred-image Address Space view and evidence for
+  entry-point, TLS, anti-debug-import, packer, entropy, and writable/executable-section findings. No
+  debugger host, Windows AppContainer provider, Hyper-V guest, attach path, or live memory mutation is
+  implemented yet; these contracts must not be represented as an operating-system security boundary.
 - Added the first Windows-first `resymbol-workbench.exe` desktop slice. It runs bounded core-only PE
   analysis away from the UI thread and presents exact identity, evidence- and provenance-first
   function review, read-only plugin health, and a visual Reconstruction Graph rooted at the PE entry

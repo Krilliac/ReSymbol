@@ -48,8 +48,30 @@ project maturity.
 ## Security boundaries under development
 
 The plugin isolation, permission, package-signing, and update designs are not yet stable security
-guarantees. Current implementation details—not roadmap statements—determine the protection a build
+guarantees. Current implementation details--not roadmap statements--determine the protection a build
 provides. See [docs/plugin-system.md](docs/plugin-system.md) for the intended model.
+
+### Debugger targets and the first-party sandbox
+
+The current debugger work is an offline foundation, not a live debugger or malware sandbox. Static
+address-space construction and protection assessment parse bytes without loading the target. The
+backend-neutral command, event, wire, policy, attestation, and cleanup types define checks that later
+processes must enforce; serializing those types does not create containment.
+
+There is currently no shipped AppContainer launcher, debugger-host process, Hyper-V guest agent, or
+verified cleanup journal. Do not execute a hostile sample through the current workbench. Use a
+separately administered disposable virtual machine with host integration and networking disabled
+until ReSymbol ships and verifies an execution provider. Ordinary host launch and attach will remain
+explicit high-risk operations, never fallbacks from an unavailable sandbox.
+
+The planned local provider is a shared-kernel user-mode boundary. Even after it exists, AppContainer,
+Job Object, handle, environment, and mitigation restrictions cannot make a kernel exploit safe. The
+planned disposable-VM provider is the stronger boundary for samples that may attack Windows itself.
+Neither provider is intended to hide from anti-cheat systems or supply covert kernel debugging.
+Protection indicators are evidence for analyst review, not proof that a binary is malicious or safe.
+
+See [Debugger and sandbox architecture](docs/debugger-sandbox.md) for the implemented/planned split
+and the fail-closed integration gates.
 
 The current external, native, and managed plugin processes provide crash isolation, not an
 operating-system sandbox. Approved plugin code retains the ambient filesystem, network, credential,
