@@ -1612,6 +1612,19 @@ impl WorkbenchApp {
                     .validate_for_binary(project.session().base_analysis().identity())
                     .is_ok()
             });
+        let selected_rva = if reviews_still_bound {
+            self.selected_projection_index
+                .and_then(|index| self.project.as_ref()?.functions.get(index))
+                .map(|row| row.rva)
+        } else {
+            None
+        };
+        let previous_graph_root = if reviews_still_bound {
+            self.graph_root_rva
+        } else {
+            None
+        };
+        let previous_main_tab = self.main_tab;
         let replacement_reviews = if reviews_still_bound {
             None
         } else {
@@ -1664,14 +1677,26 @@ impl WorkbenchApp {
             .into_owned();
         self.export_result = None;
         self.analysis_path = Some(project.identity.path.clone());
-        self.selected_projection_index = project.functions.first().map(|row| row.projection_index);
+        self.selected_projection_index = selected_rva
+            .and_then(|rva| {
+                project
+                    .functions
+                    .iter()
+                    .find(|row| row.rva == rva)
+                    .map(|row| row.projection_index)
+            })
+            .or_else(|| project.functions.first().map(|row| row.projection_index));
         if !reviews_still_bound {
             self.selected_review_subject = None;
         }
         let reconstruction_graph = ReconstructionGraph::from_project(&project);
-        self.graph_root_rva = reconstruction_graph.default_root().map(|root| root.rva);
+        self.graph_root_rva = previous_graph_root
+            .filter(|rva| project.functions.iter().any(|row| row.rva == *rva))
+            .or_else(|| reconstruction_graph.default_root().map(|root| root.rva));
         self.reconstruction_graph = Some(reconstruction_graph);
-        self.function_filter = FunctionFilter::default();
+        if !reviews_still_bound {
+            self.function_filter = FunctionFilter::default();
+        }
         if let Some(review) = replacement_reviews {
             self.review_destination = default_review_path(&project).to_string_lossy().into_owned();
             self.review_result = None;
@@ -1680,7 +1705,11 @@ impl WorkbenchApp {
         self.review_orphaned_decisions = updated_orphaned_decisions;
         self.project = Some(project);
         self.stage = WorkflowStage::Review;
-        self.main_tab = MainTab::Overview;
+        self.main_tab = if reviews_still_bound {
+            previous_main_tab
+        } else {
+            MainTab::Overview
+        };
         if protection_requires_review {
             self.activity_tab = ActivityTab::Warnings;
             self.log(

@@ -323,7 +323,10 @@ impl LoadedProject {
         let (functions, function_details) =
             build_function_inventory(&projection.functions, combined_graph.claims())?;
         let binary = &projection.binary;
-        let path = snapshot.origin_path().to_path_buf();
+        let path = snapshot
+            .verified_source_path()
+            .unwrap_or_else(|| snapshot.origin_path())
+            .to_path_buf();
         let display_name = path
             .file_name()
             .and_then(|name| name.to_str())
@@ -937,6 +940,19 @@ mod tests {
             project.static_address_space.binary_id,
             project.identity.sha256
         );
+
+        let verified = services
+            .verify_source_binary(&project.snapshot, &source_path)
+            .expect("verify package source");
+        let exact_project = LoadedProject::from_snapshot(verified).expect("verified package model");
+        assert_eq!(
+            exact_project.identity.path,
+            exact_project
+                .snapshot
+                .verified_source_path()
+                .expect("verified source path")
+        );
+        assert_eq!(exact_project.identity.display_name, "fixture.exe");
     }
 
     #[test]
