@@ -31,7 +31,7 @@ Every package contains four top-level fields:
   "binary_sha256": "<64 lowercase hexadecimal characters>",
   "generator_version": "0.1.0-alpha.1",
   "payload": {},
-  "schema_version": 7
+  "schema_version": 8
 }
 ```
 
@@ -41,8 +41,8 @@ Every package contains four top-level fields:
 - `payload` contains one validated `AnalysisSession`: deterministic base analysis, a plugin-run
   ledger, and accepted plugin claims.
 
-This package envelope currently writes schema 7. The CLI can also inspect and export schemas 1
-through 6 through the compatibility paths described below, while other schema versions fail
+This package envelope currently writes schema 8. The CLI can also inspect and export schemas 1
+through 7 through the compatibility paths described below, while other schema versions fail
 explicitly. The debugger-neutral JSON produced by `resymbol export --format json` is a different
 artifact with its own schema version; its current projection is schema 6.
 
@@ -61,7 +61,7 @@ the bytes it names. ReSymbol fully validates the package, canonicalizes and read
 and requires its exact size and SHA-256 to match before emitting inspection output to stdout.
 Failures report on stderr. A successful human summary includes
 `source binary: <canonical-path>` and `identity gate: matched`. With `--json`, stdout stays pure
-package JSON and omits both status lines. This gate applies to supported schemas 1 through 7 but
+package JSON and omits both status lines. This gate applies to supported schemas 1 through 8 but
 performs no reanalysis, legacy-result reconstruction, or rewrite of either input.
 
 A package must not be applied to a loaded program until its SHA-256 identity has been compared with
@@ -104,17 +104,20 @@ through 4 remains available, but loading cannot discover omitted descriptors wit
 bytes. Schema 5 records both RTTI descriptor layouts but predates transitive executable thunk-chain
 discovery; its existing calls and thunks remain available, but loading cannot add omitted hops.
 Schema 6 records that closure but predates TLS callback discovery and callback-based thunk seeding.
-The TLS callback result family is therefore reported as unavailable for every schema 1-through-6
-package. Reanalyze the exact original executable to create a schema 7 package with all current
-recovery results. The compatibility reader explicitly rejects a schema 2 or 3 envelope whose base
+Schema 7 records TLS callbacks but predates modern PE32+ delay-import recovery. The TLS callback
+result family is therefore reported as unavailable for every schema 1-through-6 package, while
+delay imports are unavailable for schemas 1 through 7. Reanalyze the exact original executable to
+create a schema 8 package with all current recovery results. The compatibility reader explicitly
+rejects a schema 2 or 3 envelope whose base
 analysis, base graph, or plugin claims contain a schema-4 `function-pointer` target. It also rejects
 any schema 1-through-4 payload whose RTTI base records have a missing or null
 `class_hierarchy_descriptor_rva`. Schema 1's closed migration path rejects every persisted
 post-schema-1 control-flow record; schemas 2 through 5 explicitly reject a deterministic base thunk
 source valid only through schema-6 transitive endpoint seeding. Changing only the envelope label is
 not migration. Schemas 1 through 6 also reject schema-7 TLS callback state and callback-only base
-thunk seeds. Plugin-supplied exact thunk claims remain independent of the built-in base-analysis
-seed invariant.
+thunk seeds. Schemas 1 through 7 reject schema-8 delay-import directory and inventory fields;
+schema 8 rejects a payload missing its explicit delay-import inventory marker.
+Plugin-supplied exact thunk claims remain independent of the built-in base-analysis seed invariant.
 `inspect --json`, with or without the optional binary gate, emits only package JSON. For schema 1 it
 preserves the validated original representation rather than placing the migrated current payload
 beneath a legacy schema label.
@@ -141,7 +144,12 @@ The base analysis includes:
 
 - normalized binary identity and image metadata;
 - COFF and optional-header fields used by analysis;
-- bounded section, import, export, exception-directory, and TLS-directory records;
+- bounded section, conventional-import, modern delay-import, export, exception-directory, and
+  TLS-directory records;
+- a separate ordered delay-import inventory retaining the DLL name,
+  descriptor/name/HMOD/IAT/INT base RVAs, optional BIAT/UIAT base RVAs, per-entry lookup/IAT RVAs
+  and names or ordinals, and the timestamp, but not raw array contents; schema 8 always serializes
+  this inventory, including an empty array, as an explicit compatibility marker;
 - x64 `RUNTIME_FUNCTION` entries as evidence-backed candidate function boundaries;
 - up to 4,096 ordered PE32+ TLS callback entries with duplicates preserved, their callback-table
   RVA, and an independent partial-scan flag;
@@ -164,10 +172,10 @@ producer/run mismatches, invalid subject/assertion combinations, and ledger coun
 match the accepted claims.
 
 Plugins granted `symbols.read` receive the same detached base analysis as JSON, so schema-7
-sessions add the TLS directory and callback fields to that object. This is additive data inside the
-existing request payload: it does not change the plugin API or wire protocol 1.0, add a new
-assertion shape, or change neutral projection schema 6. Plugins without `symbols.read` still receive
-no base analysis.
+sessions add the TLS directory and callback fields and schema-8 sessions add the delay-import
+directory and ordered inventory. This is additive data inside the existing request payload: it does
+not change the plugin API or wire protocol 1.0, add a new assertion shape, or change neutral
+projection schema 6. Plugins without `symbols.read` still receive no base analysis.
 
 Plugin execution is transactional. A failed process run contributes no claims, so an invalid,
 crashed, timed-out, or quarantined plugin cannot corrupt the deterministic base analysis. Ordinary
@@ -199,6 +207,32 @@ claims separate when multiple slots repeat the same target RVA. Callback targets
 deterministic initial thunk seeds, so an exact supported first-instruction thunk can be retained
 without turning the callback into an unbounded body scan. ReSymbol never executes a callback and
 does not infer its name or extent.
+
+### Modern PE32+ delay-import boundary
+
+Modern delay-import discovery consumes optional-header data-directory entry 13 as ordered 32-byte
+descriptors terminated by one all-zero descriptor; every remaining descriptor in the declared
+range must be all-zero padding. ReSymbol supports only the RVA-based form whose
+attributes field is exactly `dlattrRva` (`1`). It explicitly rejects zero, unknown attribute bits,
+and the legacy VA form rather than guessing through the ambiguity in generic PE table documentation.
+
+Every active descriptor must carry nonzero name, module-handle (HMOD), delay-IAT, and delay-INT RVAs.
+The complete declared descriptor range, each consumed descriptor and string, HMOD storage, paired
+64-bit INT/IAT slots and terminators, and optional bound-IAT (BIAT) or unload-IAT (UIAT) arrays must
+be fully file-backed. The HMOD slot's initial bytes and section permissions remain opaque. INT, IAT,
+and each present BIAT or UIAT must be pairwise disjoint and terminate at the same entry index. BIAT
+payload values are otherwise opaque, while the complete UIAT must byte-match the original delay
+IAT. Names and ordinals are decoded from the INT. The package preserves descriptor and entry order,
+the DLL name,
+descriptor/name/HMOD/IAT/INT base RVAs, optional BIAT/UIAT base RVAs, each entry's lookup/IAT RVAs
+and name or ordinal, and the timestamp. It does not serialize raw INT/IAT/BIAT/UIAT array contents.
+
+Conventional and delay imports share aggregate ceilings of 4,096 libraries, 65,536 symbols, and
+16 MiB of name bytes. Malformation, conflicting table structure, or exhaustion of any shared limit
+is a hard analysis error: this slice never serializes a partial delay-import prefix. Each accepted
+delay-IAT slot nevertheless joins the existing parsed-IAT membership used by code recovery. Exact
+supported calls and thunks use the existing `ImportIat` target and that membership outranks
+read-only function-pointer interpretation.
 
 ### MSVC x64 RTTI boundary
 
@@ -379,7 +413,9 @@ competing data references by caller and instruction site. If the selected same-s
 targets something other than the pointer slot, projection omits the pointer call and emits an
 `unsupported-assertion` warning. Pointer thunks do not require that companion relationship.
 Internal relation targets must reference projected function entries; import targets retain their
-IAT RVA. Its projection/model bounds are intentionally separate from the lower built-in recovery
+IAT RVA. Conventional and delay-IAT control flow uses that same import target; the ordered
+delay-import inventory remains package-only and adds no neutral-projection field. Its
+projection/model bounds are intentionally separate from the lower built-in recovery
 caps: at most 65,536 strings, 32 MiB of retained string UTF-8 with 16 KiB per value, and 262,144
 data references. A function retains at most 4,096 distinct memberships. Overflow is loss-aware
 rather than order-dependent: ReSymbol keeps the deterministically strongest 4,096 and emits one
@@ -398,7 +434,7 @@ inspection of the exact original PE. It emits deterministic, bounded, pure-Rust 
 containing selected public function and global names and verbatim section headers. Same-RVA
 function/global collisions prefer the function; unnamed functions do not suppress globals. The
 writer does not synthesize private symbols, compilands, source lines, locals, prototypes, function
-extents, or type records, and it does not add fields to package schema 7 or neutral projection
+extents, or type records, and it does not add fields to package schema 8 or neutral projection
 schema 6. Generating the file requires no separately installed Visual Studio, DIA, LLVM, or
 compiler toolchain; Windows compatibility CI validates it with native and DIA-backed
 `llvm-pdbutil` reads and a direct DIA identity/public-symbol probe.

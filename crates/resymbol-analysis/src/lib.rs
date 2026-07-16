@@ -17,9 +17,9 @@ pub use pe::{PeCodeViewInspection, PeCodeViewRsds, analyze_pe, inspect_pe_codevi
 pub use session::{AnalysisSession, PluginRunRecord, PluginRunStatus, SessionValidationError};
 pub use types::{
     BinaryAnalysis, CoffHeader, DataDirectory, ImportTarget, MsvcRttiBaseClass, MsvcRttiVftable,
-    PeAnalysis, PeControlFlowTarget, PeDataDirectories, PeDataReference, PeDirectCall, PeExport,
-    PeExportName, PeImport, PeImportLibrary, PeRecoveredString, PeSection, PeStringEncoding,
-    PeThunk, PeTlsCallback, RuntimeFunction,
+    PeAnalysis, PeControlFlowTarget, PeDataDirectories, PeDataReference, PeDelayImportLibrary,
+    PeDirectCall, PeExport, PeExportName, PeImport, PeImportLibrary, PeRecoveredString, PeSection,
+    PeStringEncoding, PeThunk, PeTlsCallback, RuntimeFunction,
 };
 
 /// Detect and analyze a supported binary container.

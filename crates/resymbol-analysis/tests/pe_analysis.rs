@@ -19,6 +19,16 @@ const IMAGE_BASE: u64 = 0x0000_0001_4000_0000;
 const TLS_DIRECTORY_RVA: u32 = 0x1380;
 const TLS_CALLBACK_TABLE_RVA: u32 = 0x13c0;
 const TLS_CALLBACK_LIMIT: usize = 4_096;
+const DELAY_IMPORT_DIRECTORY_RVA: u32 = 0x1400;
+const DELAY_IMPORT_NAME_RVA: u32 = 0x1440;
+const DELAY_IMPORT_MODULE_HANDLE_RVA: u32 = 0x1450;
+const DELAY_IMPORT_INT_RVA: u32 = 0x1460;
+const DELAY_IMPORT_IAT_RVA: u32 = 0x1480;
+const DELAY_IMPORT_HINT_NAME_RVA: u32 = 0x14a0;
+const DELAY_IMPORT_BOUND_IAT_RVA: u32 = 0x14c0;
+const DELAY_IMPORT_UNLOAD_IAT_RVA: u32 = 0x14e0;
+const DELAY_IMPORT_CODE_IAT_RVA: u32 = 0x2000;
+const DELAY_IMPORT_CODE_IAT_RAW_OFFSET: usize = 0x800;
 const DIRECT_CALL_EVIDENCE_SUMMARY: &str = concat!(
     "exact supported x64 call encoding observed during a bounded ",
     "control-flow-guided traversal of a file-backed runtime-function range",
@@ -146,6 +156,254 @@ fn fixture() -> Vec<u8> {
     put_u32(&mut bytes, exception, 0x1000);
     put_u32(&mut bytes, exception + 4, 0x1020);
     put_u32(&mut bytes, exception + 8, 0x1350);
+    bytes
+}
+
+fn expand_single_section(bytes: &mut Vec<u8>, raw_size: u32) {
+    assert!(raw_size >= 0x600);
+    assert_eq!(raw_size % 0x200, 0, "fixture raw size stays file-aligned");
+    bytes.resize(
+        RAW_OFFSET + usize::try_from(raw_size).expect("expanded fixture size"),
+        0,
+    );
+    let image_end = SECTION_RVA
+        .checked_add(raw_size)
+        .expect("expanded section image end");
+    let size_of_image = image_end.checked_add(0xfff).expect("aligned image size") & !0xfff;
+    put_u32(bytes, OPTIONAL_OFFSET + 56, size_of_image);
+    put_u32(bytes, SECTION_OFFSET + 8, raw_size);
+    put_u32(bytes, SECTION_OFFSET + 16, raw_size);
+}
+
+fn delay_import_fixture() -> Vec<u8> {
+    let mut bytes = fixture();
+    set_directory(&mut bytes, 13, DELAY_IMPORT_DIRECTORY_RVA, 64);
+
+    let descriptor = file_offset(DELAY_IMPORT_DIRECTORY_RVA);
+    put_u32(&mut bytes, descriptor, 1);
+    put_u32(&mut bytes, descriptor + 4, DELAY_IMPORT_NAME_RVA);
+    put_u32(&mut bytes, descriptor + 8, DELAY_IMPORT_MODULE_HANDLE_RVA);
+    put_u32(&mut bytes, descriptor + 12, DELAY_IMPORT_IAT_RVA);
+    put_u32(&mut bytes, descriptor + 16, DELAY_IMPORT_INT_RVA);
+    put_u32(&mut bytes, descriptor + 28, 0x2222_3333);
+    // The second 32-byte descriptor remains the required all-zero terminator.
+
+    put_c_string(
+        &mut bytes,
+        file_offset(DELAY_IMPORT_NAME_RVA),
+        "DELAYED.dll",
+    );
+    put_u64(&mut bytes, file_offset(DELAY_IMPORT_MODULE_HANDLE_RVA), 0);
+
+    put_u64(
+        &mut bytes,
+        file_offset(DELAY_IMPORT_INT_RVA),
+        u64::from(DELAY_IMPORT_HINT_NAME_RVA),
+    );
+    put_u64(
+        &mut bytes,
+        file_offset(DELAY_IMPORT_INT_RVA + 8),
+        (1_u64 << 63) | 77,
+    );
+    put_u64(&mut bytes, file_offset(DELAY_IMPORT_INT_RVA + 16), 0);
+
+    put_u64(
+        &mut bytes,
+        file_offset(DELAY_IMPORT_IAT_RVA),
+        IMAGE_BASE + 0x1040,
+    );
+    put_u64(
+        &mut bytes,
+        file_offset(DELAY_IMPORT_IAT_RVA + 8),
+        IMAGE_BASE + 0x1080,
+    );
+    put_u64(&mut bytes, file_offset(DELAY_IMPORT_IAT_RVA + 16), 0);
+
+    put_u16(&mut bytes, file_offset(DELAY_IMPORT_HINT_NAME_RVA), 13);
+    put_c_string(
+        &mut bytes,
+        file_offset(DELAY_IMPORT_HINT_NAME_RVA + 2),
+        "DelayedEntry",
+    );
+    bytes
+}
+
+fn delay_import_fixture_with_zero_descriptor_padding() -> Vec<u8> {
+    const NAME_RVA: u32 = 0x1500;
+    const MODULE_HANDLE_RVA: u32 = 0x1510;
+    const INT_RVA: u32 = 0x1520;
+    const IAT_RVA: u32 = 0x1540;
+    const HINT_NAME_RVA: u32 = 0x1560;
+
+    let mut bytes = delay_import_fixture();
+    set_directory(&mut bytes, 13, DELAY_IMPORT_DIRECTORY_RVA, 96);
+    bytes[file_offset(DELAY_IMPORT_DIRECTORY_RVA + 32)
+        ..file_offset(DELAY_IMPORT_DIRECTORY_RVA + 96)]
+        .fill(0);
+
+    let descriptor = file_offset(DELAY_IMPORT_DIRECTORY_RVA);
+    put_u32(&mut bytes, descriptor + 4, NAME_RVA);
+    put_u32(&mut bytes, descriptor + 8, MODULE_HANDLE_RVA);
+    put_u32(&mut bytes, descriptor + 12, IAT_RVA);
+    put_u32(&mut bytes, descriptor + 16, INT_RVA);
+    put_c_string(&mut bytes, file_offset(NAME_RVA), "DELAYED.dll");
+    put_u64(&mut bytes, file_offset(MODULE_HANDLE_RVA), 0);
+    put_u64(&mut bytes, file_offset(INT_RVA), u64::from(HINT_NAME_RVA));
+    put_u64(&mut bytes, file_offset(INT_RVA + 8), (1_u64 << 63) | 77);
+    put_u64(&mut bytes, file_offset(INT_RVA + 16), 0);
+    put_u64(&mut bytes, file_offset(IAT_RVA), IMAGE_BASE + 0x1040);
+    put_u64(&mut bytes, file_offset(IAT_RVA + 8), IMAGE_BASE + 0x1080);
+    put_u64(&mut bytes, file_offset(IAT_RVA + 16), 0);
+    put_u16(&mut bytes, file_offset(HINT_NAME_RVA), 13);
+    put_c_string(&mut bytes, file_offset(HINT_NAME_RVA + 2), "DelayedEntry");
+    bytes
+}
+
+fn delay_import_fixture_with_auxiliary_tables() -> Vec<u8> {
+    let mut bytes = delay_import_fixture();
+    let descriptor = file_offset(DELAY_IMPORT_DIRECTORY_RVA);
+    put_u32(&mut bytes, descriptor + 20, DELAY_IMPORT_BOUND_IAT_RVA);
+    put_u32(&mut bytes, descriptor + 24, DELAY_IMPORT_UNLOAD_IAT_RVA);
+
+    put_u64(
+        &mut bytes,
+        file_offset(DELAY_IMPORT_BOUND_IAT_RVA),
+        IMAGE_BASE + 0x1050,
+    );
+    put_u64(
+        &mut bytes,
+        file_offset(DELAY_IMPORT_BOUND_IAT_RVA + 8),
+        IMAGE_BASE + 0x1090,
+    );
+    put_u64(&mut bytes, file_offset(DELAY_IMPORT_BOUND_IAT_RVA + 16), 0);
+
+    let iat = file_offset(DELAY_IMPORT_IAT_RVA);
+    let unload_iat = file_offset(DELAY_IMPORT_UNLOAD_IAT_RVA);
+    bytes.copy_within(iat..iat + 24, unload_iat);
+    bytes
+}
+
+fn delay_import_code_recovery_fixture() -> Vec<u8> {
+    let mut bytes = delay_import_fixture();
+    bytes.resize(0xa00, 0);
+    put_u16(&mut bytes, COFF_OFFSET + 2, 2);
+    put_u32(&mut bytes, OPTIONAL_OFFSET + 56, 0x3000);
+
+    let rdata_section = SECTION_OFFSET + 40;
+    bytes[rdata_section..rdata_section + 7].copy_from_slice(b".rdata\0");
+    put_u32(&mut bytes, rdata_section + 8, 0x200);
+    put_u32(&mut bytes, rdata_section + 12, DELAY_IMPORT_CODE_IAT_RVA);
+    put_u32(&mut bytes, rdata_section + 16, 0x200);
+    put_u32(
+        &mut bytes,
+        rdata_section + 20,
+        u32::try_from(DELAY_IMPORT_CODE_IAT_RAW_OFFSET).expect("fixture raw offset"),
+    );
+    put_u32(&mut bytes, rdata_section + 36, 0x4000_0040);
+
+    put_u32(
+        &mut bytes,
+        file_offset(DELAY_IMPORT_DIRECTORY_RVA) + 12,
+        DELAY_IMPORT_CODE_IAT_RVA,
+    );
+    put_u64(
+        &mut bytes,
+        DELAY_IMPORT_CODE_IAT_RAW_OFFSET,
+        IMAGE_BASE + 0x1040,
+    );
+    put_u64(
+        &mut bytes,
+        DELAY_IMPORT_CODE_IAT_RAW_OFFSET + 8,
+        IMAGE_BASE + 0x1080,
+    );
+    put_u64(&mut bytes, DELAY_IMPORT_CODE_IAT_RAW_OFFSET + 16, 0);
+
+    bytes[file_offset(0x1000)..file_offset(0x1020)].fill(0x90);
+    put_rip_relative_instruction(&mut bytes, 0x1000, 0x15, DELAY_IMPORT_CODE_IAT_RVA);
+    put_rel32_instruction(&mut bytes, 0x1006, 0xe8, 0x1040);
+    bytes[file_offset(0x100b)] = 0xc3;
+    put_rip_relative_instruction(&mut bytes, 0x1040, 0x25, DELAY_IMPORT_CODE_IAT_RVA + 8);
+    bytes
+}
+
+fn combined_import_library_budget_fixture() -> Vec<u8> {
+    const ACTIVE_NORMAL_LIBRARIES: usize = 4_096;
+    const DIRECTORY_RVA: u32 = 0x2000;
+    const SECTION_SIZE: u32 = 0x16000;
+
+    let mut bytes = delay_import_fixture();
+    expand_single_section(&mut bytes, SECTION_SIZE);
+    let descriptor_count = ACTIVE_NORMAL_LIBRARIES + 1;
+    let directory_size = u32::try_from(descriptor_count * 20).expect("import directory size");
+    set_directory(&mut bytes, 1, DIRECTORY_RVA, directory_size);
+    for index in 0..ACTIVE_NORMAL_LIBRARIES {
+        let descriptor = file_offset(DIRECTORY_RVA) + index * 20;
+        put_u32(&mut bytes, descriptor + 12, 0x1280);
+        put_u32(&mut bytes, descriptor + 16, 0x1250);
+    }
+    bytes
+}
+
+fn combined_import_symbol_budget_fixture() -> Vec<u8> {
+    const ACTIVE_NORMAL_SYMBOLS: usize = 65_536;
+    const LOOKUP_RVA: u32 = 0x2000;
+    const IAT_RVA: u32 = 0x83000;
+    const SECTION_SIZE: u32 = 0x110000;
+
+    let mut bytes = delay_import_fixture();
+    expand_single_section(&mut bytes, SECTION_SIZE);
+    let descriptor = file_offset(0x1200);
+    put_u32(&mut bytes, descriptor, LOOKUP_RVA);
+    put_u32(&mut bytes, descriptor + 16, IAT_RVA);
+    for index in 0..ACTIVE_NORMAL_SYMBOLS {
+        let delta = u32::try_from(index * 8).expect("import thunk delta");
+        put_u64(
+            &mut bytes,
+            file_offset(LOOKUP_RVA + delta),
+            (1_u64 << 63) | 42,
+        );
+    }
+    bytes
+}
+
+fn combined_import_name_budget_fixture() -> Vec<u8> {
+    const ACTIVE_NORMAL_SYMBOLS: usize = 4_096;
+    const LONG_HINT_NAME_RVA: u32 = 0x2000;
+    const LOOKUP_RVA: u32 = 0x4000;
+    const IAT_RVA: u32 = 0xd000;
+    const DELAY_NAME_RVA: u32 = 0x3010;
+    const DELAY_HINT_NAME_RVA: u32 = 0x3020;
+    const SECTION_SIZE: u32 = 0x16000;
+
+    let mut bytes = delay_import_fixture();
+    expand_single_section(&mut bytes, SECTION_SIZE);
+    let normal_descriptor = file_offset(0x1200);
+    put_u32(&mut bytes, normal_descriptor, LOOKUP_RVA);
+    put_u32(&mut bytes, normal_descriptor + 12, LONG_HINT_NAME_RVA + 2);
+    put_u32(&mut bytes, normal_descriptor + 16, IAT_RVA);
+    put_u16(&mut bytes, file_offset(LONG_HINT_NAME_RVA), 7);
+    let long_name = file_offset(LONG_HINT_NAME_RVA + 2);
+    bytes[long_name..long_name + 4_095].fill(b'A');
+    bytes[long_name + 4_095] = 0;
+    for index in 0..ACTIVE_NORMAL_SYMBOLS {
+        let delta = u32::try_from(index * 8).expect("import thunk delta");
+        put_u64(
+            &mut bytes,
+            file_offset(LOOKUP_RVA + delta),
+            u64::from(LONG_HINT_NAME_RVA),
+        );
+    }
+
+    let delay_descriptor = file_offset(DELAY_IMPORT_DIRECTORY_RVA);
+    put_u32(&mut bytes, delay_descriptor + 4, DELAY_NAME_RVA);
+    put_c_string(&mut bytes, file_offset(DELAY_NAME_RVA), "D");
+    put_u64(
+        &mut bytes,
+        file_offset(DELAY_IMPORT_INT_RVA),
+        u64::from(DELAY_HINT_NAME_RVA),
+    );
+    put_u16(&mut bytes, file_offset(DELAY_HINT_NAME_RVA), 1);
+    put_c_string(&mut bytes, file_offset(DELAY_HINT_NAME_RVA + 2), "X");
     bytes
 }
 
@@ -1001,6 +1259,490 @@ fn analyzes_minimal_pe_with_imports_exports_and_runtime_functions() {
 }
 
 #[test]
+fn parses_modern_delay_imports_alongside_normal_imports() {
+    let analysis = analyze_pe(&delay_import_fixture()).expect("valid modern delay imports");
+
+    assert_eq!(analysis.imports.len(), 1);
+    assert_eq!(analysis.imports[0].name, "KERNEL32.dll");
+    assert_eq!(
+        analysis.directories.delay_imports,
+        Some(resymbol_analysis::DataDirectory {
+            rva: DELAY_IMPORT_DIRECTORY_RVA,
+            size: 64,
+        })
+    );
+    assert_eq!(analysis.delay_imports.len(), 1);
+    let library = &analysis.delay_imports[0];
+    assert_eq!(library.name, "DELAYED.dll");
+    assert_eq!(library.descriptor_rva, DELAY_IMPORT_DIRECTORY_RVA);
+    assert_eq!(library.attributes, 1);
+    assert_eq!(library.name_rva, DELAY_IMPORT_NAME_RVA);
+    assert_eq!(library.module_handle_rva, DELAY_IMPORT_MODULE_HANDLE_RVA);
+    assert_eq!(library.iat_rva, DELAY_IMPORT_IAT_RVA);
+    assert_eq!(library.int_rva, DELAY_IMPORT_INT_RVA);
+    assert_eq!(library.bound_iat_rva, None);
+    assert_eq!(library.unload_iat_rva, None);
+    assert_eq!(library.timestamp, 0x2222_3333);
+    assert_eq!(library.entries.len(), 2);
+    assert_eq!(library.entries[0].lookup_rva, DELAY_IMPORT_INT_RVA);
+    assert_eq!(library.entries[0].iat_rva, DELAY_IMPORT_IAT_RVA);
+    assert_eq!(
+        library.entries[0].target,
+        ImportTarget::Name {
+            hint: 13,
+            name: "DelayedEntry".to_owned(),
+        }
+    );
+    assert_eq!(library.entries[1].lookup_rva, DELAY_IMPORT_INT_RVA + 8);
+    assert_eq!(library.entries[1].iat_rva, DELAY_IMPORT_IAT_RVA + 8);
+    assert_eq!(
+        library.entries[1].target,
+        ImportTarget::Ordinal { ordinal: 77 }
+    );
+}
+
+#[test]
+fn rejects_nonzero_delay_descriptor_after_the_null_terminator() {
+    let mut bytes = delay_import_fixture();
+    set_directory(&mut bytes, 13, DELAY_IMPORT_DIRECTORY_RVA, 96);
+
+    let error = analyze_pe(&bytes)
+        .expect_err("descriptors after the first all-zero delay descriptor are forbidden");
+    assert!(
+        matches!(
+            &error,
+            AnalysisError::InvalidField {
+                field: "delay-import directory",
+                reason,
+            } if reason.contains("nonzero after the null terminator")
+        ),
+        "{error}"
+    );
+}
+
+#[test]
+fn rejects_legacy_or_unknown_delay_attributes_and_zero_required_rvas() {
+    for attributes in [0_u32, 2, 3] {
+        let mut bytes = delay_import_fixture();
+        put_u32(
+            &mut bytes,
+            file_offset(DELAY_IMPORT_DIRECTORY_RVA),
+            attributes,
+        );
+        let error =
+            analyze_pe(&bytes).expect_err("only the exact modern dlattrRva value is supported");
+        assert!(
+            matches!(
+                &error,
+                AnalysisError::InvalidField {
+                    field: "delay-import attributes",
+                    ..
+                }
+            ),
+            "attributes {attributes:#x}: {error}"
+        );
+    }
+
+    for (field, descriptor_offset) in [
+        ("DLL name", 4_usize),
+        ("module handle", 8),
+        ("IAT", 12),
+        ("INT", 16),
+    ] {
+        let mut bytes = delay_import_fixture();
+        put_u32(
+            &mut bytes,
+            file_offset(DELAY_IMPORT_DIRECTORY_RVA) + descriptor_offset,
+            0,
+        );
+        let error = analyze_pe(&bytes).expect_err("required descriptor RVAs must be nonzero");
+        assert!(
+            matches!(
+                &error,
+                AnalysisError::InvalidField {
+                    field: "delay-import descriptor",
+                    ..
+                }
+            ),
+            "zero {field} RVA: {error}"
+        );
+    }
+}
+
+#[test]
+fn rejects_reserved_bits_in_pe32_plus_named_import_thunks() {
+    for (name, mut bytes, thunk_rva) in [
+        ("conventional", fixture(), 0x1240),
+        ("delay", delay_import_fixture(), DELAY_IMPORT_INT_RVA),
+    ] {
+        put_u64(&mut bytes, file_offset(thunk_rva), (1_u64 << 31) | 0x1290);
+        let error = analyze_pe(&bytes).expect_err("PE32+ named-thunk bit 31 is reserved");
+        assert!(
+            matches!(
+                &error,
+                AnalysisError::InvalidField {
+                    field: "name import thunk",
+                    reason,
+                } if reason.contains("reserved bits")
+            ),
+            "{name} import: {error}"
+        );
+    }
+}
+
+#[test]
+fn rejects_malformed_or_unbacked_delay_import_directories() {
+    let mut misaligned = delay_import_fixture();
+    set_directory(&mut misaligned, 13, DELAY_IMPORT_DIRECTORY_RVA, 63);
+    assert!(matches!(
+        analyze_pe(&misaligned),
+        Err(AnalysisError::InvalidField {
+            field: "delay-import directory size",
+            ..
+        })
+    ));
+
+    let mut unbacked = delay_import_fixture();
+    set_directory(&mut unbacked, 13, 0x15f0, 64);
+    assert!(matches!(
+        analyze_pe(&unbacked),
+        Err(AnalysisError::UnmappedRva {
+            context: "delay-import directory",
+            rva: 0x15f0,
+            size: 64,
+        })
+    ));
+
+    let mut missing_terminator = delay_import_fixture();
+    set_directory(&mut missing_terminator, 13, DELAY_IMPORT_DIRECTORY_RVA, 32);
+    assert!(matches!(
+        analyze_pe(&missing_terminator),
+        Err(AnalysisError::MissingTerminator {
+            context: "delay-import directory",
+        })
+    ));
+
+    analyze_pe(&delay_import_fixture_with_zero_descriptor_padding())
+        .expect("multiple all-zero descriptors are valid declared tail padding");
+    let mut nonzero_after_terminator = delay_import_fixture_with_zero_descriptor_padding();
+    put_u32(
+        &mut nonzero_after_terminator,
+        file_offset(DELAY_IMPORT_DIRECTORY_RVA + 64),
+        1,
+    );
+    let error = analyze_pe(&nonzero_after_terminator)
+        .expect_err("declared delay-import tail padding must remain all zero");
+    assert!(matches!(
+        &error,
+        AnalysisError::InvalidField {
+            field: "delay-import directory",
+            reason,
+        } if reason.contains("nonzero after the null terminator")
+    ));
+
+    let mut short_optional_header = delay_import_fixture();
+    put_u16(&mut short_optional_header, COFF_OFFSET + 16, 223);
+    put_u32(&mut short_optional_header, OPTIONAL_OFFSET + 108, 14);
+    assert!(matches!(
+        analyze_pe(&short_optional_header),
+        Err(AnalysisError::OptionalHeaderTooSmall {
+            actual: 223,
+            minimum: 224,
+        })
+    ));
+}
+
+#[test]
+fn rejects_overlapping_delay_import_tables() {
+    let mut overlapping_int_and_iat = delay_import_fixture();
+    put_u32(
+        &mut overlapping_int_and_iat,
+        file_offset(DELAY_IMPORT_DIRECTORY_RVA) + 12,
+        DELAY_IMPORT_INT_RVA,
+    );
+    let error = analyze_pe(&overlapping_int_and_iat)
+        .expect_err("the delay INT and IAT must occupy distinct ranges");
+    assert!(
+        matches!(
+            &error,
+            AnalysisError::InvalidField {
+                field: "delay-import tables",
+                reason,
+            } if reason.contains("delay-import INT overlaps delay-import IAT")
+        ),
+        "{error}"
+    );
+
+    let mut overlapping_bound_and_unload = delay_import_fixture_with_auxiliary_tables();
+    put_u32(
+        &mut overlapping_bound_and_unload,
+        file_offset(DELAY_IMPORT_DIRECTORY_RVA) + 20,
+        DELAY_IMPORT_UNLOAD_IAT_RVA,
+    );
+    let error = analyze_pe(&overlapping_bound_and_unload)
+        .expect_err("the optional bound and unload tables must occupy distinct ranges");
+    assert!(
+        matches!(
+            &error,
+            AnalysisError::InvalidField {
+                field: "delay-import tables",
+                reason,
+            } if reason.contains("bound delay-import table overlaps unload delay-import table")
+        ),
+        "{error}"
+    );
+}
+
+#[test]
+fn rejects_duplicate_iat_slots_across_normal_and_delay_imports() {
+    const ORDINARY_IMPORT_IAT_RVA: u32 = 0x1260;
+
+    let mut bytes = delay_import_fixture();
+    put_u32(
+        &mut bytes,
+        file_offset(DELAY_IMPORT_DIRECTORY_RVA) + 12,
+        ORDINARY_IMPORT_IAT_RVA,
+    );
+    put_u64(
+        &mut bytes,
+        file_offset(ORDINARY_IMPORT_IAT_RVA),
+        IMAGE_BASE + 0x1040,
+    );
+    put_u64(
+        &mut bytes,
+        file_offset(ORDINARY_IMPORT_IAT_RVA + 8),
+        IMAGE_BASE + 0x1080,
+    );
+    put_u64(&mut bytes, file_offset(ORDINARY_IMPORT_IAT_RVA + 16), 0);
+
+    let error =
+        analyze_pe(&bytes).expect_err("ordinary and delay imports cannot claim the same IAT slot");
+    assert!(
+        matches!(
+            &error,
+            AnalysisError::InvalidField {
+                field: "import IAT slot",
+                reason,
+            } if reason.contains("RVA 0x1260")
+                && reason.contains("more than one import entry")
+        ),
+        "{error}"
+    );
+}
+
+#[test]
+fn requires_delay_int_and_iat_to_terminate_at_the_same_index() {
+    let mut early_int_terminator = delay_import_fixture();
+    put_u64(
+        &mut early_int_terminator,
+        file_offset(DELAY_IMPORT_INT_RVA + 8),
+        0,
+    );
+    let error = analyze_pe(&early_int_terminator)
+        .expect_err("a nonzero IAT entry cannot outlive its matching INT entry");
+    assert!(error.to_string().contains("delay-import IAT"));
+
+    let mut early_iat_terminator = delay_import_fixture();
+    put_u64(
+        &mut early_iat_terminator,
+        file_offset(DELAY_IMPORT_IAT_RVA + 8),
+        0,
+    );
+    let error = analyze_pe(&early_iat_terminator)
+        .expect_err("a nonzero INT entry cannot outlive its matching IAT entry");
+    assert!(error.to_string().contains("delay-import IAT"));
+}
+
+#[test]
+fn validates_optional_bound_and_unload_delay_iat_tables() {
+    let analysis = analyze_pe(&delay_import_fixture_with_auxiliary_tables())
+        .expect("fully backed BIAT and exact UIAT copy");
+    assert_eq!(analysis.delay_imports[0].bound_iat_rva, Some(0x14c0));
+    assert_eq!(analysis.delay_imports[0].unload_iat_rva, Some(0x14e0));
+
+    for (name, descriptor_offset) in [("BIAT", 20_usize), ("UIAT", 24)] {
+        let mut bytes = delay_import_fixture_with_auxiliary_tables();
+        put_u32(
+            &mut bytes,
+            file_offset(DELAY_IMPORT_DIRECTORY_RVA) + descriptor_offset,
+            0x15f0,
+        );
+        let error = analyze_pe(&bytes).expect_err("an auxiliary table must be fully backed");
+        assert!(
+            matches!(&error, AnalysisError::UnmappedRva { rva: 0x15f0, .. }),
+            "unbacked {name}: {error}"
+        );
+    }
+
+    for (name, table_rva) in [
+        ("BIAT", DELAY_IMPORT_BOUND_IAT_RVA),
+        ("UIAT", DELAY_IMPORT_UNLOAD_IAT_RVA),
+    ] {
+        let mut bytes = delay_import_fixture_with_auxiliary_tables();
+        put_u64(&mut bytes, file_offset(table_rva + 16), IMAGE_BASE + 0x10c0);
+        let error = analyze_pe(&bytes)
+            .expect_err("an auxiliary table must terminate at the matching entry count");
+        assert!(
+            error.to_string().contains("delay-import table"),
+            "nonterminated {name}: {error}"
+        );
+    }
+
+    let mut stale_unload_copy = delay_import_fixture_with_auxiliary_tables();
+    put_u64(
+        &mut stale_unload_copy,
+        file_offset(DELAY_IMPORT_UNLOAD_IAT_RVA),
+        IMAGE_BASE + 0x10e0,
+    );
+    let error = analyze_pe(&stale_unload_copy)
+        .expect_err("the UIAT must be an exact copy of the original delay IAT");
+    assert!(error.to_string().contains("unload delay-import table"));
+
+    for (name, descriptor_offset, table_rva) in [
+        ("BIAT aliases IAT", 20_usize, DELAY_IMPORT_IAT_RVA),
+        ("BIAT partially overlaps IAT", 20, DELAY_IMPORT_IAT_RVA + 8),
+        ("UIAT aliases IAT", 24, DELAY_IMPORT_IAT_RVA),
+    ] {
+        let mut bytes = delay_import_fixture();
+        put_u32(
+            &mut bytes,
+            file_offset(DELAY_IMPORT_DIRECTORY_RVA) + descriptor_offset,
+            table_rva,
+        );
+        let error = analyze_pe(&bytes).expect_err("delay-import tables must be pairwise disjoint");
+        assert!(
+            matches!(
+                &error,
+                AnalysisError::InvalidField {
+                    field: "delay-import tables",
+                    ..
+                }
+            ),
+            "{name}: {error}"
+        );
+    }
+}
+
+#[test]
+fn shares_import_library_symbol_and_name_budgets_across_both_directories() {
+    for (name, bytes, expected_kind, expected_count, expected_limit) in [
+        (
+            "library",
+            combined_import_library_budget_fixture(),
+            "import library",
+            4_097,
+            4_096,
+        ),
+        (
+            "symbol",
+            combined_import_symbol_budget_fixture(),
+            "import symbol",
+            65_537,
+            65_536,
+        ),
+        (
+            "name byte",
+            combined_import_name_budget_fixture(),
+            "import-name byte",
+            16_777_217,
+            16_777_216,
+        ),
+    ] {
+        let error = analyze_pe(&bytes).expect_err("the aggregate import budget must be enforced");
+        assert!(
+            matches!(
+                &error,
+                AnalysisError::LimitExceeded { kind, count, limit }
+                    if *kind == expected_kind
+                        && *count == expected_count
+                        && *limit == expected_limit
+            ),
+            "shared {name} budget: {error}"
+        );
+    }
+}
+
+#[test]
+fn classifies_delay_iat_calls_and_thunks_without_data_reference_duplicates() {
+    let analysis = analyze_pe(&delay_import_code_recovery_fixture())
+        .expect("delay IAT slots participate in control-flow recovery");
+
+    assert!(analysis.direct_calls.contains(&PeDirectCall {
+        caller_rva: 0x1000,
+        call_site_rva: 0x1000,
+        instruction_size: 6,
+        target: PeControlFlowTarget::ImportIat {
+            iat_rva: DELAY_IMPORT_CODE_IAT_RVA,
+        },
+    }));
+    assert!(analysis.thunks.contains(&PeThunk {
+        rva: 0x1040,
+        instruction_size: 6,
+        target: PeControlFlowTarget::ImportIat {
+            iat_rva: DELAY_IMPORT_CODE_IAT_RVA + 8,
+        },
+    }));
+    assert!(analysis.data_references.iter().all(|reference| {
+        !matches!(reference.instruction_rva, 0x1000 | 0x1040)
+            && reference.target_rva != DELAY_IMPORT_CODE_IAT_RVA
+            && reference.target_rva != DELAY_IMPORT_CODE_IAT_RVA + 8
+    }));
+}
+
+#[test]
+fn validated_deserialization_rejects_tampered_delay_import_state() {
+    let analysis =
+        analyze_pe(&delay_import_code_recovery_fixture()).expect("valid delay-import analysis");
+    let original = serde_json::to_value(analysis).expect("serialize delay-import analysis");
+
+    let mut missing_directory = original.clone();
+    missing_directory["directories"]["delay_imports"] = serde_json::Value::Null;
+    serde_json::from_value::<resymbol_analysis::PeAnalysis>(missing_directory)
+        .expect_err("delay-import records require their source directory");
+
+    let mut noncanonical_descriptor = original.clone();
+    noncanonical_descriptor["delay_imports"][0]["descriptor_rva"] = serde_json::json!(0x1420);
+    serde_json::from_value::<resymbol_analysis::PeAnalysis>(noncanonical_descriptor)
+        .expect_err("delay-import descriptors remain contiguous from the directory start");
+
+    let mut noncanonical_thunk = original.clone();
+    noncanonical_thunk["delay_imports"][0]["entries"][1]["lookup_rva"] =
+        serde_json::json!(DELAY_IMPORT_INT_RVA + 16);
+    serde_json::from_value::<resymbol_analysis::PeAnalysis>(noncanonical_thunk)
+        .expect_err("delay-import thunk source order is validated");
+
+    let mut overlapping_table = original.clone();
+    overlapping_table["delay_imports"][0]["bound_iat_rva"] =
+        serde_json::json!(DELAY_IMPORT_CODE_IAT_RVA);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(overlapping_table)
+        .expect_err("deserialized delay-import tables must remain pairwise disjoint");
+    assert!(error.to_string().contains("delay-import tables"));
+
+    let mut unknown_iat = original.clone();
+    unknown_iat["direct_calls"][0]["target"]["iat_rva"] =
+        serde_json::json!(DELAY_IMPORT_CODE_IAT_RVA + 24);
+    serde_json::from_value::<resymbol_analysis::PeAnalysis>(unknown_iat)
+        .expect_err("persisted ImportIat targets must name exact parsed delay-IAT slots");
+
+    let auxiliary_analysis = analyze_pe(&delay_import_fixture_with_auxiliary_tables())
+        .expect("valid auxiliary delay-import tables");
+    let mut overlapping_auxiliary =
+        serde_json::to_value(auxiliary_analysis).expect("serialize auxiliary delay-import state");
+    overlapping_auxiliary["delay_imports"][0]["bound_iat_rva"] =
+        serde_json::json!(DELAY_IMPORT_UNLOAD_IAT_RVA);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(overlapping_auxiliary)
+        .expect_err("persisted bound and unload delay tables cannot overlap");
+    assert!(error.to_string().contains("delay-import tables"));
+
+    let mut short_optional_header = original;
+    short_optional_header["coff"]["optional_header_size"] = serde_json::json!(223);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(short_optional_header)
+        .expect_err("data-directory entry 13 requires at least 224 optional-header bytes");
+    assert!(error.to_string().contains("optional header"));
+    assert!(error.to_string().contains("224"));
+}
+
+#[test]
 fn emits_one_metadata_claim_for_a_file_backed_executable_pe_entry_point() {
     let analysis = analyze_pe(&fixture()).expect("valid PE entry point");
     let entry_claims = analysis
@@ -1532,6 +2274,36 @@ fn tls_callback_cap_distinguishes_exact_completion_from_partial_recovery() {
     assert_eq!(
         callback_claims[TLS_CALLBACK_LIMIT - 1].evidence()[0].artifacts["table_index"],
         (TLS_CALLBACK_LIMIT - 1).to_string()
+    );
+}
+
+#[test]
+fn tls_callback_cap_probe_does_not_resolve_or_retain_its_nonzero_value() {
+    let mut bytes = expanded_tls_callbacks_fixture(TLS_CALLBACK_LIMIT, false);
+    put_u64(
+        &mut bytes,
+        file_offset(TLS_CALLBACK_TABLE_RVA) + TLS_CALLBACK_LIMIT * 8,
+        IMAGE_BASE + u64::from(u32::MAX),
+    );
+
+    let analysis = analyze_pe(&bytes)
+        .expect("a nonzero out-of-image probe proves truncation without endpoint validation");
+    assert_eq!(analysis.tls_callbacks.len(), TLS_CALLBACK_LIMIT);
+    assert!(analysis.tls_callback_scan_truncated);
+    assert!(
+        analysis
+            .tls_callbacks
+            .iter()
+            .all(|callback| callback.callback_rva == 0x1040)
+    );
+    assert_eq!(
+        analysis
+            .symbol_graph
+            .claims()
+            .iter()
+            .filter(|claim| claim.provenance().method == "pe-tls-callback")
+            .count(),
+        TLS_CALLBACK_LIMIT
     );
 }
 
@@ -4050,7 +4822,11 @@ fn enforces_declared_pe_limits_before_allocating() {
     }
 
     fn exceed_import_descriptor_count(bytes: &mut [u8]) {
-        set_directory(bytes, 1, 0x1200, 4_097 * 20);
+        set_directory(bytes, 1, 0x1200, 4_098 * 20);
+    }
+
+    fn exceed_delay_import_descriptor_count(bytes: &mut [u8]) {
+        set_directory(bytes, 13, 0x1400, 4_098 * 32);
     }
 
     fn exceed_export_directory_size(bytes: &mut [u8]) {
@@ -4105,8 +4881,17 @@ fn enforces_declared_pe_limits_before_allocating() {
             mutate: exceed_import_descriptor_count,
             expected: ExpectedError::LimitExceeded {
                 kind: "import-library descriptor",
-                count: 4_097,
-                limit: 4_096,
+                count: 4_098,
+                limit: 4_097,
+            },
+        },
+        Case {
+            name: "delay-import descriptor count",
+            mutate: exceed_delay_import_descriptor_count,
+            expected: ExpectedError::LimitExceeded {
+                kind: "delay-import-library descriptor",
+                count: 4_098,
+                limit: 4_097,
             },
         },
         Case {

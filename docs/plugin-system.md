@@ -401,8 +401,11 @@ rejects unsupported encoding names, invalid literal text, and zero instruction s
 submission. `AnalysisRequest.BaseAnalysis` contains the detached canonical base analysis only when
 `symbols.read` was granted; without that permission it is `null`.
 Package schema 7 adds the TLS directory, callback-table RVA, ordered callback records, and partial
-flag to that detached JSON object. Those fields are additive data, not a new managed SDK type or
-plugin assertion; the plugin API remains unchanged.
+flag to that detached JSON object. Package schema 8 adds the separate ordered modern delay-import
+directory and inventory: the DLL name, descriptor/name/HMOD/IAT/INT base RVAs, optional BIAT/UIAT
+base RVAs, each entry's lookup/IAT RVAs and name or ordinal, and the timestamp. Raw array contents
+are not serialized. Those fields are additive data, not a new managed SDK type or plugin assertion;
+the plugin API remains unchanged.
 
 #### Managed plugin author quickstart
 
@@ -492,8 +495,10 @@ independent of the deterministic base analyzer's transitive seed-closure invaria
 Package schema 7's TLS callback discovery likewise reuses existing `function-entry` assertions for
 retained callback slots and existing exact `thunk-target` assertions for callback-seeded hops;
 it adds no assertion or control-flow target shape. Plugins granted `symbols.read` observe the
-additive TLS directory and ordered callback fields in detached base-analysis JSON. The plugin API,
-WIT/ABI, `resymbol.plugin-wire` 1.0 handshake, and neutral projection schema 6 remain unchanged.
+additive TLS directory and ordered callback fields in detached base-analysis JSON. Package schema
+8's delay-import inventory is another additive `symbols.read` field, while delay-IAT calls and
+thunks reuse the existing `import-IAT` target shape. The plugin API, WIT/ABI,
+`resymbol.plugin-wire` 1.0 handshake, and neutral projection schema 6 remain unchanged.
 
 ### Tool-hosted bridges (planned host)
 

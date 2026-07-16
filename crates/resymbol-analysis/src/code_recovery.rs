@@ -6,8 +6,9 @@ use std::{
 use iced_x86::{Code, Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
 
 use crate::{
-    AnalysisError, MsvcRttiVftable, PeAnalysis, PeControlFlowTarget, PeDataReference, PeDirectCall,
-    PeExport, PeImportLibrary, PeSection, PeThunk, PeTlsCallback, RuntimeFunction,
+    AnalysisError, MsvcRttiVftable, PeAnalysis, PeControlFlowTarget, PeDataReference,
+    PeDelayImportLibrary, PeDirectCall, PeExport, PeImportLibrary, PeSection, PeThunk,
+    PeTlsCallback, RuntimeFunction,
     pe::{RvaMap, section_for_rva},
 };
 
@@ -39,6 +40,7 @@ pub(crate) struct CodeRecoveryInput<'a, 'data> {
     pub entry_point_rva: u32,
     pub sections: &'a [PeSection],
     pub imports: &'a [PeImportLibrary],
+    pub delay_imports: &'a [PeDelayImportLibrary],
     pub exports: &'a [PeExport],
     pub runtime_functions: &'a [RuntimeFunction],
     pub tls_callbacks: &'a [PeTlsCallback],
@@ -516,7 +518,7 @@ fn scan_runtime_function(
 }
 
 pub(crate) fn recover_code(input: CodeRecoveryInput<'_, '_>) -> CodeRecovery {
-    let import_iat_rvas = import_iat_rvas(input.imports);
+    let import_iat_rvas = import_iat_rvas(input.imports, input.delay_imports);
     let runtime_targets = RuntimeTargetPolicy::new(input.runtime_functions);
     let target_context = TargetContext {
         mapper: input.mapper,
@@ -927,7 +929,7 @@ pub(crate) fn validate_code_recovery(analysis: &PeAnalysis) -> Result<(), Analys
         return invalid("thunks", "must be strictly sorted and unique");
     }
 
-    let import_iat_rvas = import_iat_rvas(&analysis.imports);
+    let import_iat_rvas = import_iat_rvas(&analysis.imports, &analysis.delay_imports);
     let runtime_targets = RuntimeTargetPolicy::new(&analysis.runtime_functions);
     let mut previous_call_site = None;
     for call in &analysis.direct_calls {
@@ -1257,10 +1259,15 @@ fn validate_target(
     Ok(())
 }
 
-fn import_iat_rvas(imports: &[PeImportLibrary]) -> BTreeSet<u32> {
+fn import_iat_rvas(
+    imports: &[PeImportLibrary],
+    delay_imports: &[PeDelayImportLibrary],
+) -> BTreeSet<u32> {
     imports
         .iter()
-        .flat_map(|library| library.entries.iter().map(|entry| entry.iat_rva))
+        .flat_map(|library| &library.entries)
+        .chain(delay_imports.iter().flat_map(|library| &library.entries))
+        .map(|entry| entry.iat_rva)
         .collect()
 }
 

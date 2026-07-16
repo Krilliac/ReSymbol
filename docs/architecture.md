@@ -5,7 +5,8 @@ preserve. ReSymbol is in early development; sections marked as design describe t
 not necessarily behavior implemented in the current checkout.
 
 The current implementation covers bounded PE32+ x86-64 ingestion, including ordered TLS callback
-discovery, a conservative metadata-derived symbol graph, modern MSVC x64 Rev1 RTTI/vftable
+and modern RVA-form delay-import discovery, a conservative metadata-derived symbol graph, modern
+MSVC x64 Rev1 RTTI/vftable
 discovery, canonical JSON `.resym` packages, plugin
 discovery/contracts, a no-WASI WebAssembly Component Model host, and trusted external-process,
 native C/C++, and managed/.NET analysis runtimes. It also includes a validated, debugger-neutral
@@ -78,8 +79,9 @@ Analysis should be incremental. A plugin that resolves RTTI should not require t
 unrelated signature index, and removing a plugin's results should not require rebuilding claims that
 have no dependency on that plugin.
 
-The implemented slice extracts PE image/section metadata, imports, exports, forwarded exports, x64
-`RUNTIME_FUNCTION` records, ordered TLS callbacks, bounded exact strings, supported RIP-relative
+The implemented slice extracts PE image/section metadata, conventional and delay imports, exports,
+forwarded exports, x64 `RUNTIME_FUNCTION` records, ordered TLS callbacks, bounded exact strings,
+supported RIP-relative
 data references, bounded direct calls and thunks, and a bounded modern MSVC x64 RTTI/vftable subset
 without loading or executing the input. Exact export names, corroborated metadata-backed
 boundaries, slot-attributed TLS callback entries, supported decoded function entries and relationships,
@@ -118,9 +120,30 @@ slot to be fully file-backed and each retained target to begin in file-backed ex
 retains at most 4,096 entries. It then probes one additional slot: null proves an exactly capped
 table complete, while nonzero records a partial deterministic prefix without retaining that entry.
 Graph construction emits one `FunctionEntry` claim per retained slot with `pe-tls-callback`
-provenance. Its `callback_slot_rva` and `table_index` evidence keeps claims separate when target
-RVAs repeat.
+provenance. The `callback_slot_rva` and `table_index` evidence artifacts keep claims separate when
+target RVAs repeat.
 The four checked-in MSVC fixture binaries, semantic oracle, and recorded hashes remain unchanged.
+
+Modern PE32+ delay-import discovery is likewise proven with focused synthetic fixtures without
+regenerating that corpus. Optional-header data-directory entry 13 is a fully file-backed sequence of
+32-byte descriptors ending in an all-zero descriptor and then only all-zero declared tail padding.
+The parser accepts only the modern RVA form
+whose attributes value is exactly `dlattrRva` (`1`) and rejects the legacy VA form, zero, and
+unknown bits despite ambiguity in the generic PE table documentation. Each active descriptor has
+nonzero name, module-handle (HMOD), delay-IAT, and delay-INT RVAs; HMOD contents and permissions stay
+opaque. Its paired null-terminated 64-bit INT/IAT arrays and any nonzero optional bound-IAT (BIAT) or
+unload-IAT (UIAT) array must be fully file-backed, pairwise disjoint, and terminate at the same entry
+count. BIAT payload values are otherwise opaque, while the complete UIAT must byte-match the
+original delay IAT. The deterministic package inventory preserves
+descriptor and entry order, the DLL name, descriptor/name/HMOD/IAT/INT base RVAs, optional
+BIAT/UIAT base RVAs, each entry's lookup/IAT RVAs and name or ordinal, and the timestamp. It does
+not serialize raw INT/IAT/BIAT/UIAT array contents.
+
+Conventional and delay imports consume shared ceilings of 4,096 libraries, 65,536 symbols, and
+16 MiB of names. Structural failure or budget exhaustion rejects the analysis instead of retaining
+a partial import prefix. Accepted delay-IAT slots join conventional IAT slots in the existing
+control-flow membership set; an exact supported call or thunk becomes `ImportIat` before any
+read-only function-pointer fallback. The inventory itself does not create a new graph shape.
 
 The x86-64 decoder is a pure-Rust, bounded control-flow-guided block sweep used only over complete
 file-backed executable exception ranges and the first instruction at deterministic thunk seeds.
@@ -129,10 +152,11 @@ unconditional targets within that same range are dequeued by smallest RVA, while
 fallthrough continues immediately. Returns, terminal or indirect control flow, invalid
 instructions, out-of-range targets, and targets inside a previously decoded instruction stop only
 the affected path. The recorded forms include `E8` internal calls; exact RIP-relative
-`FF 15 disp32` and `48 FF 15 disp32` calls to parsed IAT slots or one read-only function-pointer
+`FF 15 disp32` and `48 FF 15 disp32` calls to parsed conventional or delay IAT slots or one
+read-only function-pointer
 slot; `E9`/`EB` internal thunks; and exact RIP-relative `FF 25 disp32` or `48 FF 25 disp32` thunks
-to parsed IAT slots or one read-only function-pointer slot. Parsed IAT membership wins before
-pointer interpretation. A non-IAT slot must be eight fully file-backed bytes in initialized,
+to parsed conventional or delay IAT slots or one read-only function-pointer slot. Parsed IAT
+membership wins before pointer interpretation. A non-IAT slot must be eight fully file-backed bytes in initialized,
 readable, non-writable, non-executable data. Its little-endian preferred-image VA is resolved one
 hop to a file-backed executable endpoint, and the control-flow target retains both the slot and
 endpoint. A pointer call also retains a same-site data reference; a pointer thunk does not require
@@ -271,8 +295,10 @@ Transitive thunk chains require no new projection shape: each exact `ThunkTarget
 independently, every internal hop is a projected function entry, and connected cycles remain exact
 relationships rather than an invented terminal destination.
 TLS callbacks likewise require no new neutral projection shape: each slot-backed callback claim
-uses the existing attributed function-entry assertion. Package schema 7 therefore leaves neutral
-projection schema 6 unchanged.
+uses the existing attributed function-entry assertion. Delay-import descriptor and inventory data
+remain package-only, while calls and thunks through delay-IAT slots use the existing import-IAT
+target containing the slot RVA. Package schema 8 therefore leaves neutral projection schema 6
+unchanged.
 
 The first writers serialize the projection as JSON, render bounded Markdown or
 Microsoft-linker-style MAP text, emit an exact-RSDS public-symbol PDB, or generate self-contained
@@ -526,31 +552,35 @@ A plugin declares a supported API range. Unsupported plugins are marked incompat
 loaded optimistically. Schema migrations are explicit and must preserve provenance. Before 1.0,
 breaking changes are expected, but they still require version bumps and release notes.
 
-The current CLI writes analysis-package schema 7 and can inspect or export schemas 1 through 6
+The current CLI writes analysis-package schema 8 and can inspect or export schemas 1 through 7
 through explicit compatibility paths. It migrates schema 1 into a validated current session,
 rebuilds the base graph from persisted legacy metadata, and never rewrites the source package.
 Schema 2 already records direct calls and thunks but predates recovered strings and data references;
 schema 3 includes string/data recovery but predates read-only function-pointer call and thunk
 resolution; schema 4 records pointer control flow but predates 24-byte RTTI base-class descriptor
 recovery; schema 5 records that RTTI form but predates transitive executable thunk-chain discovery;
-and schema 6 records that closure but predates TLS callback discovery and callback-based thunk
-seeding.
+schema 6 records that closure but predates TLS callback discovery and callback-based thunk seeding;
+and schema 7 records TLS callbacks but predates modern delay-import recovery.
 Because a package omits the analyzed binary bytes, compatibility loading cannot recreate absent
 recovery results. Schemas 1 through 6 report TLS callbacks unavailable; obtaining every current
-result requires reanalyzing the exact original binary into schema 7.
+result also requires treating delay imports as unavailable in schemas 1 through 7 and reanalyzing
+the exact original binary into schema 8.
 Schemas 2 and 3 are also semantically gated against relabeled schema-4 `function-pointer` targets.
 All schemas 1 through 4 are semantically gated against relabeled schema-5 base-class records whose
 `class_hierarchy_descriptor_rva` is missing or null. Schemas 1 through 5 reject a deterministic
 base thunk source that is valid only under schema-6 transitive endpoint seeding.
 Schemas 1 through 6 reject schema-7 TLS fields, core `pe-tls-callback` claims, and callback-only
 base thunk seeds rather than accepting a relabeled package.
+Schemas 1 through 7 likewise reject schema-8 delay-import directory and inventory fields. Current
+schema 8 always serializes the delay-import inventory, including an empty array, and rejects a
+payload missing that marker so relabeling alone cannot upgrade a legacy package.
 The independently versioned debugger-neutral projection is schema 6; its string-reference
 correlation and exact per-hop thunk relationships are derived from already validated claims and
 therefore do not require a projection-schema change or legacy package rewrite. The equal numeric
-versions do not couple these two compatibility domains. Package schema 7 also leaves the plugin
+versions do not couple these two compatibility domains. Package schema 8 also leaves the plugin
 API and external wire protocol 1.0 unchanged. Plugins with `symbols.read` can observe the additive
-TLS fields in detached base-analysis JSON; plugins without that permission receive no base
-analysis.
+TLS and delay-import fields in detached base-analysis JSON; plugins without that permission receive
+no base analysis.
 
 ## Core invariants
 

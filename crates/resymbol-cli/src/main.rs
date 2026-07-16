@@ -47,6 +47,7 @@ use serde_json::{Map, Value};
 const NO_PCHD_BASE_DESCRIPTOR_SCHEMA_VERSION: u32 = 5;
 const TRANSITIVE_THUNK_CHAIN_SCHEMA_VERSION: u32 = 6;
 const TLS_CALLBACK_SCHEMA_VERSION: u32 = 7;
+const DELAY_IMPORT_SCHEMA_VERSION: u32 = 8;
 const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 
 #[derive(Debug, Parser)]
@@ -294,6 +295,7 @@ fn analyze(args: AnalyzeArgs, safe_mode: bool, plugin_dir: PathBuf) -> Result<()
         StringDataRecoveryAvailability::Recorded,
         RttiRecoveryAvailability::Recorded,
         TlsCallbackAvailability::Recorded,
+        DelayImportAvailability::Recorded,
     )?;
     println!("package: {}", output.display());
     println!("plugin directory: {}", plugin_dir.display());
@@ -359,6 +361,7 @@ fn inspect(args: InspectArgs) -> Result<()> {
         loaded.string_data_recovery_availability,
         loaded.rtti_recovery_availability,
         loaded.tls_callback_availability,
+        loaded.delay_import_availability,
     )?;
 
     Ok(())
@@ -500,6 +503,23 @@ impl TlsCallbackAvailability {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DelayImportAvailability {
+    Recorded,
+    Unavailable(u32),
+}
+
+impl DelayImportAvailability {
+    fn export_summary_line(self) -> Option<String> {
+        match self {
+            Self::Recorded => None,
+            Self::Unavailable(schema_version) => Some(format!(
+                "delay imports: unavailable (schema {schema_version} package predates PE32+ delay-import data; reanalyze the exact original binary)"
+            )),
+        }
+    }
+}
+
 impl RttiRecoveryAvailability {
     fn summary_line(self) -> Option<String> {
         match self {
@@ -518,6 +538,7 @@ struct LoadedAnalysisPackage {
     string_data_recovery_availability: StringDataRecoveryAvailability,
     rtti_recovery_availability: RttiRecoveryAvailability,
     tls_callback_availability: TlsCallbackAvailability,
+    delay_import_availability: DelayImportAvailability,
     schema1_source: Option<ResymPackage<Value>>,
 }
 
@@ -543,7 +564,7 @@ fn read_analysis_package(
         1 => CodeRecoveryAvailability::UnavailableSchema1,
         2 => CodeRecoveryAvailability::RecordedWithoutReadOnlyPointerControlFlow(2),
         3 => CodeRecoveryAvailability::RecordedWithoutReadOnlyPointerControlFlow(3),
-        4..=7 => CodeRecoveryAvailability::Recorded,
+        4..=8 => CodeRecoveryAvailability::Recorded,
         _ => bail!("unsupported analysis package schema {schema_version}"),
     };
     let transitive_thunk_recovery_availability = match schema_version {
@@ -551,26 +572,38 @@ fn read_analysis_package(
         2..=5 => TransitiveThunkRecoveryAvailability::RecordedWithoutTransitiveThunkChains(
             schema_version,
         ),
-        6..=7 => TransitiveThunkRecoveryAvailability::Recorded,
+        6..=8 => TransitiveThunkRecoveryAvailability::Recorded,
         _ => bail!("unsupported analysis package schema {schema_version}"),
     };
     let string_data_recovery_availability = match schema_version {
         1 => StringDataRecoveryAvailability::UnavailableSchema1,
         2 => StringDataRecoveryAvailability::UnavailableSchema2,
-        3..=7 => StringDataRecoveryAvailability::Recorded,
+        3..=8 => StringDataRecoveryAvailability::Recorded,
         _ => bail!("unsupported analysis package schema {schema_version}"),
     };
     let rtti_recovery_availability = match schema_version {
         1..=4 => RttiRecoveryAvailability::RecordedWithoutNoPchdBaseDescriptors(schema_version),
-        5..=7 => RttiRecoveryAvailability::Recorded,
+        5..=8 => RttiRecoveryAvailability::Recorded,
         _ => bail!("unsupported analysis package schema {schema_version}"),
     };
     let tls_callback_availability = match schema_version {
         1..=6 => TlsCallbackAvailability::Unavailable(schema_version),
-        TLS_CALLBACK_SCHEMA_VERSION => TlsCallbackAvailability::Recorded,
+        7..=8 => TlsCallbackAvailability::Recorded,
+        _ => bail!("unsupported analysis package schema {schema_version}"),
+    };
+    let delay_import_availability = match schema_version {
+        1..=7 => DelayImportAvailability::Unavailable(schema_version),
+        DELAY_IMPORT_SCHEMA_VERSION => DelayImportAvailability::Recorded,
         _ => bail!("unsupported analysis package schema {schema_version}"),
     };
     let schema1_source = (preserve_schema1_source && schema_version == 1).then(|| package.clone());
+    match schema_version.cmp(&DELAY_IMPORT_SCHEMA_VERSION) {
+        std::cmp::Ordering::Equal => require_v8_delay_import_marker(package.payload())?,
+        std::cmp::Ordering::Less => {
+            reject_pre_v8_delay_import_semantics(package.payload(), schema_version)?;
+        }
+        std::cmp::Ordering::Greater => {}
+    }
     if schema_version < TLS_CALLBACK_SCHEMA_VERSION {
         reject_pre_v7_tls_callback_semantics(package.payload(), schema_version)?;
     }
@@ -589,7 +622,8 @@ fn read_analysis_package(
         4 => serde_json::from_value(payload).context("cannot decode schema-v4 analysis payload"),
         5 => serde_json::from_value(payload).context("cannot decode schema-v5 analysis payload"),
         6 => serde_json::from_value(payload).context("cannot decode schema-v6 analysis payload"),
-        7 => serde_json::from_value(payload).context("cannot decode current analysis payload"),
+        7 => serde_json::from_value(payload).context("cannot decode schema-v7 analysis payload"),
+        8 => serde_json::from_value(payload).context("cannot decode current analysis payload"),
         _ => bail!("unsupported analysis package schema {schema_version}"),
     })?;
     if (2..TRANSITIVE_THUNK_CHAIN_SCHEMA_VERSION).contains(&schema_version) {
@@ -605,8 +639,44 @@ fn read_analysis_package(
         string_data_recovery_availability,
         rtti_recovery_availability,
         tls_callback_availability,
+        delay_import_availability,
         schema1_source,
     })
+}
+
+fn require_v8_delay_import_marker(payload: &Value) -> Result<()> {
+    let Some(analysis) = payload
+        .pointer("/base_analysis/analysis")
+        .and_then(Value::as_object)
+    else {
+        return Ok(());
+    };
+    if !analysis.contains_key("delay_imports") {
+        bail!(
+            "package schema 8 requires an explicit delay_imports inventory, even when empty; a legacy package without that marker cannot be migrated by changing only its envelope label, so reanalyze the exact original binary"
+        );
+    }
+    Ok(())
+}
+
+fn reject_pre_v8_delay_import_semantics(payload: &Value, schema_version: u32) -> Result<()> {
+    debug_assert!((1..DELAY_IMPORT_SCHEMA_VERSION).contains(&schema_version));
+    let Some(analysis) = payload.pointer("/base_analysis/analysis") else {
+        return Ok(());
+    };
+    let uses_delay_import_shape = analysis.as_object().is_some_and(|analysis| {
+        analysis.contains_key("delay_imports")
+            || analysis
+                .get("directories")
+                .and_then(Value::as_object)
+                .is_some_and(|directories| directories.contains_key("delay_imports"))
+    });
+    if uses_delay_import_shape {
+        bail!(
+            "package schema {schema_version} predates PE32+ delay-import recovery but its base analysis contains schema-8 delay-import semantics; legacy envelopes cannot be relabeled, so reanalyze the exact original binary"
+        );
+    }
+    Ok(())
 }
 
 fn reject_pre_v7_tls_callback_semantics(payload: &Value, schema_version: u32) -> Result<()> {
@@ -996,6 +1066,7 @@ impl SchemaV1PeAnalysis {
             directories: self.directories,
             sections: self.sections,
             imports: self.imports,
+            delay_imports: Vec::new(),
             export_library_name: self.export_library_name,
             exports: self.exports,
             runtime_functions: self.runtime_functions,
@@ -1138,6 +1209,9 @@ fn export(args: ExportArgs) -> Result<()> {
         println!("{line}");
     }
     if let Some(line) = package_data.tls_callback_availability.export_summary_line() {
+        println!("{line}");
+    }
+    if let Some(line) = package_data.delay_import_availability.export_summary_line() {
         println!("{line}");
     }
     println!(
@@ -2205,6 +2279,7 @@ fn print_session_summary(
     string_data_recovery_availability: StringDataRecoveryAvailability,
     rtti_recovery_availability: RttiRecoveryAvailability,
     tls_callback_availability: TlsCallbackAvailability,
+    delay_import_availability: DelayImportAvailability,
 ) -> Result<()> {
     print_analysis_summary(
         session.base_analysis(),
@@ -2213,6 +2288,7 @@ fn print_session_summary(
         string_data_recovery_availability,
         rtti_recovery_availability,
         tls_callback_availability,
+        delay_import_availability,
     );
     let succeeded = session
         .plugin_runs()
@@ -2258,6 +2334,7 @@ fn print_analysis_summary(
     string_data_recovery_availability: StringDataRecoveryAvailability,
     rtti_recovery_availability: RttiRecoveryAvailability,
     tls_callback_availability: TlsCallbackAvailability,
+    delay_import_availability: DelayImportAvailability,
 ) {
     let identity = analysis.identity();
     println!("size: {} bytes", identity.size);
@@ -2315,6 +2392,10 @@ fn print_analysis_summary(
                 pe.imports.len()
             );
             println!(
+                "{}",
+                delay_import_summary_line(pe, delay_import_availability)
+            );
+            println!(
                 "exports: {} slot(s), {} name(s), {} forwarder(s)",
                 pe.exports.len(),
                 named_export_count,
@@ -2370,6 +2451,28 @@ fn tls_callback_summary_lines(
                 "TLS callback scan: not run (schema {schema_version} package predates TLS callback recovery; reanalyze the exact original binary)"
             ),
         ],
+    }
+}
+
+fn delay_import_summary_line(
+    pe: &resymbol_analysis::PeAnalysis,
+    availability: DelayImportAvailability,
+) -> String {
+    match availability {
+        DelayImportAvailability::Recorded => {
+            let symbol_count = pe
+                .delay_imports
+                .iter()
+                .map(|library| library.entries.len())
+                .sum::<usize>();
+            format!(
+                "delay imports: {symbol_count} symbol(s) from {} library/libraries",
+                pe.delay_imports.len()
+            )
+        }
+        DelayImportAvailability::Unavailable(schema_version) => format!(
+            "delay imports: unavailable (not recorded by schema {schema_version}; reanalyze the exact original binary)"
+        ),
     }
 }
 
@@ -3151,6 +3254,67 @@ mod tests {
         bytes
     }
 
+    fn pe_tls_duplicate_thunk_fixture() -> Vec<u8> {
+        const IMAGE_BASE: u64 = 0x0000_0001_4000_0000;
+        const TLS_DIRECTORY_RVA: u32 = 0x1380;
+        const TLS_CALLBACK_TABLE_RVA: u32 = 0x13c0;
+        const CALLBACK_RVA: u32 = 0x1040;
+        const THUNK_TARGET_RVA: u32 = 0x1060;
+
+        let mut bytes = pe_fixture();
+        set_directory(&mut bytes, 9, TLS_DIRECTORY_RVA, 40);
+        put_u64(
+            &mut bytes,
+            file_offset(TLS_DIRECTORY_RVA) + 24,
+            IMAGE_BASE + u64::from(TLS_CALLBACK_TABLE_RVA),
+        );
+        for table_index in 0..2 {
+            put_u64(
+                &mut bytes,
+                file_offset(TLS_CALLBACK_TABLE_RVA) + table_index * 8,
+                IMAGE_BASE + u64::from(CALLBACK_RVA),
+            );
+        }
+        put_u64(&mut bytes, file_offset(TLS_CALLBACK_TABLE_RVA) + 16, 0);
+
+        let thunk = file_offset(CALLBACK_RVA);
+        bytes[thunk] = 0xe9;
+        put_u32(&mut bytes, thunk + 1, THUNK_TARGET_RVA - CALLBACK_RVA - 5);
+        bytes[file_offset(THUNK_TARGET_RVA)] = 0xc3;
+        bytes
+    }
+
+    fn pe_delay_import_fixture() -> Vec<u8> {
+        const IMAGE_BASE: u64 = 0x0000_0001_4000_0000;
+        const DIRECTORY_RVA: u32 = 0x1380;
+        const NAME_RVA: u32 = 0x13c0;
+        const MODULE_HANDLE_RVA: u32 = 0x13d0;
+        const INT_RVA: u32 = 0x13e0;
+        const IAT_RVA: u32 = 0x1400;
+        const HINT_NAME_RVA: u32 = 0x1420;
+
+        let mut bytes = pe_fixture();
+        set_directory(&mut bytes, 13, DIRECTORY_RVA, 64);
+        let descriptor = file_offset(DIRECTORY_RVA);
+        put_u32(&mut bytes, descriptor, 1);
+        put_u32(&mut bytes, descriptor + 4, NAME_RVA);
+        put_u32(&mut bytes, descriptor + 8, MODULE_HANDLE_RVA);
+        put_u32(&mut bytes, descriptor + 12, IAT_RVA);
+        put_u32(&mut bytes, descriptor + 16, INT_RVA);
+        put_c_string(&mut bytes, file_offset(NAME_RVA), "DELAYED.dll");
+        put_u64(&mut bytes, file_offset(MODULE_HANDLE_RVA), 0);
+        put_u64(&mut bytes, file_offset(INT_RVA), u64::from(HINT_NAME_RVA));
+        put_u64(&mut bytes, file_offset(IAT_RVA), IMAGE_BASE + 0x1000);
+        put_u16(&mut bytes, file_offset(HINT_NAME_RVA), 9);
+        put_c_string(&mut bytes, file_offset(HINT_NAME_RVA + 2), "Delayed");
+
+        let call = file_offset(0x1000);
+        bytes[call..call + 2].copy_from_slice(&[0xff, 0x15]);
+        put_u32(&mut bytes, call + 2, IAT_RVA - 0x1006);
+        bytes[call + 6] = 0xc3;
+        bytes
+    }
+
     fn create_plugin(root: &Path, id: &str) -> PathBuf {
         let plugin = root.join("example");
         fs::create_dir(&plugin).expect("create plugin directory");
@@ -3679,6 +3843,206 @@ entrypoint = "Plugin.dll"
     }
 
     #[test]
+    fn delay_import_summaries_distinguish_current_and_legacy_data() {
+        let analysis = analyze_bytes(&pe_fixture()).expect("analyze PE fixture");
+        let BinaryAnalysis::Pe(pe) = &analysis else {
+            panic!("PE analysis expected");
+        };
+        let symbol_count = pe
+            .delay_imports
+            .iter()
+            .map(|library| library.entries.len())
+            .sum::<usize>();
+
+        assert_eq!(
+            delay_import_summary_line(pe, DelayImportAvailability::Recorded),
+            format!(
+                "delay imports: {symbol_count} symbol(s) from {} library/libraries",
+                pe.delay_imports.len()
+            )
+        );
+        assert_eq!(
+            DelayImportAvailability::Recorded.export_summary_line(),
+            None
+        );
+
+        for schema_version in 1..DELAY_IMPORT_SCHEMA_VERSION {
+            let availability = DelayImportAvailability::Unavailable(schema_version);
+            assert_eq!(
+                delay_import_summary_line(pe, availability),
+                format!(
+                    "delay imports: unavailable (not recorded by schema {schema_version}; reanalyze the exact original binary)"
+                )
+            );
+            assert_eq!(
+                availability.export_summary_line(),
+                Some(format!(
+                    "delay imports: unavailable (schema {schema_version} package predates PE32+ delay-import data; reanalyze the exact original binary)"
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn schema_v8_delay_imports_stay_additive_for_symbols_read_and_projection() {
+        let base_analysis =
+            analyze_bytes(&pe_delay_import_fixture()).expect("analyze delay-import fixture");
+        let BinaryAnalysis::Pe(pe) = &base_analysis else {
+            panic!("PE analysis expected");
+        };
+        assert_eq!(pe.delay_imports.len(), 1);
+        assert_eq!(pe.delay_imports[0].name, "DELAYED.dll");
+
+        let detached =
+            serde_json::to_value(&base_analysis).expect("serialize symbols.read base analysis");
+        assert_eq!(
+            detached["analysis"]["directories"]["delay_imports"],
+            serde_json::json!({"rva": 0x1380, "size": 64})
+        );
+        assert_eq!(
+            detached["analysis"]["delay_imports"][0]["name"],
+            "DELAYED.dll"
+        );
+
+        let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
+            .expect("create delay-import analysis session");
+        let package = ResymPackage::from_bound_payload("0.1.0-schema8-test", session)
+            .expect("create delay-import package");
+        assert_eq!(package.schema_version(), 8);
+        let projection = ExportProjection::from_session(package.payload())
+            .expect("project delay-import session through neutral schema");
+        assert_eq!(projection.schema_version, 6);
+        assert!(projection.direct_calls.iter().any(|call| {
+            matches!(
+                &call.target,
+                resymbol_export::ExportControlFlowTarget::ImportIat { iat_rva: 0x1400 }
+            )
+        }));
+        assert!(
+            !serde_json::to_string(&projection)
+                .expect("serialize neutral projection")
+                .contains("delay_imports")
+        );
+    }
+
+    #[test]
+    fn schema_v8_tls_data_projects_through_existing_shapes_and_stays_additive_for_symbols_read() {
+        let base_analysis = analyze_bytes(&pe_tls_duplicate_thunk_fixture())
+            .expect("analyze duplicate TLS callback fixture");
+        let BinaryAnalysis::Pe(pe) = &base_analysis else {
+            panic!("PE analysis expected");
+        };
+
+        assert_eq!(pe.tls_callback_table_rva, Some(0x13c0));
+        assert_eq!(pe.tls_callbacks.len(), 2);
+        assert_eq!(pe.tls_callbacks[0].table_index, 0);
+        assert_eq!(pe.tls_callbacks[1].table_index, 1);
+        assert!(
+            pe.tls_callbacks
+                .iter()
+                .all(|callback| callback.callback_rva == 0x1040)
+        );
+        let callback_claims = pe
+            .symbol_graph
+            .claims()
+            .iter()
+            .filter(|claim| claim.provenance().method == "pe-tls-callback")
+            .collect::<Vec<_>>();
+        assert_eq!(callback_claims.len(), 2);
+        assert_eq!(
+            callback_claims
+                .iter()
+                .map(|claim| {
+                    (
+                        claim.evidence()[0].artifacts["table_index"].clone(),
+                        claim.evidence()[0].artifacts["callback_slot_rva"].clone(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            [
+                ("0".to_owned(), "0x13c0".to_owned()),
+                ("1".to_owned(), "0x13c8".to_owned()),
+            ]
+        );
+        assert_eq!(pe.thunks.len(), 1);
+        assert_eq!(pe.thunks[0].rva, 0x1040);
+        assert!(matches!(
+            pe.thunks[0].target,
+            PeControlFlowTarget::Function { rva: 0x1060 }
+        ));
+
+        let detached_base_analysis =
+            serde_json::to_value(&base_analysis).expect("serialize symbols.read base analysis");
+        assert_eq!(detached_base_analysis["format"], "pe");
+        assert_eq!(
+            detached_base_analysis["analysis"]["directories"]["tls"],
+            serde_json::json!({"rva": 0x1380, "size": 40})
+        );
+        assert_eq!(
+            detached_base_analysis["analysis"]["tls_callback_table_rva"],
+            0x13c0
+        );
+        assert_eq!(
+            detached_base_analysis["analysis"]["tls_callbacks"],
+            serde_json::json!([
+                {"table_index": 0, "callback_rva": 0x1040},
+                {"table_index": 1, "callback_rva": 0x1040}
+            ])
+        );
+        assert!(
+            detached_base_analysis["analysis"]
+                .get("tls_callback_scan_truncated")
+                .is_none(),
+            "the false partial flag remains an omitted additive field"
+        );
+
+        let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
+            .expect("create TLS-bearing analysis session");
+        let package = ResymPackage::from_bound_payload("0.1.0-schema7-test", session)
+            .expect("create current TLS-bearing package");
+        assert_eq!(package.schema_version(), CURRENT_SCHEMA_VERSION);
+        let projection = ExportProjection::from_session(package.payload())
+            .expect("project TLS-bearing session through neutral schema");
+        assert_eq!(projection.schema_version, 6);
+
+        let projected_callbacks = projection
+            .functions
+            .iter()
+            .filter(|function| function.rva == 0x1040)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            projected_callbacks.len(),
+            1,
+            "duplicate callback claims reduce to one function entry"
+        );
+        let callback_attribution = projected_callbacks[0]
+            .entry_attribution
+            .as_ref()
+            .expect("TLS callback establishes a function entry");
+        assert_eq!(callback_attribution.confidence, 0.99);
+        assert_eq!(callback_attribution.provenance.method, "pe-tls-callback");
+        assert!(matches!(
+            &callback_attribution.provenance.producer,
+            resymbol_export::ExportProducer::Core { component, .. }
+                if component == "resymbol-analysis"
+        ));
+
+        let projected_thunk = projection
+            .thunks
+            .iter()
+            .find(|thunk| thunk.rva == 0x1040)
+            .expect("callback-seeded thunk remains a normal projected thunk");
+        assert!(matches!(
+            projected_thunk.target,
+            resymbol_export::ExportControlFlowTarget::Function { rva: 0x1060 }
+        ));
+        assert_eq!(
+            projected_thunk.attribution.provenance.method,
+            "pe-x64-jump-thunk"
+        );
+    }
+
+    #[test]
     fn command_line_accepts_exact_plugin_state_commands() {
         let fingerprint = "a".repeat(64);
         let cli = Cli::try_parse_from([
@@ -3997,7 +4361,7 @@ entrypoint = "Plugin.dll"
 
         let package: ResymPackage<AnalysisSession> =
             read_file_bound(&output).expect("read bound package");
-        assert_eq!(CURRENT_SCHEMA_VERSION, 7);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 8);
         assert_eq!(package.schema_version(), CURRENT_SCHEMA_VERSION);
         assert_eq!(
             package.binary_sha256(),
@@ -4060,6 +4424,18 @@ entrypoint = "Plugin.dll"
         .expect("JSON inspection serializes validated package");
     }
 
+    fn strip_schema_v8_delay_import_semantics(value: &mut Value) {
+        let pe = value
+            .pointer_mut("/payload/base_analysis/analysis")
+            .and_then(Value::as_object_mut)
+            .expect("serialized PE analysis object");
+        pe.remove("delay_imports");
+        pe.get_mut("directories")
+            .and_then(Value::as_object_mut)
+            .expect("serialized PE data directories")
+            .remove("delay_imports");
+    }
+
     fn strip_schema_v7_tls_semantics(value: &mut Value) {
         let pe = value
             .pointer_mut("/payload/base_analysis/analysis")
@@ -4099,6 +4475,7 @@ entrypoint = "Plugin.dll"
             .expect("create current package value");
         let mut value = serde_json::to_value(package).expect("serialize package value");
         value["schema_version"] = serde_json::json!(1);
+        strip_schema_v8_delay_import_semantics(&mut value);
         strip_schema_v7_tls_semantics(&mut value);
 
         let pe = value
@@ -4214,6 +4591,10 @@ entrypoint = "Plugin.dll"
         assert_eq!(
             loaded.tls_callback_availability,
             TlsCallbackAvailability::Recorded
+        );
+        assert_eq!(
+            loaded.delay_import_availability,
+            DelayImportAvailability::Recorded
         );
 
         let verified = verify_inspection_binary(&loaded, &binary_path)
@@ -4489,6 +4870,7 @@ entrypoint = "Plugin.dll"
             .expect("create current package value");
         let mut value = serde_json::to_value(package).expect("serialize package value");
         value["schema_version"] = serde_json::json!(1);
+        strip_schema_v8_delay_import_semantics(&mut value);
         strip_schema_v7_tls_semantics(&mut value);
         let pe = value
             .pointer_mut("/payload/base_analysis/analysis")
@@ -4549,9 +4931,15 @@ entrypoint = "Plugin.dll"
             decoded.tls_callback_availability,
             TlsCallbackAvailability::Unavailable(1)
         );
+        assert_eq!(
+            decoded.delay_import_availability,
+            DelayImportAvailability::Unavailable(1)
+        );
         let BinaryAnalysis::Pe(pe) = decoded.package.payload().base_analysis() else {
             panic!("PE analysis expected");
         };
+        assert!(pe.directories.delay_imports.is_none());
+        assert!(pe.delay_imports.is_empty());
         assert!(pe.directories.tls.is_none());
         assert!(pe.tls_callback_table_rva.is_none());
         assert!(!pe.tls_callback_scan_truncated);
@@ -4576,6 +4964,13 @@ entrypoint = "Plugin.dll"
             .pointer("/payload/base_analysis/analysis")
             .and_then(Value::as_object)
             .expect("schema-v1 PE payload remains an object");
+        assert!(!inspected_pe.contains_key("delay_imports"));
+        assert!(
+            !inspected_pe["directories"]
+                .as_object()
+                .expect("schema-v1 PE directories remain an object")
+                .contains_key("delay_imports")
+        );
         assert!(!inspected_pe.contains_key("tls_callback_table_rva"));
         assert!(!inspected_pe.contains_key("tls_callback_scan_truncated"));
         assert!(!inspected_pe.contains_key("tls_callbacks"));
@@ -4628,6 +5023,7 @@ entrypoint = "Plugin.dll"
             .expect("create current package value");
         let mut value = serde_json::to_value(package).expect("serialize package value");
         value["schema_version"] = serde_json::json!(2);
+        strip_schema_v8_delay_import_semantics(&mut value);
         strip_schema_v7_tls_semantics(&mut value);
         let pe = value
             .pointer_mut("/payload/base_analysis/analysis")
@@ -4676,6 +5072,10 @@ entrypoint = "Plugin.dll"
         assert_eq!(
             decoded.tls_callback_availability,
             TlsCallbackAvailability::Unavailable(2)
+        );
+        assert_eq!(
+            decoded.delay_import_availability,
+            DelayImportAvailability::Unavailable(2)
         );
         assert!(decoded.schema1_source.is_none());
         let BinaryAnalysis::Pe(pe) = decoded.package.payload().base_analysis() else {
@@ -4731,6 +5131,7 @@ entrypoint = "Plugin.dll"
             .expect("create current package value");
         let mut value = serde_json::to_value(package).expect("serialize package value");
         value["schema_version"] = serde_json::json!(3);
+        strip_schema_v8_delay_import_semantics(&mut value);
         strip_schema_v7_tls_semantics(&mut value);
         fs::write(
             &path,
@@ -4760,6 +5161,10 @@ entrypoint = "Plugin.dll"
         assert_eq!(
             decoded.tls_callback_availability,
             TlsCallbackAvailability::Unavailable(3)
+        );
+        assert_eq!(
+            decoded.delay_import_availability,
+            DelayImportAvailability::Unavailable(3)
         );
         assert!(decoded.schema1_source.is_none());
         assert_eq!(
@@ -4828,6 +5233,7 @@ entrypoint = "Plugin.dll"
             .expect("create current package value");
         let mut value = serde_json::to_value(package).expect("serialize package value");
         value["schema_version"] = serde_json::json!(4);
+        strip_schema_v8_delay_import_semantics(&mut value);
         strip_schema_v7_tls_semantics(&mut value);
         fs::write(
             &path,
@@ -4857,6 +5263,10 @@ entrypoint = "Plugin.dll"
         assert_eq!(
             decoded.tls_callback_availability,
             TlsCallbackAvailability::Unavailable(4)
+        );
+        assert_eq!(
+            decoded.delay_import_availability,
+            DelayImportAvailability::Unavailable(4)
         );
         assert!(decoded.schema1_source.is_none());
         let BinaryAnalysis::Pe(decoded_pe) = decoded.package.payload().base_analysis() else {
@@ -4901,6 +5311,7 @@ entrypoint = "Plugin.dll"
             .expect("create current package value");
         let mut value = serde_json::to_value(package).expect("serialize package value");
         value["schema_version"] = serde_json::json!(5);
+        strip_schema_v8_delay_import_semantics(&mut value);
         strip_schema_v7_tls_semantics(&mut value);
         fs::write(
             &path,
@@ -4930,6 +5341,10 @@ entrypoint = "Plugin.dll"
         assert_eq!(
             decoded.tls_callback_availability,
             TlsCallbackAvailability::Unavailable(5)
+        );
+        assert_eq!(
+            decoded.delay_import_availability,
+            DelayImportAvailability::Unavailable(5)
         );
         let BinaryAnalysis::Pe(pe) = decoded.package.payload().base_analysis() else {
             panic!("PE analysis expected");
@@ -4968,6 +5383,7 @@ entrypoint = "Plugin.dll"
             .expect("create current package value");
         let mut value = serde_json::to_value(package).expect("serialize package value");
         value["schema_version"] = serde_json::json!(6);
+        strip_schema_v8_delay_import_semantics(&mut value);
         strip_schema_v7_tls_semantics(&mut value);
         let pe = value
             .pointer("/payload/base_analysis/analysis")
@@ -5018,6 +5434,10 @@ entrypoint = "Plugin.dll"
             decoded.tls_callback_availability,
             TlsCallbackAvailability::Unavailable(6)
         );
+        assert_eq!(
+            decoded.delay_import_availability,
+            DelayImportAvailability::Unavailable(6)
+        );
         let BinaryAnalysis::Pe(pe) = decoded.package.payload().base_analysis() else {
             panic!("PE analysis expected");
         };
@@ -5044,21 +5464,90 @@ entrypoint = "Plugin.dll"
                 .expect("projection JSON is valid");
         assert_eq!(
             projection["schema_version"], 6,
+            "package schema 8 must not change debugger projection schema 6"
+        );
+    }
+
+    #[test]
+    fn schema_v7_with_recorded_empty_tls_and_no_delay_imports_inspects_and_exports() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let path = temp.path().join("schema-v7.resym");
+        let output = temp.path().join("schema-v7.json");
+        let base_analysis = analyze_bytes(&pe_fixture()).expect("analyze PE fixture");
+        let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
+            .expect("create base-only session");
+        let package = ResymPackage::from_bound_payload("0.1.0-schema7", session)
+            .expect("create current package value");
+        let mut value = serde_json::to_value(package).expect("serialize package value");
+        value["schema_version"] = serde_json::json!(7);
+        strip_schema_v8_delay_import_semantics(&mut value);
+        let pe = value
+            .pointer_mut("/payload/base_analysis/analysis")
+            .and_then(Value::as_object_mut)
+            .expect("serialized PE analysis object");
+        pe.insert("tls_callback_table_rva".to_owned(), Value::Null);
+        pe.insert("tls_callback_scan_truncated".to_owned(), Value::Bool(false));
+        pe.insert("tls_callbacks".to_owned(), Value::Array(Vec::new()));
+        pe.get_mut("directories")
+            .and_then(Value::as_object_mut)
+            .expect("serialized PE directories")
+            .insert("tls".to_owned(), Value::Null);
+        fs::write(
+            &path,
+            serde_json::to_vec(&value).expect("encode schema-v7 package"),
+        )
+        .expect("write schema-v7 package");
+
+        let decoded = read_analysis_package(&path, true)
+            .expect("CLI compatibility policy accepts schema 7 explicitly");
+        assert_eq!(decoded.package.schema_version(), 7);
+        assert_eq!(
+            decoded.tls_callback_availability,
+            TlsCallbackAvailability::Recorded
+        );
+        assert_eq!(
+            decoded.delay_import_availability,
+            DelayImportAvailability::Unavailable(7)
+        );
+        let BinaryAnalysis::Pe(pe) = decoded.package.payload().base_analysis() else {
+            panic!("PE analysis expected");
+        };
+        assert!(pe.directories.delay_imports.is_none());
+        assert!(pe.delay_imports.is_empty());
+
+        inspect(InspectArgs {
+            package: path.clone(),
+            binary: None,
+            json: false,
+        })
+        .expect("CLI inspection accepts schema 7");
+        export(ExportArgs {
+            package: path,
+            format: ExportFormat::Json,
+            output: Some(output.clone()),
+            binary: None,
+        })
+        .expect("JSON export accepts schema 7");
+        let projection: Value =
+            serde_json::from_slice(&fs::read(output).expect("read schema-v7 JSON projection"))
+                .expect("projection JSON is valid");
+        assert_eq!(
+            projection["schema_version"], 6,
             "package schema 7 must not change debugger projection schema 6"
         );
     }
 
     #[test]
-    fn cli_rejects_schema_v8_before_decoding_the_analysis_payload() {
+    fn cli_rejects_schema_v9_before_decoding_the_analysis_payload() {
         let temp = tempfile::tempdir().expect("create temporary directory");
-        let path = temp.path().join("schema-v8.resym");
+        let path = temp.path().join("schema-v9.resym");
         let base_analysis = analyze_bytes(&pe_fixture()).expect("analyze PE fixture");
         let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
             .expect("create base-only session");
         let package = ResymPackage::from_bound_payload("0.1.0-future", session)
             .expect("create current package value");
         let mut value = serde_json::to_value(package).expect("serialize package value");
-        value["schema_version"] = serde_json::json!(8);
+        value["schema_version"] = serde_json::json!(9);
         value["payload"] = serde_json::json!("not an analysis session");
         fs::write(
             &path,
@@ -5067,13 +5556,144 @@ entrypoint = "Plugin.dll"
         .expect("write future package");
 
         let error = match read_analysis_package(&path, false) {
-            Ok(_) => panic!("schema 8 must be rejected"),
+            Ok(_) => panic!("schema 9 must be rejected"),
             Err(error) => error,
         };
         let diagnostic = format!("{error:#}");
-        assert!(diagnostic.contains("unsupported package schema 8"));
-        assert!(diagnostic.contains("schemas 1 through 7"));
+        assert!(diagnostic.contains("unsupported package schema 9"));
+        assert!(diagnostic.contains("schemas 1 through 8"));
         assert!(!diagnostic.contains("analysis payload"));
+    }
+
+    #[test]
+    fn schema_v8_requires_an_explicit_delay_import_inventory_marker() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let path = temp.path().join("relabeled-schema-v7.resym");
+        let base_analysis = analyze_bytes(&pe_fixture()).expect("analyze PE fixture");
+        let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
+            .expect("create base-only session");
+        let package = ResymPackage::from_bound_payload("0.1.0-schema8", session)
+            .expect("create current package value");
+        let mut value = serde_json::to_value(package).expect("serialize current package value");
+        assert_eq!(
+            value.pointer("/payload/base_analysis/analysis/delay_imports"),
+            Some(&Value::Array(Vec::new())),
+            "schema 8 must serialize its inventory marker even when no delay imports exist"
+        );
+        value
+            .pointer_mut("/payload/base_analysis/analysis")
+            .and_then(Value::as_object_mut)
+            .expect("serialized PE analysis object")
+            .remove("delay_imports");
+        fs::write(
+            &path,
+            serde_json::to_vec(&value).expect("encode relabeled package"),
+        )
+        .expect("write relabeled package");
+
+        let error = match read_analysis_package(&path, false) {
+            Ok(_) => panic!("schema 8 must require its explicit inventory marker"),
+            Err(error) => error,
+        };
+        let diagnostic = format!("{error:#}");
+        assert!(diagnostic.contains("schema 8 requires an explicit delay_imports inventory"));
+        assert!(diagnostic.contains("cannot be migrated by changing only its envelope label"));
+        assert!(!diagnostic.contains("cannot decode current analysis payload"));
+    }
+
+    #[test]
+    fn pre_v8_delay_import_gate_rejects_each_exact_base_analysis_shape_for_schemas_1_through_7() {
+        for schema_version in 1..DELAY_IMPORT_SCHEMA_VERSION {
+            for analysis in [
+                serde_json::json!({"delay_imports": []}),
+                serde_json::json!({"directories": {"delay_imports": null}}),
+            ] {
+                let payload = serde_json::json!({
+                    "base_analysis": {"analysis": analysis},
+                    "plugin_claims": []
+                });
+                let error = reject_pre_v8_delay_import_semantics(&payload, schema_version)
+                    .expect_err("an exact schema-8 delay-import key must reject a legacy envelope");
+                let diagnostic = error.to_string();
+                assert!(diagnostic.contains(&format!("package schema {schema_version}")));
+                assert!(diagnostic.contains("schema-8 delay-import semantics"));
+                assert!(diagnostic.contains("cannot be relabeled"));
+            }
+        }
+    }
+
+    #[test]
+    fn pre_v8_delay_import_gate_ignores_plugins_nested_extensions_and_lookalikes() {
+        for allowed in [
+            serde_json::json!({
+                "base_analysis": {
+                    "analysis": {
+                        "extension": {
+                            "delay_imports": [],
+                            "directories": {"delay_imports": null}
+                        }
+                    }
+                },
+                "plugin_claims": []
+            }),
+            serde_json::json!({
+                "base_analysis": {
+                    "delay_imports": [],
+                    "analysis": {
+                        "delay_import": [],
+                        "directories": {"delay_import": null}
+                    }
+                },
+                "plugin_claims": []
+            }),
+            serde_json::json!({
+                "base_analysis": {"analysis": {}},
+                "plugin_claims": [{
+                    "delay_imports": [],
+                    "directories": {"delay_imports": null}
+                }]
+            }),
+        ] {
+            for schema_version in 1..DELAY_IMPORT_SCHEMA_VERSION {
+                reject_pre_v8_delay_import_semantics(&allowed, schema_version)
+                    .expect("plugin data, nested extensions, and lookalike keys remain valid");
+            }
+        }
+    }
+
+    #[test]
+    fn cli_runs_the_pre_v8_delay_import_gate_before_other_legacy_gates_and_decoders() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let base_analysis = analyze_bytes(&pe_fixture()).expect("analyze PE fixture");
+        let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
+            .expect("create base-only session");
+        let package = ResymPackage::from_bound_payload("0.1.0", session)
+            .expect("create current package value");
+        let current = serde_json::to_value(package).expect("serialize current package value");
+
+        for schema_version in 1..DELAY_IMPORT_SCHEMA_VERSION {
+            let mut value = current.clone();
+            value["schema_version"] = serde_json::json!(schema_version);
+            value["payload"]["base_analysis"]["analysis"]["delay_imports"] =
+                Value::Array(Vec::new());
+            let path = temp.path().join(format!(
+                "relabeled-delay-import-schema-{schema_version}.resym"
+            ));
+            fs::write(
+                &path,
+                serde_json::to_vec(&value).expect("encode relabeled package"),
+            )
+            .expect("write relabeled package");
+
+            let error = match read_analysis_package(&path, false) {
+                Ok(_) => panic!("schema {schema_version} must reject schema-8 delay imports"),
+                Err(error) => error,
+            };
+            let diagnostic = format!("{error:#}");
+            assert!(diagnostic.contains("schema-8 delay-import semantics"));
+            assert!(!diagnostic.contains("schema-7 TLS callback semantics"));
+            assert!(!diagnostic.contains("cannot decode schema"));
+        }
     }
 
     #[test]
@@ -5112,6 +5732,7 @@ entrypoint = "Plugin.dll"
         for schema_version in 1..TLS_CALLBACK_SCHEMA_VERSION {
             let mut value = current.clone();
             value["schema_version"] = serde_json::json!(schema_version);
+            strip_schema_v8_delay_import_semantics(&mut value);
             value["payload"]["base_analysis"]["analysis"]["tls_callbacks"] = serde_json::json!([]);
             let path = temp
                 .path()
@@ -5231,6 +5852,7 @@ entrypoint = "Plugin.dll"
             .expect("create current package value");
         let mut current = serde_json::to_value(package).expect("serialize current package value");
         current["schema_version"] = serde_json::json!(6);
+        strip_schema_v8_delay_import_semantics(&mut current);
         strip_schema_v7_tls_semantics(&mut current);
         let current_path = temp.path().join("schema-v6-thunk-chain.resym");
         fs::write(
@@ -5286,6 +5908,7 @@ entrypoint = "Plugin.dll"
             .expect("create current package value");
         let mut value = serde_json::to_value(package).expect("serialize current package value");
         value["schema_version"] = serde_json::json!(5);
+        strip_schema_v8_delay_import_semantics(&mut value);
         strip_schema_v7_tls_semantics(&mut value);
         install_schema_v1_plugin_claims(
             &mut value,
@@ -5357,6 +5980,7 @@ entrypoint = "Plugin.dll"
             for omit_pchd_field in [false, true] {
                 let mut value = current.clone();
                 value["schema_version"] = serde_json::json!(schema_version);
+                strip_schema_v8_delay_import_semantics(&mut value);
                 strip_schema_v7_tls_semantics(&mut value);
                 let base_class = value
                     .pointer_mut(
@@ -5486,6 +6110,7 @@ entrypoint = "Plugin.dll"
         for schema_version in [2, 3] {
             let mut value = current.clone();
             value["schema_version"] = serde_json::json!(schema_version);
+            strip_schema_v8_delay_import_semantics(&mut value);
             strip_schema_v7_tls_semantics(&mut value);
             value["payload"]["base_analysis"]["analysis"]["direct_calls"][0]["target"] = serde_json::json!({
                 "kind": "function-pointer",
@@ -5524,6 +6149,7 @@ entrypoint = "Plugin.dll"
         for schema_version in [2, 3] {
             let mut value = current.clone();
             value["schema_version"] = serde_json::json!(schema_version);
+            strip_schema_v8_delay_import_semantics(&mut value);
             strip_schema_v7_tls_semantics(&mut value);
             value["payload"]["base_analysis"]["analysis"]["thunks"][0]["target"] = serde_json::json!({
                 "kind": "function-pointer",

@@ -71,10 +71,11 @@ reduces that graph to a bounded export projection. The projection is tied to one
 SHA-256 and uses RVAs rather than assuming a process or debugger load address.
 
 After a successful write, the CLI prints the destination, binary SHA-256, projected entity counts,
-TLS callback availability, and a bounded summary of projection warning groups. Schemas 1 through 6
-report TLS callback recovery as unavailable and direct the user to reanalyze the exact original
-binary. Inspect the warnings before applying a script; the output file is still created when a
-deliberate lossy reduction is safe and diagnosed.
+and a bounded summary of projection warning groups. For schemas 1 through 6 it also reports TLS
+callback recovery as unavailable; for schemas 1 through 7 it reports delay-import recovery as
+unavailable. Both diagnostics direct the user to reanalyze the exact original binary.
+Inspect the warnings before applying a script; the output file is still created when a deliberate
+lossy reduction is safe and diagnosed.
 
 Both generated debugger scripts enforce the same application rules:
 
@@ -117,7 +118,7 @@ added deterministic string correlation to each data reference. Schema 6 adds the
 projection schema is independent from the `.resym` package-envelope schema; consumers must validate
 the version of the artifact they are actually reading.
 
-The CLI can export package schemas 1 through 6 through validated in-memory compatibility paths.
+The CLI can export package schemas 1 through 7 through validated in-memory compatibility paths.
 Migration neither rewrites the package nor reruns analysis: the package does not embed executable
 bytes. Schema 1 therefore has no available direct calls, thunks, strings, or data references.
 Schema 2 retains its persisted calls and thunks but predates strings and data references. Schema 3
@@ -125,12 +126,14 @@ retains those records, but schemas 2 and 3 both predate read-only function-point
 resolution. Schema 4 retains pointer control flow but predates legacy 24-byte MSVC RTTI base-class
 descriptor recovery. Schema 5 records both RTTI descriptor layouts but predates transitive
 executable thunk-chain discovery. Schema 6 records that closure but predates TLS callback
-discovery and callback-based thunk seeding. Reanalyze the exact original binary to produce schema 7
-before expecting all current recovery relationships in the export. Schemas 1 through 4 reject
+discovery and callback-based thunk seeding. Schema 7 records TLS callbacks but predates modern
+delay-import recovery. Reanalyze the exact original binary to produce schema 8 before expecting all
+current recovery relationships in the export. Schemas 1 through 4 reject
 relabeled RTTI base records whose `class_hierarchy_descriptor_rva` is missing or null, and schemas 1
 through 5 reject a deterministic base thunk source valid only through schema-6 endpoint seeding.
 Schemas 1 through 6 reject schema-7 TLS fields, core `pe-tls-callback` claims, and callback-only
-base thunk seeds rather than accepting a relabeled package.
+base thunk seeds rather than accepting a relabeled package. Schemas 1 through 7 likewise reject
+schema-8 delay-import directory and inventory fields.
 
 Entries are emitted in stable order. Name and range conflicts are resolved conservatively, and
 colliding selected names receive deterministic output suffixes rather than silently referring to
@@ -159,7 +162,7 @@ function-pointer target preserves both the read-only slot RVA and resolved funct
 flattening the indirection. Relations are canonical, bounded to 262,144 direct calls and 65,536
 thunks, and validated against the binary's virtual image. These are neutral projection/model caps,
 not the built-in decoder's lower recovery caps of 8,192 direct calls and 4,096 thunks. During
-analysis, the built-in producer additionally checks exact parsed IAT membership, file-backed
+analysis, the built-in producer additionally checks exact parsed conventional/delay IAT membership, file-backed
 instruction bytes, and the section properties used to resolve any pointer slot.
 
 An executable thunk chain remains a sequence of exact relationships. A call to `A` followed by
@@ -175,6 +178,14 @@ its `pe-tls-callback` provenance to the existing entry-attribution model, where 
 one RVA reduce to one selected attribution; a callback-seeded exact thunk projects through the
 existing per-hop relationship. No TLS-specific field is added to neutral projection schema 6, and
 callbacks seed only the first-instruction thunk check rather than a body sweep.
+
+The ordered delay-import descriptors and inventory likewise remain package-only. That inventory
+retains the DLL name, descriptor/name/HMOD/IAT/INT base RVAs, optional BIAT/UIAT base RVAs, each
+entry's lookup/IAT RVAs and name or ordinal, and the timestamp, but not raw INT/IAT/BIAT/UIAT array
+contents. Delay-IAT slots still participate in projected control flow through the existing import
+target containing the slot RVA. Conventional and delay-IAT membership both outrank read-only
+function-pointer fallback; no delay-import-specific field or target is added to neutral projection
+schema 6.
 
 Built-in control-flow recovery is a bounded control-flow-guided block sweep with heuristic
 confidence, not a complete recursive disassembler. It recognizes only exact RIP-relative
@@ -322,7 +333,7 @@ schema-6 JSON record.
 Markdown is a human-facing presentation format, not a stable interchange contract. Its wording,
 table layout, and section organization may evolve between alpha releases. Tools should consume the
 `json` output and validate its `schema_version` instead of parsing the report. New analyses write
-package schema 7; export also accepts package schemas 1 through 6 through validated compatibility
+package schema 8; export also accepts package schemas 1 through 7 through validated compatibility
 paths without rewriting them. The current neutral projection is schema 6, and adding this writer
 changes neither independently versioned domain.
 
@@ -352,8 +363,8 @@ resymbol export application.resym --format map
 The default destination is `application.map`. This is a deterministic text export, not a claim that
 every debugger or linker will accept it. ReSymbol currently rejects non-PE sessions and
 projections, mismatched session/projection binary fields, selected symbol RVAs outside real PE
-sections, and a nonzero entry point outside those sections. New analyses write package schema 7;
-export also accepts package schemas 1 through 6 through validated compatibility paths without
+sections, and a nonzero entry point outside those sections. New analyses write package schema 8;
+export also accepts package schemas 1 through 7 through validated compatibility paths without
 rewriting them. The current neutral projection is schema 6, and MAP adds no schema fields.
 
 The writer emits the PE timestamp and preferred load address, one group for each final PE section,

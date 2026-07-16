@@ -60,6 +60,13 @@ pub struct PeAnalysis {
     pub directories: PeDataDirectories,
     pub sections: Vec<PeSection>,
     pub imports: Vec<PeImportLibrary>,
+    /// Ordered modern RVA-form delay-load import descriptors.
+    ///
+    /// Schema 8 serializes this field even when it is empty so the inventory is
+    /// an explicit compatibility marker rather than something an older package
+    /// can acquire by changing only its envelope version.
+    #[serde(default)]
+    pub delay_imports: Vec<PeDelayImportLibrary>,
     pub export_library_name: Option<String>,
     pub exports: Vec<PeExport>,
     pub runtime_functions: Vec<RuntimeFunction>,
@@ -152,6 +159,8 @@ struct UncheckedPeAnalysis {
     directories: PeDataDirectories,
     sections: Vec<PeSection>,
     imports: Vec<PeImportLibrary>,
+    #[serde(default)]
+    delay_imports: Vec<PeDelayImportLibrary>,
     export_library_name: Option<String>,
     exports: Vec<PeExport>,
     runtime_functions: Vec<RuntimeFunction>,
@@ -200,6 +209,7 @@ impl TryFrom<UncheckedPeAnalysis> for PeAnalysis {
             directories: value.directories,
             sections: value.sections,
             imports: value.imports,
+            delay_imports: value.delay_imports,
             export_library_name: value.export_library_name,
             exports: value.exports,
             runtime_functions: value.runtime_functions,
@@ -250,6 +260,9 @@ pub struct PeDataDirectories {
     /// PE optional-header data-directory entry 9.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<DataDirectory>,
+    /// PE optional-header data-directory entry 13.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delay_imports: Option<DataDirectory>,
 }
 
 /// One 40-byte PE section-table entry.
@@ -273,6 +286,33 @@ pub struct PeImportLibrary {
     pub descriptor_rva: u32,
     pub timestamp: u32,
     pub forwarder_chain: u32,
+    pub entries: Vec<PeImport>,
+}
+
+/// One modern RVA-form `ImgDelayDescr` and its null-terminated INT/IAT pair.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeDelayImportLibrary {
+    pub name: String,
+    pub descriptor_rva: u32,
+    /// Exact descriptor attributes. The supported modern form is `dlattrRva` (`1`).
+    pub attributes: u32,
+    /// RVA of the descriptor's NUL-terminated DLL name.
+    pub name_rva: u32,
+    /// RVA of the delay-load helper's module-handle storage.
+    ///
+    /// Ingestion requires a nonzero RVA and eight fully file-backed bytes but
+    /// deliberately leaves the stored value and section permissions opaque.
+    pub module_handle_rva: u32,
+    /// RVA of the delay import address table.
+    pub iat_rva: u32,
+    /// RVA of the delay import name table.
+    pub int_rva: u32,
+    /// Optional RVA of the bound delay import address table.
+    pub bound_iat_rva: Option<u32>,
+    /// Optional RVA of the unload copy of the original delay IAT.
+    pub unload_iat_rva: Option<u32>,
+    pub timestamp: u32,
     pub entries: Vec<PeImport>,
 }
 

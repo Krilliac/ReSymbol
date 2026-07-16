@@ -12,9 +12,9 @@ use resymbol_core::{
 
 use crate::{
     AnalysisError, CoffHeader, DataDirectory, ImportTarget, MsvcRttiVftable, PeAnalysis,
-    PeControlFlowTarget, PeDataDirectories, PeDataReference, PeDirectCall, PeExport, PeExportName,
-    PeImport, PeImportLibrary, PeRecoveredString, PeSection, PeThunk, PeTlsCallback,
-    RuntimeFunction,
+    PeControlFlowTarget, PeDataDirectories, PeDataReference, PeDelayImportLibrary, PeDirectCall,
+    PeExport, PeExportName, PeImport, PeImportLibrary, PeRecoveredString, PeSection, PeThunk,
+    PeTlsCallback, RuntimeFunction,
     code_recovery::{
         CodeRecoveryInput, recover_code, validate_code_recovery, validate_data_references,
     },
@@ -35,6 +35,8 @@ const DEBUG_DIRECTORY_ENTRY_SIZE: usize = 28;
 const DEBUG_DIRECTORY_ENTRY_SIZE_U32: u32 = 28;
 const IMPORT_DESCRIPTOR_SIZE: usize = 20;
 const IMPORT_DESCRIPTOR_SIZE_U32: u32 = 20;
+const DELAY_IMPORT_DESCRIPTOR_SIZE: usize = 32;
+const DELAY_IMPORT_DESCRIPTOR_SIZE_U32: u32 = 32;
 const RUNTIME_FUNCTION_SIZE: usize = 12;
 const RUNTIME_FUNCTION_SIZE_U32: u32 = 12;
 const TLS_DIRECTORY_SIZE_U32: u32 = 40;
@@ -42,6 +44,7 @@ const TLS_DIRECTORY_SIZE_U32: u32 = 40;
 const MACHINE_AMD64: u16 = 0x8664;
 const OPTIONAL_MAGIC_PE32_PLUS: u16 = 0x020b;
 const IMPORT_BY_ORDINAL_64: u64 = 1_u64 << 63;
+const DELAY_IMPORT_ATTRIBUTE_RVA: u32 = 1;
 const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 
 const MAX_PE_HEADER_OFFSET: u32 = 16 * 1024 * 1024;
@@ -49,6 +52,7 @@ const MAX_SECTIONS: u64 = 96;
 const MAX_DATA_DIRECTORIES: u64 = 16;
 const MAX_DIRECTORY_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_IMPORT_LIBRARIES: u64 = 4_096;
+const MAX_IMPORT_DESCRIPTORS: u64 = MAX_IMPORT_LIBRARIES + 1;
 const MAX_IMPORT_SYMBOLS: u64 = 65_536;
 const MAX_IMPORT_NAME_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_EXPORT_FUNCTIONS: u64 = 65_536;
@@ -91,6 +95,7 @@ const IMPORT_DIRECTORY_INDEX: usize = 1;
 const EXCEPTION_DIRECTORY_INDEX: usize = 3;
 const DEBUG_DIRECTORY_INDEX: usize = 6;
 const TLS_DIRECTORY_INDEX: usize = 9;
+const DELAY_IMPORT_DIRECTORY_INDEX: usize = 13;
 
 const IMAGE_DEBUG_TYPE_CODEVIEW: u32 = 2;
 const CODEVIEW_RSDS_HEADER_SIZE: usize = 24;
@@ -188,6 +193,14 @@ struct ParsedHeaders {
     sections: Vec<PeSection>,
 }
 
+#[derive(Default)]
+struct ImportBudget {
+    libraries: u64,
+    symbols: u64,
+    name_bytes: u64,
+    iat_rvas: BTreeSet<u32>,
+}
+
 pub(crate) struct SymbolGraphInput<'a> {
     pub identity: &'a BinaryIdentity,
     pub entry_point_rva: u32,
@@ -211,7 +224,19 @@ pub fn analyze_pe(bytes: &[u8]) -> Result<PeAnalysis, AnalysisError> {
     let mapper = RvaMap::new(bytes, headers.size_of_headers, &headers.sections);
     let string_recovery = recover_strings(bytes, &headers.sections);
 
-    let imports = parse_imports(&reader, &mapper, headers.directories.imports)?;
+    let mut import_budget = ImportBudget::default();
+    let imports = parse_imports(
+        &reader,
+        &mapper,
+        headers.directories.imports,
+        &mut import_budget,
+    )?;
+    let delay_imports = parse_delay_imports(
+        &reader,
+        &mapper,
+        headers.directories.delay_imports,
+        &mut import_budget,
+    )?;
     let (export_library_name, exports) = parse_exports(
         &reader,
         &mapper,
@@ -245,6 +270,7 @@ pub fn analyze_pe(bytes: &[u8]) -> Result<PeAnalysis, AnalysisError> {
         entry_point_rva: headers.entry_point_rva,
         sections: &headers.sections,
         imports: &imports,
+        delay_imports: &delay_imports,
         exports: &exports,
         runtime_functions: &runtime_functions,
         tls_callbacks: &tls_callbacks,
@@ -282,6 +308,7 @@ pub fn analyze_pe(bytes: &[u8]) -> Result<PeAnalysis, AnalysisError> {
         directories: headers.directories,
         sections: headers.sections,
         imports,
+        delay_imports,
         export_library_name,
         exports,
         runtime_functions,
@@ -574,6 +601,10 @@ pub(crate) fn validate_pe_analysis(analysis: &PeAnalysis) -> Result<(), Analysis
         (analysis.directories.imports, IMPORT_DIRECTORY_INDEX),
         (analysis.directories.exceptions, EXCEPTION_DIRECTORY_INDEX),
         (analysis.directories.tls, TLS_DIRECTORY_INDEX),
+        (
+            analysis.directories.delay_imports,
+            DELAY_IMPORT_DIRECTORY_INDEX,
+        ),
     ]
     .into_iter()
     .filter_map(|(directory, index)| {
@@ -613,6 +644,7 @@ pub(crate) fn validate_pe_analysis(analysis: &PeAnalysis) -> Result<(), Analysis
         ("import directory", analysis.directories.imports),
         ("exception directory", analysis.directories.exceptions),
         ("TLS directory", analysis.directories.tls),
+        ("delay-import directory", analysis.directories.delay_imports),
     ] {
         if let Some(directory) = directory {
             if directory.rva == 0 || directory.size == 0 {
@@ -675,6 +707,7 @@ pub(crate) fn validate_pe_analysis(analysis: &PeAnalysis) -> Result<(), Analysis
         ("import directory", analysis.directories.imports),
         ("exception directory", analysis.directories.exceptions),
         ("TLS directory", analysis.directories.tls),
+        ("delay-import directory", analysis.directories.delay_imports),
     ] {
         if let Some(directory) = directory {
             if !model_rva_is_backed(analysis, directory.rva, directory.size) {
@@ -685,9 +718,21 @@ pub(crate) fn validate_pe_analysis(analysis: &PeAnalysis) -> Result<(), Analysis
 
     let import_library_count = u64::try_from(analysis.imports.len())
         .map_err(|_| AnalysisError::IntegerConversion("import-library count"))?;
-    enforce_limit("import library", import_library_count, MAX_IMPORT_LIBRARIES)?;
+    let delay_import_library_count = u64::try_from(analysis.delay_imports.len())
+        .map_err(|_| AnalysisError::IntegerConversion("delay-import-library count"))?;
+    let total_import_library_count = import_library_count
+        .checked_add(delay_import_library_count)
+        .ok_or(AnalysisError::ArithmeticOverflow(
+            "total import-library count",
+        ))?;
+    enforce_limit(
+        "import library",
+        total_import_library_count,
+        MAX_IMPORT_LIBRARIES,
+    )?;
     let mut import_symbol_count = 0_u64;
     let mut import_name_bytes = 0_u64;
+    let mut import_iat_rvas = BTreeSet::new();
     if !analysis.imports.is_empty() && analysis.directories.imports.is_none() {
         return invalid_field("imports", "entries exist without an import directory");
     }
@@ -702,7 +747,7 @@ pub(crate) fn validate_pe_analysis(analysis: &PeAnalysis) -> Result<(), Analysis
         enforce_limit(
             "import-library descriptor",
             descriptor_count,
-            MAX_IMPORT_LIBRARIES,
+            MAX_IMPORT_DESCRIPTORS,
         )?;
         let required_descriptors =
             import_library_count
@@ -791,6 +836,15 @@ pub(crate) fn validate_pe_analysis(analysis: &PeAnalysis) -> Result<(), Analysis
                     "lookup and address-table RVAs must be contiguous and file-backed",
                 );
             }
+            if !import_iat_rvas.insert(entry.iat_rva) {
+                return invalid_field(
+                    "import IAT slot",
+                    format!(
+                        "RVA {:#x} is claimed by more than one import entry",
+                        entry.iat_rva
+                    ),
+                );
+            }
             if let ImportTarget::Name { name, .. } = &entry.target {
                 if name.is_empty() {
                     return invalid_field("import symbol name", "must not be empty");
@@ -825,6 +879,13 @@ pub(crate) fn validate_pe_analysis(analysis: &PeAnalysis) -> Result<(), Analysis
             }
         }
     }
+    validate_delay_imports(
+        analysis,
+        delay_import_library_count,
+        &mut import_symbol_count,
+        &mut import_name_bytes,
+        &mut import_iat_rvas,
+    )?;
 
     if analysis
         .export_library_name
@@ -1044,6 +1105,243 @@ pub(crate) fn validate_pe_analysis(analysis: &PeAnalysis) -> Result<(), Analysis
             "symbol graph",
             "does not semantically match claims derived from the PE metadata",
         );
+    }
+    Ok(())
+}
+
+fn validate_delay_imports(
+    analysis: &PeAnalysis,
+    library_count: u64,
+    import_symbol_count: &mut u64,
+    import_name_bytes: &mut u64,
+    import_iat_rvas: &mut BTreeSet<u32>,
+) -> Result<(), AnalysisError> {
+    let Some(directory) = analysis.directories.delay_imports else {
+        if analysis.delay_imports.is_empty() {
+            return Ok(());
+        }
+        return invalid_field(
+            "delay imports",
+            "entries exist without a delay-import directory",
+        );
+    };
+    if directory.size % DELAY_IMPORT_DESCRIPTOR_SIZE_U32 != 0 {
+        return invalid_field(
+            "delay-import directory size",
+            "must be a multiple of the 32-byte descriptor size",
+        );
+    }
+    let descriptor_count = u64::from(directory.size / DELAY_IMPORT_DESCRIPTOR_SIZE_U32);
+    enforce_limit(
+        "delay-import-library descriptor",
+        descriptor_count,
+        MAX_IMPORT_DESCRIPTORS,
+    )?;
+    let required_descriptors =
+        library_count
+            .checked_add(1)
+            .ok_or(AnalysisError::ArithmeticOverflow(
+                "delay-import descriptor count including terminator",
+            ))?;
+    if required_descriptors > descriptor_count {
+        return invalid_field(
+            "delay imports",
+            "the delay-import directory does not leave room for its zero terminator",
+        );
+    }
+
+    for (library_index, library) in analysis.delay_imports.iter().enumerate() {
+        if library.attributes != DELAY_IMPORT_ATTRIBUTE_RVA {
+            return invalid_field(
+                "delay-import attributes",
+                format!(
+                    "descriptor {library_index} uses {:#x}; only the modern dlattrRva value {DELAY_IMPORT_ATTRIBUTE_RVA:#x} is supported",
+                    library.attributes
+                ),
+            );
+        }
+        if library.name.is_empty() {
+            return invalid_field("delay-import DLL name", "must not be empty");
+        }
+        enforce_string_length("delay-import DLL-name byte", &library.name)?;
+        consume_string_budget(
+            import_name_bytes,
+            &library.name,
+            "import-name byte",
+            MAX_IMPORT_NAME_BYTES,
+        )?;
+        let descriptor_delta = checked_u32_mul(
+            u32::try_from(library_index)
+                .map_err(|_| AnalysisError::IntegerConversion("delay-import descriptor index"))?,
+            DELAY_IMPORT_DESCRIPTOR_SIZE_U32,
+            "delay-import descriptor RVA",
+        )?;
+        let expected_descriptor_rva = checked_u32_add(
+            directory.rva,
+            descriptor_delta,
+            "delay-import descriptor RVA",
+        )?;
+        if library.descriptor_rva != expected_descriptor_rva
+            || !model_rva_is_backed(
+                analysis,
+                library.descriptor_rva,
+                DELAY_IMPORT_DESCRIPTOR_SIZE_U32,
+            )
+        {
+            return invalid_field(
+                "delay-import descriptor",
+                "source RVAs are not contiguous from the delay-import-directory start",
+            );
+        }
+        if library.name_rva == 0
+            || library.module_handle_rva == 0
+            || library.iat_rva == 0
+            || library.int_rva == 0
+        {
+            return invalid_field(
+                "delay-import descriptor",
+                format!(
+                    "descriptor {library_index} has a zero DLL-name, module-handle, IAT, or INT RVA"
+                ),
+            );
+        }
+        let name_size =
+            library
+                .name
+                .len()
+                .checked_add(1)
+                .ok_or(AnalysisError::ArithmeticOverflow(
+                    "delay-import DLL-name size",
+                ))?;
+        let name_size = u32::try_from(name_size)
+            .map_err(|_| AnalysisError::IntegerConversion("delay-import DLL-name size"))?;
+        if !model_rva_is_backed(analysis, library.name_rva, name_size)
+            || !model_rva_is_backed(analysis, library.module_handle_rva, 8)
+        {
+            return invalid_field(
+                "delay-import descriptor",
+                "DLL-name or module-handle storage is not fully backed by file data",
+            );
+        }
+
+        for (entry_index, entry) in library.entries.iter().enumerate() {
+            *import_symbol_count = (*import_symbol_count)
+                .checked_add(1)
+                .ok_or(AnalysisError::ArithmeticOverflow("import-symbol count"))?;
+            enforce_limit("import symbol", *import_symbol_count, MAX_IMPORT_SYMBOLS)?;
+            let thunk_delta = checked_u32_mul(
+                u32::try_from(entry_index)
+                    .map_err(|_| AnalysisError::IntegerConversion("delay-import thunk index"))?,
+                8,
+                "delay-import thunk position",
+            )?;
+            let expected_lookup_rva =
+                checked_u32_add(library.int_rva, thunk_delta, "delay-import lookup RVA")?;
+            let expected_iat_rva =
+                checked_u32_add(library.iat_rva, thunk_delta, "delay-import IAT RVA")?;
+            if entry.lookup_rva != expected_lookup_rva
+                || entry.iat_rva != expected_iat_rva
+                || !model_rva_is_backed(analysis, entry.lookup_rva, 8)
+                || !model_rva_is_backed(analysis, entry.iat_rva, 8)
+            {
+                return invalid_field(
+                    "delay-import thunk",
+                    "INT and IAT RVAs must be contiguous and file-backed",
+                );
+            }
+            if !import_iat_rvas.insert(entry.iat_rva) {
+                return invalid_field(
+                    "import IAT slot",
+                    format!(
+                        "RVA {:#x} is claimed by more than one import entry",
+                        entry.iat_rva
+                    ),
+                );
+            }
+            if let ImportTarget::Name { name, .. } = &entry.target {
+                if name.is_empty() {
+                    return invalid_field("delay-import symbol name", "must not be empty");
+                }
+                enforce_string_length("delay-import symbol-name byte", name)?;
+                consume_string_budget(
+                    import_name_bytes,
+                    name,
+                    "import-name byte",
+                    MAX_IMPORT_NAME_BYTES,
+                )?;
+            }
+        }
+
+        let terminator_delta = checked_u32_mul(
+            u32::try_from(library.entries.len())
+                .map_err(|_| AnalysisError::IntegerConversion("delay-import thunk count"))?,
+            8,
+            "delay-import thunk terminator position",
+        )?;
+        let int_terminator = checked_u32_add(
+            library.int_rva,
+            terminator_delta,
+            "delay-import INT terminator RVA",
+        )?;
+        let iat_terminator = checked_u32_add(
+            library.iat_rva,
+            terminator_delta,
+            "delay-import IAT terminator RVA",
+        )?;
+        if !model_rva_is_backed(analysis, int_terminator, 8)
+            || !model_rva_is_backed(analysis, iat_terminator, 8)
+        {
+            return invalid_field(
+                "delay-import thunk terminator",
+                "INT or IAT terminator RVA is not backed by file data",
+            );
+        }
+        let table_size =
+            terminator_delta
+                .checked_add(8)
+                .ok_or(AnalysisError::ArithmeticOverflow(
+                    "delay-import table byte size",
+                ))?;
+        for (table_rva, field) in [
+            (library.bound_iat_rva, "bound delay-import table"),
+            (library.unload_iat_rva, "unload delay-import table"),
+        ] {
+            if let Some(table_rva) = table_rva {
+                if table_rva == 0 || !model_rva_is_backed(analysis, table_rva, table_size) {
+                    return invalid_field(field, "is not fully backed by file data");
+                }
+            }
+        }
+        let table_ranges = [
+            ("delay-import INT", Some(library.int_rva)),
+            ("delay-import IAT", Some(library.iat_rva)),
+            ("bound delay-import table", library.bound_iat_rva),
+            ("unload delay-import table", library.unload_iat_rva),
+        ];
+        for first in 0..table_ranges.len() {
+            let Some(first_rva) = table_ranges[first].1 else {
+                continue;
+            };
+            for second in first + 1..table_ranges.len() {
+                let Some(second_rva) = table_ranges[second].1 else {
+                    continue;
+                };
+                if ranges_overlap(
+                    u64::from(first_rva),
+                    u64::from(table_size),
+                    u64::from(second_rva),
+                    u64::from(table_size),
+                )? {
+                    return invalid_field(
+                        "delay-import tables",
+                        format!(
+                            "{} overlaps {}",
+                            table_ranges[first].0, table_ranges[second].0
+                        ),
+                    );
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -1392,6 +1690,13 @@ fn parse_headers(reader: &Reader<'_>) -> Result<ParsedHeaders, AnalysisError> {
             TLS_DIRECTORY_INDEX,
             "TLS directory",
         )?,
+        delay_imports: read_directory(
+            reader,
+            optional_offset,
+            directory_count,
+            DELAY_IMPORT_DIRECTORY_INDEX,
+            "delay-import directory",
+        )?,
     };
     let debug_directory = read_directory(
         reader,
@@ -1534,6 +1839,7 @@ fn parse_imports(
     reader: &Reader<'_>,
     mapper: &RvaMap<'_>,
     directory: Option<DataDirectory>,
+    budget: &mut ImportBudget,
 ) -> Result<Vec<PeImportLibrary>, AnalysisError> {
     let Some(directory) = directory else {
         return Ok(Vec::new());
@@ -1549,15 +1855,13 @@ fn parse_imports(
     enforce_limit(
         "import-library descriptor",
         descriptor_count,
-        MAX_IMPORT_LIBRARIES,
+        MAX_IMPORT_DESCRIPTORS,
     )?;
     let directory_size = usize::try_from(directory.size)
         .map_err(|_| AnalysisError::IntegerConversion("import-directory size"))?;
     let directory_offset = mapper.offset(directory.rva, directory_size, "import directory")?;
 
     let mut libraries = Vec::new();
-    let mut total_symbols = 0_u64;
-    let mut total_name_bytes = 0_u64;
     let mut terminated = false;
     for index in 0..usize::try_from(descriptor_count)
         .map_err(|_| AnalysisError::IntegerConversion("import descriptor count"))?
@@ -1587,6 +1891,11 @@ fn parse_imports(
                 format!("descriptor {index} has a zero DLL-name or IAT RVA"),
             );
         }
+        consume_count_budget(
+            &mut budget.libraries,
+            "import library",
+            MAX_IMPORT_LIBRARIES,
+        )?;
         let name = mapper.c_string(name_rva, "import DLL name", MAX_STRING_BYTES)?;
         if name.is_empty() {
             return invalid_field(
@@ -1595,7 +1904,7 @@ fn parse_imports(
             );
         }
         consume_string_budget(
-            &mut total_name_bytes,
+            &mut budget.name_bytes,
             &name,
             "import-name byte",
             MAX_IMPORT_NAME_BYTES,
@@ -1605,14 +1914,8 @@ fn parse_imports(
         } else {
             original_first_thunk
         };
-        let entries = parse_import_thunks(
-            reader,
-            mapper,
-            lookup_table_rva,
-            first_thunk,
-            &mut total_symbols,
-            &mut total_name_bytes,
-        )?;
+        let entries =
+            parse_import_thunks(reader, mapper, lookup_table_rva, first_thunk, budget, false)?;
         let descriptor_delta = checked_u32_mul(
             u32::try_from(index)
                 .map_err(|_| AnalysisError::IntegerConversion("import descriptor index"))?,
@@ -1639,38 +1942,258 @@ fn parse_imports(
     Ok(libraries)
 }
 
+fn parse_delay_imports(
+    reader: &Reader<'_>,
+    mapper: &RvaMap<'_>,
+    directory: Option<DataDirectory>,
+    budget: &mut ImportBudget,
+) -> Result<Vec<PeDelayImportLibrary>, AnalysisError> {
+    let Some(directory) = directory else {
+        return Ok(Vec::new());
+    };
+    enforce_directory_size("delay-import-directory byte", directory.size)?;
+    if directory.size % DELAY_IMPORT_DESCRIPTOR_SIZE_U32 != 0 {
+        return invalid_field(
+            "delay-import directory size",
+            "must be a multiple of the 32-byte descriptor size",
+        );
+    }
+    let descriptor_count = u64::from(directory.size) / u64::from(DELAY_IMPORT_DESCRIPTOR_SIZE_U32);
+    enforce_limit(
+        "delay-import-library descriptor",
+        descriptor_count,
+        MAX_IMPORT_DESCRIPTORS,
+    )?;
+    let directory_size = usize::try_from(directory.size)
+        .map_err(|_| AnalysisError::IntegerConversion("delay-import-directory size"))?;
+    let directory_offset =
+        mapper.offset(directory.rva, directory_size, "delay-import directory")?;
+
+    let mut libraries = Vec::new();
+    let mut terminated = false;
+    for index in 0..usize::try_from(descriptor_count)
+        .map_err(|_| AnalysisError::IntegerConversion("delay-import descriptor count"))?
+    {
+        let offset = checked_add(
+            directory_offset,
+            checked_mul(
+                index,
+                DELAY_IMPORT_DESCRIPTOR_SIZE,
+                "delay-import-descriptor position",
+            )?,
+            "delay-import-descriptor offset",
+        )?;
+        let attributes = reader.u32(offset, "delay-import attributes")?;
+        let name_rva = reader.u32(offset + 4, "delay-import DLL-name RVA")?;
+        let module_handle_rva = reader.u32(offset + 8, "delay-import module-handle RVA")?;
+        let iat_rva = reader.u32(offset + 12, "delay-import address-table RVA")?;
+        let int_rva = reader.u32(offset + 16, "delay-import name-table RVA")?;
+        let bound_iat_rva = reader.u32(offset + 20, "bound delay-import table RVA")?;
+        let unload_iat_rva = reader.u32(offset + 24, "unload delay-import table RVA")?;
+        let timestamp = reader.u32(offset + 28, "delay-import timestamp")?;
+        if attributes == 0
+            && name_rva == 0
+            && module_handle_rva == 0
+            && iat_rva == 0
+            && int_rva == 0
+            && bound_iat_rva == 0
+            && unload_iat_rva == 0
+            && timestamp == 0
+        {
+            terminated = true;
+            continue;
+        }
+        if terminated {
+            return invalid_field(
+                "delay-import directory",
+                format!("descriptor {index} is nonzero after the null terminator"),
+            );
+        }
+        if attributes != DELAY_IMPORT_ATTRIBUTE_RVA {
+            return invalid_field(
+                "delay-import attributes",
+                format!(
+                    "descriptor {index} uses {attributes:#x}; only the modern dlattrRva value {DELAY_IMPORT_ATTRIBUTE_RVA:#x} is supported"
+                ),
+            );
+        }
+        if name_rva == 0 || module_handle_rva == 0 || iat_rva == 0 || int_rva == 0 {
+            return invalid_field(
+                "delay-import descriptor",
+                format!("descriptor {index} has a zero DLL-name, module-handle, IAT, or INT RVA"),
+            );
+        }
+        consume_count_budget(
+            &mut budget.libraries,
+            "import library",
+            MAX_IMPORT_LIBRARIES,
+        )?;
+        let name = mapper.c_string(name_rva, "delay-import DLL name", MAX_STRING_BYTES)?;
+        if name.is_empty() {
+            return invalid_field(
+                "delay-import DLL name",
+                format!("descriptor {index} has an empty name"),
+            );
+        }
+        consume_string_budget(
+            &mut budget.name_bytes,
+            &name,
+            "import-name byte",
+            MAX_IMPORT_NAME_BYTES,
+        )?;
+        let _ = mapper.offset(module_handle_rva, 8, "delay-import module-handle storage")?;
+        let entries = parse_import_thunks(reader, mapper, int_rva, iat_rva, budget, true)?;
+        let table_slots = entries
+            .len()
+            .checked_add(1)
+            .ok_or(AnalysisError::ArithmeticOverflow(
+                "delay-import auxiliary table slot count",
+            ))?;
+        let table_size = checked_mul(table_slots, 8, "delay-import auxiliary table byte size")?;
+        let iat_table_offset = mapper.offset(iat_rva, table_size, "delay-import address table")?;
+        let iat_table = reader.bytes(iat_table_offset, table_size, "delay-import address table")?;
+        for (table_rva, context) in [
+            (bound_iat_rva, "bound delay-import table"),
+            (unload_iat_rva, "unload delay-import table"),
+        ] {
+            if table_rva != 0 {
+                let table_offset = mapper.offset(table_rva, table_size, context)?;
+                let terminator_offset = checked_add(
+                    table_offset,
+                    checked_mul(
+                        entries.len(),
+                        8,
+                        "delay-import auxiliary terminator position",
+                    )?,
+                    "delay-import auxiliary terminator offset",
+                )?;
+                if reader.u64(terminator_offset, context)? != 0 {
+                    return invalid_field(context, "does not end at the matching thunk index");
+                }
+                if table_rva == unload_iat_rva
+                    && reader.bytes(table_offset, table_size, context)? != iat_table
+                {
+                    return invalid_field(
+                        "unload delay-import table",
+                        "must be an exact copy of the original delay IAT",
+                    );
+                }
+            }
+        }
+        let table_size = u64::try_from(table_size)
+            .map_err(|_| AnalysisError::IntegerConversion("delay-import table byte size"))?;
+        let table_ranges = [
+            ("delay-import INT", Some(int_rva)),
+            ("delay-import IAT", Some(iat_rva)),
+            (
+                "bound delay-import table",
+                (bound_iat_rva != 0).then_some(bound_iat_rva),
+            ),
+            (
+                "unload delay-import table",
+                (unload_iat_rva != 0).then_some(unload_iat_rva),
+            ),
+        ];
+        for first in 0..table_ranges.len() {
+            let Some(first_rva) = table_ranges[first].1 else {
+                continue;
+            };
+            for second in first + 1..table_ranges.len() {
+                let Some(second_rva) = table_ranges[second].1 else {
+                    continue;
+                };
+                if ranges_overlap(
+                    u64::from(first_rva),
+                    table_size,
+                    u64::from(second_rva),
+                    table_size,
+                )? {
+                    return invalid_field(
+                        "delay-import tables",
+                        format!(
+                            "{} overlaps {}",
+                            table_ranges[first].0, table_ranges[second].0
+                        ),
+                    );
+                }
+            }
+        }
+        let descriptor_delta = checked_u32_mul(
+            u32::try_from(index)
+                .map_err(|_| AnalysisError::IntegerConversion("delay-import descriptor index"))?,
+            DELAY_IMPORT_DESCRIPTOR_SIZE_U32,
+            "delay-import descriptor RVA",
+        )?;
+        libraries.push(PeDelayImportLibrary {
+            name,
+            descriptor_rva: checked_u32_add(
+                directory.rva,
+                descriptor_delta,
+                "delay-import descriptor RVA",
+            )?,
+            attributes,
+            name_rva,
+            module_handle_rva,
+            iat_rva,
+            int_rva,
+            bound_iat_rva: (bound_iat_rva != 0).then_some(bound_iat_rva),
+            unload_iat_rva: (unload_iat_rva != 0).then_some(unload_iat_rva),
+            timestamp,
+            entries,
+        });
+    }
+    if !terminated {
+        return Err(AnalysisError::MissingTerminator {
+            context: "delay-import directory",
+        });
+    }
+    Ok(libraries)
+}
+
 fn parse_import_thunks(
     reader: &Reader<'_>,
     mapper: &RvaMap<'_>,
     lookup_table_rva: u32,
     first_thunk_rva: u32,
-    total_symbols: &mut u64,
-    total_name_bytes: &mut u64,
+    budget: &mut ImportBudget,
+    require_iat_terminator: bool,
 ) -> Result<Vec<PeImport>, AnalysisError> {
     let mut entries = Vec::new();
     loop {
-        enforce_limit("import symbol", *total_symbols, MAX_IMPORT_SYMBOLS)?;
+        enforce_limit("import symbol", budget.symbols, MAX_IMPORT_SYMBOLS)?;
         let index = u32::try_from(entries.len())
             .map_err(|_| AnalysisError::IntegerConversion("import thunk index"))?;
         let delta = checked_u32_mul(index, 8, "import thunk position")?;
         let lookup_rva = checked_u32_add(lookup_table_rva, delta, "import lookup RVA")?;
         let iat_rva = checked_u32_add(first_thunk_rva, delta, "import IAT RVA")?;
         let lookup_offset = mapper.offset(lookup_rva, 8, "import lookup thunk")?;
-        let _ = mapper.offset(iat_rva, 8, "import address thunk")?;
+        let iat_offset = mapper.offset(iat_rva, 8, "import address thunk")?;
         let value = reader.u64(lookup_offset, "import lookup thunk")?;
+        let delay_iat_value = require_iat_terminator
+            .then(|| reader.u64(iat_offset, "delay-import IAT thunk"))
+            .transpose()?;
         if value == 0 {
+            if delay_iat_value.is_some_and(|value| value != 0) {
+                return invalid_field(
+                    "delay-import IAT terminator",
+                    "must be zero at the same index as the INT terminator",
+                );
+            }
             break;
         }
-        if *total_symbols == MAX_IMPORT_SYMBOLS {
-            return Err(AnalysisError::LimitExceeded {
-                kind: "import symbol",
-                count: (*total_symbols).saturating_add(1),
-                limit: MAX_IMPORT_SYMBOLS,
-            });
+        if delay_iat_value == Some(0) {
+            return invalid_field(
+                "delay-import IAT thunk",
+                "must be nonzero while the corresponding INT entry is present",
+            );
         }
-        *total_symbols = (*total_symbols)
-            .checked_add(1)
-            .ok_or(AnalysisError::ArithmeticOverflow("import-symbol count"))?;
+        consume_count_budget(&mut budget.symbols, "import symbol", MAX_IMPORT_SYMBOLS)?;
+        if !budget.iat_rvas.insert(iat_rva) {
+            return invalid_field(
+                "import IAT slot",
+                format!("RVA {iat_rva:#x} is claimed by more than one import entry"),
+            );
+        }
 
         let target = if value & IMPORT_BY_ORDINAL_64 != 0 {
             if value & 0x7fff_ffff_ffff_0000 != 0 {
@@ -1684,6 +2207,12 @@ fn parse_import_thunks(
                     .map_err(|_| AnalysisError::IntegerConversion("import ordinal"))?,
             }
         } else {
+            if value & 0x7fff_ffff_8000_0000 != 0 {
+                return invalid_field(
+                    "name import thunk",
+                    format!("reserved bits are set in {value:#018x}"),
+                );
+            }
             let hint_name_rva = u32::try_from(value).map_err(|_| AnalysisError::InvalidField {
                 field: "name import thunk",
                 reason: format!("RVA {value:#x} does not fit in 32 bits"),
@@ -1696,7 +2225,7 @@ fn parse_import_thunks(
                 return invalid_field("import symbol name", "must not be empty");
             }
             consume_string_budget(
-                total_name_bytes,
+                &mut budget.name_bytes,
                 &name,
                 "import-name byte",
                 MAX_IMPORT_NAME_BYTES,
@@ -3151,6 +3680,17 @@ fn enforce_string_length(kind: &'static str, value: &str) -> Result<(), Analysis
     let length = u64::try_from(value.len())
         .map_err(|_| AnalysisError::IntegerConversion("decoded string length"))?;
     enforce_limit(kind, length, MAX_STRING_CONTENT_BYTES)
+}
+
+fn consume_count_budget(
+    consumed: &mut u64,
+    kind: &'static str,
+    limit: u64,
+) -> Result<(), AnalysisError> {
+    *consumed = (*consumed)
+        .checked_add(1)
+        .ok_or(AnalysisError::ArithmeticOverflow("record count budget"))?;
+    enforce_limit(kind, *consumed, limit)
 }
 
 fn consume_string_budget(

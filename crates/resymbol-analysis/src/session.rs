@@ -925,7 +925,13 @@ fn import_iat_rvas(analysis: &BinaryAnalysis) -> BTreeSet<u64> {
         BinaryAnalysis::Pe(analysis) => analysis
             .imports
             .iter()
-            .flat_map(|library| library.entries.iter())
+            .flat_map(|library| &library.entries)
+            .chain(
+                analysis
+                    .delay_imports
+                    .iter()
+                    .flat_map(|library| &library.entries),
+            )
             .map(|entry| u64::from(entry.iat_rva))
             .collect(),
     }
