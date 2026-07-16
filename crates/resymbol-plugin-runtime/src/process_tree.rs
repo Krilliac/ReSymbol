@@ -3,7 +3,10 @@
 //! Unix children become leaders of a fresh process group before `exec`, so a
 //! single signal can terminate the leader and all descendants that remain in
 //! that group. Linux and macOS observe natural leader exit without reaping,
-//! keeping its process-group identifier reserved until group termination.
+//! keeping its process-group identifier reserved while group termination is
+//! attempted. XNU's zombie-only `EPERM` exception is resolved by relinquishing
+//! destructive authority, reaping the leader, and accepting only an `ESRCH`
+//! signal-zero proof that the group is absent.
 //! Windows children are assigned to a kill-on-close Job Object.
 //! Windows' ordinary [`Command::spawn`] API cannot create a process already
 //! suspended inside a job, so there is an unavoidable spawn-to-assignment race
@@ -14,6 +17,8 @@ use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitSta
 
 #[cfg(target_os = "macos")]
 use kqueue::{Event, EventData, EventFilter, FilterFlag, Ident, Proc, Watcher};
+#[cfg(target_os = "macos")]
+use rustix::process::test_kill_process_group;
 #[cfg(target_os = "linux")]
 use rustix::process::{WaitId, WaitIdOptions, waitid};
 #[cfg(unix)]
@@ -40,6 +45,8 @@ pub(crate) struct ContainedChild {
     process_group: Option<Pid>,
     #[cfg(target_os = "macos")]
     exit_observation: MacOsExitObservation,
+    #[cfg(target_os = "macos")]
+    terminal_containment_error: Option<MacOsContainmentError>,
     #[cfg(windows)]
     job: Option<Job>,
 }
@@ -82,6 +89,8 @@ impl ContainedChild {
                 process_group: Some(process_group),
                 #[cfg(target_os = "macos")]
                 exit_observation,
+                #[cfg(target_os = "macos")]
+                terminal_containment_error: None,
             })
         }
 
@@ -135,10 +144,14 @@ impl ContainedChild {
     ///
     /// Linux uses `waitid(WNOWAIT)` and macOS uses a pre-registered kqueue
     /// `NOTE_EXIT` filter to observe exit without reaping. Both platforms
-    /// terminate the still-stable containment boundary before collecting the
-    /// direct child's status, so its process-group identifier cannot be reused
-    /// by an unrelated process during cleanup.
+    /// normally terminate the still-stable containment boundary before collecting
+    /// the direct child's status. macOS handles XNU's zombie-only `EPERM` by first
+    /// relinquishing destructive authority, reaping, and then requiring an `ESRCH`
+    /// absence proof, so a recycled identifier is never signaled destructively.
     pub(crate) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        #[cfg(target_os = "macos")]
+        self.check_terminal_containment_error()?;
+
         if let Some(status) = self.direct_child_status {
             return Ok(Some(status));
         }
@@ -169,9 +182,14 @@ impl ContainedChild {
 
     /// Waits for and returns the direct child's exit status.
     ///
-    /// Linux and macOS retain the exited leader until the containment boundary
-    /// has been terminated, preventing process-group identifier reuse.
+    /// Linux and macOS retain the exited leader while terminating the containment
+    /// boundary. macOS' `EPERM` fallback clears destructive group authority before
+    /// reaping and reports an error unless the now-non-destructive probe proves
+    /// the group absent.
     pub(crate) fn wait(&mut self) -> io::Result<ExitStatus> {
+        #[cfg(target_os = "macos")]
+        self.check_terminal_containment_error()?;
+
         if let Some(status) = self.direct_child_status {
             return Ok(status);
         }
@@ -213,7 +231,7 @@ impl ContainedChild {
     }
 
     /// Terminates the still-stable containment boundary, then reaps its leader.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     fn reap_observed_direct_child(&mut self) -> io::Result<ExitStatus> {
         self.terminate()?;
         let status = self.child.wait()?;
@@ -221,25 +239,105 @@ impl ContainedChild {
         Ok(status)
     }
 
-    /// Requests immediate termination of the entire contained process tree.
-    ///
-    /// Calling this method repeatedly is harmless. It initiates termination but
-    /// deliberately leaves direct-child reaping to [`Self::wait`] or `Drop`.
-    pub(crate) fn terminate(&mut self) -> io::Result<()> {
-        #[cfg(unix)]
-        let containment_result = match self.process_group {
+    /// Resolves XNU's zombie-only process-group `EPERM` without accepting a live descendant.
+    #[cfg(target_os = "macos")]
+    fn reap_observed_direct_child(&mut self) -> io::Result<ExitStatus> {
+        let Some(process_group) = self.process_group else {
+            let status = self.child.wait()?;
+            self.direct_child_status = Some(status);
+            return Ok(status);
+        };
+
+        match kill_process_group(process_group, Signal::KILL) {
+            Ok(()) | Err(Errno::SRCH) => {
+                // Signal delivery succeeded or the group was already absent. Forget the identifier
+                // before reaping so no later call can target a recycled process group.
+                let _ = self.process_group.take();
+                let status = self.child.wait()?;
+                self.direct_child_status = Some(status);
+                Ok(status)
+            }
+            Err(Errno::PERM) => {
+                // XNU excludes zombie members from process-group signal delivery. A group whose
+                // only member is the observed-but-unreaped leader therefore reports EPERM. Clear
+                // destructive authority before reaping, then use signal 0 solely to prove absence;
+                // a recycled identifier can only produce a safe false failure at that point.
+                let _ = self.process_group.take();
+                let status = match self.child.wait() {
+                    Ok(status) => {
+                        self.direct_child_status = Some(status);
+                        status
+                    }
+                    Err(error) => {
+                        let error = io::Error::new(
+                            error.kind(),
+                            format!(
+                                "failed to reap the observed macOS process-group leader after kill returned EPERM: {error}"
+                            ),
+                        );
+                        return Err(self.remember_terminal_containment_error(error));
+                    }
+                };
+
+                if let Err(error) =
+                    require_macos_process_group_absent(test_kill_process_group(process_group))
+                {
+                    let error = io::Error::new(
+                        error.kind(),
+                        format!(
+                            "macOS process-group kill returned EPERM and absence could not be proven for {process_group:?}: {error}"
+                        ),
+                    );
+                    return Err(self.remember_terminal_containment_error(error));
+                }
+                Ok(status)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn check_terminal_containment_error(&self) -> io::Result<()> {
+        match &self.terminal_containment_error {
+            Some(error) => Err(error.to_io_error()),
+            None => Ok(()),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn remember_terminal_containment_error(&mut self, error: io::Error) -> io::Error {
+        let error = MacOsContainmentError::from_io_error(error);
+        let returned = error.to_io_error();
+        self.terminal_containment_error = Some(error);
+        returned
+    }
+
+    #[cfg(unix)]
+    fn terminate_containment_group(&mut self) -> io::Result<()> {
+        match self.process_group {
             None => Ok(()),
             Some(process_group) => match terminate_process_group(process_group) {
                 Ok(()) => {
-                    // Process-group identifiers can eventually be recycled.
-                    // Forget the group after a conclusive result so Drop or a
-                    // repeated caller cannot signal an unrelated future group.
+                    // Process-group identifiers can eventually be recycled. Forget the group after
+                    // a conclusive result so a repeated caller cannot signal an unrelated group.
                     self.process_group = None;
                     Ok(())
                 }
                 Err(error) => Err(error),
             },
-        };
+        }
+    }
+
+    /// Requests immediate termination of the entire contained process tree.
+    ///
+    /// Calling this method repeatedly is harmless. It initiates termination but
+    /// deliberately leaves direct-child reaping to [`Self::wait`] or `Drop`.
+    pub(crate) fn terminate(&mut self) -> io::Result<()> {
+        #[cfg(target_os = "macos")]
+        self.check_terminal_containment_error()?;
+
+        #[cfg(unix)]
+        let containment_result = self.terminate_containment_group();
 
         #[cfg(windows)]
         let containment_result = {
@@ -265,6 +363,27 @@ impl Drop for ContainedChild {
     fn drop(&mut self) {
         let _ = self.terminate();
         let _ = self.child.wait();
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+struct MacOsContainmentError {
+    kind: io::ErrorKind,
+    message: String,
+}
+
+#[cfg(target_os = "macos")]
+impl MacOsContainmentError {
+    fn from_io_error(error: io::Error) -> Self {
+        Self {
+            kind: error.kind(),
+            message: error.to_string(),
+        }
+    }
+
+    fn to_io_error(&self) -> io::Error {
+        io::Error::new(self.kind, self.message.clone())
     }
 }
 
@@ -386,6 +505,23 @@ fn terminate_process_group(process_group: Pid) -> io::Result<()> {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn require_macos_process_group_absent(result: rustix::io::Result<()>) -> io::Result<()> {
+    match result {
+        Err(Errno::SRCH) => Ok(()),
+        Ok(()) => Err(io::Error::other(
+            "process group still exists after its observed leader was reaped",
+        )),
+        Err(error) => {
+            let error: io::Error = error.into();
+            Err(io::Error::new(
+                error.kind(),
+                format!("process-group absence probe failed: {error}"),
+            ))
+        }
+    }
+}
+
 fn terminate_direct_child(child: &mut Child) -> io::Result<()> {
     match child.kill() {
         Ok(()) => Ok(()),
@@ -472,15 +608,17 @@ fn append_cleanup_errors(
 mod tests {
     use super::ContainedChild;
     #[cfg(target_os = "macos")]
-    use super::classify_macos_exit_event;
+    use super::{classify_macos_exit_event, require_macos_process_group_absent};
     #[cfg(target_os = "macos")]
     use kqueue::{Event, EventData, Ident, Proc};
+    #[cfg(target_os = "macos")]
+    use rustix::io::Errno;
     use std::io;
     use std::process::{Command, Stdio};
     #[cfg(target_os = "macos")]
     use std::thread;
     #[cfg(target_os = "macos")]
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     #[test]
     fn preserves_direct_leader_status_and_termination_is_idempotent() -> io::Result<()> {
@@ -541,6 +679,87 @@ mod tests {
             assert_eq!(status.code(), Some(37));
             assert_eq!(child.wait()?.code(), Some(37));
         }
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_group_absence_requires_esrch() {
+        assert!(require_macos_process_group_absent(Err(Errno::SRCH)).is_ok());
+        assert!(require_macos_process_group_absent(Ok(())).is_err());
+        assert!(require_macos_process_group_absent(Err(Errno::PERM)).is_err());
+        assert!(require_macos_process_group_absent(Err(Errno::INVAL)).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_terminal_containment_error_stays_sticky_after_status_is_cached() -> io::Result<()> {
+        let mut command = exit_command(0);
+        let mut child = ContainedChild::spawn(&mut command)?;
+        let _ = child.process_group.take();
+        let status = child.child.wait()?;
+        child.direct_child_status = Some(status);
+
+        let expected = "synthetic terminal containment failure";
+        let first = child.remember_terminal_containment_error(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            expected,
+        ));
+        assert_eq!(first.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(first.to_string(), expected);
+
+        let wait_error = child
+            .wait()
+            .expect_err("cached status must not mask the error");
+        assert_eq!(wait_error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(wait_error.to_string(), expected);
+        let poll_error = child
+            .try_wait()
+            .expect_err("polling must preserve the terminal containment error");
+        assert_eq!(poll_error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(poll_error.to_string(), expected);
+        let terminate_error = child
+            .terminate()
+            .expect_err("termination must preserve the terminal containment error");
+        assert_eq!(terminate_error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(terminate_error.to_string(), expected);
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_observed_leader_exit_kills_live_same_group_descendant() -> io::Result<()> {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let marker = std::env::temp_dir().join(format!(
+            "resymbol-process-tree-{}-{nonce}.marker",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&marker);
+
+        let mut command = Command::new("sh");
+        command
+            .args([
+                "-c",
+                "trap '' HUP TERM; (sleep 0.25; printf leaked > \"$1\") & exit 0",
+                "resymbol-process-tree",
+            ])
+            .arg(&marker)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = ContainedChild::spawn(&mut command)?;
+        assert!(child.wait()?.success());
+
+        thread::sleep(Duration::from_millis(500));
+        let descendant_survived = marker.exists();
+        let _ = std::fs::remove_file(&marker);
+        assert!(
+            !descendant_survived,
+            "same-group descendant survived observed-leader cleanup"
+        );
         Ok(())
     }
 
