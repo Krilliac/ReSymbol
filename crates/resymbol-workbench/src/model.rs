@@ -5,10 +5,12 @@
 //! records, but never reconciles claims independently or reorders the canonical
 //! projection.
 
+#[cfg(feature = "screenshot")]
+use std::path::Path;
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::Arc,
 };
 
@@ -266,6 +268,7 @@ pub struct LoadedProject {
 
 impl LoadedProject {
     /// Read and analyze an exact binary through the bounded application service.
+    #[cfg(feature = "screenshot")]
     pub fn from_path(path: impl AsRef<Path>) -> Result<Self, ModelError> {
         let snapshot = AppServices::default().analyze_binary(path)?;
         Self::from_snapshot(snapshot)

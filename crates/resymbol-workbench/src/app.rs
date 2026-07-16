@@ -13,9 +13,7 @@ use resymbol_core::{
     DiscoveredPlugin, PluginDiscoveryOptions, PluginDiscoveryReport, discover_plugins,
     plugin_api::PluginHealthState,
 };
-use resymbol_debugger::{
-    EvidenceStrength, MemoryAccess, ProtectionEvidence, ProtectionSeverity, StaticRegionKind,
-};
+use resymbol_debugger::{MemoryAccess, ProtectionSeverity, StaticRegionKind};
 use resymbol_export::{ExportControlFlowTarget, ExportProducer};
 use serde::{Deserialize, Serialize};
 
@@ -3023,85 +3021,6 @@ fn protection_severity_visual(
         ProtectionSeverity::Notice => ("NOTICE", colors.inferred),
         ProtectionSeverity::Warning => ("WARNING", colors.warning_conflict),
         ProtectionSeverity::High => ("HIGH", colors.destructive_quarantined),
-    }
-}
-
-fn protection_strength_label(strength: EvidenceStrength) -> &'static str {
-    match strength {
-        EvidenceStrength::ExactArtifact => "exact artifact",
-        EvidenceStrength::StrongHeuristic => "strong heuristic",
-        EvidenceStrength::Heuristic => "heuristic",
-    }
-}
-
-fn protection_evidence_text(evidence: &ProtectionEvidence) -> String {
-    match evidence {
-        ProtectionEvidence::Import {
-            library,
-            function,
-            iat_rva,
-            delayed,
-        } => format!(
-            "{}!{} at IAT RVA 0x{iat_rva:08X}{}",
-            library,
-            function,
-            if *delayed { " (delay import)" } else { "" }
-        ),
-        ProtectionEvidence::Section {
-            table_index,
-            name,
-            rva,
-            size,
-            characteristics,
-        } => format!(
-            "section #{table_index} {name} RVA 0x{rva:08X}+0x{size:X}, characteristics 0x{characteristics:08X}"
-        ),
-        ProtectionEvidence::EntropySample {
-            table_index,
-            name,
-            sample_bytes,
-            entropy_millibits_per_byte,
-        } => format!(
-            "section #{table_index} {name}, {sample_bytes} sampled bytes, entropy {:.3} bits/byte",
-            f32::from(*entropy_millibits_per_byte) / 1000.0
-        ),
-        ProtectionEvidence::EntryPoint {
-            rva,
-            section_index,
-            section_name,
-        } => format!("entry RVA 0x{rva:08X} in section #{section_index} {section_name}"),
-        ProtectionEvidence::EntryPointLocation {
-            rva,
-            section_index,
-            section_name,
-            file_backed,
-            executable,
-        } => {
-            let section = match (section_index, section_name) {
-                (Some(index), Some(name)) => format!("section #{index} {name}"),
-                _ => "no mapped section".to_owned(),
-            };
-            format!(
-                "entry RVA 0x{rva:08X} in {section}; {} file backing; {}",
-                if *file_backed { "has" } else { "no" },
-                if *executable {
-                    "executable"
-                } else {
-                    "not executable"
-                }
-            )
-        }
-        ProtectionEvidence::TlsCallback {
-            table_index,
-            callback_rva,
-        } => format!("TLS callback #{table_index} at RVA 0x{callback_rva:08X}"),
-        ProtectionEvidence::TlsCallbackCoverage {
-            retained_callbacks,
-            truncated,
-        } => format!(
-            "{retained_callbacks} TLS callbacks retained{}",
-            if *truncated { "; scan truncated" } else { "" }
-        ),
     }
 }
 
