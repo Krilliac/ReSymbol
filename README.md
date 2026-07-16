@@ -365,6 +365,12 @@ current `.resym` packages and creates new `.resym`, neutral JSON, Markdown, MAP,
 IDA Python, or Ghidra Java artifacts. It does not execute plugins, migrate legacy packages, or
 overwrite an output or review-sidecar file.
 
+The main review views stay on one responsive tab row at the default viewport and collapse into an
+explicit all-view selector at the documented minimum size. Use **Ctrl+Tab** or
+**Ctrl+Shift+Tab** to cycle views, **Ctrl+F** to focus Function search, and **Up/Down**,
+**Page Up/Page Down**, **Home**, or **End** to move through the current filtered and sorted Function
+rows. Keyboard focus has a separate outline from the selected-row fill.
+
 The optional companion console starts only when **View -> Companion console** is checked. It mirrors
 timestamped workbench activity and accepts `help`, `status`, `open`, `tab`, `focus`, `theme`,
 `panel`, `reset-layout`, `export`, and `quit`. Closing or disabling that helper does not close the

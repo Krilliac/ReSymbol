@@ -7,13 +7,24 @@ its opt-in `screenshot` feature, disables persisted window state and animation, 
 pointer state, sets a fixed native viewport and UI zoom, waits for the workbench panels to settle,
 and then uses egui's next-frame screenshot event. The screenshot build disables eframe's normal
 monitor-size clamp so a smaller hosted-runner desktop cannot shrink the framebuffer. Every PNG must
-be exactly 1440x900 pixels.
+be exactly 1440x900 pixels in the default reference run.
 
 On Windows, regenerate the views with:
 
 ```powershell
 ./tools/capture-workbench.ps1
 ```
+
+For the focused keyboard layout at the documented minimum viewport, write a disposable capture with:
+
+```powershell
+./tools/capture-workbench.ps1 -OutputDirectory ./target/workbench-minimum `
+  -CaptureWidth 1024 -CaptureHeight 680 -CaptureTabs functions-focused
+```
+
+`-CaptureTabs` accepts any supported subset, while `-CaptureWidth` and `-CaptureHeight` retain exact
+framebuffer validation. Custom dimensions or interaction scenarios should use a disposable output
+directory; they do not replace the default checked-in reference set.
 
 The default output directory is `docs/images`. Use `-OutputDirectory <path>` for disposable review
 artifacts or `-SkipBuild` after explicitly building
@@ -38,11 +49,12 @@ every PNG whose bytes changed. A manually replaced individual image or manifest-
 complete reference refresh; byte-identical regenerated images do not need new Git objects.
 
 The Windows visual-review workflow runs for relevant crate, fixture, capture-tool, and Rust
-dependency changes. It regenerates the same five views into a temporary directory, validates PNG
-format, exact dimensions, completeness, and manifest metadata, and uploads the files for three days
-with PNG recompression disabled. CI deliberately does not compare those pixels with `docs/images`,
-so a passing job proves capture integrity—not rendering equivalence. The generated artifact remains
-available for human comparison with the checked-in references.
+dependency changes. It regenerates the same five standard views plus a separate focused Functions
+view at 1024x680, validates PNG format, each scenario's exact dimensions, completeness, and manifest
+metadata, and uploads the files for three days with PNG recompression disabled. CI deliberately does
+not compare those pixels with `docs/images`, so a passing job proves capture integrity—not rendering
+equivalence. The generated artifact remains available for human comparison with the checked-in
+references.
 
 GitHub's hosted Windows runner uses a SHA-256-pinned Mesa llvmpipe build placed beside the capture
 binary for that job only. This supplies a deterministic software OpenGL implementation without a

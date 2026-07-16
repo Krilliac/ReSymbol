@@ -2,6 +2,12 @@
 param(
     [string]$Binary,
     [string]$OutputDirectory,
+    [ValidateRange(640, 3840)]
+    [int]$CaptureWidth = 1440,
+    [ValidateRange(480, 2160)]
+    [int]$CaptureHeight = 900,
+    [ValidateSet('overview', 'functions', 'functions-focused', 'graph', 'address-space', 'debugger-sandbox')]
+    [string[]]$CaptureTabs = @('overview', 'functions', 'graph', 'address-space', 'debugger-sandbox'),
     [switch]$SkipBuild,
     [ValidateRange(10, 600)]
     [int]$CaptureTimeoutSeconds = 90
@@ -10,9 +16,6 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-$captureWidth = 1440
-$captureHeight = 900
-$captureTabs = @('overview', 'functions', 'graph', 'address-space', 'debugger-sandbox')
 $maxCapturedProcessLogChars = 16 * 1024
 $captureTerminationTimeoutMilliseconds = 5 * 1000
 
@@ -31,6 +34,23 @@ function Write-BoundedCaptureProcessLog {
         $Value = $Value.Substring(0, $maxCapturedProcessLogChars) + "`n[output truncated]"
     }
     Write-Host "$Label`n$Value"
+}
+
+function Resolve-CargoTargetDirectory {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RepoRoot
+    )
+
+    if ([string]::IsNullOrWhiteSpace($env:CARGO_TARGET_DIR)) {
+        return [IO.Path]::GetFullPath((Join-Path $RepoRoot 'target'))
+    }
+
+    $candidate = $env:CARGO_TARGET_DIR
+    if (-not [IO.Path]::IsPathRooted($candidate)) {
+        $candidate = Join-Path $RepoRoot $candidate
+    }
+    return [IO.Path]::GetFullPath($candidate)
 }
 
 if (-not ('ReSymbol.WorkbenchCaptureDpi' -as [type])) {
@@ -74,6 +94,7 @@ $viewportPoints = '{0},{1}' -f @(
 $uiZoomText = $uiZoom.ToString('R', $invariant)
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
+$cargoTargetDirectory = Resolve-CargoTargetDirectory -RepoRoot $repoRoot
 if (-not $Binary) {
     $Binary = Join-Path $repoRoot 'fixtures\pe-x64-msvc\artifacts\milestone2-symbolized.exe'
 }
@@ -97,7 +118,7 @@ try {
         }
     }
 
-    $executable = Join-Path $repoRoot 'target\debug\resymbol-workbench.exe'
+    $executable = Join-Path $cargoTargetDirectory 'debug\resymbol-workbench.exe'
     if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) {
         throw "Screenshot executable does not exist: $executable"
     }

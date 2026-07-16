@@ -585,6 +585,12 @@ closes the session, releases it, and disconnects before returning a result. The 
 result only when its operation, full identity, canonical verified source, span, and lifecycle receipt
 still match. It displays exact SHA-256 binary identity and read-only plugin health. Graphite, Light,
 IDA-inspired, and Classic Debugger are persisted theme presets; arbitrary docking is not implemented.
+The responsive shell keeps all main views on one compact row at the default viewport and uses one
+explicit all-view selector at the documented minimum. Its pure policy also compacts identity and
+activity chrome at minimum height so the central row viewport remains usable. Main-view cycling,
+Function-search focus, and stable filtered/sorted Function-row movement are reduced on the GUI event
+loop; the pure layout and navigation policy owns no widgets, worker resources, project data, or
+mutable selection state.
 
 The Reconstruction Graph is a read-only projection of retained analysis, not a second analyzer or a
 claim of complete call-graph recovery. It roots at the PE entry point when that point is available as
