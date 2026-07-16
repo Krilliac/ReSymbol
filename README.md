@@ -292,8 +292,9 @@ ReSymbol is growing from the working PE/package foundation toward:
 
 See the [changelog](CHANGELOG.md), [analysis-package format](docs/analysis-packages.md),
 [export guide](docs/exporting.md), [architecture](docs/architecture.md),
-[plugin-system design](docs/plugin-system.md), [GUI design](docs/gui-design.md), and
-[roadmap](docs/roadmap.md) for implemented boundaries, release-facing changes, and remaining goals.
+[plugin-system design](docs/plugin-system.md), [GUI design](docs/gui-design.md),
+[visual-capture guide](docs/visual-regression.md), and [roadmap](docs/roadmap.md) for implemented
+boundaries, release-facing changes, and remaining goals.
 
 ## Product principles
 
