@@ -39,7 +39,9 @@ The backend-neutral debugger foundation now includes strict bounded framing, typ
 command-specific reducers, one-use authorization leases, exact attestation/cleanup evidence models,
 a single-owner host-client seam, and a read-only provider-readiness service. The feature-gated
 synthetic host supports only test/offline open-close mechanics and reports no platform capability.
-Its plaintext build-claim exchange detects protocol mismatch and replay but does not authenticate a
+The production in-process `OfflineImageDebugHost` owns only a retained identity-verified source
+snapshot; the Workbench exposes it as bounded exact-RVA reads on the application-service worker.
+The plaintext build-claim exchange detects protocol mismatch and replay but does not authenticate a
 peer or process. No live Windows host transport, AppContainer/Hyper-V provider, target execution,
 attach, breakpoint, register, or process-memory service is implemented.
 

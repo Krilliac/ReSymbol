@@ -222,15 +222,16 @@ The current seam is intentionally narrow:
   held. A cleanup-stage retained rejection additionally requires exactly one validated
   `CleanupAttemptFailed` event carrying its incomplete receipt. Every rejected command still
   consumes its command identifier and any presented one-use authority;
-- the audited controller and host-client path uses a public-but-opaque, move-only remote-command
-  transaction ticket bound to the exact reducer instance, command ID, and post-accept state; future
-  external helper or provider crates must preserve the same contract. Exactly one transaction may
-  be active. Dropping or forgetting its ticket leaves that reducer permanently pending and
-  fail-closed; it never implies rollback. An effect-free rejection restores the exact pre-command
-  state token, so the next visible state generation remains wire-contiguous. A host must validate
-  the complete remote evidence before explicitly committing successful or cleanup-required
-  effects. Stale, foreign, mismatched, already-resolved, and post-effect rollback attempts fail
-  closed; command, run/stop, and one-use authorization watermarks remain consumed;
+- the audited controller and host-client path uses the public-but-opaque, move-only
+  `RemoteCommandCheckpoint`, bound to the exact reducer instance, command ID, and post-accept state;
+  future external helper or provider crates must preserve the same transaction boundary. Exactly one
+  transaction may be active. Dropping or forgetting its checkpoint leaves that reducer permanently
+  pending and fail-closed; it never implies rollback. An effect-free rejection restores the exact
+  pre-command visible state and state token; its speculative generation never becomes wire-visible,
+  so the next accepted transition remains exactly +1. A host must validate the complete remote
+  evidence before explicitly committing successful or cleanup-required effects. Stale, foreign,
+  mismatched, already-resolved, and post-effect rollback attempts fail closed; command, run/stop, and
+  one-use authorization watermarks remain consumed;
 - failure, attestation, and cleanup events are bound both to the outer event session and to the
   reducer's exact binary or inherited process, policy, provider, helper build, provisioning epoch,
   and cleanup expectation before failure can be retained or `Closed` can be accepted and released;
@@ -267,6 +268,22 @@ The current seam is intentionally narrow:
   never imply cleanup or synthesize `Closed`; and
 - the client and transport expose value types only. Future process, pipe, token, Job, VM, and provider
   handles stay opaque inside the owning host implementation.
+
+### Sandbox failure acceptance matrix
+
+The client validates both the failure kind and the exact reducer phase before accepting a rejected
+command. Policy and discovery are the only effect-free rollback stages; every other accepted failure
+retains the observed command-state transition and, where applicable, sandbox cleanup ownership.
+
+| Stage | Allowed kinds | Required command and observed phase |
+| --- | --- | --- |
+| Policy | `InvalidPolicy`, `ProtocolViolation` | Sandboxed `Open` at the exact accepted `Opening` / `Provisioning` post-state, with no command-state event, attestation, or operation effect. |
+| Discovery | `ProviderUnavailable`, `HelperFailure`, `ProtocolViolation` | Sandboxed `Open` under the same effect-free rollback conditions as Policy. |
+| Provisioning | `ProviderUnavailable`, `ResourceLimitReached`, `HelperFailure`, `ProtocolViolation` | Sandboxed `Open` after its state event, still exactly `Opening` / `Provisioning`, before attestation. |
+| Attestation | `AttestationRejected`, `HelperFailure`, `ProtocolViolation` | Sandboxed `Open` after its state event at `AwaitingAttestation` / `TargetCreatedSuspended`, before an accepted attestation. |
+| Launch | `LaunchDenied`, `ResourceLimitReached`, `HelperFailure`, `ProtocolViolation` | Sandboxed `Open` after its state event, either at `Opening` / `Provisioning` before attestation or at the exact accepted-attestation phase with matching evidence. |
+| Runtime | `ResourceLimitReached`, `HelperFailure`, `ProtocolViolation` | The command-specific observed phase: sandboxed open after attestation, inherited-sandbox open, running `Continue` / `Step`, pausing `Pause`, or closing `Terminate`. |
+| Cleanup | `CleanupIncomplete` | `Close` or `Terminate` after its state event at `Closing` / `Cleanup` (or the inherited equivalent), with exactly one matching `CleanupAttemptFailed` event and incomplete receipt. |
 
 The JSON typed-control codec retains the 64 KiB control ceiling. Memory-write pairs and memory-read or
 memory-written event buffers are carried exactly once through the separately bounded raw channel, with

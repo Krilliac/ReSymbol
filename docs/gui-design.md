@@ -127,10 +127,11 @@ allocations, loaded modules, guard pages, or changed page protections have been 
 
 When the active project retains an exact verified source snapshot, this tab also offers a bounded
 RVA byte reader. The application-service worker creates a one-shot in-process
-`OfflineImageDebugHost`, verifies its complete offline-only capability report, opens the exact
-canonical source, reads 16, 32, 64, 128, or 256 bytes, then closes, releases, and disconnects before
-publishing the result. The UI accepts it only when the monotonic operation, full binary identity,
-canonical source path, requested span, and completed lifecycle still match the current project.
+`OfflineImageDebugHost`, verifies its complete offline-only capability report, opens a session
+against the exact canonical `OfflineTarget` backed by the retained source snapshot, reads 16, 32,
+64, 128, or 256 bytes, then closes, releases, and disconnects before publishing the result. The UI
+accepts it only when the monotonic operation, full binary identity, canonical source path, requested
+span, and completed lifecycle still match the current project.
 File gaps, zero-fill, loader padding, raw tails, and crossing spans are shown as typed unavailability;
 package-only projects remain **SOURCE REQUIRED**. This is a frozen-source hex preview, not
 disassembly, a process-memory view, or a sandbox operation.

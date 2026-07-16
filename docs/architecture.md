@@ -570,13 +570,13 @@ export crates. The workbench does not fork reconciliation or identity rules from
 
 The initial shell implements the approved four-region structure: persistent, resizable and
 collapsible project/plugin navigation, a virtualized sortable/filterable function table, a bounded
-Reconstruction Graph, a static Address Space/protection view with a worker-owned 256-byte exact-RVA
-reader, a non-executing Debugger / Sandbox readiness view, an evidence inspector, and a
-progress/warning/log area. The reader constructs and closes one in-process offline client per request
-and accepts a result only when its operation, full identity, canonical verified source, span, and
-lifecycle receipt still match. The shell displays exact SHA-256 binary identity and read-only plugin
-health. Graphite, Light, IDA-inspired, and Classic Debugger are persisted theme presets; arbitrary
-docking is not implemented.
+Reconstruction Graph, a static Address Space/protection view with an at-most-256-byte worker-owned
+exact-RVA reader, a non-executing Debugger / Sandbox readiness view, an evidence inspector, and a
+progress/warning/log area. The reader constructs one in-process offline client per request, then
+closes the session, releases it, and disconnects before returning a result. The shell accepts that
+result only when its operation, full identity, canonical verified source, span, and lifecycle receipt
+still match. It displays exact SHA-256 binary identity and read-only plugin health. Graphite, Light,
+IDA-inspired, and Classic Debugger are persisted theme presets; arbitrary docking is not implemented.
 
 The Reconstruction Graph is a read-only projection of retained analysis, not a second analyzer or a
 claim of complete call-graph recovery. It roots at the PE entry point when that point is available as
