@@ -4320,6 +4320,13 @@ impl WorkbenchApp {
 
 impl eframe::App for WorkbenchApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg(feature = "screenshot")]
+        context.input_mut(|input| {
+            // Visual captures are evidence artifacts, not interactive sessions. Discard the
+            // host cursor before laying out widgets so hover highlights and scrollbar handles
+            // cannot make otherwise identical captures depend on its desktop position.
+            input.pointer = egui::PointerState::default();
+        });
         self.preferences.theme.apply(context);
         self.poll_console(context);
         self.poll_service_worker(context);

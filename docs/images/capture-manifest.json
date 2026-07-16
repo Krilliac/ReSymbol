@@ -35,8 +35,8 @@
                          "view":  "graph",
                          "width":  1440,
                          "height":  900,
-                         "bytes":  260539,
-                         "sha256":  "8c2ea17b88172160013f64f5f426780c232f49451a4ce9c060dfab5153a48333"
+                         "bytes":  257425,
+                         "sha256":  "feaffd00543dd5d91a707dff0677fc62af7116642761d0f747b08a79edf23152"
                      },
                      {
                          "file":  "workbench-address-space.png",
