@@ -1562,6 +1562,51 @@ fn analyzes_minimal_pe_with_imports_exports_and_runtime_functions() {
 }
 
 #[test]
+fn rejects_noncanonical_section_order_while_parsing_exact_bytes() {
+    let mut reversed_rvas = rtti_fixture();
+    put_u32(&mut reversed_rvas, SECTION_OFFSET + 12, RTTI_RDATA_RVA);
+    put_u32(&mut reversed_rvas, SECTION_OFFSET + 40 + 12, RTTI_TEXT_RVA);
+    assert!(matches!(
+        analyze_pe(&reversed_rvas),
+        Err(AnalysisError::InvalidField {
+            field: "section table order",
+            ..
+        })
+    ));
+
+    let mut reversed_raw_data = rtti_fixture();
+    put_u32(&mut reversed_raw_data, SECTION_OFFSET + 20, 0x600);
+    put_u32(&mut reversed_raw_data, SECTION_OFFSET + 40 + 20, 0x200);
+    assert!(matches!(
+        analyze_pe(&reversed_raw_data),
+        Err(AnalysisError::InvalidField {
+            field: "section raw-data order",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn validated_deserialization_rejects_noncanonical_section_order() {
+    let analysis = analyze_pe(&rtti_fixture()).expect("valid ordered RTTI fixture");
+    let original = serde_json::to_value(analysis).expect("serialize ordered analysis");
+
+    let mut reversed_rvas = original.clone();
+    reversed_rvas["sections"][0]["virtual_address"] = serde_json::json!(RTTI_RDATA_RVA);
+    reversed_rvas["sections"][1]["virtual_address"] = serde_json::json!(RTTI_TEXT_RVA);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(reversed_rvas)
+        .expect_err("persisted section headers must remain in RVA order");
+    assert!(error.to_string().contains("section table order"));
+
+    let mut reversed_raw_data = original;
+    reversed_raw_data["sections"][0]["raw_data_offset"] = serde_json::json!(0x600);
+    reversed_raw_data["sections"][1]["raw_data_offset"] = serde_json::json!(0x200);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(reversed_raw_data)
+        .expect_err("persisted section data must remain in RVA-corresponding file order");
+    assert!(error.to_string().contains("section raw-data order"));
+}
+
+#[test]
 fn parses_modern_delay_imports_alongside_normal_imports() {
     let analysis = analyze_pe(&delay_import_fixture()).expect("valid modern delay imports");
 

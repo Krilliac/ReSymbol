@@ -837,6 +837,7 @@ pub(crate) fn validate_pe_analysis(analysis: &PeAnalysis) -> Result<(), Analysis
             );
         }
     }
+    validate_section_order(&analysis.sections)?;
     validate_section_overlaps(&analysis.sections)?;
     for (name, directory) in [
         ("export directory", analysis.directories.exports),
@@ -2730,6 +2731,7 @@ fn parse_headers(reader: &Reader<'_>) -> Result<ParsedHeaders, AnalysisError> {
 
         sections.push(section);
     }
+    validate_section_order(&sections)?;
     validate_section_overlaps(&sections)?;
 
     Ok(ParsedHeaders {
@@ -5914,6 +5916,43 @@ fn validate_section_alignment(
     Ok(())
 }
 
+fn validate_section_order(sections: &[PeSection]) -> Result<(), AnalysisError> {
+    for (index, pair) in sections.windows(2).enumerate() {
+        if pair[0].virtual_address > pair[1].virtual_address {
+            return invalid_field(
+                "section table order",
+                format!(
+                    "section {} RVA {:#x} follows section {} RVA {:#x}",
+                    index + 1,
+                    pair[1].virtual_address,
+                    index,
+                    pair[0].virtual_address
+                ),
+            );
+        }
+    }
+
+    let mut previous_raw = None;
+    for (index, section) in sections.iter().enumerate() {
+        if section.raw_data_size == 0 {
+            continue;
+        }
+        if let Some((previous_index, previous_offset)) = previous_raw {
+            if section.raw_data_offset < previous_offset {
+                return invalid_field(
+                    "section raw-data order",
+                    format!(
+                        "section {index} raw-data offset {:#x} precedes section {previous_index} raw-data offset {previous_offset:#x}",
+                        section.raw_data_offset
+                    ),
+                );
+            }
+        }
+        previous_raw = Some((index, section.raw_data_offset));
+    }
+    Ok(())
+}
+
 fn validate_section_overlaps(sections: &[PeSection]) -> Result<(), AnalysisError> {
     for first in 0..sections.len() {
         for second in first + 1..sections.len() {
@@ -6104,6 +6143,38 @@ mod section_layout_tests {
                 first: 0,
                 second: 1,
                 space: "virtual"
+            })
+        ));
+    }
+
+    #[test]
+    fn section_order_tracks_headers_and_only_sections_with_raw_data() {
+        let sections = [
+            section(0x1000, 0x100, 0x200, 0x200),
+            section(0x2000, 0x100, 0, 0),
+            section(0x3000, 0, 0, 0),
+            section(0x4000, 0x100, 0x400, 0x200),
+        ];
+        validate_section_order(&sections)
+            .expect("zero-raw and zero-sized sections do not claim file ranges");
+
+        let mut reversed_rvas = sections.clone();
+        reversed_rvas.swap(1, 2);
+        assert!(matches!(
+            validate_section_order(&reversed_rvas),
+            Err(AnalysisError::InvalidField {
+                field: "section table order",
+                ..
+            })
+        ));
+
+        let mut reversed_raw = sections;
+        reversed_raw[0].raw_data_offset = 0x600;
+        assert!(matches!(
+            validate_section_order(&reversed_raw),
+            Err(AnalysisError::InvalidField {
+                field: "section raw-data order",
+                ..
             })
         ));
     }
