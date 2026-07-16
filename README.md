@@ -65,15 +65,19 @@ The current alpha implements and tests an end-to-end, deliberately narrow analys
   summarizes a package or emits its JSON representation;
 - a Windows-first `resymbol-workbench.exe` desktop application that opens a supported PE or current
   `.resym` package, runs core-only analysis in the background, and presents exact binary identity,
-  durable provenance-first exact-claim review, a bounded Reconstruction Graph, and read-only plugin
-  health.
+  durable provenance-first exact-claim review, a bounded Reconstruction Graph, a non-executing
+  static Address Space/protection view, read-only debugger/sandbox provider readiness, and read-only
+  plugin health.
   The graph starts from the PE entry point or a clearly labeled deterministic lowest-RVA fallback,
   shares function selection with the table and inspector, and draws only retained direct-call,
   thunk, and import relationships. Accept Primary, Keep as Alias, Reject, rationale, undo, and redo
-  are stored in a binary-bound create-new sidecar. The workbench creates new `.resym`, neutral JSON,
-  Markdown, MAP, public-symbol PDB, IDA Python, and Ghidra Java artifacts without replacing an
+  are stored in a binary-bound create-new sidecar; a dirty ledger cannot be silently discarded by
+  the window close button or companion-console `quit`. The workbench creates new `.resym`, neutral
+  JSON, Markdown, MAP, public-symbol PDB, IDA Python, and Ghidra Java artifacts without replacing an
   existing destination. Its separately spawned companion console is off by default; enable it from
-  **View -> Companion console** when live activity and typed control are useful;
+  **View -> Companion console** when live activity and typed control are useful. Provider readiness
+  is a non-mutating preflight only: it does not provision a sandbox, launch or attach to a target, or
+  attest containment. See [the debugger and sandbox architecture](docs/debugger-sandbox.md);
 - a deterministic, debugger-neutral export projection plus `resymbol export`, which writes the
   projection as JSON, renders a bounded human-readable Markdown report, emits deterministic
   Microsoft-linker-style MAP text for compatible tools, creates an exact-RSDS public-symbol PDB
@@ -284,8 +288,8 @@ ReSymbol is growing from the working PE/package foundation toward:
   bridges, richer PDB records, DWARF, and other debugging formats;
 - a Windows-first desktop workbench for background core analysis, current-package opening, exact
   claim review with durable binary-bound decisions, read-only plugin health, reconstruction and
-  address-space views, and constrained create-new exports, followed by GUI plugin execution and
-  richer debugger/tool bridges;
+  address-space views, non-executing debugger/sandbox readiness, and constrained create-new exports,
+  followed by GUI plugin execution and richer debugger/tool bridges;
 - drop-in plugin discovery from a local `plugins/` directory;
 - WASM, native C/C++, managed/.NET, external-process, and debugger-hosted plugin families from the
   initial architecture, with WASM, external-process, native C/C++, and managed/.NET execution
@@ -345,20 +349,26 @@ On Windows, open the same supported PE in the desktop workbench:
 ```
 
 The desktop slice runs core analysis only. It exposes evidence, provenance, durable exact-claim
-review, and plugin health. Its Reconstruction Graph roots at the PE entry point when available,
-otherwise at a clearly labeled deterministic lowest-RVA navigation fallback, synchronizes selection
-with the function inspector, and shows only relationships retained by analysis. Large graphs are
-rendered through an explicit bounded view rather than implying complete call-graph recovery. The
-workbench opens current `.resym` packages and creates new `.resym`, neutral JSON, Markdown, MAP,
-public-symbol PDB, IDA Python, or Ghidra Java artifacts. It does not execute plugins, migrate legacy
-packages, or overwrite an output or review-sidecar file.
+review, plugin health, a static Address Space/protection assessment, and read-only debugger/sandbox
+provider readiness. Its Reconstruction Graph roots at the PE entry point when available, otherwise
+at a clearly labeled deterministic lowest-RVA navigation fallback, synchronizes selection with the
+function inspector, and shows only relationships retained by analysis. Large graphs are rendered
+through an explicit bounded view rather than implying complete call-graph recovery. Address Space is
+a preferred-image model, not a live process map, and provider readiness means only that provisioning
+may be attempted; neither surface executes the input or proves containment. The workbench opens
+current `.resym` packages and creates new `.resym`, neutral JSON, Markdown, MAP, public-symbol PDB,
+IDA Python, or Ghidra Java artifacts. It does not execute plugins, migrate legacy packages, or
+overwrite an output or review-sidecar file.
 
 The optional companion console starts only when **View -> Companion console** is checked. It mirrors
 timestamped workbench activity and accepts `help`, `status`, `open`, `tab`, `focus`, `theme`,
 `panel`, `reset-layout`, `export`, and `quit`. Closing or disabling that helper does not close the
 workbench; pipe input is read off-thread, then commands are parsed and applied by the GUI event
 loop. The `quit` command closes the workbench; close the terminal window or clear the checkbox when
-you only want to detach the console.
+you only want to detach the console. If review decisions have changed since the last durable
+create-new sidecar save, both `quit` and the native window close button pause for **Save New...**,
+**Discard and Close**, or **Cancel**. Save-and-close waits for the exact queued ledger snapshot to
+become durable before the workbench exits.
 
 `analyze` writes `application.resym` by default. Use `--output another.resym` to choose a different
 path. ReSymbol refuses to replace an existing package, so an earlier analysis cannot be lost by

@@ -4,8 +4,8 @@ This document records both the first implemented ReSymbol workbench slice and th
 long-term direction. `crates/resymbol-workbench` is a Windows-first desktop application built with
 the pinned eframe/egui 0.32.3 stack; that version was selected to preserve the workspace's Rust 1.86
 minimum. The `resymbol` CLI remains supported and currently exposes capabilities that the GUI does
-not. Sections that describe later review, docking, disassembly, or debugger integration are target
-design rather than current behavior.
+not. Sections that describe later bulk review, docking, disassembly, or live debugger integration
+are target design rather than current behavior.
 
 The workbench should feel familiar to people who spend time in disassemblers and debuggers while
 making ReSymbol's evidence, confidence, provenance, and plugin health more visible than a typical
@@ -73,7 +73,8 @@ results.
 ### Main work area
 
 The main region retains the approved task-tab model. The first slice implements the dense
-**Functions** table and the evidence-first **Reconstruction Graph** tab. The table includes:
+**Functions** table, the evidence-first **Reconstruction Graph**, the static **Address Space** view,
+and the non-executing **Debugger / Sandbox** readiness view. The table includes:
 
 - status;
 - RVA;
@@ -134,6 +135,22 @@ policy; dismissing an offline finding can never authorize execution.
 Static and future live mappings remain distinct views. See
 [Debugger and sandbox architecture](debugger-sandbox.md) for the ownership and containment gates.
 
+### Debugger and sandbox readiness
+
+The implemented **Debugger / Sandbox** tab is a read-only preflight surface, not a live debugger or
+provider control panel. It combines the active project's exact SHA-256, file size, exact-source
+state, and bounded static protection summary with discovery for the selected Local AppContainer,
+Windows Sandbox, or Hyper-V requirement set. A result of **ready for provisioning attempt** means
+only that a later caller may try to provision that exact provider and boundary; it is not an
+attestation, authorization, or containment guarantee.
+
+Discovery runs on the existing bounded application-service worker. Each result is bound to a
+monotonic operation identifier, the exact project evidence snapshot, and the selected provider, so
+a project change, source-verification change, provider change, or superseding request makes an older
+result stale. The surface shows typed unavailable/indeterminate reasons and unresolved requirements
+without enabling a Windows feature, creating a profile or VM, requesting elevation, launching or
+attaching to the target, or falling back to direct host execution.
+
 ### Contextual inspector
 
 Selecting a function opens the implemented evidence inspector on the right. It shows the selected
@@ -153,10 +170,20 @@ The complete approved inspector model contains:
 
 The inspector implements **Accept Primary**, **Keep as Alias**, and **Reject** for exact name claims.
 Each proposal displays its retained producer, method, run identifier, evidence, and complete-claim
-SHA-256 fingerprint. Decisions and optional rationale annotations enter a binary-bound ledger with
-undo/redo history; non-name claims remain explicitly read-only. Sidecar loads, create-new saves, and
-reviewed-projection rebuilds run on the bounded service worker, and stale operation or ledger results
-cannot replace current UI state. Bulk review remains future work.
+SHA-256 fingerprint. The current semantic fingerprint and sidecar schema are versioned; supported
+schema-1 ledgers migrate through strict validation to schema 2. **Keep as Alias** removes the proposal
+from primary selection while retaining it as an attributed alternate, including the honest
+alias-only case where no primary remains. A disposition and its optional rationale annotation form
+one transaction, so undo and redo cannot split the explanation from the decision. Failed actions do
+not mutate the ledger or destroy an existing redo suffix.
+
+The ledger remains bound to the exact binary and non-name claims remain explicitly read-only.
+Sidecar loads, create-new saves, and reviewed-projection rebuilds run on the bounded service worker,
+and stale operation or ledger results cannot replace current UI state. A native window close or
+companion-console `quit` with unsaved review changes opens **Save New...**, **Discard and Close**, and
+**Cancel** choices. Save-and-close exits only after the exact queued ledger snapshot is durable; a
+later edit remains visibly dirty rather than being misreported as saved. Bulk review remains future
+work.
 
 An evidence percentage is shown only when its producer defines that quantity. The UI must not imply
 that evidence scores are universally additive or that adding the displayed values computes the
@@ -184,6 +211,7 @@ An optional external companion console mirrors the same timestamped activity and
 typed commands for status, project loading, tab/function focus, themes, panel visibility, exports,
 and shutdown. It is off by default and can be spawned or disabled from the workbench. Console input
 never mutates widgets or analysis state directly; the UI event loop remains the single state owner.
+Its `quit` command passes through the same dirty-review close guard as the native window button.
 
 ## Export experience
 
@@ -314,8 +342,9 @@ The current slice has no GUI plugin execution, legacy-package migration, bulk-re
 docking, disassembly/pseudocode views, editable or exhaustive control-flow graphing, live debugger
 bridge, process-executing debugger host, verified AppContainer/VM provider, multi-binary workspace,
 or remote collaboration. Current-package opening, exact-claim Accept Primary/Keep as Alias/Reject,
-undo/redo, binary-bound review sidecars, and all six symbol export formats are implemented. The
-backend-neutral debugger and sandbox contracts are foundations for later live features, not proof
-that an operating-system boundary exists. Future choices must still be evaluated against startup
-size, portability, accessibility, crash isolation, exact identity, and the one-download product
-principle.
+transaction-level undo/redo, binary-bound versioned review sidecars, dirty-close protection, static
+Address Space/protection assessment, read-only provider readiness, and all six symbol export formats
+are implemented. The backend-neutral debugger and sandbox contracts and readiness result are
+foundations for later live features, not proof that an operating-system boundary exists. Future
+choices must still be evaluated against startup size, portability, accessibility, crash isolation,
+exact identity, and the one-download product principle.
