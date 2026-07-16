@@ -12,6 +12,28 @@ exception metadata, and derives conservative metadata-backed claims. Canonical `
 now carry an `AnalysisSession`: deterministic base analysis, an auditable plugin-run ledger, and
 separately validated plugin claims with a derived combined graph.
 
+The first Windows-first desktop slice is now implemented in `crates/resymbol-workbench` with pinned
+eframe/egui 0.32.3 dependencies so the workspace can retain Rust 1.86. It runs **Open Binary ->
+background core-only Analyze -> Review -> Export**, preserves exact SHA-256 identity, and presents
+read-only plugin health in a persistent four-theme, four-region shell. The shell includes a
+virtualized sortable/filterable function table, synchronized evidence inspector,
+progress/warning/log surface, and evidence-first Reconstruction Graph. That graph roots at the PE
+entry point or a clearly labeled deterministic lowest-RVA navigation fallback, shares selection with
+the function review surfaces, and displays only retained direct-call, thunk, and import
+relationships. Explicit node/tier bounds keep large binaries responsive and visible as truncated
+rather than implying complete call-graph recovery. Through the existing shared package and export
+models the workbench can create new `.resym`, neutral JSON, bounded Markdown, and MAP files without
+replacing an existing destination.
+
+An off-by-default companion console can be spawned from the running workbench. It mirrors bounded
+timestamped activity and routes status, navigation, layout, export, and lifecycle commands back to
+the GUI event loop through private process pipes; it never becomes a second owner of analysis state.
+
+This is a foundation, not the completed workbench. GUI plugin execution, legacy-package opening,
+durable review decisions and **Accept**/**Keep as Alias**/**Reject**, PDB/IDA/Ghidra GUI export,
+docking, disassembly views, and an interactive debugger bridge remain planned. A portable Windows
+archive is the initial GUI packaging target; broader desktop packaging remains future validation.
+
 The CLI writes package schema 12 and can inspect or export schemas 1 through 11 through explicit
 compatibility paths. Schema 1 is migrated in memory by revalidating persisted metadata and
 rebuilding the base graph; schema 2 already contains direct-call and thunk recovery, and schema 3
@@ -418,8 +440,10 @@ Semantic inference remains optional and never converts a hypothesis into an extr
 ## Milestone 5: ecosystem and collaboration
 
 - Desktop workbench GUI for project navigation, evidence review, claim comparison, plugin health,
-  and export preview; the [approved layout and theme system](gui-design.md) are currently
-  design-only
+  bounded retained-relationship graphing, and export preview (initial Windows-first core-only shell,
+  synchronized Reconstruction Graph, and evidence inspector implemented; durable review, plugin
+  execution, docking/disassembly, editable or exhaustive graphing, debugger bridges, and the
+  remaining [approved design](gui-design.md) are planned)
 - Signed or verifiable plugin packages and registry metadata
 - Hash-addressed community symbol packs without bundled application binaries
 - Mergeable annotations and review decisions

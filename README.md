@@ -63,6 +63,15 @@ The current alpha implements and tests an end-to-end, deliberately narrow analys
   graph;
 - `resymbol analyze`, which writes a portable package, and `resymbol inspect`, which validates and
   summarizes a package or emits its JSON representation;
+- a Windows-first `resymbol-workbench.exe` desktop application that opens a supported PE, runs
+  core-only analysis in the background, and presents exact binary identity, evidence- and
+  provenance-first function review, a bounded Reconstruction Graph, and read-only plugin health.
+  The graph starts from the PE entry point or a clearly labeled deterministic lowest-RVA fallback,
+  shares function selection with the table and inspector, and draws only retained direct-call,
+  thunk, and import relationships. The workbench creates new `.resym`, neutral JSON, Markdown, and
+  MAP artifacts without replacing an existing destination. Its separately spawned companion console
+  is off by default; enable it from **View -> Companion console** when live activity and typed control
+  are useful;
 - a deterministic, debugger-neutral export projection plus `resymbol export`, which writes the
   projection as JSON, renders a bounded human-readable Markdown report, emits deterministic
   Microsoft-linker-style MAP text for compatible tools, creates an exact-RSDS public-symbol PDB
@@ -270,8 +279,9 @@ ReSymbol is growing from the working PE/package foundation toward:
 - conservative standalone import-script exporters for IDA and Ghidra, deterministic
   Microsoft-linker-style MAP output, and exact-RSDS public-symbol PDB output, followed by richer
   bridges, richer PDB records, DWARF, and other debugging formats;
-- a desktop workbench GUI for reviewing evidence and conflicts before applying results, with its
-  approved layout and themes currently documented as design rather than implemented behavior;
+- an initial Windows-first desktop workbench for background core analysis, evidence and provenance
+  review, read-only plugin health, and constrained create-new exports, followed by GUI plugin
+  execution, legacy-package opening, durable review decisions, and richer tool bridges;
 - drop-in plugin discovery from a local `plugins/` directory;
 - WASM, native C/C++, managed/.NET, external-process, and debugger-hosted plugin families from the
   initial architecture, with WASM, external-process, native C/C++, and managed/.NET execution
@@ -286,9 +296,10 @@ See the [changelog](CHANGELOG.md), [analysis-package format](docs/analysis-packa
 
 ## Product principles
 
-1. **One uncomplicated download.** Ordinary users should receive a portable `resymbol` executable
-   and any required prebuilt hosts or adapters. They should not need Rust, Python, Java, CMake,
-   Visual Studio, LLVM, or a .NET installation to run a release.
+1. **One uncomplicated download.** Ordinary users should receive a portable `resymbol` executable,
+   the Windows `resymbol-workbench.exe` where applicable, and any required prebuilt hosts or
+   adapters. They should not need Rust, Python, Java, CMake, Visual Studio, LLVM, or a .NET
+   installation to run a release.
 2. **Facts and hypotheses stay distinguishable.** ReSymbol must never present model output or a
    heuristic guess as recovered ground truth.
 3. **Plugins submit claims.** The core validates and reconciles evidence-backed claims instead of
@@ -321,6 +332,27 @@ resymbol plugin doctor
 resymbol plugin trust community.example-analyzer --fingerprint <sha256>
 resymbol analyze application.exe --plugin community.example-analyzer
 ```
+
+On Windows, open the same supported PE in the desktop workbench:
+
+```console
+.\resymbol-workbench.exe application.exe
+```
+
+The first desktop slice runs core analysis only. It exposes evidence, provenance, and plugin health
+for review. Its Reconstruction Graph roots at the PE entry point when available, otherwise at a
+clearly labeled deterministic lowest-RVA navigation fallback, synchronizes selection with the
+function inspector, and shows only relationships retained by analysis. Large graphs are rendered
+through an explicit bounded view rather than implying complete call-graph recovery. The workbench
+then creates new `.resym`, neutral JSON, Markdown, or MAP artifacts; it does not execute plugins,
+open an existing `.resym` package, or overwrite an output file.
+
+The optional companion console starts only when **View -> Companion console** is checked. It mirrors
+timestamped workbench activity and accepts `help`, `status`, `open`, `tab`, `focus`, `theme`,
+`panel`, `reset-layout`, `export`, and `quit`. Closing or disabling that helper does not close the
+workbench; pipe input is read off-thread, then commands are parsed and applied by the GUI event
+loop. The `quit` command closes the workbench; close the terminal window or clear the checkbox when
+you only want to detach the console.
 
 `analyze` writes `application.resym` by default. Use `--output another.resym` to choose a different
 path. ReSymbol refuses to replace an existing package, so an earlier analysis cannot be lost by
@@ -487,9 +519,10 @@ Process-tree ownership is lifecycle containment, not authority sandboxing. On Wi
 a safe Rust wrapper for immediate post-spawn Job Object assignment, but a narrow pre-assignment
 escape race remains. On POSIX a hostile plugin/helper or descendant can deliberately leave its
 process group or session. Only trust artifacts whose code and publisher you would run directly.
-Official archives bundle both helpers beside `resymbol`; Linux archives pair the static musl main
-executable with a GNU native helper built on Ubuntu 22.04 for glibc 2.35 or newer so it can load
-ordinary glibc `.so` plugins.
+Official archives bundle both helpers beside `resymbol`; the Windows archive also places
+`resymbol-workbench.exe` beside `resymbol.exe`. Linux archives pair the static musl main executable
+with a GNU native helper built on Ubuntu 22.04 for glibc 2.35 or newer so it can load ordinary glibc
+`.so` plugins.
 
 ## Development
 

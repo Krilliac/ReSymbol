@@ -1,6 +1,7 @@
 # Install ReSymbol
 
-ReSymbol prereleases are portable command-line downloads. You do not need Rust, .NET, Python,
+ReSymbol prereleases are portable downloads. Every archive includes the command-line application;
+the Windows x64 archive also includes the desktop workbench. You do not need Rust, .NET, Python,
 CMake, Visual Studio, LLVM, DIA, or another compiler to run an official archive.
 
 > [!IMPORTANT]
@@ -39,6 +40,18 @@ The built-in bounded RTTI pass also validates modern MSVC x64 Rev1 type descript
 records, vftables, and executable virtual-slot targets. Recovered class/type names, vftable names,
 and function-to-class relationships become evidence-bearing claims, and the result is written to a
 portable `.resym` package bound to the input's SHA-256 identity.
+
+On Windows x64, `resymbol-workbench.exe` opens a supported PE, runs the same core analysis away from
+the UI thread, and presents the exact identity, evidence- and provenance-first function review, a
+bounded Reconstruction Graph, and discovered plugin health. The graph roots at the PE entry point
+or a clearly labeled deterministic lowest-RVA navigation fallback, synchronizes function selection
+with the inspector, and draws only retained direct-call, thunk, and import relationships. Its visible
+bounded state makes large binary truncation explicit instead of suggesting complete call-graph
+recovery. This first desktop slice is core-only: plugin health is read-only and the GUI does not
+execute plugins or open an existing `.resym` package. It can create new `.resym`, neutral JSON,
+Markdown, and MAP artifacts, and it refuses to replace an existing destination. Its companion
+console is off by default; enable **View -> Companion console** to spawn live logs and typed
+workbench controls, then clear the same checkbox to close only that console session.
 
 This is not yet a general disassembler or a full symbol-recovery pipeline. It does not infer names
 erased by compilation, reconstruct general C++ layouts, recover register-indirect control flow, or
@@ -109,14 +122,15 @@ binary. These are input-buffering gates, not a process-memory sandbox. The helpe
 `ReSymbol.PluginSdk` assembly, so a plugin package contains its entry DLL and private dependencies,
 not a private SDK copy.
 
-The command-line executable itself is built for these host platforms:
+The command-line executable is built for every host platform; the workbench is included only in the
+Windows x64 archive:
 
-| Archive suffix | Host |
-|---|---|
-| `windows-x64.zip` | 64-bit Windows 10 or newer |
-| `linux-x64.tar.gz` | 64-bit x86 Linux; musl CLI plus GNU/glibc native helper |
-| `macos-x64.tar.gz` | Intel Mac |
-| `macos-arm64.tar.gz` | Apple silicon Mac |
+| Archive suffix | Host | Applications |
+|---|---|---|
+| `windows-x64.zip` | 64-bit Windows 10 or newer | CLI and desktop workbench |
+| `linux-x64.tar.gz` | 64-bit x86 Linux; musl CLI plus GNU/glibc native helper | CLI |
+| `macos-x64.tar.gz` | Intel Mac | CLI |
+| `macos-arm64.tar.gz` | Apple silicon Mac | CLI |
 
 The host platform identifies where ReSymbol runs, not which binary format it can analyze. The
 Linux `resymbol` executable remains statically linked with musl. Its sibling native helper is built
@@ -179,6 +193,27 @@ resymbol export path/to/application.resym --format ghidra-java
 resymbol plugin list
 resymbol plugin doctor
 ```
+
+On Windows, start the desktop workbench with a supported PE path or launch it without a path and use
+the file picker:
+
+```powershell
+.\resymbol-workbench.exe .\path\to\application.exe
+```
+
+The workbench performs background core-only analysis and provides read-only evidence, provenance,
+plugin-health, and bounded Reconstruction Graph views. The graph's root and synchronized selection
+controls let you move between the entry point or deterministic lowest-RVA fallback and individual
+functions; only retained direct-call, thunk, and import edges are drawn. A **BOUNDED** cue identifies
+large views that exceed the rendering budget. The export page creates new `.resym`, neutral JSON,
+Markdown, or MAP files; plugin execution, existing-package opening, and overwriting destinations are
+not implemented in this first slice. Use the CLI for plugin execution, PDB/IDA/Ghidra exports, and
+package inspection.
+
+The **View -> Companion console** checkbox spawns the packaged console helper when you want live
+timestamped activity or command control. Enter `help` there for the bounded command set. The helper
+is not a standalone analyzer, starts disabled on every launch, and can be closed without ending the
+GUI.
 
 On Linux or macOS, use `./resymbol` instead of `resymbol` unless the extracted directory is on
 `PATH`. By default, `analyze` replaces the input extension with `.resym`. Select another destination
@@ -402,11 +437,15 @@ currently use an installer or modify the system `PATH`.
 
 ## Plugin directory
 
-Every archive contains this layout:
+The Windows archive contains the representative layout below, plus the project changelog,
+contributor/security guides, and the complete `docs/` set. Other platform archives omit the two
+Windows-only workbench executables:
 
 ```text
 resymbol-v0.1.0-alpha.1-<platform>/
 ├── resymbol[.exe]
+├── resymbol-workbench.exe        # Windows x64 archive only
+├── resymbol-workbench-console.exe # Windows x64, spawned by the workbench on demand
 ├── resymbol-native-host[.exe]
 ├── resymbol-managed-host[.exe]
 ├── README.md
@@ -583,8 +622,8 @@ resymbol --safe-mode analyze path/to/application.exe
 
 ## Build from source
 
-Source builds are for contributors and platforms without a prerelease archive. The Rust CLI and
-native helper require:
+Source builds are for contributors and platforms without a prerelease archive. The Rust CLI,
+Windows workbench, and native helper require:
 
 - Git;
 - `rustup`, which installs the pinned Rust 1.86.0 toolchain from `rust-toolchain.toml`; and
@@ -600,6 +639,16 @@ rustup show active-toolchain
 cargo test --workspace --all-features
 cargo build --release --bin resymbol --bin resymbol-native-host
 ```
+
+On Windows, build and launch the desktop executable separately:
+
+```powershell
+cargo build --locked --release --bin resymbol-workbench --bin resymbol-workbench-console
+.\target\release\resymbol-workbench.exe .\path\to\application.exe
+```
+
+Official Windows release jobs build this executable for `x86_64-pc-windows-msvc` with the static
+MSVC CRT and package it beside `resymbol.exe`.
 
 To rebuild the source-backed WASM example, add the ordinary Rust core-WASM target and run the
 platform script. It uses `wit-bindgen` plus an example-local `wit-component` encoder; no

@@ -192,6 +192,13 @@ jobs:
         run: cargo build --locked --release --target "$TARGET" --bin resymbol
         shell: bash
 
+      - name: Build Windows desktop workbench and opt-in console
+        if: runner.os == 'Windows'
+        run: >-
+          cargo build --locked --release --target "$TARGET"
+          --bin resymbol-workbench --bin resymbol-workbench-console
+        shell: bash
+
       - name: Build disposable native helper
         run: >-
           cargo build --locked --release --target "$HELPER_TARGET"
@@ -391,6 +398,8 @@ jobs:
           $ErrorActionPreference = "Stop"
           $binaries = @(
             "target/$env:TARGET/release/${{ matrix.executable }}",
+            "target/$env:TARGET/release/resymbol-workbench.exe",
+            "target/$env:TARGET/release/resymbol-workbench-console.exe",
             "target/$env:HELPER_TARGET/release/${{ matrix.helper_executable }}"
           )
           foreach ($binary in $binaries) {
@@ -400,6 +409,28 @@ jobs:
             }
             if ($dependencies -match '(?im)^\s*(VCRUNTIME|MSVCP|UCRTBASE|api-ms-win-crt)[^\s]*\.dll\s*$') {
               throw "$binary still depends on a dynamic MSVC/UCRT library`n$dependencies"
+            }
+          }
+
+          $subsystemChecks = @(
+            @{
+              Path = "target/$env:TARGET/release/resymbol-workbench.exe"
+              Pattern = '(?im)^\s*2 subsystem \(Windows GUI\)\s*$'
+              Expected = 'Windows GUI subsystem 2'
+            },
+            @{
+              Path = "target/$env:TARGET/release/resymbol-workbench-console.exe"
+              Pattern = '(?im)^\s*3 subsystem \(Windows CUI\)\s*$'
+              Expected = 'Windows CUI subsystem 3'
+            }
+          )
+          foreach ($check in $subsystemChecks) {
+            $headers = (& dumpbin /NOLOGO /HEADERS $check.Path | Out-String)
+            if ($LASTEXITCODE -ne 0) {
+              throw "dumpbin /HEADERS failed for $($check.Path)"
+            }
+            if ($headers -notmatch $check.Pattern) {
+              throw "$($check.Path) is not $($check.Expected)`n$headers"
             }
           }
 
@@ -414,9 +445,8 @@ jobs:
           cp "target/${TARGET}/release/${{ matrix.executable }}" "${stage}/"
           cp "target/${HELPER_TARGET}/release/${{ matrix.helper_executable }}" "${stage}/"
           cp "target/managed/${MANAGED_RID}/publish/${{ matrix.managed_executable }}" "${stage}/"
-          cp README.md LICENSE-MIT LICENSE-APACHE "${stage}/"
-          cp docs/install.md "${stage}/docs/"
-          cp docs/plugin-system.md "${stage}/docs/"
+          cp README.md CHANGELOG.md CONTRIBUTING.md SECURITY.md LICENSE-MIT LICENSE-APACHE "${stage}/"
+          cp docs/*.md "${stage}/docs/"
           cp packaging/plugins/README.txt "${stage}/plugins/"
           wasm_plugin="${stage}/plugins/dev.resymbol.example.wasm-resolver"
           mkdir -p "$wasm_plugin"
@@ -440,11 +470,12 @@ jobs:
           New-Item -ItemType Directory -Path (Join-Path $stage "plugins") -Force | Out-Null
           New-Item -ItemType Directory -Path (Join-Path $stage "docs") -Force | Out-Null
           Copy-Item "target/$env:TARGET/release/${{ matrix.executable }}" $stage
+          Copy-Item "target/$env:TARGET/release/resymbol-workbench.exe" $stage
+          Copy-Item "target/$env:TARGET/release/resymbol-workbench-console.exe" $stage
           Copy-Item "target/$env:HELPER_TARGET/release/${{ matrix.helper_executable }}" $stage
           Copy-Item "target/managed/$env:MANAGED_RID/publish/${{ matrix.managed_executable }}" $stage
-          Copy-Item README.md, LICENSE-MIT, LICENSE-APACHE $stage
-          Copy-Item docs/install.md (Join-Path $stage "docs")
-          Copy-Item docs/plugin-system.md (Join-Path $stage "docs")
+          Copy-Item README.md, CHANGELOG.md, CONTRIBUTING.md, SECURITY.md, LICENSE-MIT, LICENSE-APACHE $stage
+          Copy-Item docs/*.md (Join-Path $stage "docs")
           Copy-Item packaging/plugins/README.txt (Join-Path $stage "plugins")
           $wasmPlugin = Join-Path $stage "plugins/dev.resymbol.example.wasm-resolver"
           New-Item -ItemType Directory -Path $wasmPlugin -Force | Out-Null

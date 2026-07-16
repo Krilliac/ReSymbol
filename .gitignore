@@ -8,6 +8,8 @@
 
 # .NET
 **/bin/
+!crates/resymbol-workbench/src/bin/
+!crates/resymbol-workbench/src/bin/resymbol-workbench-console.rs
 **/obj/
 TestResults/
 *.user

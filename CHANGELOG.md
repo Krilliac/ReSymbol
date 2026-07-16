@@ -8,6 +8,19 @@ prereleases; breaking changes remain explicit.
 
 ### Added
 
+- Added the first Windows-first `resymbol-workbench.exe` desktop slice. It runs bounded core-only PE
+  analysis away from the UI thread and presents exact identity, evidence- and provenance-first
+  function review, read-only plugin health, and a visual Reconstruction Graph rooted at the PE entry
+  point or a clearly labeled deterministic lowest-RVA navigation fallback. Graph and table
+  selections stay synchronized; edges come only from retained direct-call, thunk, and import
+  relationships, and large binaries receive an explicitly bounded rendering instead of a fabricated
+  complete call graph. The workbench uses shared package/export models and renderers with a
+  consistent create-new policy for `.resym`, neutral JSON, Markdown, and MAP artifacts. Windows
+  release archives package the static-CRT workbench beside `resymbol.exe`. An off-by-default
+  companion console can be enabled or disabled from the running workbench to mirror workbench
+  activity and accept typed status, navigation, layout, export, and lifecycle commands without
+  giving its I/O thread direct ownership of GUI state. Plugin execution, existing-package opening,
+  and durable review actions remain future work.
 - Added the first sandboxed WebAssembly Component Model analysis host for PE32+ x86-64 sessions.
   Components run in an in-process Wasmtime store that links only the checked-in ReSymbol WIT
   imports and no WASI interfaces, receive permission- and phase-gated `binary.read` and claim

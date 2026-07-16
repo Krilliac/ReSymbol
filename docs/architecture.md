@@ -15,9 +15,10 @@ discovery/contracts, a no-WASI WebAssembly Component Model host, and trusted ext
 native C/C++, and managed/.NET analysis runtimes. It also includes a validated, debugger-neutral
 export projection, deterministic Microsoft-linker-style MAP output, an exact-RSDS public-symbol PDB
 writer, and conservative standalone import-script generators
-for IDA and Ghidra. Broader disassembly-assisted discovery, matching, semantic inference,
-interactive debugger bridges, richer PDB and DWARF output, and the workbench GUI remain design
-work.
+for IDA and Ghidra. A first Windows-first workbench slice now provides background core analysis,
+evidence review, and a constrained shared-model export path. Broader disassembly-assisted
+discovery, matching, semantic inference, interactive debugger bridges, richer PDB and DWARF output,
+and the complete workbench review model remain design work.
 
 ## Goals
 
@@ -523,22 +524,54 @@ make the planned interactive tool-host boundary complete.
 
 See [plugin-system.md](plugin-system.md) for discovery, health states, and contracts.
 
-## Workbench GUI (design)
+## Workbench GUI
 
-The approved GUI direction is a desktop analysis workbench organized around a central results and
-evidence view, project and symbol navigation, contextual details, and a persistent activity and
-diagnostics area. It must expose confidence, provenance, competing claims, plugin health, and
-export losses instead of hiding them behind a single resolved label.
+`crates/resymbol-workbench` implements the first Windows-first desktop slice with pinned
+eframe/egui 0.32.3 dependencies. That version preserves the workspace's Rust 1.86 minimum. Its
+workflow is **Open Binary -> background core-only Analyze -> Review -> Export**: file analysis runs
+away from the UI thread, then the shell receives one validated `AnalysisSession`, bound `.resym`
+package, and debugger-neutral `ExportProjection` built by the existing analysis, package, and
+export crates. The workbench does not fork reconciliation or identity rules from the CLI.
 
-No GUI is implemented in the current alpha. [gui-design.md](gui-design.md) records the approved
-layout, theme presets, semantic-color invariants, and accessibility requirements that a future UI
-must preserve.
+The initial shell implements the approved four-region structure: persistent, resizable and
+collapsible project/plugin navigation, a virtualized sortable/filterable function table, a bounded
+Reconstruction Graph, an evidence inspector, and a progress/warning/log area. It displays exact
+SHA-256 binary identity and read-only plugin health. Graphite, Light, IDA-inspired, and Classic
+Debugger are persisted theme presets; arbitrary docking is not implemented.
+
+The Reconstruction Graph is a read-only projection of retained analysis, not a second analyzer or a
+claim of complete call-graph recovery. It roots at the PE entry point when that point is available as
+a projected function, otherwise at a deterministic lowest-RVA navigation fallback that is not
+presented as an inferred `main`; a selected function can become the focus. Graph node selection
+updates the same function selection used by the table and evidence inspector. Edges are created only
+for retained direct calls and thunks, including their explicit import-slot endpoints, and never from
+address proximity or layout guesses. A fixed node/tier window keeps large binaries responsive, with
+a visible bounded/truncation cue whenever the reachable view exceeds that rendering budget.
+
+GUI exports use the same shared models and create-new policy to write canonical `.resym`, neutral
+JSON, bounded Markdown, and PE MAP files. The first slice does not execute plugins, open legacy
+packages, or persist review decisions, and **Accept**, **Keep as Alias**, and **Reject** are not
+active operations. PDB, IDAPython, and Ghidra Java GUI export, arbitrary docking, synchronized
+disassembly/pseudocode views, editable or exhaustive control-flow graphs, and an interactive
+debugger bridge remain planned.
+
+The companion console is an opt-in process rather than a second state owner. The GUI spawns the
+packaged console helper only after the user enables it and uses private redirected standard-I/O
+pipes for bounded command and activity transport. The helper owns the visible terminal while typed
+commands are applied only on the GUI event loop. Disabling or closing the helper tears down only
+that console session, while the workbench and analysis state remain alive. The console is off again
+on every application launch.
+
+[gui-design.md](gui-design.md) distinguishes implemented behavior from the approved long-term
+layout, review semantics, theme variants, semantic-color invariants, and accessibility requirements.
 
 ## Packaging boundary
 
-The application is centered on the Rust CLI plus prebuilt, version-matched plugin hosts and thin
-tool adapters as they become implemented. Ordinary users should not need to install a compiler,
-language runtime, build system, or package manager. In particular:
+The application is centered on the Rust CLI and workbench plus prebuilt, version-matched plugin
+hosts and thin tool adapters as they become implemented. A portable Windows archive is the initial
+workbench packaging target; broader desktop packaging remains to be validated. Ordinary users
+should not need to install a compiler, language runtime, build system, or package manager. In
+particular:
 
 - current archives ship a prebuilt source-backed WASM example under `plugins/`,
   `resymbol-native-host[.exe]`, and a single-file, self-contained

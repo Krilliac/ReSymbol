@@ -1,8 +1,11 @@
 # ReSymbol workbench GUI design
 
-This document records the approved direction for ReSymbol's graphical workbench. It is a design
-target, not implemented behavior. The current usable interface remains the `resymbol` CLI, and the
-choice of UI framework is intentionally not fixed by this document.
+This document records both the first implemented ReSymbol workbench slice and the approved
+long-term direction. `crates/resymbol-workbench` is a Windows-first desktop application built with
+the pinned eframe/egui 0.32.3 stack; that version was selected to preserve the workspace's Rust 1.86
+minimum. The `resymbol` CLI remains supported and currently exposes capabilities that the GUI does
+not. Sections that describe later review, docking, disassembly, or debugger integration are target
+design rather than current behavior.
 
 The workbench should feel familiar to people who spend time in disassemblers and debuggers while
 making ReSymbol's evidence, confidence, provenance, and plugin health more visible than a typical
@@ -13,22 +16,24 @@ single-name symbol list.
 The application shell follows four visible stages:
 
 1. **Open Binary** — select an input and establish its exact identity.
-2. **Analyze** — configure and run core analyzers and eligible plugins.
+2. **Analyze** — run the core analyzer without blocking the UI.
 3. **Review** — inspect reconstructed symbols, conflicts, evidence, and losses.
 4. **Export** — preview target capabilities and write a package, projection, or tool-specific
    output.
 
-The stage indicator is orientation, not a blocking wizard. An experienced user can move among
-project, analysis, review, and export surfaces without discarding state. The primary action at the
-top right changes with the stage; during review it is **Export Symbols**, with a menu for choosing
-the target.
+The first slice implements **Open Binary -> background core-only Analyze -> Review -> Export**.
+Opening a binary queues analysis away from the egui event loop, then publishes one validated shared
+session and export projection to the review surface. Plugin execution and analysis configuration
+are not wired into this flow yet. The stage indicator remains orientation rather than a blocking
+wizard, and the primary action changes with the active stage.
 
-The title/identity area always shows the active binary and its SHA-256 verification state. A short
-status label and icon accompany the hash so verification is never communicated by color alone.
+The title/identity area shows the active binary and the exact SHA-256 identity bound to the analysis
+package. A short status label accompanies the hash so identity is never communicated by color
+alone.
 
 ## Approved workbench layout
 
-The default desktop layout has four persistent regions:
+The implemented shell has the approved four persistent regions:
 
 ```text
 ┌──────────────── active binary / SHA-256 / workflow / primary action ────────────────┐
@@ -39,13 +44,14 @@ The default desktop layout has four persistent regions:
 └──────────────────────────────────────────────────────────┴────────────────────────┘
 ```
 
-Splitters should make the left navigation, right inspector, and bottom activity area resizable and
-collapsible. The application remembers a user's layout. A **Reset Layout** action restores the
-supported default, which is important when plugins or future panels have changed the workspace.
+The left navigation, right inspector, and bottom activity area are resizable and collapsible. Panel
+sizes and collapsed state persist with the application, and **Reset Layout** restores the supported
+default. This is a splitter-based shell rather than a docking system; arbitrary tab docking remains
+deferred.
 
 ### Project navigation
 
-The left rail presents the current project as a tree:
+The approved left rail presents the current project as a tree:
 
 - active binary and exact-identity status;
 - analysis sessions;
@@ -60,10 +66,14 @@ approval-required, and quarantined states use an icon plus text. A quarantined p
 visible with its reason and recovery path; it does not disappear or prevent the project from
 opening.
 
+The first slice shows discovered plugin health as read-only information. It does not execute,
+enable, disable, approve, or recover plugins from the GUI, and analyzed sessions contain only core
+results.
+
 ### Main work area
 
-The main region uses task tabs for **Overview**, **Functions**, **Types**, **Relationships**, and
-**Exports**. The approved Functions view is a dense, sortable table with:
+The main region retains the approved task-tab model. The first slice implements the dense
+**Functions** table and the evidence-first **Reconstruction Graph** tab. The table includes:
 
 - status;
 - RVA;
@@ -72,22 +82,45 @@ The main region uses task tabs for **Overview**, **Functions**, **Types**, **Rel
 - producing source or sources; and
 - known size.
 
-Search, a filter button, and a status selector sit immediately above the results. Large result sets
-use virtualized rows and stable paging or equivalent position-preserving navigation. Addresses,
-sizes, hashes, and disassembly-oriented data use a readable monospace face; controls and prose can
-use the normal UI face.
+Search and status filtering sit immediately above the results. Rows are virtualized, and sorting by
+the exposed columns operates on stable indexes without reordering the canonical shared model.
+Addresses, sizes, hashes, and disassembly-oriented data use a readable monospace face; controls and
+prose use the normal UI face.
 
 Table status distinguishes at least verified/extracted results, conflicts, inferred hypotheses,
 review decisions, and automatic fallback labels. Plugin origin is provenance, not an epistemic
 status, and remains visible in the source column or badge. Confidence never acts as a substitute
 for provenance: the numeric value, status, and source remain visible independently.
 
-The layout can later host synchronized disassembly, pseudocode, graph, hex, and cross-reference
-views without changing the surrounding navigation and inspector model.
+The Reconstruction Graph is a bounded navigator over retained relationships, not a visual inference
+engine. Its default root is the PE entry point when that address is a projected function; otherwise
+it uses a deterministic lowest-RVA navigation fallback, explicitly not an inferred `main`.
+**Focus selected** can make the current function the root, selecting a graph node updates the shared
+function selection and evidence inspector, and the Functions table remains the full
+sortable/filterable inventory.
+
+Every displayed edge corresponds to a retained direct-call or thunk record. Function targets connect
+to projected function nodes and import targets connect to explicit import-slot nodes; spatial
+proximity, RVA ordering, and drawing layout never create relationships. This keeps the view aligned
+with the same evidence and provenance shown in the inspector rather than presenting a plausible but
+unsupported call graph.
+
+Rendering is deliberately bounded for large binaries. The graph expands a fixed number of tiers and
+nodes from the active root, reports the retained node/edge count for that view, and shows an explicit
+**BOUNDED** cue when more reachable content exists. Refocusing is how the user inspects another local
+region; truncation is never hidden or described as complete recovery.
+
+The layout can later host synchronized disassembly, pseudocode, hex, and cross-reference views
+without changing the surrounding navigation and inspector model. Editable and exhaustive
+control-flow graphing remains later work.
 
 ### Contextual inspector
 
-Selecting a symbol opens its inspector on the right. The approved function inspector contains:
+Selecting a function opens the implemented evidence inspector on the right. It shows the selected
+name and status, RVA, size, confidence, producer/source information, competing names, uncollapsed
+claims, provenance, and evidence with any producer-defined confidence and artifacts.
+
+The complete approved inspector model contains:
 
 - selected reconstructed name and status;
 - RVA, size, confidence, sources, and last analysis observation;
@@ -98,9 +131,10 @@ Selecting a symbol opens its inspector on the right. The approved function inspe
 - an annotation field; and
 - relevant diagnostics or links to the full log.
 
-Review actions create explicit user decisions with provenance; they do not destructively erase the
-underlying alternatives. Undo/redo and a decision history are required before bulk review is
-considered complete.
+**Accept**, **Keep as Alias**, **Reject**, annotations, undo/redo, and decision history are not
+implemented in this slice. When added, review actions must create durable decisions with provenance
+and must not destructively erase the underlying alternatives. Those requirements must be satisfied
+before bulk review is considered complete.
 
 An evidence percentage is shown only when its producer defines that quantity. The UI must not imply
 that evidence scores are universally additive or that adding the displayed values computes the
@@ -108,8 +142,9 @@ claim confidence.
 
 ### Activity and diagnostics
 
-The bottom area keeps long-running work understandable without covering the result table. Its
-default panels are:
+The bottom area keeps long-running work understandable without covering the result table. The first
+slice exposes analysis progress, warnings, and timestamped log messages. Its approved complete
+panel set is:
 
 - stage-by-stage analysis progress;
 - plugin runs with outcome and elapsed/completion information;
@@ -120,10 +155,26 @@ Warnings link to the affected results or plugin details. Export preparation belo
 progress model and must surface lossy conversions before the user writes a debugger-specific
 artifact.
 
+Plugin-run activity remains empty until GUI plugin execution is implemented; read-only plugin
+health in the navigation is not represented as a run.
+
+An optional external companion console mirrors the same timestamped activity and accepts bounded
+typed commands for status, project loading, tab/function focus, themes, panel visibility, exports,
+and shutdown. It is off by default and can be spawned or disabled from the workbench. Console input
+never mutates widgets or analysis state directly; the UI event loop remains the single state owner.
+
 ## Export experience
 
-The GUI should consume the same validated export projection as the CLI. It must not maintain an
-independent reconciliation path. The export surface should show:
+The implemented GUI consumes the same validated `AnalysisSession`, `.resym` package envelope, and
+neutral export projection as the CLI; it has no independent reconciliation path. The first slice
+writes only new files and refuses to replace an existing destination. It can create:
+
+- a canonical `.resym` package;
+- the debugger-neutral JSON projection;
+- the bounded Markdown review report; and
+- Microsoft-linker-style MAP output.
+
+The broader export surface should show:
 
 - exact target binary identity;
 - selected format and destination;
@@ -132,14 +183,18 @@ independent reconciliation path. The export surface should show:
 - existing-file/create-new behavior; and
 - a reviewable summary before writing.
 
-IDA/Ghidra script export and the current MAP and exact-RSDS public-symbol PDB CLI targets should
-differ only in their target capability panels. A future PDB panel must require selection of the
+IDA/Ghidra script export and the existing exact-RSDS public-symbol PDB CLI target are not exposed in
+the GUI yet. When those formats are added, their target capability panels should differ without
+changing shared reconciliation. A future PDB panel must require selection of the
 exact original PE, show that its SHA-256 matches the package, and report the unambiguous RSDS
 GUID+age gate before enabling the write action. It must describe the current output as public
 function/global names only, without implying that types, private symbols, source lines, or
-function extents are present. This records how the existing CLI capability should appear; it does
-not claim that the GUI exists. An interactive debugger bridge may add preview and selective
-application, but it still uses the core identity and projection rules.
+function extents are present. An interactive debugger bridge may add preview and selective
+application, but it must still use the core identity and projection rules.
+
+The first slice opens and analyzes binaries; it does not open legacy `.resym` packages. Supporting
+legacy package review must use the CLI's explicit compatibility paths and must not relabel missing
+analysis as current recovery.
 
 ## Theme system
 
@@ -147,8 +202,8 @@ Themes are token sets over one layout and interaction model. A theme can change 
 typography tuning, borders, syntax colors, and selection treatment. It cannot change the meaning
 of a status or hide required identity, provenance, warning, or focus cues.
 
-The approved presets are described below. This theme catalog is design-only until the desktop
-workbench itself is implemented.
+Graphite, Light, IDA-inspired, and Classic Debugger are implemented and persist as application
+preferences. They share the same layout, density, status meanings, and evidence requirements.
 
 Theme selection is an application preference, not analysis data, and is remembered across
 projects. Switching themes must not change table density, hide panels, or alter a review/export
@@ -208,7 +263,7 @@ verified merely because the plugin completed successfully.
 
 ## Accessibility and interaction requirements
 
-The workbench is not complete until all shipped themes support:
+The workbench is not feature-complete until all themes support:
 
 - text and essential control contrast targeting WCAG 2.2 AA;
 - status conveyed by label and icon as well as color;
@@ -223,10 +278,19 @@ The workbench is not complete until all shipped themes support:
 Confidence meters always include a numeric value. Progress bars include stage text and outcome.
 Tooltips supplement visible labels; they do not contain the only explanation of a status.
 
-## Deliberately deferred decisions
+The existence of the initial alpha shell does not mark this checklist complete. Keyboard traversal,
+assistive-technology naming, contrast, scaling, reduced motion, and high-contrast behavior remain
+workbench-completion and pre-1.0 requirements for every theme and workflow.
 
-This design does not yet select a GUI framework, docking library, renderer, or packaging strategy.
-It also does not claim that disassembly editing, live debugging, multi-binary workspaces, remote
-collaboration, or interactive IDA/Ghidra connectivity exists. Those choices should be evaluated
-against startup size, portability, accessibility, crash isolation, and the one-download product
-principle when GUI implementation begins.
+## Current boundaries and deliberately deferred work
+
+eframe/egui 0.32.3 with the glow renderer is selected for the initial application shell, and a
+portable Windows archive is the first packaging target. Cross-platform release packaging remains a
+later validation task.
+
+The current slice has no GUI plugin execution, legacy-package opening, durable review decisions,
+**Accept**/**Keep as Alias**/**Reject** behavior, PDB or IDA/Ghidra GUI export, docking,
+disassembly/pseudocode views, editable or exhaustive control-flow graphing, live debugger bridge,
+multi-binary workspace, or remote collaboration. Future choices in those areas must still be
+evaluated against startup size, portability, accessibility, crash isolation, exact identity, and
+the one-download product principle.
