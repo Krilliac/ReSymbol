@@ -514,13 +514,19 @@ mod tests {
 
     #[test]
     fn rva_reads_stop_at_file_backing_boundaries() {
-        let image = image();
+        let verified_image = image();
         let mut destination = [0_u8; 32];
-        assert_eq!(image.read_rva(0xf8, &mut destination).unwrap(), 8);
-        assert_eq!(image.read_rva(0x11f8, &mut destination).unwrap(), 8);
-        assert_eq!(image.read_rva(0x1200, &mut destination).unwrap(), 0);
+        assert_eq!(verified_image.read_rva(0xf8, &mut destination).unwrap(), 8);
+        assert_eq!(
+            verified_image.read_rva(0x11f8, &mut destination).unwrap(),
+            8
+        );
+        assert_eq!(
+            verified_image.read_rva(0x1200, &mut destination).unwrap(),
+            0
+        );
         assert!(matches!(
-            image.read_rva(0x3000, &mut destination),
+            verified_image.read_rva(0x3000, &mut destination),
             Err(ImageReadError::OutsideImage)
         ));
 
