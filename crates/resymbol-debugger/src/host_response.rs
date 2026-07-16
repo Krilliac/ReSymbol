@@ -202,7 +202,7 @@ impl HostResponseBatch {
 ///
 /// Pipe transports obtain this before reading `raw_len` bytes, then consume it
 /// with [`HostResponseBatchBuilder::push_preflighted`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct HostResponseFramePermit {
     index: usize,
     frame_bytes: usize,
@@ -211,7 +211,7 @@ pub struct HostResponseFramePermit {
 
 impl HostResponseFramePermit {
     #[must_use]
-    pub const fn frame_bytes(self) -> usize {
+    pub const fn frame_bytes(&self) -> usize {
         self.frame_bytes
     }
 }
@@ -291,19 +291,16 @@ impl HostResponseBatchBuilder {
         permit: HostResponseFramePermit,
         frame: HostFrame,
     ) -> Result<(), HostResponseBudgetError> {
-        let frame_bytes = response_frame_len(frame.header())?;
-        let expected_total = self
-            .total_bytes
-            .checked_add(frame_bytes)
-            .ok_or(HostResponseBudgetError::TotalBytesOverflow)?;
-        if permit.index != self.frames.len()
-            || permit.frame_bytes != frame_bytes
-            || permit.total_after != expected_total
-        {
+        // Re-run the receiver's preflight rather than trusting a permit merely
+        // because its private fields match the current index. This keeps a
+        // permit minted by a more permissive builder from bypassing this
+        // builder's per-frame or cumulative limits.
+        let expected = self.preflight_frame(frame.header())?;
+        if permit != expected {
             return Err(HostResponseBudgetError::StaleFramePermit);
         }
         self.frames.push(frame);
-        self.total_bytes = expected_total;
+        self.total_bytes = expected.total_after;
         Ok(())
     }
 
@@ -314,11 +311,16 @@ impl HostResponseBatchBuilder {
                 actual: self.frames.len(),
             });
         }
-        Ok(HostResponseBatch {
+        let limits = self.limits;
+        let batch = HostResponseBatch {
             declared_frame_count: self.declared_frame_count,
             frames: self.frames,
             total_bytes: self.total_bytes,
-        })
+        };
+        // Preserve the private batch invariant even if this builder is later
+        // extended with another insertion path.
+        batch.validate(limits)?;
+        Ok(batch)
     }
 }
 
@@ -326,4 +328,99 @@ fn response_frame_len(header: &FrameHeader) -> Result<usize, HostResponseBudgetE
     header
         .frame_len()
         .map_err(|_| HostResponseBudgetError::InvalidFrameLength)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::host_codec::HostFrame;
+    use crate::host_wire::{ControlBody, FrameHeader, FrameSequence, MessageKind};
+
+    use super::*;
+
+    fn response_frame(raw_bytes: usize) -> HostFrame {
+        let raw_len = u32::try_from(raw_bytes).expect("test payload length fits u32");
+        HostFrame::new(
+            FrameHeader::new(
+                FrameSequence::new(2).expect("nonzero sequence"),
+                MessageKind::Event,
+                raw_len,
+                None,
+                ControlBody::Bytes(vec![0]),
+            )
+            .expect("valid test frame header"),
+            vec![0; raw_bytes],
+        )
+        .expect("valid test frame")
+    }
+
+    #[test]
+    fn permit_from_permissive_builder_cannot_bypass_receiver_frame_limit() {
+        let frame = response_frame(64);
+        let frame_bytes = response_frame_len(frame.header()).expect("encoded frame length");
+        let permissive_limits =
+            HostResponseLimits::new(1, frame_bytes, frame_bytes).expect("permissive limits");
+        let strict_limits =
+            HostResponseLimits::new(1, frame_bytes - 1, frame_bytes).expect("strict frame limits");
+        let permissive =
+            HostResponseBatchBuilder::new(1, permissive_limits).expect("permissive builder");
+        let permit = permissive
+            .preflight_frame(frame.header())
+            .expect("permissive permit");
+        let mut strict = HostResponseBatchBuilder::new(1, strict_limits).expect("strict builder");
+
+        assert_eq!(
+            strict.push_preflighted(permit, frame),
+            Err(HostResponseBudgetError::FrameTooLarge {
+                index: 0,
+                actual: frame_bytes,
+                maximum: frame_bytes - 1,
+            })
+        );
+    }
+
+    #[test]
+    fn permit_from_permissive_builder_cannot_bypass_receiver_total_limit() {
+        let first = response_frame(32);
+        let second = response_frame(32);
+        let frame_bytes = response_frame_len(first.header()).expect("encoded frame length");
+        let strict_total = frame_bytes * 2 - 1;
+        let strict_limits = HostResponseLimits::new(2, frame_bytes, strict_total)
+            .expect("strict cumulative limits");
+        let permissive_limits = HostResponseLimits::new(2, frame_bytes, frame_bytes * 2)
+            .expect("permissive cumulative limits");
+        let mut strict = HostResponseBatchBuilder::new(2, strict_limits).expect("strict builder");
+        strict.push(first.clone()).expect("first strict frame");
+        let mut permissive =
+            HostResponseBatchBuilder::new(2, permissive_limits).expect("permissive builder");
+        permissive.push(first).expect("first permissive frame");
+        let permit = permissive
+            .preflight_frame(second.header())
+            .expect("permissive second permit");
+
+        assert_eq!(
+            strict.push_preflighted(permit, second),
+            Err(HostResponseBudgetError::TotalBytesExceeded {
+                actual: frame_bytes * 2,
+                maximum: strict_total,
+            })
+        );
+    }
+
+    #[test]
+    fn finish_revalidates_private_batch_invariants() {
+        let frame = response_frame(16);
+        let frame_bytes = response_frame_len(frame.header()).expect("encoded frame length");
+        let limits = HostResponseLimits::new(1, frame_bytes, frame_bytes).expect("limits");
+        let mut builder = HostResponseBatchBuilder::new(1, limits).expect("builder");
+        builder.push(frame).expect("frame fits limits");
+        builder.total_bytes += 1;
+
+        assert_eq!(
+            builder.finish(),
+            Err(HostResponseBudgetError::RecordedTotalMismatch {
+                recorded: frame_bytes + 1,
+                actual: frame_bytes,
+            })
+        );
+    }
 }
