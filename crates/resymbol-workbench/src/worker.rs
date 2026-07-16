@@ -1,4 +1,5 @@
 use std::{
+    fmt::Write as _,
     path::PathBuf,
     sync::{
         Arc,
@@ -9,9 +10,15 @@ use std::{
 };
 
 use resymbol_app::{AppServices, ExportFormat, ProjectSnapshot, ReviewLedger};
+use resymbol_core::BinaryIdentity;
 use resymbol_debugger::{
-    SandboxProviderProbeBackend, SandboxProviderReadinessService, SystemSandboxProviderProbe,
+    CapabilityAvailability, ClientConnectionState, CommandOutcome, DebugCapability, DebugCommand,
+    DebugEvent, DebugHostClient, DebugTargetRequest, HelperBuildId, MemoryAddress,
+    OfflineImageDebugHost, ProvisioningEpoch, ReadViewToken, SandboxProviderProbeBackend,
+    SandboxProviderReadinessService, SessionId, SessionState, SessionStateKind,
+    SystemSandboxProviderProbe, VerifiedOfflineImage,
 };
+use thiserror::Error;
 
 use crate::{
     model::LoadedProject,
@@ -20,6 +27,17 @@ use crate::{
 
 const COMMAND_QUEUE_CAPACITY: usize = 4;
 const EVENT_QUEUE_CAPACITY: usize = COMMAND_QUEUE_CAPACITY + 1;
+/// Maximum byte count accepted from one UI-triggered offline image read.
+pub const MAX_OFFLINE_IMAGE_UI_READ_BYTES: u32 = 256;
+/// Maximum retained diagnostic size for an unavailable offline image span.
+pub const MAX_OFFLINE_IMAGE_UNAVAILABLE_DETAIL_BYTES: usize = 1024;
+/// Maximum printable diagnostic retained for a worker pipeline failure.
+pub const MAX_OFFLINE_IMAGE_PIPELINE_DETAIL_BYTES: usize = 1024;
+
+const OFFLINE_RANGE_UNAVAILABLE_CODE: &str = "offline-range-unavailable";
+const OFFLINE_CONTROLLER_BUILD: &str = "resymbol-workbench-offline-controller";
+const OFFLINE_HOST_BUILD: &str = "resymbol-workbench-offline-host";
+const OFFLINE_HELPER_BUILD: &str = "resymbol-workbench-offline-helper";
 
 /// Correlates a worker result with the exact UI request that produced it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -131,6 +149,264 @@ pub struct ReviewLoadOutcome {
 pub struct ReviewApplyOutcome {
     pub project: LoadedProject,
     pub orphaned_decisions: usize,
+}
+
+/// Exact immutable project identity and canonical source bound to one read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OfflineImageBinding {
+    identity: BinaryIdentity,
+    source_path: PathBuf,
+}
+
+impl OfflineImageBinding {
+    #[must_use]
+    pub const fn identity(&self) -> &BinaryIdentity {
+        &self.identity
+    }
+
+    #[must_use]
+    pub fn source_path(&self) -> &std::path::Path {
+        &self.source_path
+    }
+}
+
+/// Validated image-relative read span accepted by the worker boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OfflineImageReadSpan {
+    rva: u64,
+    size: u32,
+}
+
+impl OfflineImageReadSpan {
+    pub fn new(rva: u64, size: u32) -> Result<Self, OfflineImageReadFailure> {
+        if size == 0 || size > MAX_OFFLINE_IMAGE_UI_READ_BYTES {
+            return Err(OfflineImageReadFailure::InvalidSize {
+                actual: size,
+                maximum: MAX_OFFLINE_IMAGE_UI_READ_BYTES,
+            });
+        }
+        let _ = rva
+            .checked_add(u64::from(size))
+            .ok_or(OfflineImageReadFailure::AddressOverflow { rva, size })?;
+        Ok(Self { rva, size })
+    }
+
+    #[must_use]
+    pub const fn rva(self) -> u64 {
+        self.rva
+    }
+
+    #[must_use]
+    pub const fn size(self) -> u32 {
+        self.size
+    }
+}
+
+/// Bounded typed evidence explaining why an exact static span was unavailable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OfflineImageReadUnavailable {
+    detail: String,
+}
+
+impl OfflineImageReadUnavailable {
+    fn from_validated_host_rejection(detail: String) -> Result<Self, OfflineImageReadFailure> {
+        if detail.is_empty()
+            || detail.len() > MAX_OFFLINE_IMAGE_UNAVAILABLE_DETAIL_BYTES
+            || detail.chars().any(char::is_control)
+        {
+            return Err(OfflineImageReadFailure::pipeline(
+                "read response validation",
+                "offline range rejection carried an invalid diagnostic",
+            ));
+        }
+        Ok(Self { detail })
+    }
+
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        OFFLINE_RANGE_UNAVAILABLE_CODE
+    }
+
+    #[must_use]
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
+}
+
+/// Exact bounded result of one requested RVA span.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OfflineImageReadAvailability {
+    Available { bytes: Vec<u8> },
+    Unavailable(OfflineImageReadUnavailable),
+}
+
+impl OfflineImageReadAvailability {
+    #[must_use]
+    pub fn bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::Available { bytes } => Some(bytes),
+            Self::Unavailable(_) => None,
+        }
+    }
+}
+
+/// Observable receipt for the one-shot non-executing host lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OfflineImageLifecycleReceipt {
+    session_id: SessionId,
+    capability_count: usize,
+    session_opened: bool,
+    session_closed: bool,
+    session_released: bool,
+    control_disconnected: bool,
+}
+
+impl OfflineImageLifecycleReceipt {
+    #[must_use]
+    pub const fn session_id(self) -> SessionId {
+        self.session_id
+    }
+
+    #[must_use]
+    pub const fn capability_count(self) -> usize {
+        self.capability_count
+    }
+
+    #[must_use]
+    pub const fn session_opened(self) -> bool {
+        self.session_opened
+    }
+
+    #[must_use]
+    pub const fn session_closed(self) -> bool {
+        self.session_closed
+    }
+
+    #[must_use]
+    pub const fn session_released(self) -> bool {
+        self.session_released
+    }
+
+    #[must_use]
+    pub const fn control_disconnected(self) -> bool {
+        self.control_disconnected
+    }
+
+    #[must_use]
+    pub const fn is_complete(self) -> bool {
+        self.session_opened
+            && self.session_closed
+            && self.session_released
+            && self.control_disconnected
+    }
+}
+
+/// Worker-owned evidence for one exact offline image byte request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OfflineImageReadOutcome {
+    binding: OfflineImageBinding,
+    span: OfflineImageReadSpan,
+    availability: OfflineImageReadAvailability,
+    lifecycle: OfflineImageLifecycleReceipt,
+}
+
+impl OfflineImageReadOutcome {
+    #[must_use]
+    pub const fn binding(&self) -> &OfflineImageBinding {
+        &self.binding
+    }
+
+    #[must_use]
+    pub const fn span(&self) -> OfflineImageReadSpan {
+        self.span
+    }
+
+    #[must_use]
+    pub const fn availability(&self) -> &OfflineImageReadAvailability {
+        &self.availability
+    }
+
+    #[must_use]
+    pub const fn lifecycle(&self) -> OfflineImageLifecycleReceipt {
+        self.lifecycle
+    }
+}
+
+/// Failures that prevent an exact one-shot offline read from producing evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum OfflineImageReadFailure {
+    #[error("the project has no exact identity-verified source snapshot")]
+    VerifiedSourceRequired,
+    #[error("the project source path and retained source snapshot disagree")]
+    VerifiedSourceInvariant,
+    #[error("offline image read size {actual} must be between 1 and {maximum} bytes")]
+    InvalidSize { actual: u32, maximum: u32 },
+    #[error("offline image read at RVA {rva:#x} with size {size} overflows the address space")]
+    AddressOverflow { rva: u64, size: u32 },
+    #[error("operating-system entropy was unavailable for the offline debugger session")]
+    EntropyUnavailable,
+    #[error("{0}")]
+    Pipeline(OfflineImagePipelineFailure),
+}
+
+impl OfflineImageReadFailure {
+    fn pipeline(stage: &'static str, error: impl std::fmt::Display) -> Self {
+        Self::Pipeline(OfflineImagePipelineFailure {
+            stage,
+            detail: bounded_pipeline_detail(error.to_string()),
+        })
+    }
+}
+
+/// Bounded printable failure evidence safe for direct workbench display.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OfflineImagePipelineFailure {
+    stage: &'static str,
+    detail: String,
+}
+
+impl OfflineImagePipelineFailure {
+    #[must_use]
+    pub const fn stage(&self) -> &'static str {
+        self.stage
+    }
+
+    #[must_use]
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
+}
+
+impl std::fmt::Display for OfflineImagePipelineFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "offline image pipeline failed during {}: {}",
+            self.stage, self.detail
+        )
+    }
+}
+
+fn bounded_pipeline_detail(detail: String) -> String {
+    let mut bounded =
+        String::with_capacity(detail.len().min(MAX_OFFLINE_IMAGE_PIPELINE_DETAIL_BYTES));
+    for character in detail.chars() {
+        let character = if character.is_control() {
+            ' '
+        } else {
+            character
+        };
+        if bounded.len() + character.len_utf8() > MAX_OFFLINE_IMAGE_PIPELINE_DETAIL_BYTES {
+            break;
+        }
+        bounded.push(character);
+    }
+    let bounded = bounded.trim();
+    if bounded.is_empty() {
+        "offline image pipeline returned no printable diagnostic".to_owned()
+    } else {
+        bounded.to_owned()
+    }
 }
 
 /// Long-running application-service work never runs on egui's render thread.
@@ -248,6 +524,13 @@ pub enum WorkerCommand {
         evidence: DebuggerReadinessEvidence,
         choice: SandboxProviderChoice,
     },
+    /// Read one exact file-backed RVA span through the non-executing host path.
+    ReadOfflineImage {
+        operation: OperationId,
+        project: Arc<ProjectSnapshot>,
+        rva: u64,
+        size: u32,
+    },
     Shutdown,
 }
 
@@ -280,6 +563,10 @@ pub enum WorkerEvent {
     SandboxProviderProbed {
         operation: OperationId,
         result: Result<DebuggerReadinessOutcome, String>,
+    },
+    OfflineImageRead {
+        operation: OperationId,
+        result: Result<OfflineImageReadOutcome, OfflineImageReadFailure>,
     },
 }
 
@@ -417,6 +704,15 @@ fn process_command(services: &AppServices, command: WorkerCommand) -> Option<Wor
         } => {
             process_sandbox_provider_probe(operation, evidence, choice, SystemSandboxProviderProbe)
         }
+        WorkerCommand::ReadOfflineImage {
+            operation,
+            project,
+            rva,
+            size,
+        } => WorkerEvent::OfflineImageRead {
+            operation,
+            result: read_offline_image(project, rva, size),
+        },
         WorkerCommand::Shutdown => return None,
     };
     Some(event)
@@ -442,6 +738,274 @@ where
     WorkerEvent::SandboxProviderProbed { operation, result }
 }
 
+/// Runs entirely on the application-service worker. The client is deliberately
+/// created and destroyed in this call because it is thread-affine and because
+/// an offline byte request must not leave session or transport ownership behind.
+fn read_offline_image(
+    project: Arc<ProjectSnapshot>,
+    rva: u64,
+    size: u32,
+) -> Result<OfflineImageReadOutcome, OfflineImageReadFailure> {
+    let span = OfflineImageReadSpan::new(rva, size)?;
+    let (source_path, source_bytes) = match (
+        project.verified_source_path(),
+        project.verified_source_bytes_arc(),
+    ) {
+        (Some(path), Some(bytes)) => (path.to_path_buf(), bytes),
+        (None, None) => return Err(OfflineImageReadFailure::VerifiedSourceRequired),
+        _ => return Err(OfflineImageReadFailure::VerifiedSourceInvariant),
+    };
+    let expected_identity = project.session().base_analysis().identity().clone();
+    let image = VerifiedOfflineImage::from_snapshot(&source_path, expected_identity, source_bytes)
+        .map_err(|error| OfflineImageReadFailure::pipeline("image verification", error))?;
+    let binding = OfflineImageBinding {
+        identity: image.identity().clone(),
+        source_path: image.origin_path().to_path_buf(),
+    };
+    let target = image.target();
+
+    let entropy = OfflineSessionEntropy::generate()?;
+    let helper_build = HelperBuildId::new(OFFLINE_HELPER_BUILD)
+        .map_err(|error| OfflineImageReadFailure::pipeline("host identity", error))?;
+    let host = OfflineImageDebugHost::new(
+        image,
+        OFFLINE_HOST_BUILD,
+        OFFLINE_CONTROLLER_BUILD,
+        entropy.provisioning_epoch.clone(),
+        helper_build.clone(),
+    )
+    .map_err(|error| OfflineImageReadFailure::pipeline("host construction", error))?;
+    let mut client = DebugHostClient::connect(
+        host,
+        entropy.handshake_nonce,
+        OFFLINE_CONTROLLER_BUILD,
+        OFFLINE_HOST_BUILD,
+    )
+    .map_err(|error| OfflineImageReadFailure::pipeline("host connection", error))?;
+
+    let capabilities = client
+        .probe_capabilities()
+        .map_err(|error| OfflineImageReadFailure::pipeline("capability probe", error))?;
+    verify_offline_only_capabilities(&capabilities.statuses)?;
+    let capability_count = capabilities.statuses.len();
+
+    client
+        .begin_session(entropy.session_id, entropy.provisioning_epoch, helper_build)
+        .map_err(|error| OfflineImageReadFailure::pipeline("session begin", error))?;
+    let open = client
+        .submit(DebugCommand::Open(DebugTargetRequest::Offline(target)))
+        .map_err(|error| OfflineImageReadFailure::pipeline("offline open", error))?;
+    require_succeeded("offline open", &open.outcome)?;
+    let SessionState::Offline { token } = client.session_state().ok_or_else(|| {
+        OfflineImageReadFailure::pipeline("offline open", "host omitted the opened session state")
+    })?
+    else {
+        return Err(OfflineImageReadFailure::pipeline(
+            "offline open",
+            "host did not enter the offline state",
+        ));
+    };
+    let read_view = ReadViewToken::Offline { state: *token };
+    let read = client
+        .submit(DebugCommand::ReadMemory {
+            view: read_view,
+            address: MemoryAddress::new(span.rva()),
+            size: span.size(),
+        })
+        .map_err(|error| OfflineImageReadFailure::pipeline("offline read", error))?;
+    let availability = exact_read_availability(read, read_view, span)?;
+
+    let close_state = client
+        .session_state()
+        .ok_or_else(|| {
+            OfflineImageReadFailure::pipeline("session close", "host omitted session state")
+        })?
+        .state_token();
+    let close = client
+        .submit(DebugCommand::Close { state: close_state })
+        .map_err(|error| OfflineImageReadFailure::pipeline("session close", error))?;
+    require_succeeded("session close", &close.outcome)?;
+    if client.session_state().map(SessionState::kind) != Some(SessionStateKind::Closed) {
+        return Err(OfflineImageReadFailure::pipeline(
+            "session close",
+            "host did not enter the closed state",
+        ));
+    }
+    client
+        .release_closed_session()
+        .map_err(|error| OfflineImageReadFailure::pipeline("session release", error))?;
+    client
+        .disconnect()
+        .map_err(|error| OfflineImageReadFailure::pipeline("control disconnect", error))?;
+    if client.connection_state() != ClientConnectionState::Disconnected {
+        return Err(OfflineImageReadFailure::pipeline(
+            "control disconnect",
+            "client did not confirm the disconnected state",
+        ));
+    }
+
+    Ok(OfflineImageReadOutcome {
+        binding,
+        span,
+        availability,
+        lifecycle: OfflineImageLifecycleReceipt {
+            session_id: entropy.session_id,
+            capability_count,
+            session_opened: true,
+            session_closed: true,
+            session_released: true,
+            control_disconnected: true,
+        },
+    })
+}
+
+fn verify_offline_only_capabilities(
+    statuses: &[resymbol_debugger::CapabilityStatus],
+) -> Result<(), OfflineImageReadFailure> {
+    if statuses.len() != DebugCapability::ALL.len() {
+        return Err(OfflineImageReadFailure::pipeline(
+            "capability boundary",
+            "offline host did not report the complete capability set",
+        ));
+    }
+    for capability in DebugCapability::ALL {
+        let status = statuses
+            .iter()
+            .find(|status| status.capability == capability)
+            .ok_or_else(|| {
+                OfflineImageReadFailure::pipeline(
+                    "capability boundary",
+                    format!("offline host omitted {capability:?}"),
+                )
+            })?;
+        let exact = match capability {
+            DebugCapability::OfflineAnalysis => {
+                matches!(&status.availability, CapabilityAvailability::Available)
+            }
+            _ => matches!(
+                &status.availability,
+                CapabilityAvailability::Unavailable { .. }
+            ),
+        };
+        if !exact {
+            return Err(OfflineImageReadFailure::pipeline(
+                "capability boundary",
+                format!("offline host advertised an invalid {capability:?} capability"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn require_succeeded(
+    stage: &'static str,
+    outcome: &CommandOutcome,
+) -> Result<(), OfflineImageReadFailure> {
+    match outcome {
+        CommandOutcome::Succeeded => Ok(()),
+        CommandOutcome::Rejected { code, message } => Err(OfflineImageReadFailure::pipeline(
+            stage,
+            format!("host rejected the command ({code}): {message}"),
+        )),
+    }
+}
+
+fn exact_read_availability(
+    receipt: resymbol_debugger::CommandReceipt,
+    expected_view: ReadViewToken,
+    span: OfflineImageReadSpan,
+) -> Result<OfflineImageReadAvailability, OfflineImageReadFailure> {
+    match receipt.outcome {
+        CommandOutcome::Succeeded => {
+            let mut exact_bytes = None;
+            for envelope in receipt.events {
+                if let DebugEvent::MemoryRead {
+                    view,
+                    address,
+                    bytes,
+                } = envelope.event
+                {
+                    if view != expected_view
+                        || address != MemoryAddress::new(span.rva())
+                        || bytes.len() != span.size() as usize
+                        || exact_bytes.replace(bytes).is_some()
+                    {
+                        return Err(OfflineImageReadFailure::pipeline(
+                            "read response validation",
+                            "host returned memory evidence outside the exact requested span",
+                        ));
+                    }
+                }
+            }
+            let bytes = exact_bytes.ok_or_else(|| {
+                OfflineImageReadFailure::pipeline(
+                    "read response validation",
+                    "host succeeded without exact memory evidence",
+                )
+            })?;
+            Ok(OfflineImageReadAvailability::Available { bytes })
+        }
+        CommandOutcome::Rejected { code, message } if code == OFFLINE_RANGE_UNAVAILABLE_CODE => {
+            if receipt
+                .events
+                .iter()
+                .any(|event| matches!(&event.event, DebugEvent::MemoryRead { .. }))
+            {
+                return Err(OfflineImageReadFailure::pipeline(
+                    "read response validation",
+                    "rejected read carried memory evidence",
+                ));
+            }
+            OfflineImageReadUnavailable::from_validated_host_rejection(message)
+                .map(OfflineImageReadAvailability::Unavailable)
+        }
+        CommandOutcome::Rejected { code, message } => Err(OfflineImageReadFailure::pipeline(
+            "offline read",
+            format!("host rejected the command ({code}): {message}"),
+        )),
+    }
+}
+
+struct OfflineSessionEntropy {
+    session_id: SessionId,
+    handshake_nonce: [u8; 16],
+    provisioning_epoch: ProvisioningEpoch,
+}
+
+impl OfflineSessionEntropy {
+    fn generate() -> Result<Self, OfflineImageReadFailure> {
+        let session_bytes = nonzero_random_bytes::<8>()?;
+        let session_id = SessionId::new(u64::from_le_bytes(session_bytes))
+            .map_err(|error| OfflineImageReadFailure::pipeline("session entropy", error))?;
+        let handshake_nonce = nonzero_random_bytes::<16>()?;
+        let epoch_bytes = nonzero_random_bytes::<32>()?;
+        let mut epoch_hex = String::with_capacity(64);
+        for byte in epoch_bytes {
+            write!(&mut epoch_hex, "{byte:02x}").map_err(|error| {
+                OfflineImageReadFailure::pipeline("provisioning epoch encoding", error)
+            })?;
+        }
+        let provisioning_epoch = ProvisioningEpoch::new(epoch_hex).map_err(|error| {
+            OfflineImageReadFailure::pipeline("provisioning epoch encoding", error)
+        })?;
+        Ok(Self {
+            session_id,
+            handshake_nonce,
+            provisioning_epoch,
+        })
+    }
+}
+
+fn nonzero_random_bytes<const N: usize>() -> Result<[u8; N], OfflineImageReadFailure> {
+    loop {
+        let mut bytes = [0; N];
+        getrandom::fill(&mut bytes).map_err(|_| OfflineImageReadFailure::EntropyUnavailable)?;
+        if bytes.iter().any(|byte| *byte != 0) {
+            return Ok(bytes);
+        }
+    }
+}
+
 fn apply_reviews(
     project: Arc<ProjectSnapshot>,
     ledger: &ReviewLedger,
@@ -462,7 +1026,7 @@ fn apply_reviews(
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write as _;
+    use std::{fs, io::Write as _};
 
     use resymbol_core::{BinaryFormat, BinaryId, BinaryIdentity};
     use resymbol_debugger::{
@@ -476,13 +1040,49 @@ mod tests {
         include_bytes!("../../../fixtures/pe-x64-msvc/artifacts/milestone2-stripped.exe");
 
     fn project_snapshot() -> Arc<ProjectSnapshot> {
+        let (_source, snapshot) = project_snapshot_with_source();
+        snapshot
+    }
+
+    fn project_snapshot_with_source() -> (NamedTempFile, Arc<ProjectSnapshot>) {
+        project_snapshot_with_bytes(STRIPPED_FIXTURE)
+    }
+
+    fn project_snapshot_with_bytes(bytes: &[u8]) -> (NamedTempFile, Arc<ProjectSnapshot>) {
         let mut source = NamedTempFile::new().expect("temporary PE");
-        source
-            .write_all(STRIPPED_FIXTURE)
-            .expect("write fixture PE");
-        AppServices::default()
+        source.write_all(bytes).expect("write fixture PE");
+        let snapshot = AppServices::default()
             .analyze_binary(source.path())
-            .expect("analyze worker fixture")
+            .expect("analyze worker fixture");
+        (source, snapshot)
+    }
+
+    fn offline_read(
+        operation: OperationId,
+        project: Arc<ProjectSnapshot>,
+        rva: u64,
+        size: u32,
+    ) -> Result<OfflineImageReadOutcome, OfflineImageReadFailure> {
+        match process_command(
+            &AppServices::default(),
+            WorkerCommand::ReadOfflineImage {
+                operation,
+                project,
+                rva,
+                size,
+            },
+        )
+        .expect("offline read event")
+        {
+            WorkerEvent::OfflineImageRead {
+                operation: actual,
+                result,
+            } => {
+                assert_eq!(actual, operation);
+                result
+            }
+            _ => panic!("unexpected worker event"),
+        }
     }
 
     #[derive(Debug, Clone)]
@@ -639,5 +1239,193 @@ mod tests {
             }
             _ => panic!("unexpected worker event"),
         }
+    }
+
+    #[test]
+    fn worker_reads_mz_through_the_exact_offline_host_lifecycle() {
+        let (_source, project) = project_snapshot_with_source();
+        let operation = OperationSequence::default().issue();
+
+        let outcome = offline_read(operation, project, 0, 2).expect("read MZ header");
+
+        assert_eq!(outcome.span(), OfflineImageReadSpan::new(0, 2).unwrap());
+        assert_eq!(outcome.availability().bytes(), Some(b"MZ".as_slice()));
+    }
+
+    #[test]
+    fn package_only_project_rejects_offline_reads_without_rereading_a_path() {
+        let (_source, analyzed) = project_snapshot_with_source();
+        let directory = tempdir().expect("temporary package directory");
+        let package_path = directory.path().join("offline-read.resym");
+        let services = AppServices::default();
+        services
+            .save_package_new(&analyzed, &package_path)
+            .expect("save package");
+        let package_only = services.open_package(&package_path).expect("open package");
+
+        let result = offline_read(OperationSequence::default().issue(), package_only, 0, 2);
+
+        assert_eq!(result, Err(OfflineImageReadFailure::VerifiedSourceRequired));
+    }
+
+    #[test]
+    fn offline_worker_rejects_empty_oversized_and_overflowing_spans() {
+        let (_source, project) = project_snapshot_with_source();
+        let mut sequence = OperationSequence::default();
+
+        assert_eq!(
+            offline_read(sequence.issue(), Arc::clone(&project), 0, 0),
+            Err(OfflineImageReadFailure::InvalidSize {
+                actual: 0,
+                maximum: MAX_OFFLINE_IMAGE_UI_READ_BYTES,
+            })
+        );
+        assert_eq!(
+            offline_read(
+                sequence.issue(),
+                Arc::clone(&project),
+                0,
+                MAX_OFFLINE_IMAGE_UI_READ_BYTES + 1,
+            ),
+            Err(OfflineImageReadFailure::InvalidSize {
+                actual: MAX_OFFLINE_IMAGE_UI_READ_BYTES + 1,
+                maximum: MAX_OFFLINE_IMAGE_UI_READ_BYTES,
+            })
+        );
+        assert_eq!(
+            offline_read(sequence.issue(), project, u64::MAX, 1),
+            Err(OfflineImageReadFailure::AddressOverflow {
+                rva: u64::MAX,
+                size: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn offline_pipeline_failure_diagnostics_are_bounded_and_printable() {
+        let failure = OfflineImageReadFailure::pipeline(
+            "test stage",
+            format!(
+                "{}\n\t",
+                "x".repeat(MAX_OFFLINE_IMAGE_PIPELINE_DETAIL_BYTES * 2)
+            ),
+        );
+        let OfflineImageReadFailure::Pipeline(failure) = failure else {
+            panic!("pipeline failure")
+        };
+
+        assert_eq!(failure.stage(), "test stage");
+        assert!(!failure.detail().is_empty());
+        assert!(failure.detail().len() <= MAX_OFFLINE_IMAGE_PIPELINE_DETAIL_BYTES);
+        assert!(!failure.detail().chars().any(char::is_control));
+
+        let fallback = OfflineImageReadFailure::pipeline("empty", "\n\t");
+        let OfflineImageReadFailure::Pipeline(fallback) = fallback else {
+            panic!("pipeline fallback")
+        };
+        assert_eq!(
+            fallback.detail(),
+            "offline image pipeline returned no printable diagnostic"
+        );
+    }
+
+    #[test]
+    fn offline_worker_reports_gap_and_crossing_spans_as_bounded_unavailable() {
+        let mut bytes = STRIPPED_FIXTURE.to_vec();
+        let pe_offset = usize::try_from(u32::from_le_bytes(
+            bytes[0x3c..0x40].try_into().expect("e_lfanew bytes"),
+        ))
+        .expect("PE offset");
+        let size_of_image = pe_offset + 24 + 56;
+        let prior_image_size = u32::from_le_bytes(
+            bytes[size_of_image..size_of_image + 4]
+                .try_into()
+                .expect("SizeOfImage bytes"),
+        );
+        bytes[size_of_image..size_of_image + 4]
+            .copy_from_slice(&prior_image_size.saturating_add(0x1000).to_le_bytes());
+        let (_source, project) = project_snapshot_with_bytes(&bytes);
+        let image = VerifiedOfflineImage::from_snapshot(
+            project.verified_source_path().expect("verified path"),
+            project.session().base_analysis().identity().clone(),
+            project
+                .verified_source_bytes_arc()
+                .expect("verified source snapshot"),
+        )
+        .expect("verified offline image");
+        let gap_rva = image
+            .address_space()
+            .regions()
+            .iter()
+            .find(|region| matches!(&region.kind, resymbol_debugger::StaticRegionKind::ImageGap))
+            .expect("fixture image gap")
+            .range
+            .start()
+            .get();
+        let crossing_rva = image
+            .address_space()
+            .regions()
+            .iter()
+            .find_map(|region| {
+                let backing = region.file_backing?;
+                (backing.size >= 1)
+                    .then(|| region.range.start().get() + backing.size.saturating_sub(1))
+            })
+            .expect("file-backed fixture region");
+        let mut sequence = OperationSequence::default();
+
+        for (rva, size) in [(gap_rva, 1), (crossing_rva, 2)] {
+            let outcome = offline_read(sequence.issue(), Arc::clone(&project), rva, size)
+                .expect("typed unavailable read");
+            let OfflineImageReadAvailability::Unavailable(unavailable) = outcome.availability()
+            else {
+                panic!("range must be unavailable")
+            };
+            assert_eq!(unavailable.code(), OFFLINE_RANGE_UNAVAILABLE_CODE);
+            assert!(!unavailable.detail().is_empty());
+            assert!(unavailable.detail().len() <= MAX_OFFLINE_IMAGE_UNAVAILABLE_DETAIL_BYTES);
+        }
+    }
+
+    #[test]
+    fn offline_read_outcome_is_bound_to_the_exact_identity_source_and_span() {
+        let (_source, project) = project_snapshot_with_source();
+        let expected_identity = project.session().base_analysis().identity().clone();
+        let expected_source = fs::canonicalize(
+            project
+                .verified_source_path()
+                .expect("verified source path"),
+        )
+        .expect("canonical source");
+
+        let outcome = offline_read(
+            OperationSequence::default().issue(),
+            Arc::clone(&project),
+            0x10,
+            8,
+        )
+        .expect("bound header read");
+
+        assert_eq!(outcome.binding().identity(), &expected_identity);
+        assert_eq!(outcome.binding().source_path(), expected_source.as_path());
+        assert_eq!(outcome.span().rva(), 0x10);
+        assert_eq!(outcome.span().size(), 8);
+    }
+
+    #[test]
+    fn offline_read_exposes_complete_release_and_disconnect_evidence() {
+        let (_source, project) = project_snapshot_with_source();
+
+        let outcome = offline_read(OperationSequence::default().issue(), project, 0, 2)
+            .expect("complete offline read");
+        let lifecycle = outcome.lifecycle();
+
+        assert_ne!(lifecycle.session_id().get(), 0);
+        assert_eq!(lifecycle.capability_count(), DebugCapability::ALL.len());
+        assert!(lifecycle.session_opened());
+        assert!(lifecycle.session_closed());
+        assert!(lifecycle.session_released());
+        assert!(lifecycle.control_disconnected());
+        assert!(lifecycle.is_complete());
     }
 }

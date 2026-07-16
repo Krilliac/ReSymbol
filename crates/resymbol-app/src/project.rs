@@ -281,6 +281,18 @@ impl ProjectSnapshot {
             .map(|source| source.bytes.as_ref())
     }
 
+    /// Clone ownership of the exact, identity-verified source snapshot.
+    ///
+    /// This shares the retained allocation through [`Arc`] without copying the
+    /// binary. It is intended for bounded worker-side consumers that must keep
+    /// the verified snapshot alive independently of the project handle.
+    #[must_use]
+    pub fn verified_source_bytes_arc(&self) -> Option<Arc<[u8]>> {
+        self.exact_source
+            .as_ref()
+            .map(|source| Arc::clone(&source.bytes))
+    }
+
     /// Apply the current review ledger to a fresh export projection.
     pub fn reviewed_projection(
         &self,

@@ -1607,6 +1607,31 @@ impl WorkbenchApp {
                         }
                     }
                 }
+                WorkerEvent::OfflineImageRead { operation, result } => {
+                    let (level, message) = match result {
+                        Ok(outcome) => {
+                            let summary = outcome.availability().bytes().map_or_else(
+                                || "exact RVA span was unavailable".to_owned(),
+                                |bytes| format!("read {} exact byte(s)", bytes.len()),
+                            );
+                            (
+                                ActivityLevel::Info,
+                                format!(
+                                    "Offline image operation {} completed before a UI consumer was registered: {summary}",
+                                    operation.get()
+                                ),
+                            )
+                        }
+                        Err(error) => (
+                            ActivityLevel::Error,
+                            format!(
+                                "Offline image operation {} failed before a UI consumer was registered: {error}",
+                                operation.get()
+                            ),
+                        ),
+                    };
+                    self.log(level, message);
+                }
             }
         }
     }
