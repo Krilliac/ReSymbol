@@ -49,6 +49,7 @@ const TRANSITIVE_THUNK_CHAIN_SCHEMA_VERSION: u32 = 6;
 const TLS_CALLBACK_SCHEMA_VERSION: u32 = 7;
 const DELAY_IMPORT_SCHEMA_VERSION: u32 = 8;
 const GUARD_CF_SCHEMA_VERSION: u32 = 9;
+const GUARD_TARGET_TABLE_SCHEMA_VERSION: u32 = 10;
 const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 
 #[derive(Debug, Parser)]
@@ -357,6 +358,7 @@ fn inspect(args: InspectArgs) -> Result<()> {
             tls_callbacks: loaded.tls_callback_availability,
             delay_imports: loaded.delay_import_availability,
             guard_cf: loaded.guard_cf_availability,
+            guard_target_tables: loaded.guard_target_table_availability,
         },
     )?;
 
@@ -512,6 +514,12 @@ enum GuardCfAvailability {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuardTargetTableAvailability {
+    Recorded,
+    Unavailable(u32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct AnalysisFeatureAvailability {
     code_recovery: CodeRecoveryAvailability,
     transitive_thunk_recovery: TransitiveThunkRecoveryAvailability,
@@ -520,6 +528,7 @@ struct AnalysisFeatureAvailability {
     tls_callbacks: TlsCallbackAvailability,
     delay_imports: DelayImportAvailability,
     guard_cf: GuardCfAvailability,
+    guard_target_tables: GuardTargetTableAvailability,
 }
 
 impl AnalysisFeatureAvailability {
@@ -531,6 +540,7 @@ impl AnalysisFeatureAvailability {
         tls_callbacks: TlsCallbackAvailability::Recorded,
         delay_imports: DelayImportAvailability::Recorded,
         guard_cf: GuardCfAvailability::Recorded,
+        guard_target_tables: GuardTargetTableAvailability::Recorded,
     };
 }
 
@@ -540,6 +550,17 @@ impl GuardCfAvailability {
             Self::Recorded => None,
             Self::Unavailable(schema_version) => Some(format!(
                 "GuardCF functions: unavailable (schema {schema_version} package predates PE GuardCF recovery; reanalyze the exact original binary)"
+            )),
+        }
+    }
+}
+
+impl GuardTargetTableAvailability {
+    fn export_summary_line(self) -> Option<String> {
+        match self {
+            Self::Recorded => None,
+            Self::Unavailable(schema_version) => Some(format!(
+                "modern PE Guard target inventories: unavailable (schema {schema_version} package predates address-taken IAT, long-jump, and EH-continuation table data; reanalyze the exact original binary)"
             )),
         }
     }
@@ -576,6 +597,7 @@ struct LoadedAnalysisPackage {
     tls_callback_availability: TlsCallbackAvailability,
     delay_import_availability: DelayImportAvailability,
     guard_cf_availability: GuardCfAvailability,
+    guard_target_table_availability: GuardTargetTableAvailability,
     legacy_inspection_source: Option<ResymPackage<Value>>,
 }
 
@@ -601,7 +623,7 @@ fn read_analysis_package(
         1 => CodeRecoveryAvailability::UnavailableSchema1,
         2 => CodeRecoveryAvailability::RecordedWithoutReadOnlyPointerControlFlow(2),
         3 => CodeRecoveryAvailability::RecordedWithoutReadOnlyPointerControlFlow(3),
-        4..=9 => CodeRecoveryAvailability::Recorded,
+        4..=CURRENT_SCHEMA_VERSION => CodeRecoveryAvailability::Recorded,
         _ => bail!("unsupported analysis package schema {schema_version}"),
     };
     let transitive_thunk_recovery_availability = match schema_version {
@@ -609,44 +631,52 @@ fn read_analysis_package(
         2..=5 => TransitiveThunkRecoveryAvailability::RecordedWithoutTransitiveThunkChains(
             schema_version,
         ),
-        6..=9 => TransitiveThunkRecoveryAvailability::Recorded,
+        6..=CURRENT_SCHEMA_VERSION => TransitiveThunkRecoveryAvailability::Recorded,
         _ => bail!("unsupported analysis package schema {schema_version}"),
     };
     let string_data_recovery_availability = match schema_version {
         1 => StringDataRecoveryAvailability::UnavailableSchema1,
         2 => StringDataRecoveryAvailability::UnavailableSchema2,
-        3..=9 => StringDataRecoveryAvailability::Recorded,
+        3..=CURRENT_SCHEMA_VERSION => StringDataRecoveryAvailability::Recorded,
         _ => bail!("unsupported analysis package schema {schema_version}"),
     };
     let rtti_recovery_availability = match schema_version {
         1..=4 => RttiRecoveryAvailability::RecordedWithoutNoPchdBaseDescriptors(schema_version),
-        5..=9 => RttiRecoveryAvailability::Recorded,
+        5..=CURRENT_SCHEMA_VERSION => RttiRecoveryAvailability::Recorded,
         _ => bail!("unsupported analysis package schema {schema_version}"),
     };
     let tls_callback_availability = match schema_version {
         1..=6 => TlsCallbackAvailability::Unavailable(schema_version),
-        7..=9 => TlsCallbackAvailability::Recorded,
+        7..=CURRENT_SCHEMA_VERSION => TlsCallbackAvailability::Recorded,
         _ => bail!("unsupported analysis package schema {schema_version}"),
     };
     let delay_import_availability = match schema_version {
         1..=7 => DelayImportAvailability::Unavailable(schema_version),
-        DELAY_IMPORT_SCHEMA_VERSION..=GUARD_CF_SCHEMA_VERSION => DelayImportAvailability::Recorded,
+        DELAY_IMPORT_SCHEMA_VERSION..=CURRENT_SCHEMA_VERSION => DelayImportAvailability::Recorded,
         _ => bail!("unsupported analysis package schema {schema_version}"),
     };
     let guard_cf_availability = match schema_version {
         1..=8 => GuardCfAvailability::Unavailable(schema_version),
-        GUARD_CF_SCHEMA_VERSION => GuardCfAvailability::Recorded,
+        GUARD_CF_SCHEMA_VERSION..=CURRENT_SCHEMA_VERSION => GuardCfAvailability::Recorded,
+        _ => bail!("unsupported analysis package schema {schema_version}"),
+    };
+    let guard_target_table_availability = match schema_version {
+        1..=9 => GuardTargetTableAvailability::Unavailable(schema_version),
+        GUARD_TARGET_TABLE_SCHEMA_VERSION => GuardTargetTableAvailability::Recorded,
         _ => bail!("unsupported analysis package schema {schema_version}"),
     };
     let legacy_inspection_source = (preserve_legacy_inspection_source
         && schema_version < CURRENT_SCHEMA_VERSION)
         .then(|| package.clone());
-    match schema_version.cmp(&GUARD_CF_SCHEMA_VERSION) {
-        std::cmp::Ordering::Equal => require_v9_guard_cf_marker(package.payload())?,
-        std::cmp::Ordering::Less => {
-            reject_pre_v9_guard_cf_semantics(package.payload(), schema_version)?;
-        }
-        std::cmp::Ordering::Greater => {}
+    if schema_version >= GUARD_TARGET_TABLE_SCHEMA_VERSION {
+        require_v10_guard_target_table_markers(package.payload(), schema_version)?;
+    } else {
+        reject_pre_v10_guard_target_table_semantics(package.payload(), schema_version)?;
+    }
+    if schema_version >= GUARD_CF_SCHEMA_VERSION {
+        require_v9_guard_cf_marker(package.payload(), schema_version)?;
+    } else {
+        reject_pre_v9_guard_cf_semantics(package.payload(), schema_version)?;
     }
     if schema_version >= DELAY_IMPORT_SCHEMA_VERSION {
         require_v8_delay_import_marker(package.payload(), schema_version)?;
@@ -673,7 +703,8 @@ fn read_analysis_package(
         6 => serde_json::from_value(payload).context("cannot decode schema-v6 analysis payload"),
         7 => serde_json::from_value(payload).context("cannot decode schema-v7 analysis payload"),
         8 => serde_json::from_value(payload).context("cannot decode schema-v8 analysis payload"),
-        9 => serde_json::from_value(payload).context("cannot decode current analysis payload"),
+        9 => serde_json::from_value(payload).context("cannot decode schema-v9 analysis payload"),
+        10 => serde_json::from_value(payload).context("cannot decode current analysis payload"),
         _ => bail!("unsupported analysis package schema {schema_version}"),
     })?;
     if (2..TRANSITIVE_THUNK_CHAIN_SCHEMA_VERSION).contains(&schema_version) {
@@ -691,11 +722,64 @@ fn read_analysis_package(
         tls_callback_availability,
         delay_import_availability,
         guard_cf_availability,
+        guard_target_table_availability,
         legacy_inspection_source,
     })
 }
 
-fn require_v9_guard_cf_marker(payload: &Value) -> Result<()> {
+fn require_v10_guard_target_table_markers(payload: &Value, schema_version: u32) -> Result<()> {
+    debug_assert!(schema_version >= GUARD_TARGET_TABLE_SCHEMA_VERSION);
+    let Some(analysis) = payload
+        .pointer("/base_analysis/analysis")
+        .and_then(Value::as_object)
+    else {
+        return Ok(());
+    };
+    let missing = [
+        "guard_address_taken_iat_entries",
+        "guard_long_jump_targets",
+        "guard_eh_continuation_targets",
+    ]
+    .into_iter()
+    .filter(|field| !analysis.contains_key(*field))
+    .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        bail!(
+            "package schema {schema_version} requires explicit guard_address_taken_iat_entries, guard_long_jump_targets, and guard_eh_continuation_targets inventories, even when empty; missing {}; a legacy package without those markers cannot be migrated by changing only its envelope label, so reanalyze the exact original binary",
+            missing.join(", ")
+        );
+    }
+    Ok(())
+}
+
+fn reject_pre_v10_guard_target_table_semantics(payload: &Value, schema_version: u32) -> Result<()> {
+    debug_assert!((1..GUARD_TARGET_TABLE_SCHEMA_VERSION).contains(&schema_version));
+    let Some(analysis) = payload
+        .pointer("/base_analysis/analysis")
+        .and_then(Value::as_object)
+    else {
+        return Ok(());
+    };
+    let uses_guard_target_table_shape = [
+        "guard_address_taken_iat_entry_table_rva",
+        "guard_address_taken_iat_entries",
+        "guard_long_jump_target_table_rva",
+        "guard_long_jump_targets",
+        "guard_eh_continuation_table_rva",
+        "guard_eh_continuation_targets",
+    ]
+    .iter()
+    .any(|field| analysis.contains_key(*field));
+    if uses_guard_target_table_shape {
+        bail!(
+            "package schema {schema_version} predates modern PE Guard target-table recovery but its base analysis contains schema-10 address-taken IAT, long-jump, or EH-continuation semantics; legacy envelopes cannot be relabeled, so reanalyze the exact original binary"
+        );
+    }
+    Ok(())
+}
+
+fn require_v9_guard_cf_marker(payload: &Value, schema_version: u32) -> Result<()> {
+    debug_assert!(schema_version >= GUARD_CF_SCHEMA_VERSION);
     let Some(analysis) = payload
         .pointer("/base_analysis/analysis")
         .and_then(Value::as_object)
@@ -704,7 +788,7 @@ fn require_v9_guard_cf_marker(payload: &Value) -> Result<()> {
     };
     if !analysis.contains_key("guard_cf_functions") {
         bail!(
-            "package schema 9 requires an explicit guard_cf_functions inventory, even when empty; a legacy package without that marker cannot be migrated by changing only its envelope label, so reanalyze the exact original binary"
+            "package schema {schema_version} requires an explicit guard_cf_functions inventory, even when empty; a legacy package without that marker cannot be migrated by changing only its envelope label, so reanalyze the exact original binary"
         );
     }
     Ok(())
@@ -1181,6 +1265,12 @@ impl SchemaV1PeAnalysis {
             guard_flags: None,
             guard_cf_function_table_rva: None,
             guard_cf_functions: Vec::new(),
+            guard_address_taken_iat_entry_table_rva: None,
+            guard_address_taken_iat_entries: Vec::new(),
+            guard_long_jump_target_table_rva: None,
+            guard_long_jump_targets: Vec::new(),
+            guard_eh_continuation_table_rva: None,
+            guard_eh_continuation_targets: Vec::new(),
             tls_callback_table_rva: None,
             tls_callback_scan_truncated: false,
             tls_callbacks: Vec::new(),
@@ -1326,6 +1416,12 @@ fn export(args: ExportArgs) -> Result<()> {
         println!("{line}");
     }
     if let Some(line) = package_data.guard_cf_availability.export_summary_line() {
+        println!("{line}");
+    }
+    if let Some(line) = package_data
+        .guard_target_table_availability
+        .export_summary_line()
+    {
         println!("{line}");
     }
     println!(
@@ -2437,6 +2533,7 @@ fn print_analysis_summary(analysis: &BinaryAnalysis, availability: AnalysisFeatu
         tls_callbacks: tls_callback_availability,
         delay_imports: delay_import_availability,
         guard_cf: guard_cf_availability,
+        guard_target_tables: guard_target_table_availability,
     } = availability;
     let identity = analysis.identity();
     println!("size: {} bytes", identity.size);
@@ -2505,6 +2602,9 @@ fn print_analysis_summary(analysis: &BinaryAnalysis, availability: AnalysisFeatu
             );
             println!("runtime functions: {}", pe.runtime_functions.len());
             println!("{}", guard_cf_summary_line(pe, guard_cf_availability));
+            for line in guard_target_table_summary_lines(pe, guard_target_table_availability) {
+                println!("{line}");
+            }
             for line in tls_callback_summary_lines(pe, tls_callback_availability) {
                 println!("{line}");
             }
@@ -2605,6 +2705,39 @@ fn guard_cf_summary_line(
         GuardCfAvailability::Unavailable(schema_version) => format!(
             "GuardCF functions: unavailable (not recorded by schema {schema_version}; reanalyze the exact original binary)"
         ),
+    }
+}
+
+fn guard_target_table_summary_lines(
+    pe: &resymbol_analysis::PeAnalysis,
+    availability: GuardTargetTableAvailability,
+) -> [String; 3] {
+    match availability {
+        GuardTargetTableAvailability::Recorded => [
+            format!(
+                "Guard address-taken IAT entries: {}",
+                pe.guard_address_taken_iat_entries.len()
+            ),
+            format!(
+                "Guard long-jump targets: {}",
+                pe.guard_long_jump_targets.len()
+            ),
+            format!(
+                "Guard EH-continuation targets: {}",
+                pe.guard_eh_continuation_targets.len()
+            ),
+        ],
+        GuardTargetTableAvailability::Unavailable(schema_version) => [
+            format!(
+                "Guard address-taken IAT entries: unavailable (not recorded by schema {schema_version}; reanalyze the exact original binary)"
+            ),
+            format!(
+                "Guard long-jump targets: unavailable (not recorded by schema {schema_version}; reanalyze the exact original binary)"
+            ),
+            format!(
+                "Guard EH-continuation targets: unavailable (not recorded by schema {schema_version}; reanalyze the exact original binary)"
+            ),
+        ],
     }
 }
 
@@ -4082,7 +4215,51 @@ entrypoint = "Plugin.dll"
     }
 
     #[test]
-    fn schema_v9_guard_cf_stays_additive_for_symbols_read_and_projection() {
+    fn guard_target_table_summaries_distinguish_current_and_legacy_data() {
+        let analysis = analyze_bytes(&pe_guard_cf_fixture()).expect("analyze GuardCF fixture");
+        let BinaryAnalysis::Pe(pe) = &analysis else {
+            panic!("PE analysis expected");
+        };
+        assert_eq!(
+            guard_target_table_summary_lines(pe, GuardTargetTableAvailability::Recorded),
+            [
+                "Guard address-taken IAT entries: 0",
+                "Guard long-jump targets: 0",
+                "Guard EH-continuation targets: 0",
+            ]
+        );
+        assert_eq!(
+            GuardTargetTableAvailability::Recorded.export_summary_line(),
+            None
+        );
+
+        for schema_version in 1..GUARD_TARGET_TABLE_SCHEMA_VERSION {
+            let availability = GuardTargetTableAvailability::Unavailable(schema_version);
+            assert_eq!(
+                guard_target_table_summary_lines(pe, availability),
+                [
+                    format!(
+                        "Guard address-taken IAT entries: unavailable (not recorded by schema {schema_version}; reanalyze the exact original binary)"
+                    ),
+                    format!(
+                        "Guard long-jump targets: unavailable (not recorded by schema {schema_version}; reanalyze the exact original binary)"
+                    ),
+                    format!(
+                        "Guard EH-continuation targets: unavailable (not recorded by schema {schema_version}; reanalyze the exact original binary)"
+                    ),
+                ]
+            );
+            assert_eq!(
+                availability.export_summary_line(),
+                Some(format!(
+                    "modern PE Guard target inventories: unavailable (schema {schema_version} package predates address-taken IAT, long-jump, and EH-continuation table data; reanalyze the exact original binary)"
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn guard_cf_stays_additive_for_symbols_read_and_projection() {
         let base_analysis = analyze_bytes(&pe_guard_cf_fixture()).expect("analyze GuardCF fixture");
         let BinaryAnalysis::Pe(pe) = &base_analysis else {
             panic!("PE analysis expected");
@@ -4120,9 +4297,9 @@ entrypoint = "Plugin.dll"
 
         let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
             .expect("create GuardCF analysis session");
-        let package = ResymPackage::from_bound_payload("0.1.0-schema9-test", session)
+        let package = ResymPackage::from_bound_payload("0.1.0-schema10-test", session)
             .expect("create GuardCF package");
-        assert_eq!(package.schema_version(), 9);
+        assert_eq!(package.schema_version(), CURRENT_SCHEMA_VERSION);
         let projection = ExportProjection::from_session(package.payload())
             .expect("project GuardCF session through neutral schema");
         assert_eq!(projection.schema_version, 6);
@@ -4662,7 +4839,7 @@ entrypoint = "Plugin.dll"
 
         let package: ResymPackage<AnalysisSession> =
             read_file_bound(&output).expect("read bound package");
-        assert_eq!(CURRENT_SCHEMA_VERSION, 9);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 10);
         assert_eq!(package.schema_version(), CURRENT_SCHEMA_VERSION);
         assert_eq!(
             package.binary_sha256(),
@@ -4725,7 +4902,27 @@ entrypoint = "Plugin.dll"
         .expect("JSON inspection serializes validated package");
     }
 
+    fn strip_schema_v10_guard_target_semantics(value: &mut Value) {
+        let pe = value
+            .pointer_mut("/payload/base_analysis/analysis")
+            .and_then(Value::as_object_mut)
+            .expect("serialized PE analysis object");
+        for field in [
+            "guard_address_taken_iat_entry_table_rva",
+            "guard_address_taken_iat_entries",
+            "guard_long_jump_target_table_rva",
+            "guard_long_jump_targets",
+            "guard_eh_continuation_table_rva",
+            "guard_eh_continuation_targets",
+        ] {
+            pe.remove(field);
+        }
+    }
+
     fn strip_schema_v9_guard_cf_semantics(value: &mut Value) {
+        // Every schema predating GuardCF also predates the modern Guard target
+        // inventories. Cascade the newer strip before removing schema-nine state.
+        strip_schema_v10_guard_target_semantics(value);
         let pe = value
             .pointer_mut("/payload/base_analysis/analysis")
             .and_then(Value::as_object_mut)
@@ -4959,6 +5156,10 @@ entrypoint = "Plugin.dll"
             DelayImportAvailability::Recorded
         );
         assert_eq!(loaded.guard_cf_availability, GuardCfAvailability::Recorded);
+        assert_eq!(
+            loaded.guard_target_table_availability,
+            GuardTargetTableAvailability::Recorded
+        );
 
         let verified = verify_inspection_binary(&loaded, &binary_path)
             .expect("exact current binary passes the inspection gate");
@@ -5302,6 +5503,10 @@ entrypoint = "Plugin.dll"
             decoded.guard_cf_availability,
             GuardCfAvailability::Unavailable(1)
         );
+        assert_eq!(
+            decoded.guard_target_table_availability,
+            GuardTargetTableAvailability::Unavailable(1)
+        );
         let BinaryAnalysis::Pe(pe) = decoded.package.payload().base_analysis() else {
             panic!("PE analysis expected");
         };
@@ -5312,6 +5517,12 @@ entrypoint = "Plugin.dll"
         assert!(pe.guard_flags.is_none());
         assert!(pe.guard_cf_function_table_rva.is_none());
         assert!(pe.guard_cf_functions.is_empty());
+        assert!(pe.guard_address_taken_iat_entry_table_rva.is_none());
+        assert!(pe.guard_address_taken_iat_entries.is_empty());
+        assert!(pe.guard_long_jump_target_table_rva.is_none());
+        assert!(pe.guard_long_jump_targets.is_empty());
+        assert!(pe.guard_eh_continuation_table_rva.is_none());
+        assert!(pe.guard_eh_continuation_targets.is_empty());
         assert!(pe.directories.tls.is_none());
         assert!(pe.tls_callback_table_rva.is_none());
         assert!(!pe.tls_callback_scan_truncated);
@@ -5904,16 +6115,16 @@ entrypoint = "Plugin.dll"
     }
 
     #[test]
-    fn cli_rejects_schema_v10_before_decoding_the_analysis_payload() {
+    fn cli_rejects_schema_v11_before_decoding_the_analysis_payload() {
         let temp = tempfile::tempdir().expect("create temporary directory");
-        let path = temp.path().join("schema-v10.resym");
+        let path = temp.path().join("schema-v11.resym");
         let base_analysis = analyze_bytes(&pe_fixture()).expect("analyze PE fixture");
         let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
             .expect("create base-only session");
         let package = ResymPackage::from_bound_payload("0.1.0-future", session)
             .expect("create current package value");
         let mut value = serde_json::to_value(package).expect("serialize package value");
-        value["schema_version"] = serde_json::json!(10);
+        value["schema_version"] = serde_json::json!(11);
         value["payload"] = serde_json::json!("not an analysis session");
         fs::write(
             &path,
@@ -5922,50 +6133,197 @@ entrypoint = "Plugin.dll"
         .expect("write future package");
 
         let error = match read_analysis_package(&path, false) {
-            Ok(_) => panic!("schema 10 must be rejected"),
+            Ok(_) => panic!("schema 11 must be rejected"),
             Err(error) => error,
         };
         let diagnostic = format!("{error:#}");
-        assert!(diagnostic.contains("unsupported package schema 10"));
-        assert!(diagnostic.contains("schemas 1 through 9"));
+        assert!(diagnostic.contains("unsupported package schema 11"));
+        assert!(diagnostic.contains("schemas 1 through 10"));
         assert!(!diagnostic.contains("analysis payload"));
     }
 
     #[test]
-    fn schema_v9_requires_an_explicit_guard_cf_inventory_marker() {
+    fn schema_v10_requires_all_explicit_guard_target_inventory_markers() {
         let temp = tempfile::tempdir().expect("create temporary directory");
-        let path = temp.path().join("schema-v9-without-guard-cf-marker.resym");
         let base_analysis = analyze_bytes(&pe_fixture()).expect("analyze PE fixture");
         let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
             .expect("create base-only session");
-        let package = ResymPackage::from_bound_payload("0.1.0-schema9", session)
+        let package = ResymPackage::from_bound_payload("0.1.0-schema10", session)
             .expect("create current package value");
-        let mut value = serde_json::to_value(package).expect("serialize current package value");
-        assert_eq!(
-            value.pointer("/payload/base_analysis/analysis/guard_cf_functions"),
-            Some(&Value::Array(Vec::new())),
-            "schema 9 must serialize its inventory marker even when no GuardCF table exists"
-        );
-        value
-            .pointer_mut("/payload/base_analysis/analysis")
-            .and_then(Value::as_object_mut)
-            .expect("serialized PE analysis object")
-            .remove("guard_cf_functions");
-        fs::write(
-            &path,
-            serde_json::to_vec(&value).expect("encode relabeled package"),
-        )
-        .expect("write relabeled package");
+        let current = serde_json::to_value(package).expect("serialize current package value");
+        for marker in [
+            "guard_address_taken_iat_entries",
+            "guard_long_jump_targets",
+            "guard_eh_continuation_targets",
+        ] {
+            assert_eq!(
+                current.pointer(&format!("/payload/base_analysis/analysis/{marker}")),
+                Some(&Value::Array(Vec::new())),
+                "schema 10 must serialize {marker} even when the table is empty"
+            );
 
-        let error = match read_analysis_package(&path, false) {
-            Ok(_) => panic!("schema 9 must require its explicit GuardCF inventory marker"),
-            Err(error) => error,
-        };
-        let diagnostic = format!("{error:#}");
-        assert!(diagnostic.contains("schema 9 requires an explicit guard_cf_functions inventory"));
-        assert!(diagnostic.contains("cannot be migrated by changing only its envelope label"));
-        assert!(!diagnostic.contains("delay_imports inventory"));
-        assert!(!diagnostic.contains("cannot decode current analysis payload"));
+            let mut missing = current.clone();
+            missing
+                .pointer_mut("/payload/base_analysis/analysis")
+                .and_then(Value::as_object_mut)
+                .expect("serialized PE analysis object")
+                .remove(marker);
+            let path = temp
+                .path()
+                .join(format!("schema-v10-without-{marker}.resym"));
+            fs::write(
+                &path,
+                serde_json::to_vec(&missing).expect("encode missing-marker package"),
+            )
+            .expect("write missing-marker package");
+
+            let error = match read_analysis_package(&path, false) {
+                Ok(_) => panic!("schema 10 must require its {marker} inventory marker"),
+                Err(error) => error,
+            };
+            let diagnostic = format!("{error:#}");
+            assert!(diagnostic.contains("package schema 10 requires explicit"));
+            assert!(diagnostic.contains(marker));
+            assert!(diagnostic.contains("cannot be migrated by changing only its envelope label"));
+            assert!(!diagnostic.contains("guard_cf_functions inventory"));
+            assert!(!diagnostic.contains("cannot decode current analysis payload"));
+        }
+    }
+
+    #[test]
+    fn pre_v10_guard_target_gate_rejects_exact_base_shapes_but_ignores_lookalikes() {
+        for schema_version in 1..GUARD_TARGET_TABLE_SCHEMA_VERSION {
+            for analysis in [
+                serde_json::json!({"guard_address_taken_iat_entry_table_rva": null}),
+                serde_json::json!({"guard_address_taken_iat_entries": []}),
+                serde_json::json!({"guard_long_jump_target_table_rva": null}),
+                serde_json::json!({"guard_long_jump_targets": []}),
+                serde_json::json!({"guard_eh_continuation_table_rva": null}),
+                serde_json::json!({"guard_eh_continuation_targets": []}),
+            ] {
+                let payload = serde_json::json!({
+                    "base_analysis": {"analysis": analysis},
+                    "plugin_claims": []
+                });
+                let error = reject_pre_v10_guard_target_table_semantics(&payload, schema_version)
+                    .expect_err(
+                        "an exact schema-10 Guard target shape must reject a legacy envelope",
+                    );
+                let diagnostic = error.to_string();
+                assert!(diagnostic.contains(&format!("package schema {schema_version}")));
+                assert!(diagnostic.contains("schema-10"));
+                assert!(diagnostic.contains("cannot be relabeled"));
+            }
+
+            for allowed in [
+                serde_json::json!({
+                    "base_analysis": {"analysis": {
+                        "extension": {"guard_long_jump_targets": []}
+                    }},
+                    "plugin_claims": []
+                }),
+                serde_json::json!({
+                    "base_analysis": {"analysis": {}},
+                    "plugin_claims": [{"guard_eh_continuation_targets": []}]
+                }),
+                serde_json::json!({
+                    "base_analysis": {"analysis": {
+                        "symbol_graph": {"claims": [{
+                            "evidence": {"guard_address_taken_iat_entries": []}
+                        }]}
+                    }},
+                    "plugin_claims": []
+                }),
+            ] {
+                reject_pre_v10_guard_target_table_semantics(&allowed, schema_version)
+                    .expect("nested and plugin-owned lookalikes are not base schema fields");
+            }
+        }
+    }
+
+    #[test]
+    fn cli_runs_the_pre_v10_guard_target_gate_before_all_older_gates_and_decoding() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let base_analysis = analyze_bytes(&pe_fixture()).expect("analyze PE fixture");
+        let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
+            .expect("create base-only session");
+        let package = ResymPackage::from_bound_payload("0.1.0-schema10", session)
+            .expect("create current package value");
+        let current = serde_json::to_value(package).expect("serialize current package value");
+
+        for schema_version in 1..GUARD_TARGET_TABLE_SCHEMA_VERSION {
+            let mut value = current.clone();
+            value["schema_version"] = serde_json::json!(schema_version);
+            let path = temp.path().join(format!(
+                "relabeled-guard-target-schema-{schema_version}.resym"
+            ));
+            fs::write(
+                &path,
+                serde_json::to_vec(&value).expect("encode relabeled package"),
+            )
+            .expect("write relabeled package");
+
+            let error = match read_analysis_package(&path, false) {
+                Ok(_) => panic!("schema {schema_version} must reject schema-10 Guard target state"),
+                Err(error) => error,
+            };
+            let diagnostic = format!("{error:#}");
+            assert!(diagnostic.contains("schema-10"));
+            assert!(!diagnostic.contains("schema-9 GuardCF semantics"));
+            assert!(!diagnostic.contains("schema-8 delay-import semantics"));
+            assert!(!diagnostic.contains("cannot decode schema"));
+        }
+    }
+
+    #[test]
+    fn schemas_v9_and_v10_require_an_explicit_guard_cf_inventory_marker() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let base_analysis = analyze_bytes(&pe_fixture()).expect("analyze PE fixture");
+        let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
+            .expect("create base-only session");
+        let package = ResymPackage::from_bound_payload("0.1.0-schema10", session)
+            .expect("create current package value");
+        let current = serde_json::to_value(package).expect("serialize current package value");
+
+        for schema_version in [9, 10] {
+            let mut value = current.clone();
+            value["schema_version"] = serde_json::json!(schema_version);
+            if schema_version == 9 {
+                strip_schema_v10_guard_target_semantics(&mut value);
+            }
+            assert_eq!(
+                value.pointer("/payload/base_analysis/analysis/guard_cf_functions"),
+                Some(&Value::Array(Vec::new())),
+                "schema {schema_version} must serialize its inventory marker even when no GuardCF table exists"
+            );
+            value
+                .pointer_mut("/payload/base_analysis/analysis")
+                .and_then(Value::as_object_mut)
+                .expect("serialized PE analysis object")
+                .remove("guard_cf_functions");
+            let path = temp.path().join(format!(
+                "schema-v{schema_version}-without-guard-cf-marker.resym"
+            ));
+            fs::write(
+                &path,
+                serde_json::to_vec(&value).expect("encode relabeled package"),
+            )
+            .expect("write relabeled package");
+
+            let error = match read_analysis_package(&path, false) {
+                Ok(_) => panic!(
+                    "schema {schema_version} must require its explicit GuardCF inventory marker"
+                ),
+                Err(error) => error,
+            };
+            let diagnostic = format!("{error:#}");
+            assert!(diagnostic.contains(&format!(
+                "schema {schema_version} requires an explicit guard_cf_functions inventory"
+            )));
+            assert!(diagnostic.contains("cannot be migrated by changing only its envelope label"));
+            assert!(!diagnostic.contains("delay_imports inventory"));
+            assert!(!diagnostic.contains("analysis payload"));
+        }
     }
 
     #[test]
@@ -6068,7 +6426,8 @@ entrypoint = "Plugin.dll"
             .expect("create base-only session");
         let package = ResymPackage::from_bound_payload("0.1.0", session)
             .expect("create current package value");
-        let current = serde_json::to_value(package).expect("serialize current package value");
+        let mut current = serde_json::to_value(package).expect("serialize current package value");
+        strip_schema_v10_guard_target_semantics(&mut current);
 
         for schema_version in 1..GUARD_CF_SCHEMA_VERSION {
             let mut value = current.clone();
@@ -6091,6 +6450,74 @@ entrypoint = "Plugin.dll"
             assert!(!diagnostic.contains("schema-8 delay-import semantics"));
             assert!(!diagnostic.contains("cannot decode schema"));
         }
+    }
+
+    #[test]
+    fn schema_v9_keeps_guard_cf_but_reports_modern_guard_targets_unavailable() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let path = temp.path().join("schema-v9.resym");
+        let output = temp.path().join("schema-v9.json");
+        let base_analysis =
+            analyze_bytes(&pe_guard_cf_fixture()).expect("analyze GuardCF PE fixture");
+        let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
+            .expect("create base-only session");
+        let package = ResymPackage::from_bound_payload("0.1.0-schema9", session)
+            .expect("create current package value");
+        let mut value = serde_json::to_value(package).expect("serialize current package value");
+        value["schema_version"] = serde_json::json!(9);
+        strip_schema_v10_guard_target_semantics(&mut value);
+        fs::write(
+            &path,
+            serde_json::to_vec(&value).expect("encode schema-v9 package"),
+        )
+        .expect("write schema-v9 package");
+
+        let decoded = read_analysis_package(&path, true).expect("decode schema-v9 package");
+        assert_eq!(decoded.package.schema_version(), 9);
+        assert_eq!(decoded.guard_cf_availability, GuardCfAvailability::Recorded);
+        assert_eq!(
+            decoded.guard_target_table_availability,
+            GuardTargetTableAvailability::Unavailable(9)
+        );
+        assert!(decoded.legacy_inspection_source.is_some());
+        let BinaryAnalysis::Pe(pe) = decoded.package.payload().base_analysis() else {
+            panic!("PE analysis expected");
+        };
+        assert_eq!(pe.guard_cf_functions.len(), 3);
+        assert!(pe.guard_address_taken_iat_entries.is_empty());
+        assert!(pe.guard_long_jump_targets.is_empty());
+        assert!(pe.guard_eh_continuation_targets.is_empty());
+        assert_eq!(
+            serde_json::from_str::<Value>(
+                &decoded
+                    .to_pretty_inspection_json()
+                    .expect("serialize legacy inspection JSON")
+            )
+            .expect("inspection JSON is valid"),
+            value
+        );
+
+        inspect(InspectArgs {
+            package: path.clone(),
+            binary: None,
+            json: true,
+        })
+        .expect("JSON inspection accepts schema 9");
+        export(ExportArgs {
+            package: path,
+            format: ExportFormat::Json,
+            output: Some(output.clone()),
+            binary: None,
+        })
+        .expect("JSON export accepts schema 9");
+        let projection: Value =
+            serde_json::from_slice(&fs::read(output).expect("read schema-v9 projection"))
+                .expect("schema-v9 projection JSON is valid");
+        assert_eq!(projection["schema_version"], 6);
+        let projection_json = serde_json::to_string(&projection).expect("serialize projection");
+        assert!(!projection_json.contains("guard_address_taken"));
+        assert!(!projection_json.contains("guard_long_jump"));
+        assert!(!projection_json.contains("guard_eh_continuation"));
     }
 
     #[test]
@@ -6123,6 +6550,10 @@ entrypoint = "Plugin.dll"
             decoded.guard_cf_availability,
             GuardCfAvailability::Unavailable(8)
         );
+        assert_eq!(
+            decoded.guard_target_table_availability,
+            GuardTargetTableAvailability::Unavailable(8)
+        );
         assert!(decoded.legacy_inspection_source.is_some());
         let BinaryAnalysis::Pe(pe) = decoded.package.payload().base_analysis() else {
             panic!("PE analysis expected");
@@ -6135,6 +6566,9 @@ entrypoint = "Plugin.dll"
         ));
         assert!(pe.directories.load_config.is_none());
         assert!(pe.guard_cf_functions.is_empty());
+        assert!(pe.guard_address_taken_iat_entries.is_empty());
+        assert!(pe.guard_long_jump_targets.is_empty());
+        assert!(pe.guard_eh_continuation_targets.is_empty());
         assert_eq!(
             serde_json::from_str::<Value>(
                 &decoded
@@ -6168,19 +6602,21 @@ entrypoint = "Plugin.dll"
     }
 
     #[test]
-    fn schemas_v8_and_v9_require_the_explicit_delay_import_inventory_marker() {
+    fn schemas_v8_through_v10_require_the_explicit_delay_import_inventory_marker() {
         let temp = tempfile::tempdir().expect("create temporary directory");
         let base_analysis = analyze_bytes(&pe_fixture()).expect("analyze PE fixture");
         let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
             .expect("create base-only session");
-        let package = ResymPackage::from_bound_payload("0.1.0-schema9", session)
+        let package = ResymPackage::from_bound_payload("0.1.0-schema10", session)
             .expect("create current package value");
         let current = serde_json::to_value(package).expect("serialize current package value");
-        for schema_version in [8, 9] {
+        for schema_version in [8, 9, 10] {
             let mut value = current.clone();
             value["schema_version"] = serde_json::json!(schema_version);
             if schema_version == 8 {
                 strip_schema_v9_guard_cf_semantics(&mut value);
+            } else if schema_version == 9 {
+                strip_schema_v10_guard_target_semantics(&mut value);
             }
             assert_eq!(
                 value.pointer("/payload/base_analysis/analysis/delay_imports"),

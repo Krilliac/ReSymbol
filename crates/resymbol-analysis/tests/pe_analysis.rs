@@ -1,8 +1,9 @@
 use resymbol_analysis::{
     AnalysisError, AnalysisSession, BinaryAnalysis, ImportTarget, PeControlFlowTarget,
-    PeDataReference, PeDirectCall, PeGuardCfFunction, PeRecoveredString, PeStringEncoding, PeThunk,
-    PeTlsCallback, PluginRunRecord, PluginRunStatus, SessionValidationError, analyze_bytes,
-    analyze_pe,
+    PeDataReference, PeDirectCall, PeGuardAddressTakenIatEntry, PeGuardCfFunction,
+    PeGuardEhContinuationTarget, PeGuardLongJumpTarget, PeRecoveredString, PeStringEncoding,
+    PeThunk, PeTlsCallback, PluginRunRecord, PluginRunStatus, SessionValidationError,
+    analyze_bytes, analyze_pe,
 };
 use resymbol_core::{
     BinaryId, ClaimProducer, ClaimProvenance, Confidence, ControlFlowTarget, Evidence,
@@ -22,9 +23,19 @@ const TLS_CALLBACK_TABLE_RVA: u32 = 0x13c0;
 const TLS_CALLBACK_LIMIT: usize = 4_096;
 const LOAD_CONFIG_DIRECTORY_RVA: u32 = 0x1380;
 const LOAD_CONFIG_GUARD_FIELDS_SIZE: u32 = 148;
+const LOAD_CONFIG_GUARD_ADDRESS_TAKEN_IAT_FIELDS_SIZE: u32 = 176;
+const LOAD_CONFIG_GUARD_LONG_JUMP_FIELDS_SIZE: u32 = 192;
+const LOAD_CONFIG_GUARD_EH_CONTINUATION_FIELDS_SIZE: u32 = 280;
 const GUARD_CF_FUNCTION_TABLE_RVA: u32 = 0x1480;
+const EXTENDED_GUARD_CF_FUNCTION_TABLE_RVA: u32 = 0x14a0;
+const GUARD_ADDRESS_TAKEN_IAT_TABLE_RVA: u32 = 0x14c0;
+const GUARD_LONG_JUMP_TARGET_TABLE_RVA: u32 = 0x14e0;
+const GUARD_EH_CONTINUATION_TABLE_RVA: u32 = 0x1500;
 const GUARD_CF_FUNCTION_LIMIT: u64 = 262_144;
 const IMAGE_GUARD_CF_FUNCTION_TABLE_PRESENT: u32 = 0x0000_0400;
+const IMAGE_GUARD_CF_EXPORT_SUPPRESSION_INFO_PRESENT: u32 = 0x0000_4000;
+const IMAGE_GUARD_CF_LONGJUMP_TABLE_PRESENT: u32 = 0x0001_0000;
+const IMAGE_GUARD_EH_CONTINUATION_TABLE_PRESENT: u32 = 0x0040_0000;
 const DELAY_IMPORT_DIRECTORY_RVA: u32 = 0x1400;
 const DELAY_IMPORT_NAME_RVA: u32 = 0x1440;
 const DELAY_IMPORT_MODULE_HANDLE_RVA: u32 = 0x1450;
@@ -462,6 +473,105 @@ fn guard_cf_fixture<const N: usize>(entries: &[(u32, [u8; N])]) -> Vec<u8> {
         guard_flags,
     );
     write_guard_cf_records(&mut bytes, GUARD_CF_FUNCTION_TABLE_RVA, entries);
+    bytes
+}
+
+#[derive(Clone, Copy)]
+struct ExtendedGuardLoadConfig {
+    guard_flags: u32,
+    guard_cf_table_va: u64,
+    guard_cf_count: u64,
+    address_taken_iat_table_va: u64,
+    address_taken_iat_count: u64,
+    long_jump_table_va: u64,
+    long_jump_count: u64,
+    eh_continuation_table_va: u64,
+    eh_continuation_count: u64,
+}
+
+fn empty_extended_guard_load_config(guard_flags: u32) -> ExtendedGuardLoadConfig {
+    ExtendedGuardLoadConfig {
+        guard_flags,
+        guard_cf_table_va: 0,
+        guard_cf_count: 0,
+        address_taken_iat_table_va: 0,
+        address_taken_iat_count: 0,
+        long_jump_table_va: 0,
+        long_jump_count: 0,
+        eh_continuation_table_va: 0,
+        eh_continuation_count: 0,
+    }
+}
+
+fn set_extended_guard_load_config(
+    bytes: &mut [u8],
+    directory_size: u32,
+    load_config_size: u32,
+    fields: ExtendedGuardLoadConfig,
+) {
+    set_guard_cf_load_config(
+        bytes,
+        directory_size,
+        load_config_size,
+        fields.guard_cf_table_va,
+        fields.guard_cf_count,
+        fields.guard_flags,
+    );
+    let load_config = file_offset(LOAD_CONFIG_DIRECTORY_RVA);
+    put_u64(bytes, load_config + 160, fields.address_taken_iat_table_va);
+    put_u64(bytes, load_config + 168, fields.address_taken_iat_count);
+    put_u64(bytes, load_config + 176, fields.long_jump_table_va);
+    put_u64(bytes, load_config + 184, fields.long_jump_count);
+    put_u64(bytes, load_config + 264, fields.eh_continuation_table_va);
+    put_u64(bytes, load_config + 272, fields.eh_continuation_count);
+}
+
+fn valid_extended_guard_load_config() -> ExtendedGuardLoadConfig {
+    ExtendedGuardLoadConfig {
+        guard_flags: 0x1000_0000
+            | IMAGE_GUARD_CF_FUNCTION_TABLE_PRESENT
+            | IMAGE_GUARD_CF_EXPORT_SUPPRESSION_INFO_PRESENT
+            | IMAGE_GUARD_CF_LONGJUMP_TABLE_PRESENT
+            | IMAGE_GUARD_EH_CONTINUATION_TABLE_PRESENT,
+        guard_cf_table_va: IMAGE_BASE + u64::from(EXTENDED_GUARD_CF_FUNCTION_TABLE_RVA),
+        guard_cf_count: 1,
+        address_taken_iat_table_va: IMAGE_BASE + u64::from(GUARD_ADDRESS_TAKEN_IAT_TABLE_RVA),
+        address_taken_iat_count: 2,
+        long_jump_table_va: IMAGE_BASE + u64::from(GUARD_LONG_JUMP_TARGET_TABLE_RVA),
+        long_jump_count: 2,
+        eh_continuation_table_va: IMAGE_BASE + u64::from(GUARD_EH_CONTINUATION_TABLE_RVA),
+        eh_continuation_count: 2,
+    }
+}
+
+fn extended_guard_fixture() -> Vec<u8> {
+    let mut bytes = fixture();
+    set_extended_guard_load_config(
+        &mut bytes,
+        LOAD_CONFIG_GUARD_EH_CONTINUATION_FIELDS_SIZE,
+        LOAD_CONFIG_GUARD_EH_CONTINUATION_FIELDS_SIZE,
+        valid_extended_guard_load_config(),
+    );
+    write_guard_cf_records(
+        &mut bytes,
+        EXTENDED_GUARD_CF_FUNCTION_TABLE_RVA,
+        &[(0x1040, [0x00])],
+    );
+    write_guard_cf_records(
+        &mut bytes,
+        GUARD_ADDRESS_TAKEN_IAT_TABLE_RVA,
+        &[(0x1260, [0x00]), (0x1268, [0x00])],
+    );
+    write_guard_cf_records(
+        &mut bytes,
+        GUARD_LONG_JUMP_TARGET_TABLE_RVA,
+        &[(0x1060, [0x00]), (0x1080, [0x00])],
+    );
+    write_guard_cf_records(
+        &mut bytes,
+        GUARD_EH_CONTINUATION_TABLE_RVA,
+        &[(0x1050, [0x00]), (0x1070, [0x00])],
+    );
     bytes
 }
 
@@ -1305,6 +1415,12 @@ fn analyzes_minimal_pe_with_imports_exports_and_runtime_functions() {
     assert_eq!(analysis.guard_flags, None);
     assert_eq!(analysis.guard_cf_function_table_rva, None);
     assert!(analysis.guard_cf_functions.is_empty());
+    assert_eq!(analysis.guard_address_taken_iat_entry_table_rva, None);
+    assert!(analysis.guard_address_taken_iat_entries.is_empty());
+    assert_eq!(analysis.guard_long_jump_target_table_rva, None);
+    assert!(analysis.guard_long_jump_targets.is_empty());
+    assert_eq!(analysis.guard_eh_continuation_table_rva, None);
+    assert!(analysis.guard_eh_continuation_targets.is_empty());
     assert_eq!(analysis.symbol_graph.binaries().len(), 1);
     assert_eq!(analysis.symbol_graph.claims().len(), 5);
     assert!(matches!(
@@ -2668,6 +2784,620 @@ fn validated_deserialization_rejects_tampered_guard_cf_state_and_graphs() {
     let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(stale_evidence)
         .expect_err("persisted GuardCF evidence remains bound to exact metadata bytes");
     assert!(error.to_string().contains("symbol graph"));
+}
+
+#[test]
+fn recovers_modern_guard_target_inventories_without_inventing_function_claims_or_seeds() {
+    let mut bytes = extended_guard_fixture();
+    put_rel32_instruction(&mut bytes, 0x1050, 0xe9, 0x10a0);
+    put_rel32_instruction(&mut bytes, 0x1060, 0xe9, 0x10b0);
+    put_rel32_instruction(&mut bytes, 0x1070, 0xe9, 0x10c0);
+    put_rel32_instruction(&mut bytes, 0x1080, 0xe9, 0x10d0);
+
+    let analysis = analyze_pe(&bytes).expect("valid modern Guard target tables");
+    assert_eq!(
+        analysis.load_config_size,
+        Some(LOAD_CONFIG_GUARD_EH_CONTINUATION_FIELDS_SIZE)
+    );
+    assert_eq!(
+        analysis.guard_cf_function_table_rva,
+        Some(EXTENDED_GUARD_CF_FUNCTION_TABLE_RVA)
+    );
+    assert_eq!(analysis.guard_cf_functions.len(), 1);
+    assert_eq!(
+        analysis.guard_address_taken_iat_entry_table_rva,
+        Some(GUARD_ADDRESS_TAKEN_IAT_TABLE_RVA)
+    );
+    assert_eq!(
+        analysis.guard_address_taken_iat_entries,
+        [
+            PeGuardAddressTakenIatEntry {
+                table_index: 0,
+                iat_rva: 0x1260,
+                metadata: vec![0],
+            },
+            PeGuardAddressTakenIatEntry {
+                table_index: 1,
+                iat_rva: 0x1268,
+                metadata: vec![0],
+            },
+        ]
+    );
+    assert_eq!(
+        analysis.guard_long_jump_target_table_rva,
+        Some(GUARD_LONG_JUMP_TARGET_TABLE_RVA)
+    );
+    assert_eq!(
+        analysis.guard_long_jump_targets,
+        [
+            PeGuardLongJumpTarget {
+                table_index: 0,
+                target_rva: 0x1060,
+                metadata: vec![0],
+            },
+            PeGuardLongJumpTarget {
+                table_index: 1,
+                target_rva: 0x1080,
+                metadata: vec![0],
+            },
+        ]
+    );
+    assert_eq!(
+        analysis.guard_eh_continuation_table_rva,
+        Some(GUARD_EH_CONTINUATION_TABLE_RVA)
+    );
+    assert_eq!(
+        analysis.guard_eh_continuation_targets,
+        [
+            PeGuardEhContinuationTarget {
+                table_index: 0,
+                target_rva: 0x1050,
+                metadata: vec![0],
+            },
+            PeGuardEhContinuationTarget {
+                table_index: 1,
+                target_rva: 0x1070,
+                metadata: vec![0],
+            },
+        ]
+    );
+
+    assert_eq!(
+        analysis
+            .symbol_graph
+            .claims()
+            .iter()
+            .filter(|claim| claim.provenance().method == "pe-guard-cf-function")
+            .count(),
+        1
+    );
+    for target_rva in [0x1050_u32, 0x1060, 0x1070, 0x1080] {
+        assert!(
+            analysis.symbol_graph.claims().iter().all(|claim| !matches!(
+                (claim.subject(), claim.assertion()),
+                (
+                    SymbolSubject::Function { rva, .. },
+                    SymbolAssertion::FunctionEntry
+                    ) if *rva == u64::from(target_rva)
+            )),
+            "continuation target {target_rva:#x} must remain an inventory entry"
+        );
+        assert!(
+            analysis.thunks.iter().all(|thunk| thunk.rva != target_rva),
+            "continuation target {target_rva:#x} must not seed thunk recovery"
+        );
+    }
+
+    let encoded = serde_json::to_value(&analysis).expect("serialize modern Guard inventories");
+    for marker in [
+        "guard_address_taken_iat_entries",
+        "guard_long_jump_targets",
+        "guard_eh_continuation_targets",
+    ] {
+        assert!(
+            encoded.get(marker).is_some(),
+            "missing schema marker {marker}"
+        );
+    }
+    let decoded = serde_json::from_value::<resymbol_analysis::PeAnalysis>(encoded)
+        .expect("validated modern Guard inventory round trip");
+    assert_eq!(decoded, analysis);
+}
+
+#[test]
+fn guard_address_taken_iat_inventory_accepts_exact_delay_import_slots() {
+    const LOAD_CONFIG_RVA: u32 = 0x1500;
+    const GIAT_TABLE_RVA: u32 = 0x15b0;
+
+    let mut bytes = delay_import_fixture();
+    set_directory(
+        &mut bytes,
+        10,
+        LOAD_CONFIG_RVA,
+        LOAD_CONFIG_GUARD_ADDRESS_TAKEN_IAT_FIELDS_SIZE,
+    );
+    let load_config = file_offset(LOAD_CONFIG_RVA);
+    put_u32(
+        &mut bytes,
+        load_config,
+        LOAD_CONFIG_GUARD_ADDRESS_TAKEN_IAT_FIELDS_SIZE,
+    );
+    put_u32(
+        &mut bytes,
+        load_config + 144,
+        0x1000_0000 | IMAGE_GUARD_CF_EXPORT_SUPPRESSION_INFO_PRESENT,
+    );
+    put_u64(
+        &mut bytes,
+        load_config + 160,
+        IMAGE_BASE + u64::from(GIAT_TABLE_RVA),
+    );
+    put_u64(&mut bytes, load_config + 168, 1);
+    write_guard_cf_records(&mut bytes, GIAT_TABLE_RVA, &[(DELAY_IMPORT_IAT_RVA, [0])]);
+
+    let analysis = analyze_pe(&bytes).expect("a parsed delay-IAT slot is valid GIAT evidence");
+    assert_eq!(analysis.delay_imports.len(), 1);
+    assert_eq!(
+        analysis.guard_address_taken_iat_entry_table_rva,
+        Some(GIAT_TABLE_RVA)
+    );
+    assert_eq!(
+        analysis.guard_address_taken_iat_entries,
+        [PeGuardAddressTakenIatEntry {
+            table_index: 0,
+            iat_rva: DELAY_IMPORT_IAT_RVA,
+            metadata: vec![0],
+        }]
+    );
+}
+
+#[test]
+fn enforces_modern_guard_table_presence_bounds_storage_and_record_invariants() {
+    for (label, size, flag, expected) in [
+        (
+            "address-taken IAT",
+            LOAD_CONFIG_GUARD_ADDRESS_TAKEN_IAT_FIELDS_SIZE - 1,
+            IMAGE_GUARD_CF_EXPORT_SUPPRESSION_INFO_PRESENT,
+            "address-taken IAT fields",
+        ),
+        (
+            "long-jump",
+            LOAD_CONFIG_GUARD_LONG_JUMP_FIELDS_SIZE - 1,
+            IMAGE_GUARD_CF_LONGJUMP_TABLE_PRESENT,
+            "long-jump fields",
+        ),
+        (
+            "EH continuation",
+            LOAD_CONFIG_GUARD_EH_CONTINUATION_FIELDS_SIZE - 1,
+            IMAGE_GUARD_EH_CONTINUATION_TABLE_PRESENT,
+            "EH-continuation fields",
+        ),
+    ] {
+        let mut bytes = fixture();
+        set_extended_guard_load_config(
+            &mut bytes,
+            LOAD_CONFIG_GUARD_EH_CONTINUATION_FIELDS_SIZE,
+            size,
+            empty_extended_guard_load_config(flag),
+        );
+        let error = analyze_pe(&bytes)
+            .expect_err("a presence bit requires a structure containing its table fields");
+        assert!(error.to_string().contains(expected), "{label}: {error}");
+    }
+
+    for (label, count_offset, expected) in [
+        ("address-taken IAT", 168, "address-taken IAT table"),
+        ("long-jump", 184, "long-jump target table"),
+        ("EH continuation", 272, "EH-continuation table"),
+    ] {
+        let mut bytes = extended_guard_fixture();
+        put_u64(
+            &mut bytes,
+            file_offset(LOAD_CONFIG_DIRECTORY_RVA) + count_offset,
+            0,
+        );
+        let error =
+            analyze_pe(&bytes).expect_err("a nonzero Guard table VA requires a nonzero count");
+        assert!(error.to_string().contains(expected), "{label}: {error}");
+    }
+
+    for (label, flag, expected) in [
+        (
+            "address-taken IAT",
+            IMAGE_GUARD_CF_EXPORT_SUPPRESSION_INFO_PRESENT,
+            "IMAGE_GUARD_CF_EXPORT_SUPPRESSION_INFO_PRESENT is clear",
+        ),
+        (
+            "long-jump",
+            IMAGE_GUARD_CF_LONGJUMP_TABLE_PRESENT,
+            "IMAGE_GUARD_CF_LONGJUMP_TABLE_PRESENT is clear",
+        ),
+        (
+            "EH continuation",
+            IMAGE_GUARD_EH_CONTINUATION_TABLE_PRESENT,
+            "IMAGE_GUARD_EH_CONTINUATION_TABLE_PRESENT is clear",
+        ),
+    ] {
+        let mut bytes = extended_guard_fixture();
+        let guard_flags = valid_extended_guard_load_config().guard_flags & !flag;
+        put_u32(
+            &mut bytes,
+            file_offset(LOAD_CONFIG_DIRECTORY_RVA) + 144,
+            guard_flags,
+        );
+        let error =
+            analyze_pe(&bytes).expect_err("a nonempty Guard table requires its presence bit");
+        assert!(error.to_string().contains(expected), "{label}: {error}");
+    }
+
+    for (label, count_offset, kind) in [
+        ("address-taken IAT", 168, "Guard address-taken IAT entry"),
+        ("long-jump", 184, "Guard long-jump target"),
+        ("EH continuation", 272, "Guard EH-continuation target"),
+    ] {
+        let mut bytes = extended_guard_fixture();
+        put_u64(
+            &mut bytes,
+            file_offset(LOAD_CONFIG_DIRECTORY_RVA) + count_offset,
+            GUARD_CF_FUNCTION_LIMIT + 1,
+        );
+        let error = analyze_pe(&bytes)
+            .expect_err("Guard target count caps are checked before table mapping or allocation");
+        assert!(
+            matches!(
+                error,
+                AnalysisError::LimitExceeded {
+                    kind: actual,
+                    count: 262_145,
+                    limit: 262_144,
+                } if actual == kind
+            ),
+            "{label}: {error}"
+        );
+    }
+
+    for (label, table_rva, expected) in [
+        (
+            "address-taken IAT",
+            GUARD_ADDRESS_TAKEN_IAT_TABLE_RVA,
+            "address-taken IAT metadata",
+        ),
+        (
+            "long-jump",
+            GUARD_LONG_JUMP_TARGET_TABLE_RVA,
+            "long-jump metadata",
+        ),
+        (
+            "EH continuation",
+            GUARD_EH_CONTINUATION_TABLE_RVA,
+            "EH-continuation metadata",
+        ),
+    ] {
+        let mut bytes = extended_guard_fixture();
+        bytes[file_offset(table_rva) + 4] = 1;
+        let error = analyze_pe(&bytes).expect_err("modern Guard metadata bytes are reserved zero");
+        assert!(error.to_string().contains(expected), "{label}: {error}");
+    }
+
+    let mut unknown_iat = extended_guard_fixture();
+    put_u32(
+        &mut unknown_iat,
+        file_offset(GUARD_ADDRESS_TAKEN_IAT_TABLE_RVA),
+        0x1261,
+    );
+    let error = analyze_pe(&unknown_iat)
+        .expect_err("GIAT records must name exact conventional or delay-import IAT slots");
+    assert!(error.to_string().contains("exact parsed import IAT slot"));
+
+    for (label, second_record_rva, record_size, expected) in [
+        (
+            "address-taken IAT",
+            GUARD_ADDRESS_TAKEN_IAT_TABLE_RVA,
+            5,
+            "address-taken IAT table",
+        ),
+        (
+            "long-jump",
+            GUARD_LONG_JUMP_TARGET_TABLE_RVA,
+            5,
+            "long-jump target table",
+        ),
+        (
+            "EH continuation",
+            GUARD_EH_CONTINUATION_TABLE_RVA,
+            5,
+            "EH-continuation table",
+        ),
+    ] {
+        let mut bytes = extended_guard_fixture();
+        let first = u32::from_le_bytes(
+            bytes[file_offset(second_record_rva)..file_offset(second_record_rva) + 4]
+                .try_into()
+                .expect("four-byte fixture record"),
+        );
+        put_u32(
+            &mut bytes,
+            file_offset(second_record_rva) + record_size,
+            first,
+        );
+        let error = analyze_pe(&bytes).expect_err("Guard target RVAs remain sorted and unique");
+        assert!(error.to_string().contains(expected), "{label}: {error}");
+    }
+
+    for (label, table_rva, expected) in [
+        (
+            "long-jump",
+            GUARD_LONG_JUMP_TARGET_TABLE_RVA,
+            "long-jump target",
+        ),
+        (
+            "EH continuation",
+            GUARD_EH_CONTINUATION_TABLE_RVA,
+            "EH-continuation target",
+        ),
+    ] {
+        let mut bytes = extended_guard_fixture();
+        put_u32(&mut bytes, file_offset(table_rva), 0x1600);
+        let error = analyze_pe(&bytes)
+            .expect_err("continuation inventories require file-backed executable targets");
+        assert!(error.to_string().contains(expected), "{label}: {error}");
+    }
+
+    let mut load_config_overlap = fixture();
+    let mut fields = empty_extended_guard_load_config(
+        0x1000_0000 | IMAGE_GUARD_CF_EXPORT_SUPPRESSION_INFO_PRESENT,
+    );
+    fields.address_taken_iat_table_va = IMAGE_BASE + u64::from(LOAD_CONFIG_DIRECTORY_RVA + 0x98);
+    fields.address_taken_iat_count = 1;
+    set_extended_guard_load_config(
+        &mut load_config_overlap,
+        LOAD_CONFIG_GUARD_EH_CONTINUATION_FIELDS_SIZE,
+        LOAD_CONFIG_GUARD_EH_CONTINUATION_FIELDS_SIZE,
+        fields,
+    );
+    let error = analyze_pe(&load_config_overlap)
+        .expect_err("Guard target tables cannot alias the load-config structure");
+    assert!(
+        error
+            .to_string()
+            .contains("overlaps the declared load-config")
+    );
+
+    let mut table_overlap = extended_guard_fixture();
+    put_u64(
+        &mut table_overlap,
+        file_offset(LOAD_CONFIG_DIRECTORY_RVA) + 176,
+        IMAGE_BASE + u64::from(GUARD_ADDRESS_TAKEN_IAT_TABLE_RVA),
+    );
+    let error = analyze_pe(&table_overlap)
+        .expect_err("nonempty load-config Guard target tables must be pairwise disjoint");
+    assert!(error.to_string().contains("load-config guard tables"));
+
+    let mut one_byte_short = extended_guard_fixture();
+    put_u64(
+        &mut one_byte_short,
+        file_offset(LOAD_CONFIG_DIRECTORY_RVA) + 160,
+        IMAGE_BASE + 0x15fc,
+    );
+    put_u64(
+        &mut one_byte_short,
+        file_offset(LOAD_CONFIG_DIRECTORY_RVA) + 168,
+        1,
+    );
+    let error = analyze_pe(&one_byte_short)
+        .expect_err("the complete GIAT record including metadata must be file-backed");
+    assert!(matches!(
+        error,
+        AnalysisError::UnmappedRva {
+            context: "Guard address-taken IAT table",
+            rva: 0x15fc,
+            size: 5,
+        }
+    ));
+
+    let mut versioned_empty = fixture();
+    set_extended_guard_load_config(
+        &mut versioned_empty,
+        LOAD_CONFIG_GUARD_EH_CONTINUATION_FIELDS_SIZE,
+        LOAD_CONFIG_GUARD_EH_CONTINUATION_FIELDS_SIZE,
+        empty_extended_guard_load_config(
+            IMAGE_GUARD_CF_EXPORT_SUPPRESSION_INFO_PRESENT
+                | IMAGE_GUARD_CF_LONGJUMP_TABLE_PRESENT
+                | IMAGE_GUARD_EH_CONTINUATION_TABLE_PRESENT,
+        ),
+    );
+    let empty = analyze_pe(&versioned_empty)
+        .expect("presence flags distinguish supported empty tables from legacy structures");
+    assert!(empty.guard_address_taken_iat_entries.is_empty());
+    assert!(empty.guard_long_jump_targets.is_empty());
+    assert!(empty.guard_eh_continuation_targets.is_empty());
+}
+
+#[test]
+fn validated_deserialization_rejects_tampered_modern_guard_target_state() {
+    let analysis = analyze_pe(&extended_guard_fixture()).expect("valid modern Guard inventories");
+    let original = serde_json::to_value(analysis).expect("serialize modern Guard inventories");
+
+    let mut empty_fixture = fixture();
+    set_extended_guard_load_config(
+        &mut empty_fixture,
+        LOAD_CONFIG_GUARD_EH_CONTINUATION_FIELDS_SIZE,
+        LOAD_CONFIG_GUARD_EH_CONTINUATION_FIELDS_SIZE,
+        empty_extended_guard_load_config(
+            IMAGE_GUARD_CF_EXPORT_SUPPRESSION_INFO_PRESENT
+                | IMAGE_GUARD_CF_LONGJUMP_TABLE_PRESENT
+                | IMAGE_GUARD_EH_CONTINUATION_TABLE_PRESENT,
+        ),
+    );
+    let empty_analysis = analyze_pe(&empty_fixture).expect("valid empty modern Guard inventories");
+    let empty_original =
+        serde_json::to_value(empty_analysis).expect("serialize empty modern Guard inventories");
+
+    for (size, expected) in [
+        (
+            LOAD_CONFIG_GUARD_ADDRESS_TAKEN_IAT_FIELDS_SIZE - 1,
+            "Guard address-taken IAT fields",
+        ),
+        (
+            LOAD_CONFIG_GUARD_LONG_JUMP_FIELDS_SIZE - 1,
+            "Guard long-jump fields",
+        ),
+        (
+            LOAD_CONFIG_GUARD_EH_CONTINUATION_FIELDS_SIZE - 1,
+            "Guard EH-continuation fields",
+        ),
+    ] {
+        let mut shortened = empty_original.clone();
+        shortened["load_config_size"] = serde_json::json!(size);
+        let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(shortened)
+            .expect_err("a presence flag requires its load-config table fields even when empty");
+        assert!(error.to_string().contains(expected));
+        assert!(error.to_string().contains("presence flag"));
+    }
+
+    let mut legacy = original.clone();
+    let legacy_object = legacy
+        .as_object_mut()
+        .expect("PE analysis serializes as an object");
+    for field in [
+        "guard_address_taken_iat_entry_table_rva",
+        "guard_address_taken_iat_entries",
+        "guard_long_jump_target_table_rva",
+        "guard_long_jump_targets",
+        "guard_eh_continuation_table_rva",
+        "guard_eh_continuation_targets",
+    ] {
+        legacy_object.remove(field);
+    }
+    let legacy = serde_json::from_value::<resymbol_analysis::PeAnalysis>(legacy)
+        .expect("schema-nine analyses default absent schema-ten inventories");
+    assert!(legacy.guard_address_taken_iat_entries.is_empty());
+    assert!(legacy.guard_long_jump_targets.is_empty());
+    assert!(legacy.guard_eh_continuation_targets.is_empty());
+
+    for (table_field, entries_field, expected) in [
+        (
+            "guard_address_taken_iat_entry_table_rva",
+            "guard_address_taken_iat_entries",
+            "address-taken IAT table",
+        ),
+        (
+            "guard_long_jump_target_table_rva",
+            "guard_long_jump_targets",
+            "long-jump target table",
+        ),
+        (
+            "guard_eh_continuation_table_rva",
+            "guard_eh_continuation_targets",
+            "EH-continuation table",
+        ),
+    ] {
+        let mut missing_rva = original.clone();
+        missing_rva[table_field] = serde_json::Value::Null;
+        let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(missing_rva)
+            .expect_err("persisted Guard target entries require their table RVA");
+        assert!(error.to_string().contains(expected));
+
+        let mut empty_records = original.clone();
+        empty_records[entries_field] = serde_json::json!([]);
+        let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(empty_records)
+            .expect_err("a persisted nonzero Guard target table RVA requires records");
+        assert!(error.to_string().contains("without any records"));
+    }
+
+    for (flag, expected) in [
+        (
+            IMAGE_GUARD_CF_EXPORT_SUPPRESSION_INFO_PRESENT,
+            "IMAGE_GUARD_CF_EXPORT_SUPPRESSION_INFO_PRESENT is clear",
+        ),
+        (
+            IMAGE_GUARD_CF_LONGJUMP_TABLE_PRESENT,
+            "IMAGE_GUARD_CF_LONGJUMP_TABLE_PRESENT is clear",
+        ),
+        (
+            IMAGE_GUARD_EH_CONTINUATION_TABLE_PRESENT,
+            "IMAGE_GUARD_EH_CONTINUATION_TABLE_PRESENT is clear",
+        ),
+    ] {
+        let mut cleared = original.clone();
+        cleared["guard_flags"] =
+            serde_json::json!(valid_extended_guard_load_config().guard_flags & !flag);
+        let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(cleared)
+            .expect_err("persisted Guard target tables require their presence bits");
+        assert!(error.to_string().contains(expected));
+    }
+
+    for (size, expected) in [
+        (
+            LOAD_CONFIG_GUARD_ADDRESS_TAKEN_IAT_FIELDS_SIZE - 1,
+            "address-taken IAT table",
+        ),
+        (
+            LOAD_CONFIG_GUARD_LONG_JUMP_FIELDS_SIZE - 1,
+            "long-jump target table",
+        ),
+        (
+            LOAD_CONFIG_GUARD_EH_CONTINUATION_FIELDS_SIZE - 1,
+            "EH-continuation table",
+        ),
+    ] {
+        let mut shortened = original.clone();
+        shortened["load_config_size"] = serde_json::json!(size);
+        let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(shortened)
+            .expect_err("persisted Guard target state requires its structure version");
+        assert!(error.to_string().contains(expected));
+    }
+
+    let mut noncanonical_giat_index = original.clone();
+    noncanonical_giat_index["guard_address_taken_iat_entries"][1]["table_index"] =
+        serde_json::json!(7);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(noncanonical_giat_index)
+        .expect_err("GIAT indices preserve exact source order");
+    assert!(error.to_string().contains("address-taken IAT table index"));
+
+    let mut invalid_giat = original.clone();
+    invalid_giat["guard_address_taken_iat_entries"][0]["iat_rva"] = serde_json::json!(0x1261);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(invalid_giat)
+        .expect_err("persisted GIAT records remain tied to exact parsed import slots");
+    assert!(error.to_string().contains("exact parsed import IAT slot"));
+
+    for inventory in [
+        "guard_address_taken_iat_entries",
+        "guard_long_jump_targets",
+        "guard_eh_continuation_targets",
+    ] {
+        let mut nonzero_reserved_metadata = original.clone();
+        nonzero_reserved_metadata[inventory][0]["metadata"][0] = serde_json::json!(1);
+        let error =
+            serde_json::from_value::<resymbol_analysis::PeAnalysis>(nonzero_reserved_metadata)
+                .expect_err("persisted modern Guard metadata remains reserved zero");
+        assert!(error.to_string().contains("nonzero reserved metadata"));
+
+        let mut wrong_metadata_stride = original.clone();
+        wrong_metadata_stride[inventory][0]["metadata"] = serde_json::json!([]);
+        let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(wrong_metadata_stride)
+            .expect_err("persisted modern Guard metadata lengths follow GuardFlags");
+        assert!(error.to_string().contains("GuardFlags-selected"));
+    }
+
+    let mut unsorted_long_jump = original.clone();
+    unsorted_long_jump["guard_long_jump_targets"][1]["target_rva"] = serde_json::json!(0x1060);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(unsorted_long_jump)
+        .expect_err("persisted long-jump targets remain sorted and unique");
+    assert!(error.to_string().contains("strictly increasing and unique"));
+
+    let mut invalid_eh_target = original.clone();
+    invalid_eh_target["guard_eh_continuation_targets"][0]["target_rva"] = serde_json::json!(0x1600);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(invalid_eh_target)
+        .expect_err("persisted EH continuation targets remain backed executable RVAs");
+    assert!(error.to_string().contains("EH-continuation target"));
+
+    let mut overlapping_tables = original;
+    overlapping_tables["guard_long_jump_target_table_rva"] =
+        serde_json::json!(GUARD_ADDRESS_TAKEN_IAT_TABLE_RVA);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(overlapping_tables)
+        .expect_err("persisted Guard target tables remain pairwise disjoint");
+    assert!(error.to_string().contains("load-config guard tables"));
 }
 
 #[test]

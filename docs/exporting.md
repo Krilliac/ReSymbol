@@ -73,7 +73,8 @@ SHA-256 and uses RVAs rather than assuming a process or debugger load address.
 After a successful write, the CLI prints the destination, binary SHA-256, projected entity counts,
 and a bounded summary of projection warning groups. For schemas 1 through 6 it also reports TLS
 callback recovery as unavailable; for schemas 1 through 7 it reports delay-import recovery as
-unavailable; and for schemas 1 through 8 it reports GuardCF recovery as unavailable. These
+unavailable; for schemas 1 through 8 it reports GuardCF recovery as unavailable; and for schemas 1
+through 9 it reports the modern Guard target inventories as unavailable. These
 diagnostics direct the user to reanalyze the exact original binary.
 Inspect the warnings before applying a script; the output file is still created when a deliberate
 lossy reduction is safe and diagnosed.
@@ -119,7 +120,7 @@ added deterministic string correlation to each data reference. Schema 6 adds the
 projection schema is independent from the `.resym` package-envelope schema; consumers must validate
 the version of the artifact they are actually reading.
 
-The CLI can export package schemas 1 through 8 through validated in-memory compatibility paths.
+The CLI can export package schemas 1 through 9 through validated in-memory compatibility paths.
 Migration neither rewrites the package nor reruns analysis: the package does not embed executable
 bytes. Schema 1 therefore has no available direct calls, thunks, strings, or data references.
 Schema 2 retains its persisted calls and thunks but predates strings and data references. Schema 3
@@ -129,17 +130,20 @@ descriptor recovery. Schema 5 records both RTTI descriptor layouts but predates 
 executable thunk-chain discovery. Schema 6 records that closure but predates TLS callback
 discovery and callback-based thunk seeding. Schema 7 records TLS callbacks but predates modern
 delay-import recovery. Schema 8 records delay imports but predates load-config GuardCF recovery.
-Reanalyze the exact original binary to produce schema 9 before expecting all current recovery
+Schema 9 records GuardCF functions but predates the Guard address-taken IAT, long-jump, and
+EH-continuation inventories. Reanalyze the exact original binary to produce schema 10 before expecting all current recovery
 relationships in the export. Schemas 1 through 4 reject
 relabeled RTTI base records whose `class_hierarchy_descriptor_rva` is missing or null, and schemas 1
 through 5 reject a deterministic base thunk source valid only through schema-6 endpoint seeding.
 Schemas 1 through 6 reject schema-7 TLS fields, core `pe-tls-callback` claims, and callback-only
 base thunk seeds rather than accepting a relabeled package. Schemas 1 through 7 likewise reject
-schema-8 delay-import directory and inventory fields, while schemas 8 and 9 require the explicit
+schema-8 delay-import directory and inventory fields, while schemas 8 through 10 require the explicit
 `delay_imports` inventory even when empty.
 Schemas 1 through 8 reject schema-9 load-config/GuardCF fields,
-`directories.load_config`, and core `pe-guard-cf-function` claims; schema 9 requires an explicit
+`directories.load_config`, and core `pe-guard-cf-function` claims; schemas 9 and 10 require an explicit
 `guard_cf_functions` inventory even when empty.
+Schemas 1 through 9 reject schema-10 Guard address-taken IAT, long-jump, and EH-continuation
+table-RVA and inventory fields; schema 10 requires all three inventory arrays even when empty.
 
 Entries are emitted in stable order. Name and range conflicts are resolved conservatively, and
 colliding selected names receive deterministic output suffixes rather than silently referring to
@@ -192,6 +196,11 @@ function entry, and joins one-instruction thunk seeding, including records marke
 describes CFG eligibility rather than whether the target is a function; an export-suppressed RVA
 must be 16-byte aligned. A thunk relationship appears only when the seeded RVA contains a supported exact
 thunk. No GuardCF-specific field or relationship is added to neutral projection schema 6.
+
+The Guard address-taken IAT, long-jump, and EH-continuation inventories are also package-only.
+GIAT entries identify import slots and the continuation tables identify valid landing addresses,
+not necessarily function starts. ReSymbol therefore emits no function-entry or thunk relationship
+from these records, and neutral projection schema 6 remains unchanged.
 
 The ordered delay-import descriptors and inventory likewise remain package-only. That inventory
 retains the DLL name, descriptor RVA and exact attributes value, name/HMOD/IAT/INT base RVAs,
@@ -348,7 +357,7 @@ schema-6 JSON record.
 Markdown is a human-facing presentation format, not a stable interchange contract. Its wording,
 table layout, and section organization may evolve between alpha releases. Tools should consume the
 `json` output and validate its `schema_version` instead of parsing the report. New analyses write
-package schema 9; export also accepts package schemas 1 through 8 through validated compatibility
+package schema 10; export also accepts package schemas 1 through 9 through validated compatibility
 paths without rewriting them. The current neutral projection is schema 6, and adding this writer
 changes neither independently versioned domain.
 
@@ -378,8 +387,8 @@ resymbol export application.resym --format map
 The default destination is `application.map`. This is a deterministic text export, not a claim that
 every debugger or linker will accept it. ReSymbol currently rejects non-PE sessions and
 projections, mismatched session/projection binary fields, selected symbol RVAs outside real PE
-sections, and a nonzero entry point outside those sections. New analyses write package schema 9;
-export also accepts package schemas 1 through 8 through validated compatibility paths without
+sections, and a nonzero entry point outside those sections. New analyses write package schema 10;
+export also accepts package schemas 1 through 9 through validated compatibility paths without
 rewriting them. The current neutral projection is schema 6, and MAP adds no schema fields.
 
 The writer emits the PE timestamp and preferred load address, one group for each final PE section,

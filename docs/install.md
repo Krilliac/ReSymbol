@@ -12,8 +12,8 @@ CMake, Visual Studio, LLVM, DIA, or another compiler to run an official archive.
 
 The current analyzer accepts native Windows x86-64 PE32+ input. It safely extracts image and section
 metadata, conventional imports, modern RVA-form delay imports, exports, forwarded exports, x64
-exception-directory records, ordered TLS callback records, and load-config GuardCF function
-records. Exact export names, metadata-backed `RUNTIME_FUNCTION` ranges, GuardCF records,
+exception-directory records, ordered TLS callback records, and load-config GuardCF function,
+address-taken IAT, long-jump, and EH-continuation records. Exact export names, metadata-backed `RUNTIME_FUNCTION` ranges, GuardCF function records,
 and retained TLS callback slots become evidence-bearing symbol-graph claims.
 It also performs a bounded pure-Rust x86-64 control-flow-guided block sweep inside fully file-backed
 exception ranges and checks seeded executable candidates for one-instruction internal, import,
@@ -57,8 +57,8 @@ The core PE/RTTI analysis is offline and never executes the input. Its narrow de
 in the executable and requires no native library or compiler. Code recovery decodes at most 64 MiB
 and 1,000,000 instructions, discovers at most 262,144 block starts, and retains at most 8,192 direct
 calls, 32,768 data references, and 4,096 thunks. TLS callback discovery separately retains at most
-4,096 ordered entries. GuardCF rejects a declared count above 262,144 or any malformed record and
-never serializes a partial GFIDS prefix.
+4,096 ordered entries. Every Guard table rejects a declared count above 262,144 or any malformed
+record and never serializes a partial prefix.
 Conventional and delay imports share hard ceilings of 4,096 libraries,
 65,536 symbols, and 16 MiB of name bytes; exceeding one rejects analysis rather than retaining a
 partial import prefix. String recovery has its own bounded scan and retention budgets. Original
@@ -209,11 +209,12 @@ Inspection validates the package first and emits no inspection data to stdout un
 file's exact size and SHA-256 match; failures report on stderr. Human output includes
 `source binary: <canonical-path>` and `identity gate: matched` after a successful check. JSON mode
 emits only the validated package JSON, with neither status line mixed into stdout. This works for
-supported package schemas 1 through 9 and only verifies identity: it does not rerun analysis, fill
+supported package schemas 1 through 10 and only verifies identity: it does not rerun analysis, fill
 in results absent from an older schema, or rewrite the package or binary.
 
 Both `analyze` and `inspect` report recovered direct-call, thunk, string, data-reference, GuardCF
-record/function-candidate and FID-/export-suppressed, TLS callback, and delay-import library/symbol counts and whether
+record/function-candidate and FID-/export-suppressed, Guard address-taken IAT, long-jump,
+EH-continuation, TLS callback, and delay-import library/symbol counts and whether
 each partial-capable bounded recovery
 pass was complete or partial. They also report
 MSVC RTTI vftable, unique-type, base-record, and virtual-slot counts. A partial line appears when a
@@ -247,6 +248,16 @@ one-instruction thunk seeding. FID suppression describes CFG eligibility rather 
 target is a function; export-suppressed RVAs must be 16-byte aligned. GFIDS does not trigger a
 function-body sweep or infer a name or extent.
 
+Later load-config versions expose Guard address-taken IAT fields at 176 internal bytes, long-jump
+fields at 192 bytes, and EH-continuation fields at 280 bytes. Nonempty table/count pairs require
+their presence flags; a present flag with zero fields is a supported empty inventory. GIAT,
+long-jump, and EH-continuation records use the `4 + n` Guard stride and require zero reserved
+metadata. GIAT RVAs must equal exact parsed conventional or delay-IAT slots. Long-jump and EH-continuation RVAs
+must be strictly increasing, unique, and begin in file-backed executable data. Every nonempty Guard
+table must be fully backed, disjoint from the load-config directory, and pairwise disjoint from the
+other Guard tables. The three inventories are package/plugin data only: import slots and valid
+continuation addresses do not become function-entry claims or thunk seeds.
+
 For PE32+ inputs, modern delay-import discovery reads optional-header data-directory entry 13 as
 ordered 32-byte descriptors ending in an all-zero descriptor, followed only by all-zero padding in
 the rest of the declared range. ReSymbol accepts only the RVA-based
@@ -268,7 +279,7 @@ Malformation and shared-budget exhaustion are hard errors, never partial delay-i
 Delay-IAT slots feed the existing `ImportIat` call/thunk target and outrank
 read-only function-pointer fallback; the richer inventory is not added to the neutral projection.
 
-New analyses write package schema 9. `inspect` and `export` can also open schemas 1 through 8.
+New analyses write package schema 10. `inspect` and `export` can also open schemas 1 through 9.
 Schema 1 is migrated into a validated current in-memory session and its base graph is rebuilt;
 schemas 2 through 8 use explicit compatibility paths. None rewrites the legacy package. Because
 `.resym` does not contain the original executable, compatibility loading cannot run missing
@@ -279,21 +290,26 @@ descriptors without `pCHD`; schemas 1 through 4 report that result family as una
 contains both RTTI layouts but lacks transitive executable thunk-chain discovery. Schema 6 contains
 that closure but lacks TLS callback discovery and callback-based thunk seeding. Schema 7 retains
 TLS callback discovery but lacks modern delay-import recovery. Schema 8 retains delay imports but
-lacks load-config GuardCF recovery. Schemas 2 through 8 retain their stored direct calls and thunks,
+lacks load-config GuardCF recovery. Schema 9 retains GuardCF functions but lacks the Guard
+address-taken IAT, long-jump, and EH-continuation inventories. Schemas 2 through 9 retain their stored direct calls and thunks,
 but omitted result families remain unavailable. Schemas 1 through 7 therefore report delay imports
-unavailable, and schemas 1 through 8 report GuardCF unavailable. Analyze the exact original binary
-again to create schema 9 with all current results. Relabeling a schema-4 pointer target beneath a
+unavailable, schemas 1 through 8 report GuardCF unavailable, and schemas 1 through 9 report modern
+Guard target inventories unavailable. Analyze the exact original binary again to create schema 10
+with all current results. Relabeling a schema-4 pointer target beneath a
 schema 2 or 3
 envelope is rejected, as is placing an RTTI base record with
 a missing or null `class_hierarchy_descriptor_rva` beneath any schema 1-through-4 envelope. A
 schema 1-through-5 envelope also cannot contain a deterministic base thunk source that depends on
 schema-6 transitive endpoint seeding. Schemas 1 through 6 also reject schema-7 TLS callback state
 and callback-only base thunk seeds. Schemas 1 through 7 reject the exact schema-8 base-analysis
-`delay_imports` inventory key and `directories.delay_imports` directory key. Schemas 8 and 9 always
+`delay_imports` inventory key and `directories.delay_imports` directory key. Schemas 8 through 10 always
 serialize the delay-import inventory, even when empty, and reject a payload missing that marker.
 Schemas 1 through 8 reject schema-9 load-config/GuardCF fields,
-`directories.load_config`, and core `pe-guard-cf-function` claims. Schema 9 always serializes the
-`guard_cf_functions` inventory, even when empty, and rejects a payload missing that marker.
+`directories.load_config`, and core `pe-guard-cf-function` claims. Schemas 9 and 10 always serialize the
+`guard_cf_functions` inventory, even when empty, and reject a payload missing that marker.
+Schemas 1 through 9 reject schema-10 Guard target table-RVA and inventory fields. Schema 10 always
+serializes the address-taken IAT, long-jump, and EH-continuation inventory arrays, even when empty,
+and rejects a payload missing any marker.
 
 Export a package to a specific destination with `--output`:
 
@@ -313,8 +329,8 @@ Without `--output`, those formats write `application.symbols.json`, `application
 `application.map`, `application.pdb`, `application.ida.py`, and
 `ReSymbolImport_<first-12-binary-sha256>.java` beside the package, respectively. Markdown is a
 deterministic presentation report for human review, not a stable machine-interchange format; use
-JSON for integrations. New analyses write `.resym` package schema 9; export also accepts package
-schemas 1 through 8 through validated compatibility paths without rewriting them. The current
+JSON for integrations. New analyses write `.resym` package schema 10; export also accepts package
+schemas 1 through 9 through validated compatibility paths without rewriting them. The current
 neutral projection is independently schema 6, and MAP/PDB add no schema fields. Projection schema
 5 correlates exact or content-interior data-reference targets with retained strings, excluding NUL
 terminators and requiring UTF-16LE code-unit alignment; projection schema 6 adds explicit
@@ -324,6 +340,7 @@ correlation does not prove the target is not a string. Delay-import inventory is
 delay-IAT calls and thunks reuse the existing import target containing the slot RVA, so projection
 schema 6 remains unchanged. Load-config/GFIDS inventory and suppression evidence are likewise
 package-only; GuardCF claims and supported seeded thunks reuse existing shapes, so projection schema 6 remains unchanged.
+The later Guard target inventories are also package-only and add no claims or projection fields.
 A custom
 Ghidra filename
 must use a lowercase `.java` extension and a valid conservative Java-identifier stem; the generated

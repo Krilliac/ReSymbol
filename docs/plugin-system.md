@@ -414,6 +414,14 @@ function-entry evidence and joins one-instruction thunk seeding. FID suppression
 eligibility rather than whether the target is a function. The derived FID/export suppression
 booleans stay claim evidence rather than record fields. The plugin API remains unchanged, and only
 `symbols.read` recipients observe this detached base-analysis state.
+Package schema 10 adds optional checked table RVAs and mandatory arrays for Guard address-taken IAT
+entries `{table_index,iat_rva,metadata}`, long-jump targets
+`{table_index,target_rva,metadata}`, and EH-continuation targets
+`{table_index,target_rva,metadata}`. The
+arrays are present even when empty, array length is the retained count, and raw table bytes are not
+serialized. These are inventory records only: GIAT entries are import slots and the other entries
+are valid continuation/landing addresses, so they emit no function-entry assertion or thunk seed.
+They remain additive detached JSON visible only with `symbols.read`.
 
 #### Managed plugin author quickstart
 
@@ -510,6 +518,9 @@ thunks reuse the existing `import-IAT` target shape. The plugin API, WIT/ABI,
 schema 9's load-config/GuardCF inventory is likewise additive `symbols.read` state; GuardCF claims
 and supported seeded thunks reuse existing `function-entry` and exact `thunk-target` assertions, so the same API, WIT/ABI, wire
 1.0 handshake, and projection schema 6 remain unchanged.
+Package schema 10's Guard address-taken IAT, long-jump, and EH-continuation inventories add no claim
+or control-flow target shape. They are additive `symbols.read` state and leave the plugin API,
+WIT/ABI, wire 1.0 handshake, and projection schema 6 unchanged.
 
 ### Tool-hosted bridges (planned host)
 

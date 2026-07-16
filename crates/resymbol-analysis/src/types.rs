@@ -85,6 +85,31 @@ pub struct PeAnalysis {
     /// cannot acquire GuardCF recovery semantics by changing only its envelope.
     #[serde(default)]
     pub guard_cf_functions: Vec<PeGuardCfFunction>,
+    /// RVA of the Guard address-taken IAT entry table after converting its preferred-image VA.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard_address_taken_iat_entry_table_rva: Option<u32>,
+    /// Ordered address-taken import slots advertised for CFG export suppression.
+    ///
+    /// Schema 10 serializes this inventory even when empty so prior packages
+    /// cannot acquire this recovery result by changing only their envelope.
+    #[serde(default)]
+    pub guard_address_taken_iat_entries: Vec<PeGuardAddressTakenIatEntry>,
+    /// RVA of the Guard long-jump target table after converting its preferred-image VA.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard_long_jump_target_table_rva: Option<u32>,
+    /// Ordered valid targets from the Guard long-jump table.
+    ///
+    /// Schema 10 serializes this inventory even when empty.
+    #[serde(default)]
+    pub guard_long_jump_targets: Vec<PeGuardLongJumpTarget>,
+    /// RVA of the Guard EH-continuation table after converting its preferred-image VA.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard_eh_continuation_table_rva: Option<u32>,
+    /// Ordered valid exception-handling continuation targets.
+    ///
+    /// Schema 10 serializes this inventory even when empty.
+    #[serde(default)]
+    pub guard_eh_continuation_targets: Vec<PeGuardEhContinuationTarget>,
     /// RVA of the callback pointer array named by the TLS directory, when nonzero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_callback_table_rva: Option<u32>,
@@ -192,6 +217,18 @@ struct UncheckedPeAnalysis {
     #[serde(default)]
     guard_cf_functions: Vec<PeGuardCfFunction>,
     #[serde(default)]
+    guard_address_taken_iat_entry_table_rva: Option<u32>,
+    #[serde(default)]
+    guard_address_taken_iat_entries: Vec<PeGuardAddressTakenIatEntry>,
+    #[serde(default)]
+    guard_long_jump_target_table_rva: Option<u32>,
+    #[serde(default)]
+    guard_long_jump_targets: Vec<PeGuardLongJumpTarget>,
+    #[serde(default)]
+    guard_eh_continuation_table_rva: Option<u32>,
+    #[serde(default)]
+    guard_eh_continuation_targets: Vec<PeGuardEhContinuationTarget>,
+    #[serde(default)]
     tls_callback_table_rva: Option<u32>,
     #[serde(default)]
     tls_callback_scan_truncated: bool,
@@ -244,6 +281,12 @@ impl TryFrom<UncheckedPeAnalysis> for PeAnalysis {
             guard_flags: value.guard_flags,
             guard_cf_function_table_rva: value.guard_cf_function_table_rva,
             guard_cf_functions: value.guard_cf_functions,
+            guard_address_taken_iat_entry_table_rva: value.guard_address_taken_iat_entry_table_rva,
+            guard_address_taken_iat_entries: value.guard_address_taken_iat_entries,
+            guard_long_jump_target_table_rva: value.guard_long_jump_target_table_rva,
+            guard_long_jump_targets: value.guard_long_jump_targets,
+            guard_eh_continuation_table_rva: value.guard_eh_continuation_table_rva,
+            guard_eh_continuation_targets: value.guard_eh_continuation_targets,
             tls_callback_table_rva: value.tls_callback_table_rva,
             tls_callback_scan_truncated: value.tls_callback_scan_truncated,
             tls_callbacks: value.tls_callbacks,
@@ -428,6 +471,42 @@ impl PeGuardCfFunction {
     pub fn is_export_suppressed(&self) -> bool {
         self.metadata.first().is_some_and(|flags| flags & 0x02 != 0)
     }
+}
+
+/// One record from the Guard address-taken IAT entry table.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeGuardAddressTakenIatEntry {
+    /// Zero-based position in the strictly sorted source table.
+    pub table_index: u32,
+    /// Exact RVA of the parsed import-address-table slot.
+    pub iat_rva: u32,
+    /// Exact reserved metadata bytes selected by the high nibble of `GuardFlags`.
+    pub metadata: Vec<u8>,
+}
+
+/// One valid target from the Guard long-jump table.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeGuardLongJumpTarget {
+    /// Zero-based position in the strictly sorted source table.
+    pub table_index: u32,
+    /// Exact executable target RVA stored in the record.
+    pub target_rva: u32,
+    /// Exact reserved metadata bytes selected by the high nibble of `GuardFlags`.
+    pub metadata: Vec<u8>,
+}
+
+/// One valid target from the Guard EH-continuation table.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeGuardEhContinuationTarget {
+    /// Zero-based position in the strictly sorted source table.
+    pub table_index: u32,
+    /// Exact executable continuation RVA stored at the start of the record.
+    pub target_rva: u32,
+    /// Exact reserved metadata bytes selected by the high nibble of `GuardFlags`.
+    pub metadata: Vec<u8>,
 }
 
 /// A statically resolved target used by the bounded PE control-flow model.

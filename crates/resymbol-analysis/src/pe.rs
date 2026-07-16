@@ -13,8 +13,9 @@ use resymbol_core::{
 use crate::{
     AnalysisError, CoffHeader, DataDirectory, ImportTarget, MsvcRttiVftable, PeAnalysis,
     PeControlFlowTarget, PeDataDirectories, PeDataReference, PeDelayImportLibrary, PeDirectCall,
-    PeExport, PeExportName, PeGuardCfFunction, PeImport, PeImportLibrary, PeRecoveredString,
-    PeSection, PeThunk, PeTlsCallback, RuntimeFunction,
+    PeExport, PeExportName, PeGuardAddressTakenIatEntry, PeGuardCfFunction,
+    PeGuardEhContinuationTarget, PeGuardLongJumpTarget, PeImport, PeImportLibrary,
+    PeRecoveredString, PeSection, PeThunk, PeTlsCallback, RuntimeFunction,
     code_recovery::{
         CodeRecoveryInput, recover_code, validate_code_recovery, validate_data_references,
     },
@@ -44,12 +45,24 @@ const LOAD_CONFIG_GUARD_FIELDS_SIZE_U32: u32 = 148;
 const LOAD_CONFIG_GUARD_CF_FUNCTION_TABLE_OFFSET: usize = 128;
 const LOAD_CONFIG_GUARD_CF_FUNCTION_COUNT_OFFSET: usize = 136;
 const LOAD_CONFIG_GUARD_FLAGS_OFFSET: usize = 144;
+const LOAD_CONFIG_GUARD_ADDRESS_TAKEN_IAT_FIELDS_SIZE_U32: u32 = 176;
+const LOAD_CONFIG_GUARD_ADDRESS_TAKEN_IAT_TABLE_OFFSET: usize = 160;
+const LOAD_CONFIG_GUARD_ADDRESS_TAKEN_IAT_COUNT_OFFSET: usize = 168;
+const LOAD_CONFIG_GUARD_LONG_JUMP_FIELDS_SIZE_U32: u32 = 192;
+const LOAD_CONFIG_GUARD_LONG_JUMP_TABLE_OFFSET: usize = 176;
+const LOAD_CONFIG_GUARD_LONG_JUMP_COUNT_OFFSET: usize = 184;
+const LOAD_CONFIG_GUARD_EH_CONTINUATION_FIELDS_SIZE_U32: u32 = 280;
+const LOAD_CONFIG_GUARD_EH_CONTINUATION_TABLE_OFFSET: usize = 264;
+const LOAD_CONFIG_GUARD_EH_CONTINUATION_COUNT_OFFSET: usize = 272;
 
 const MACHINE_AMD64: u16 = 0x8664;
 const OPTIONAL_MAGIC_PE32_PLUS: u16 = 0x020b;
 const IMPORT_BY_ORDINAL_64: u64 = 1_u64 << 63;
 const DELAY_IMPORT_ATTRIBUTE_RVA: u32 = 1;
 const IMAGE_GUARD_CF_FUNCTION_TABLE_PRESENT: u32 = 0x0000_0400;
+const IMAGE_GUARD_CF_EXPORT_SUPPRESSION_INFO_PRESENT: u32 = 0x0000_4000;
+const IMAGE_GUARD_CF_LONGJUMP_TABLE_PRESENT: u32 = 0x0001_0000;
+const IMAGE_GUARD_EH_CONTINUATION_TABLE_PRESENT: u32 = 0x0040_0000;
 const IMAGE_GUARD_CF_FUNCTION_TABLE_SIZE_MASK: u32 = 0xf000_0000;
 const IMAGE_GUARD_CF_FUNCTION_TABLE_SIZE_SHIFT: u32 = 28;
 const GUARD_CF_EXPORT_SUPPRESSED_ALIGNMENT: u32 = 16;
@@ -68,6 +81,9 @@ const MAX_EXPORT_NAMES: u64 = 65_536;
 const MAX_EXPORT_NAME_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_RUNTIME_FUNCTIONS: u64 = 262_144;
 const MAX_GUARD_CF_FUNCTIONS: u64 = 262_144;
+const MAX_GUARD_ADDRESS_TAKEN_IAT_ENTRIES: u64 = 262_144;
+const MAX_GUARD_LONG_JUMP_TARGETS: u64 = 262_144;
+const MAX_GUARD_EH_CONTINUATION_TARGETS: u64 = 262_144;
 const MAX_TLS_CALLBACKS: u64 = 4_096;
 const MAX_DEBUG_DIRECTORY_ENTRIES: u64 = 4_096;
 const MAX_CODEVIEW_RECORD_BYTES: u64 = 64 * 1_024;
@@ -203,11 +219,32 @@ struct ParsedHeaders {
     sections: Vec<PeSection>,
 }
 
+struct ParsedLoadConfigMetadata {
+    load_config_size: Option<u32>,
+    guard_flags: Option<u32>,
+    function_table_rva: Option<u32>,
+    functions: Vec<PeGuardCfFunction>,
+    address_taken_iat_entry_table_rva: Option<u32>,
+    address_taken_iat_entries: Vec<PeGuardAddressTakenIatEntry>,
+    long_jump_target_table_rva: Option<u32>,
+    long_jump_targets: Vec<PeGuardLongJumpTarget>,
+    eh_continuation_table_rva: Option<u32>,
+    eh_continuation_targets: Vec<PeGuardEhContinuationTarget>,
+}
+
 struct ParsedGuardCfMetadata {
     load_config_size: Option<u32>,
     guard_flags: Option<u32>,
     function_table_rva: Option<u32>,
     functions: Vec<PeGuardCfFunction>,
+}
+
+#[derive(Clone, Copy)]
+struct GuardTableParseContext {
+    directory: DataDirectory,
+    image_base: u64,
+    size_of_image: u32,
+    guard_flags: u32,
 }
 
 #[derive(Default)]
@@ -270,18 +307,25 @@ pub fn analyze_pe(bytes: &[u8]) -> Result<PeAnalysis, AnalysisError> {
         headers.directories.exceptions,
         headers.size_of_image,
     )?;
-    let ParsedGuardCfMetadata {
+    let ParsedLoadConfigMetadata {
         load_config_size,
         guard_flags,
         function_table_rva: guard_cf_function_table_rva,
         functions: guard_cf_functions,
-    } = parse_guard_cf_functions(
+        address_taken_iat_entry_table_rva: guard_address_taken_iat_entry_table_rva,
+        address_taken_iat_entries: guard_address_taken_iat_entries,
+        long_jump_target_table_rva: guard_long_jump_target_table_rva,
+        long_jump_targets: guard_long_jump_targets,
+        eh_continuation_table_rva: guard_eh_continuation_table_rva,
+        eh_continuation_targets: guard_eh_continuation_targets,
+    } = parse_load_config_metadata(
         &reader,
         &mapper,
         headers.directories.load_config,
         headers.image_base,
         headers.size_of_image,
         &headers.sections,
+        &import_budget.iat_rvas,
     )?;
     let (tls_callback_table_rva, tls_callbacks, tls_callback_scan_truncated) = parse_tls_callbacks(
         &reader,
@@ -358,6 +402,12 @@ pub fn analyze_pe(bytes: &[u8]) -> Result<PeAnalysis, AnalysisError> {
         guard_flags,
         guard_cf_function_table_rva,
         guard_cf_functions,
+        guard_address_taken_iat_entry_table_rva,
+        guard_address_taken_iat_entries,
+        guard_long_jump_target_table_rva,
+        guard_long_jump_targets,
+        guard_eh_continuation_table_rva,
+        guard_eh_continuation_targets,
         tls_callback_table_rva,
         tls_callback_scan_truncated,
         tls_callbacks,
@@ -1127,7 +1177,7 @@ pub(crate) fn validate_pe_analysis(analysis: &PeAnalysis) -> Result<(), Analysis
     }
 
     validate_tls_callbacks(analysis)?;
-    validate_guard_cf_functions(analysis)?;
+    validate_load_config_metadata(analysis, &import_iat_rvas)?;
     validate_msvc_rtti(analysis)?;
     validate_code_recovery(analysis)?;
     validate_recovered_strings(
@@ -1410,6 +1460,160 @@ fn validate_delay_imports(
     Ok(())
 }
 
+fn validate_load_config_metadata(
+    analysis: &PeAnalysis,
+    import_iat_rvas: &BTreeSet<u32>,
+) -> Result<(), AnalysisError> {
+    validate_guard_cf_functions(analysis)?;
+
+    let has_address_taken_iat_state = analysis.guard_address_taken_iat_entry_table_rva.is_some()
+        || !analysis.guard_address_taken_iat_entries.is_empty();
+    let has_long_jump_state = analysis.guard_long_jump_target_table_rva.is_some()
+        || !analysis.guard_long_jump_targets.is_empty();
+    let has_eh_continuation_state = analysis.guard_eh_continuation_table_rva.is_some()
+        || !analysis.guard_eh_continuation_targets.is_empty();
+    let has_extended_state =
+        has_address_taken_iat_state || has_long_jump_state || has_eh_continuation_state;
+
+    let Some(directory) = analysis.directories.load_config else {
+        if has_extended_state {
+            return invalid_field(
+                "load-config guard target metadata",
+                "table state exists without a load-config directory",
+            );
+        }
+        return Ok(());
+    };
+    let load_config_size = analysis
+        .load_config_size
+        .expect("GuardCF validation requires a load-config size");
+
+    let mut table_ranges = Vec::new();
+    if let Some(table_rva) = analysis.guard_cf_function_table_rva {
+        let guard_flags = analysis
+            .guard_flags
+            .expect("GuardCF table validation requires GuardFlags");
+        let metadata_size = guard_table_metadata_size(guard_flags)?;
+        let record_size =
+            4_usize
+                .checked_add(metadata_size)
+                .ok_or(AnalysisError::ArithmeticOverflow(
+                    "GuardCF function-record size",
+                ))?;
+        let table_size = u64::try_from(analysis.guard_cf_functions.len())
+            .map_err(|_| AnalysisError::IntegerConversion("GuardCF function count"))?
+            .checked_mul(
+                u64::try_from(record_size)
+                    .map_err(|_| AnalysisError::IntegerConversion("GuardCF record size"))?,
+            )
+            .ok_or(AnalysisError::ArithmeticOverflow(
+                "GuardCF function-table byte size",
+            ))?;
+        table_ranges.push(("GuardCF function table", table_rva, table_size));
+    }
+
+    if load_config_size < LOAD_CONFIG_GUARD_ADDRESS_TAKEN_IAT_FIELDS_SIZE_U32 {
+        if has_address_taken_iat_state {
+            return invalid_field(
+                "Guard address-taken IAT table",
+                "state exists in a load-config structure too short to contain its fields",
+            );
+        }
+        if analysis
+            .guard_flags
+            .is_some_and(|flags| flags & IMAGE_GUARD_CF_EXPORT_SUPPRESSION_INFO_PRESENT != 0)
+        {
+            return invalid_field(
+                "Guard address-taken IAT fields",
+                "the presence flag is set in a load-config structure too short to contain the table fields",
+            );
+        }
+    } else {
+        let guard_flags = analysis
+            .guard_flags
+            .expect("extended load-config validation requires GuardFlags");
+        if let Some(range) = validate_guard_address_taken_iat_table(
+            analysis,
+            directory,
+            guard_flags,
+            import_iat_rvas,
+        )? {
+            table_ranges.push(range);
+        }
+    }
+
+    if load_config_size < LOAD_CONFIG_GUARD_LONG_JUMP_FIELDS_SIZE_U32 {
+        if has_long_jump_state {
+            return invalid_field(
+                "Guard long-jump target table",
+                "state exists in a load-config structure too short to contain its fields",
+            );
+        }
+        if analysis
+            .guard_flags
+            .is_some_and(|flags| flags & IMAGE_GUARD_CF_LONGJUMP_TABLE_PRESENT != 0)
+        {
+            return invalid_field(
+                "Guard long-jump fields",
+                "the presence flag is set in a load-config structure too short to contain the table fields",
+            );
+        }
+    } else {
+        let guard_flags = analysis
+            .guard_flags
+            .expect("extended load-config validation requires GuardFlags");
+        if let Some(range) = validate_guard_long_jump_table(analysis, directory, guard_flags)? {
+            table_ranges.push(range);
+        }
+    }
+
+    if load_config_size < LOAD_CONFIG_GUARD_EH_CONTINUATION_FIELDS_SIZE_U32 {
+        if has_eh_continuation_state {
+            return invalid_field(
+                "Guard EH-continuation table",
+                "state exists in a load-config structure too short to contain its fields",
+            );
+        }
+        if analysis
+            .guard_flags
+            .is_some_and(|flags| flags & IMAGE_GUARD_EH_CONTINUATION_TABLE_PRESENT != 0)
+        {
+            return invalid_field(
+                "Guard EH-continuation fields",
+                "the presence flag is set in a load-config structure too short to contain the table fields",
+            );
+        }
+    } else {
+        let guard_flags = analysis
+            .guard_flags
+            .expect("extended load-config validation requires GuardFlags");
+        if let Some(range) = validate_guard_eh_continuation_table(analysis, directory, guard_flags)?
+        {
+            table_ranges.push(range);
+        }
+    }
+
+    for first in 0..table_ranges.len() {
+        for second in first + 1..table_ranges.len() {
+            if ranges_overlap(
+                u64::from(table_ranges[first].1),
+                table_ranges[first].2,
+                u64::from(table_ranges[second].1),
+                table_ranges[second].2,
+            )? {
+                return invalid_field(
+                    "load-config guard tables",
+                    format!(
+                        "{} overlaps {}",
+                        table_ranges[first].0, table_ranges[second].0
+                    ),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_guard_cf_functions(analysis: &PeAnalysis) -> Result<(), AnalysisError> {
     let Some(directory) = analysis.directories.load_config else {
         if analysis.load_config_size.is_some()
@@ -1590,6 +1794,362 @@ fn validate_guard_cf_functions(analysis: &PeAnalysis) -> Result<(), AnalysisErro
         previous_rva = Some(function.rva);
     }
     Ok(())
+}
+
+fn guard_table_metadata_size(guard_flags: u32) -> Result<usize, AnalysisError> {
+    usize::try_from(
+        (guard_flags & IMAGE_GUARD_CF_FUNCTION_TABLE_SIZE_MASK)
+            >> IMAGE_GUARD_CF_FUNCTION_TABLE_SIZE_SHIFT,
+    )
+    .map_err(|_| AnalysisError::IntegerConversion("Guard table metadata size"))
+}
+
+fn validated_guard_table_size(
+    count: u64,
+    record_size: usize,
+    count_kind: &'static str,
+    count_limit: u64,
+    byte_kind: &'static str,
+    overflow_context: &'static str,
+) -> Result<u64, AnalysisError> {
+    enforce_limit(count_kind, count, count_limit)?;
+    let table_size = count
+        .checked_mul(
+            u64::try_from(record_size)
+                .map_err(|_| AnalysisError::IntegerConversion("Guard table record size"))?,
+        )
+        .ok_or(AnalysisError::ArithmeticOverflow(overflow_context))?;
+    enforce_limit(byte_kind, table_size, MAX_DIRECTORY_BYTES)?;
+    Ok(table_size)
+}
+
+fn validate_guard_table_storage(
+    analysis: &PeAnalysis,
+    directory: DataDirectory,
+    table_rva: u32,
+    table_size: u64,
+    field: &'static str,
+) -> Result<(), AnalysisError> {
+    let table_size_u32 = u32::try_from(table_size)
+        .map_err(|_| AnalysisError::IntegerConversion("Guard table byte size"))?;
+    if !model_rva_is_backed(analysis, table_rva, table_size_u32) {
+        return invalid_field(field, "is not fully backed by file data");
+    }
+    if ranges_overlap(
+        u64::from(directory.rva),
+        u64::from(directory.size),
+        u64::from(table_rva),
+        table_size,
+    )? {
+        return invalid_field(field, "overlaps the declared load-config directory range");
+    }
+    Ok(())
+}
+
+fn validate_guard_address_taken_iat_table(
+    analysis: &PeAnalysis,
+    directory: DataDirectory,
+    guard_flags: u32,
+    import_iat_rvas: &BTreeSet<u32>,
+) -> Result<Option<(&'static str, u32, u64)>, AnalysisError> {
+    let Some(table_rva) = analysis.guard_address_taken_iat_entry_table_rva else {
+        if !analysis.guard_address_taken_iat_entries.is_empty() {
+            return invalid_field(
+                "Guard address-taken IAT table",
+                "entries exist without a table RVA",
+            );
+        }
+        return Ok(None);
+    };
+    if guard_flags & IMAGE_GUARD_CF_EXPORT_SUPPRESSION_INFO_PRESENT == 0 {
+        return invalid_field(
+            "Guard address-taken IAT table",
+            "a table RVA exists while IMAGE_GUARD_CF_EXPORT_SUPPRESSION_INFO_PRESENT is clear",
+        );
+    }
+    if analysis.guard_address_taken_iat_entries.is_empty() {
+        return invalid_field(
+            "Guard address-taken IAT table",
+            "a nonzero table RVA exists without any records",
+        );
+    }
+
+    let metadata_size = guard_table_metadata_size(guard_flags)?;
+    let record_size =
+        4_usize
+            .checked_add(metadata_size)
+            .ok_or(AnalysisError::ArithmeticOverflow(
+                "Guard address-taken IAT record size",
+            ))?;
+    let count = u64::try_from(analysis.guard_address_taken_iat_entries.len())
+        .map_err(|_| AnalysisError::IntegerConversion("Guard address-taken IAT entry count"))?;
+    let table_size = validated_guard_table_size(
+        count,
+        record_size,
+        "Guard address-taken IAT entry",
+        MAX_GUARD_ADDRESS_TAKEN_IAT_ENTRIES,
+        "Guard address-taken IAT table byte",
+        "Guard address-taken IAT table byte size",
+    )?;
+    validate_guard_table_storage(
+        analysis,
+        directory,
+        table_rva,
+        table_size,
+        "Guard address-taken IAT table",
+    )?;
+
+    let mut previous_rva = None;
+    for (index, entry) in analysis.guard_address_taken_iat_entries.iter().enumerate() {
+        let expected_index = u32::try_from(index)
+            .map_err(|_| AnalysisError::IntegerConversion("Guard address-taken IAT index"))?;
+        if entry.table_index != expected_index {
+            return invalid_field(
+                "Guard address-taken IAT table index",
+                "does not match source-table order",
+            );
+        }
+        if entry.metadata.len() != metadata_size {
+            return invalid_field(
+                "Guard address-taken IAT metadata",
+                format!(
+                    "entry {index} retains {} bytes instead of the GuardFlags-selected {metadata_size}",
+                    entry.metadata.len()
+                ),
+            );
+        }
+        if entry.metadata.iter().any(|byte| *byte != 0) {
+            return invalid_field(
+                "Guard address-taken IAT metadata",
+                format!("entry {index} has nonzero reserved metadata"),
+            );
+        }
+        if previous_rva.is_some_and(|previous| previous >= entry.iat_rva) {
+            return invalid_field(
+                "Guard address-taken IAT table",
+                "RVAs must be strictly increasing and unique",
+            );
+        }
+        if !import_iat_rvas.contains(&entry.iat_rva) {
+            return invalid_field(
+                "Guard address-taken IAT entry",
+                format!(
+                    "entry {index} names RVA {:#x}, which is not an exact parsed import IAT slot",
+                    entry.iat_rva
+                ),
+            );
+        }
+        previous_rva = Some(entry.iat_rva);
+    }
+    Ok(Some((
+        "Guard address-taken IAT table",
+        table_rva,
+        table_size,
+    )))
+}
+
+fn validate_guard_long_jump_table(
+    analysis: &PeAnalysis,
+    directory: DataDirectory,
+    guard_flags: u32,
+) -> Result<Option<(&'static str, u32, u64)>, AnalysisError> {
+    let Some(table_rva) = analysis.guard_long_jump_target_table_rva else {
+        if !analysis.guard_long_jump_targets.is_empty() {
+            return invalid_field(
+                "Guard long-jump target table",
+                "entries exist without a table RVA",
+            );
+        }
+        return Ok(None);
+    };
+    if guard_flags & IMAGE_GUARD_CF_LONGJUMP_TABLE_PRESENT == 0 {
+        return invalid_field(
+            "Guard long-jump target table",
+            "a table RVA exists while IMAGE_GUARD_CF_LONGJUMP_TABLE_PRESENT is clear",
+        );
+    }
+    if analysis.guard_long_jump_targets.is_empty() {
+        return invalid_field(
+            "Guard long-jump target table",
+            "a nonzero table RVA exists without any records",
+        );
+    }
+
+    let metadata_size = guard_table_metadata_size(guard_flags)?;
+    let record_size =
+        4_usize
+            .checked_add(metadata_size)
+            .ok_or(AnalysisError::ArithmeticOverflow(
+                "Guard long-jump record size",
+            ))?;
+    let count = u64::try_from(analysis.guard_long_jump_targets.len())
+        .map_err(|_| AnalysisError::IntegerConversion("Guard long-jump target count"))?;
+    let table_size = validated_guard_table_size(
+        count,
+        record_size,
+        "Guard long-jump target",
+        MAX_GUARD_LONG_JUMP_TARGETS,
+        "Guard long-jump table byte",
+        "Guard long-jump table byte size",
+    )?;
+    validate_guard_table_storage(
+        analysis,
+        directory,
+        table_rva,
+        table_size,
+        "Guard long-jump target table",
+    )?;
+
+    let mut previous_rva = None;
+    for (index, target) in analysis.guard_long_jump_targets.iter().enumerate() {
+        let expected_index = u32::try_from(index)
+            .map_err(|_| AnalysisError::IntegerConversion("Guard long-jump target index"))?;
+        if target.table_index != expected_index {
+            return invalid_field(
+                "Guard long-jump target-table index",
+                "does not match source-table order",
+            );
+        }
+        if target.metadata.len() != metadata_size {
+            return invalid_field(
+                "Guard long-jump metadata",
+                format!(
+                    "entry {index} retains {} bytes instead of the GuardFlags-selected {metadata_size}",
+                    target.metadata.len()
+                ),
+            );
+        }
+        if target.metadata.iter().any(|byte| *byte != 0) {
+            return invalid_field(
+                "Guard long-jump metadata",
+                format!("entry {index} has nonzero reserved metadata"),
+            );
+        }
+        if previous_rva.is_some_and(|previous| previous >= target.target_rva) {
+            return invalid_field(
+                "Guard long-jump target table",
+                "RVAs must be strictly increasing and unique",
+            );
+        }
+        let executable = section_for_rva(target.target_rva, &analysis.sections)
+            .is_some_and(|(_, section)| section.characteristics & IMAGE_SCN_MEM_EXECUTE != 0)
+            && model_rva_is_backed(analysis, target.target_rva, 1);
+        if !executable {
+            return invalid_field(
+                "Guard long-jump target",
+                format!(
+                    "entry {index} has RVA {:#x}, which is not fully file-backed executable data",
+                    target.target_rva
+                ),
+            );
+        }
+        previous_rva = Some(target.target_rva);
+    }
+    Ok(Some((
+        "Guard long-jump target table",
+        table_rva,
+        table_size,
+    )))
+}
+
+fn validate_guard_eh_continuation_table(
+    analysis: &PeAnalysis,
+    directory: DataDirectory,
+    guard_flags: u32,
+) -> Result<Option<(&'static str, u32, u64)>, AnalysisError> {
+    let Some(table_rva) = analysis.guard_eh_continuation_table_rva else {
+        if !analysis.guard_eh_continuation_targets.is_empty() {
+            return invalid_field(
+                "Guard EH-continuation table",
+                "entries exist without a table RVA",
+            );
+        }
+        return Ok(None);
+    };
+    if guard_flags & IMAGE_GUARD_EH_CONTINUATION_TABLE_PRESENT == 0 {
+        return invalid_field(
+            "Guard EH-continuation table",
+            "a table RVA exists while IMAGE_GUARD_EH_CONTINUATION_TABLE_PRESENT is clear",
+        );
+    }
+    if analysis.guard_eh_continuation_targets.is_empty() {
+        return invalid_field(
+            "Guard EH-continuation table",
+            "a nonzero table RVA exists without any records",
+        );
+    }
+
+    let metadata_size = guard_table_metadata_size(guard_flags)?;
+    let record_size =
+        4_usize
+            .checked_add(metadata_size)
+            .ok_or(AnalysisError::ArithmeticOverflow(
+                "Guard EH-continuation record size",
+            ))?;
+    let count = u64::try_from(analysis.guard_eh_continuation_targets.len())
+        .map_err(|_| AnalysisError::IntegerConversion("Guard EH-continuation target count"))?;
+    let table_size = validated_guard_table_size(
+        count,
+        record_size,
+        "Guard EH-continuation target",
+        MAX_GUARD_EH_CONTINUATION_TARGETS,
+        "Guard EH-continuation table byte",
+        "Guard EH-continuation table byte size",
+    )?;
+    validate_guard_table_storage(
+        analysis,
+        directory,
+        table_rva,
+        table_size,
+        "Guard EH-continuation table",
+    )?;
+
+    let mut previous_rva = None;
+    for (index, target) in analysis.guard_eh_continuation_targets.iter().enumerate() {
+        let expected_index = u32::try_from(index)
+            .map_err(|_| AnalysisError::IntegerConversion("Guard EH-continuation index"))?;
+        if target.table_index != expected_index {
+            return invalid_field(
+                "Guard EH-continuation table index",
+                "does not match source-table order",
+            );
+        }
+        if target.metadata.len() != metadata_size {
+            return invalid_field(
+                "Guard EH-continuation metadata",
+                format!(
+                    "entry {index} retains {} bytes instead of the GuardFlags-selected {metadata_size}",
+                    target.metadata.len()
+                ),
+            );
+        }
+        if target.metadata.iter().any(|byte| *byte != 0) {
+            return invalid_field(
+                "Guard EH-continuation metadata",
+                format!("entry {index} has nonzero reserved metadata"),
+            );
+        }
+        if previous_rva.is_some_and(|previous| previous >= target.target_rva) {
+            return invalid_field(
+                "Guard EH-continuation table",
+                "RVAs must be strictly increasing and unique",
+            );
+        }
+        let executable = section_for_rva(target.target_rva, &analysis.sections)
+            .is_some_and(|(_, section)| section.characteristics & IMAGE_SCN_MEM_EXECUTE != 0)
+            && model_rva_is_backed(analysis, target.target_rva, 1);
+        if !executable {
+            return invalid_field(
+                "Guard EH-continuation target",
+                format!(
+                    "entry {index} has RVA {:#x}, which is not fully file-backed executable data",
+                    target.target_rva
+                ),
+            );
+        }
+        previous_rva = Some(target.target_rva);
+    }
+    Ok(Some(("Guard EH-continuation table", table_rva, table_size)))
 }
 
 fn validate_tls_callbacks(analysis: &PeAnalysis) -> Result<(), AnalysisError> {
@@ -2690,6 +3250,234 @@ fn parse_exports(
     Ok((export_library_name, exports))
 }
 
+fn parse_load_config_metadata(
+    reader: &Reader<'_>,
+    mapper: &RvaMap<'_>,
+    directory: Option<DataDirectory>,
+    image_base: u64,
+    size_of_image: u32,
+    sections: &[PeSection],
+    import_iat_rvas: &BTreeSet<u32>,
+) -> Result<ParsedLoadConfigMetadata, AnalysisError> {
+    let parsed_guard_cf = parse_guard_cf_functions(
+        reader,
+        mapper,
+        directory,
+        image_base,
+        size_of_image,
+        sections,
+    )?;
+    let mut parsed = ParsedLoadConfigMetadata {
+        load_config_size: parsed_guard_cf.load_config_size,
+        guard_flags: parsed_guard_cf.guard_flags,
+        function_table_rva: parsed_guard_cf.function_table_rva,
+        functions: parsed_guard_cf.functions,
+        address_taken_iat_entry_table_rva: None,
+        address_taken_iat_entries: Vec::new(),
+        long_jump_target_table_rva: None,
+        long_jump_targets: Vec::new(),
+        eh_continuation_table_rva: None,
+        eh_continuation_targets: Vec::new(),
+    };
+
+    let (Some(directory), Some(load_config_size), Some(guard_flags)) =
+        (directory, parsed.load_config_size, parsed.guard_flags)
+    else {
+        return Ok(parsed);
+    };
+    let directory_size = usize::try_from(directory.size)
+        .map_err(|_| AnalysisError::IntegerConversion("load-config-directory size"))?;
+    let directory_offset = mapper.offset(directory.rva, directory_size, "load-config directory")?;
+    let guard_table_context = GuardTableParseContext {
+        directory,
+        image_base,
+        size_of_image,
+        guard_flags,
+    };
+
+    if load_config_size < LOAD_CONFIG_GUARD_ADDRESS_TAKEN_IAT_FIELDS_SIZE_U32 {
+        if guard_flags & IMAGE_GUARD_CF_EXPORT_SUPPRESSION_INFO_PRESENT != 0 {
+            return invalid_field(
+                "Guard address-taken IAT fields",
+                "the presence flag is set in a load-config structure too short to contain the table fields",
+            );
+        }
+    } else {
+        let table_va = reader.u64(
+            checked_add(
+                directory_offset,
+                LOAD_CONFIG_GUARD_ADDRESS_TAKEN_IAT_TABLE_OFFSET,
+                "Guard address-taken IAT table field offset",
+            )?,
+            "GuardAddressTakenIatEntryTable",
+        )?;
+        let count = reader.u64(
+            checked_add(
+                directory_offset,
+                LOAD_CONFIG_GUARD_ADDRESS_TAKEN_IAT_COUNT_OFFSET,
+                "Guard address-taken IAT count field offset",
+            )?,
+            "GuardAddressTakenIatEntryCount",
+        )?;
+        let (table_rva, entries) = parse_guard_address_taken_iat_table(
+            reader,
+            mapper,
+            guard_table_context,
+            table_va,
+            count,
+            import_iat_rvas,
+        )?;
+        parsed.address_taken_iat_entry_table_rva = table_rva;
+        parsed.address_taken_iat_entries = entries;
+    }
+
+    if load_config_size < LOAD_CONFIG_GUARD_LONG_JUMP_FIELDS_SIZE_U32 {
+        if guard_flags & IMAGE_GUARD_CF_LONGJUMP_TABLE_PRESENT != 0 {
+            return invalid_field(
+                "Guard long-jump fields",
+                "the presence flag is set in a load-config structure too short to contain the table fields",
+            );
+        }
+    } else {
+        let table_va = reader.u64(
+            checked_add(
+                directory_offset,
+                LOAD_CONFIG_GUARD_LONG_JUMP_TABLE_OFFSET,
+                "Guard long-jump table field offset",
+            )?,
+            "GuardLongJumpTargetTable",
+        )?;
+        let count = reader.u64(
+            checked_add(
+                directory_offset,
+                LOAD_CONFIG_GUARD_LONG_JUMP_COUNT_OFFSET,
+                "Guard long-jump count field offset",
+            )?,
+            "GuardLongJumpTargetCount",
+        )?;
+        let (table_rva, targets) = parse_guard_long_jump_table(
+            reader,
+            mapper,
+            guard_table_context,
+            table_va,
+            count,
+            sections,
+        )?;
+        parsed.long_jump_target_table_rva = table_rva;
+        parsed.long_jump_targets = targets;
+    }
+
+    if load_config_size < LOAD_CONFIG_GUARD_EH_CONTINUATION_FIELDS_SIZE_U32 {
+        if guard_flags & IMAGE_GUARD_EH_CONTINUATION_TABLE_PRESENT != 0 {
+            return invalid_field(
+                "Guard EH-continuation fields",
+                "the presence flag is set in a load-config structure too short to contain the table fields",
+            );
+        }
+    } else {
+        let table_va = reader.u64(
+            checked_add(
+                directory_offset,
+                LOAD_CONFIG_GUARD_EH_CONTINUATION_TABLE_OFFSET,
+                "Guard EH-continuation table field offset",
+            )?,
+            "GuardEHContinuationTable",
+        )?;
+        let count = reader.u64(
+            checked_add(
+                directory_offset,
+                LOAD_CONFIG_GUARD_EH_CONTINUATION_COUNT_OFFSET,
+                "Guard EH-continuation count field offset",
+            )?,
+            "GuardEHContinuationCount",
+        )?;
+        let (table_rva, targets) = parse_guard_eh_continuation_table(
+            reader,
+            mapper,
+            guard_table_context,
+            table_va,
+            count,
+            sections,
+        )?;
+        parsed.eh_continuation_table_rva = table_rva;
+        parsed.eh_continuation_targets = targets;
+    }
+
+    let metadata_size = guard_table_metadata_size(guard_flags)?;
+    let record_size = 4_usize
+        .checked_add(metadata_size)
+        .ok_or(AnalysisError::ArithmeticOverflow("Guard table record size"))?;
+    let mut table_ranges = Vec::new();
+    if let Some(table_rva) = parsed.function_table_rva {
+        let size = u64::try_from(parsed.functions.len())
+            .map_err(|_| AnalysisError::IntegerConversion("GuardCF function count"))?
+            .checked_mul(
+                u64::try_from(record_size)
+                    .map_err(|_| AnalysisError::IntegerConversion("Guard table record size"))?,
+            )
+            .ok_or(AnalysisError::ArithmeticOverflow(
+                "GuardCF function-table byte size",
+            ))?;
+        table_ranges.push(("GuardCF function table", table_rva, size));
+    }
+    if let Some(table_rva) = parsed.address_taken_iat_entry_table_rva {
+        let size = u64::try_from(parsed.address_taken_iat_entries.len())
+            .map_err(|_| AnalysisError::IntegerConversion("Guard address-taken IAT count"))?
+            .checked_mul(
+                u64::try_from(record_size)
+                    .map_err(|_| AnalysisError::IntegerConversion("Guard table record size"))?,
+            )
+            .ok_or(AnalysisError::ArithmeticOverflow(
+                "Guard address-taken IAT table byte size",
+            ))?;
+        table_ranges.push(("Guard address-taken IAT table", table_rva, size));
+    }
+    if let Some(table_rva) = parsed.long_jump_target_table_rva {
+        let size = u64::try_from(parsed.long_jump_targets.len())
+            .map_err(|_| AnalysisError::IntegerConversion("Guard long-jump target count"))?
+            .checked_mul(
+                u64::try_from(record_size)
+                    .map_err(|_| AnalysisError::IntegerConversion("Guard table record size"))?,
+            )
+            .ok_or(AnalysisError::ArithmeticOverflow(
+                "Guard long-jump table byte size",
+            ))?;
+        table_ranges.push(("Guard long-jump target table", table_rva, size));
+    }
+    if let Some(table_rva) = parsed.eh_continuation_table_rva {
+        let size = u64::try_from(parsed.eh_continuation_targets.len())
+            .map_err(|_| AnalysisError::IntegerConversion("Guard EH-continuation target count"))?
+            .checked_mul(
+                u64::try_from(record_size)
+                    .map_err(|_| AnalysisError::IntegerConversion("Guard table record size"))?,
+            )
+            .ok_or(AnalysisError::ArithmeticOverflow(
+                "Guard EH-continuation table byte size",
+            ))?;
+        table_ranges.push(("Guard EH-continuation table", table_rva, size));
+    }
+    for first in 0..table_ranges.len() {
+        for second in first + 1..table_ranges.len() {
+            if ranges_overlap(
+                u64::from(table_ranges[first].1),
+                table_ranges[first].2,
+                u64::from(table_ranges[second].1),
+                table_ranges[second].2,
+            )? {
+                return invalid_field(
+                    "load-config guard tables",
+                    format!(
+                        "{} overlaps {}",
+                        table_ranges[first].0, table_ranges[second].0
+                    ),
+                );
+            }
+        }
+    }
+
+    Ok(parsed)
+}
+
 fn parse_guard_cf_functions(
     reader: &Reader<'_>,
     mapper: &RvaMap<'_>,
@@ -2884,6 +3672,367 @@ fn parse_guard_cf_functions(
         function_table_rva: Some(table_rva),
         functions,
     })
+}
+
+fn parse_guard_address_taken_iat_table(
+    reader: &Reader<'_>,
+    mapper: &RvaMap<'_>,
+    context: GuardTableParseContext,
+    table_va: u64,
+    entry_count: u64,
+    import_iat_rvas: &BTreeSet<u32>,
+) -> Result<(Option<u32>, Vec<PeGuardAddressTakenIatEntry>), AnalysisError> {
+    let GuardTableParseContext {
+        directory,
+        image_base,
+        size_of_image,
+        guard_flags,
+    } = context;
+    if table_va == 0 && entry_count == 0 {
+        return Ok((None, Vec::new()));
+    }
+    if table_va == 0 || entry_count == 0 {
+        return invalid_field(
+            "Guard address-taken IAT table",
+            "table VA and entry count must either both be zero or both be nonzero",
+        );
+    }
+    if guard_flags & IMAGE_GUARD_CF_EXPORT_SUPPRESSION_INFO_PRESENT == 0 {
+        return invalid_field(
+            "Guard address-taken IAT table",
+            "table VA and count are nonzero while IMAGE_GUARD_CF_EXPORT_SUPPRESSION_INFO_PRESENT is clear",
+        );
+    }
+
+    let metadata_size = guard_table_metadata_size(guard_flags)?;
+    let record_size =
+        4_usize
+            .checked_add(metadata_size)
+            .ok_or(AnalysisError::ArithmeticOverflow(
+                "Guard address-taken IAT record size",
+            ))?;
+    let table_size = validated_guard_table_size(
+        entry_count,
+        record_size,
+        "Guard address-taken IAT entry",
+        MAX_GUARD_ADDRESS_TAKEN_IAT_ENTRIES,
+        "Guard address-taken IAT table byte",
+        "Guard address-taken IAT table byte size",
+    )?;
+    let table_size_usize = usize::try_from(table_size)
+        .map_err(|_| AnalysisError::IntegerConversion("Guard address-taken IAT table byte size"))?;
+    let table_rva = image_va_to_rva(
+        table_va,
+        image_base,
+        size_of_image,
+        "GuardAddressTakenIatEntryTable",
+    )?;
+    let table_offset =
+        mapper.offset(table_rva, table_size_usize, "Guard address-taken IAT table")?;
+    if ranges_overlap(
+        u64::from(directory.rva),
+        u64::from(directory.size),
+        u64::from(table_rva),
+        table_size,
+    )? {
+        return invalid_field(
+            "Guard address-taken IAT table",
+            "overlaps the declared load-config directory range",
+        );
+    }
+
+    let capacity = usize::try_from(entry_count)
+        .map_err(|_| AnalysisError::IntegerConversion("Guard address-taken IAT entry count"))?;
+    let mut entries = Vec::with_capacity(capacity);
+    let mut previous_rva = None;
+    for index in 0..capacity {
+        let record_offset = checked_add(
+            table_offset,
+            checked_mul(
+                index,
+                record_size,
+                "Guard address-taken IAT record position",
+            )?,
+            "Guard address-taken IAT record offset",
+        )?;
+        let iat_rva = reader.u32(record_offset, "Guard address-taken IAT RVA")?;
+        if previous_rva.is_some_and(|previous| previous >= iat_rva) {
+            return invalid_field(
+                "Guard address-taken IAT table",
+                "RVAs must be strictly increasing and unique",
+            );
+        }
+        let metadata_offset =
+            checked_add(record_offset, 4, "Guard address-taken IAT metadata offset")?;
+        let metadata = reader
+            .bytes(
+                metadata_offset,
+                metadata_size,
+                "Guard address-taken IAT metadata",
+            )?
+            .to_vec();
+        if metadata.iter().any(|byte| *byte != 0) {
+            return invalid_field(
+                "Guard address-taken IAT metadata",
+                format!("entry {index} has nonzero reserved metadata"),
+            );
+        }
+        if !import_iat_rvas.contains(&iat_rva) {
+            return invalid_field(
+                "Guard address-taken IAT entry",
+                format!(
+                    "entry {index} names RVA {iat_rva:#x}, which is not an exact parsed import IAT slot"
+                ),
+            );
+        }
+        entries.push(PeGuardAddressTakenIatEntry {
+            table_index: u32::try_from(index).map_err(|_| {
+                AnalysisError::IntegerConversion("Guard address-taken IAT table index")
+            })?,
+            iat_rva,
+            metadata,
+        });
+        previous_rva = Some(iat_rva);
+    }
+    Ok((Some(table_rva), entries))
+}
+
+fn parse_guard_long_jump_table(
+    reader: &Reader<'_>,
+    mapper: &RvaMap<'_>,
+    context: GuardTableParseContext,
+    table_va: u64,
+    target_count: u64,
+    sections: &[PeSection],
+) -> Result<(Option<u32>, Vec<PeGuardLongJumpTarget>), AnalysisError> {
+    let GuardTableParseContext {
+        directory,
+        image_base,
+        size_of_image,
+        guard_flags,
+    } = context;
+    if table_va == 0 && target_count == 0 {
+        return Ok((None, Vec::new()));
+    }
+    if table_va == 0 || target_count == 0 {
+        return invalid_field(
+            "Guard long-jump target table",
+            "table VA and target count must either both be zero or both be nonzero",
+        );
+    }
+    if guard_flags & IMAGE_GUARD_CF_LONGJUMP_TABLE_PRESENT == 0 {
+        return invalid_field(
+            "Guard long-jump target table",
+            "table VA and count are nonzero while IMAGE_GUARD_CF_LONGJUMP_TABLE_PRESENT is clear",
+        );
+    }
+
+    let metadata_size = guard_table_metadata_size(guard_flags)?;
+    let record_size =
+        4_usize
+            .checked_add(metadata_size)
+            .ok_or(AnalysisError::ArithmeticOverflow(
+                "Guard long-jump record size",
+            ))?;
+    let table_size = validated_guard_table_size(
+        target_count,
+        record_size,
+        "Guard long-jump target",
+        MAX_GUARD_LONG_JUMP_TARGETS,
+        "Guard long-jump table byte",
+        "Guard long-jump table byte size",
+    )?;
+    let table_size_usize = usize::try_from(table_size)
+        .map_err(|_| AnalysisError::IntegerConversion("Guard long-jump table byte size"))?;
+    let table_rva = image_va_to_rva(
+        table_va,
+        image_base,
+        size_of_image,
+        "GuardLongJumpTargetTable",
+    )?;
+    let table_offset =
+        mapper.offset(table_rva, table_size_usize, "Guard long-jump target table")?;
+    if ranges_overlap(
+        u64::from(directory.rva),
+        u64::from(directory.size),
+        u64::from(table_rva),
+        table_size,
+    )? {
+        return invalid_field(
+            "Guard long-jump target table",
+            "overlaps the declared load-config directory range",
+        );
+    }
+
+    let capacity = usize::try_from(target_count)
+        .map_err(|_| AnalysisError::IntegerConversion("Guard long-jump target count"))?;
+    let mut targets = Vec::with_capacity(capacity);
+    let mut previous_rva = None;
+    for index in 0..capacity {
+        let record_offset = checked_add(
+            table_offset,
+            checked_mul(index, record_size, "Guard long-jump record position")?,
+            "Guard long-jump record offset",
+        )?;
+        let target_rva = reader.u32(record_offset, "Guard long-jump target RVA")?;
+        if previous_rva.is_some_and(|previous| previous >= target_rva) {
+            return invalid_field(
+                "Guard long-jump target table",
+                "RVAs must be strictly increasing and unique",
+            );
+        }
+        let executable = section_for_rva(target_rva, sections)
+            .is_some_and(|(_, section)| section.characteristics & IMAGE_SCN_MEM_EXECUTE != 0)
+            && mapper.is_backed(target_rva, 1);
+        if !executable {
+            return invalid_field(
+                "Guard long-jump target",
+                format!(
+                    "entry {index} has RVA {target_rva:#x}, which is not fully file-backed executable data"
+                ),
+            );
+        }
+        let metadata_offset = checked_add(record_offset, 4, "Guard long-jump metadata offset")?;
+        let metadata = reader
+            .bytes(metadata_offset, metadata_size, "Guard long-jump metadata")?
+            .to_vec();
+        if metadata.iter().any(|byte| *byte != 0) {
+            return invalid_field(
+                "Guard long-jump metadata",
+                format!("entry {index} has nonzero reserved metadata"),
+            );
+        }
+        targets.push(PeGuardLongJumpTarget {
+            table_index: u32::try_from(index).map_err(|_| {
+                AnalysisError::IntegerConversion("Guard long-jump target-table index")
+            })?,
+            target_rva,
+            metadata,
+        });
+        previous_rva = Some(target_rva);
+    }
+    Ok((Some(table_rva), targets))
+}
+
+fn parse_guard_eh_continuation_table(
+    reader: &Reader<'_>,
+    mapper: &RvaMap<'_>,
+    context: GuardTableParseContext,
+    table_va: u64,
+    target_count: u64,
+    sections: &[PeSection],
+) -> Result<(Option<u32>, Vec<PeGuardEhContinuationTarget>), AnalysisError> {
+    let GuardTableParseContext {
+        directory,
+        image_base,
+        size_of_image,
+        guard_flags,
+    } = context;
+    if table_va == 0 && target_count == 0 {
+        return Ok((None, Vec::new()));
+    }
+    if table_va == 0 || target_count == 0 {
+        return invalid_field(
+            "Guard EH-continuation table",
+            "table VA and target count must either both be zero or both be nonzero",
+        );
+    }
+    if guard_flags & IMAGE_GUARD_EH_CONTINUATION_TABLE_PRESENT == 0 {
+        return invalid_field(
+            "Guard EH-continuation table",
+            "table VA and count are nonzero while IMAGE_GUARD_EH_CONTINUATION_TABLE_PRESENT is clear",
+        );
+    }
+
+    let metadata_size = guard_table_metadata_size(guard_flags)?;
+    let record_size =
+        4_usize
+            .checked_add(metadata_size)
+            .ok_or(AnalysisError::ArithmeticOverflow(
+                "Guard EH-continuation record size",
+            ))?;
+    let table_size = validated_guard_table_size(
+        target_count,
+        record_size,
+        "Guard EH-continuation target",
+        MAX_GUARD_EH_CONTINUATION_TARGETS,
+        "Guard EH-continuation table byte",
+        "Guard EH-continuation table byte size",
+    )?;
+    let table_size_usize = usize::try_from(table_size)
+        .map_err(|_| AnalysisError::IntegerConversion("Guard EH-continuation table byte size"))?;
+    let table_rva = image_va_to_rva(
+        table_va,
+        image_base,
+        size_of_image,
+        "GuardEHContinuationTable",
+    )?;
+    let table_offset = mapper.offset(table_rva, table_size_usize, "Guard EH-continuation table")?;
+    if ranges_overlap(
+        u64::from(directory.rva),
+        u64::from(directory.size),
+        u64::from(table_rva),
+        table_size,
+    )? {
+        return invalid_field(
+            "Guard EH-continuation table",
+            "overlaps the declared load-config directory range",
+        );
+    }
+
+    let capacity = usize::try_from(target_count)
+        .map_err(|_| AnalysisError::IntegerConversion("Guard EH-continuation target count"))?;
+    let mut targets = Vec::with_capacity(capacity);
+    let mut previous_rva = None;
+    for index in 0..capacity {
+        let record_offset = checked_add(
+            table_offset,
+            checked_mul(index, record_size, "Guard EH-continuation record position")?,
+            "Guard EH-continuation record offset",
+        )?;
+        let target_rva = reader.u32(record_offset, "Guard EH-continuation target RVA")?;
+        if previous_rva.is_some_and(|previous| previous >= target_rva) {
+            return invalid_field(
+                "Guard EH-continuation table",
+                "RVAs must be strictly increasing and unique",
+            );
+        }
+        let executable = section_for_rva(target_rva, sections)
+            .is_some_and(|(_, section)| section.characteristics & IMAGE_SCN_MEM_EXECUTE != 0)
+            && mapper.is_backed(target_rva, 1);
+        if !executable {
+            return invalid_field(
+                "Guard EH-continuation target",
+                format!(
+                    "entry {index} has RVA {target_rva:#x}, which is not fully file-backed executable data"
+                ),
+            );
+        }
+        let metadata_offset =
+            checked_add(record_offset, 4, "Guard EH-continuation metadata offset")?;
+        let metadata = reader
+            .bytes(
+                metadata_offset,
+                metadata_size,
+                "Guard EH-continuation metadata",
+            )?
+            .to_vec();
+        if metadata.iter().any(|byte| *byte != 0) {
+            return invalid_field(
+                "Guard EH-continuation metadata",
+                format!("entry {index} has nonzero reserved metadata"),
+            );
+        }
+        targets.push(PeGuardEhContinuationTarget {
+            table_index: u32::try_from(index).map_err(|_| {
+                AnalysisError::IntegerConversion("Guard EH-continuation table index")
+            })?,
+            target_rva,
+            metadata,
+        });
+        previous_rva = Some(target_rva);
+    }
+    Ok((Some(table_rva), targets))
 }
 
 fn parse_tls_callbacks(

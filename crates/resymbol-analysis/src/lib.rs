@@ -18,7 +18,8 @@ pub use session::{AnalysisSession, PluginRunRecord, PluginRunStatus, SessionVali
 pub use types::{
     BinaryAnalysis, CoffHeader, DataDirectory, ImportTarget, MsvcRttiBaseClass, MsvcRttiVftable,
     PeAnalysis, PeControlFlowTarget, PeDataDirectories, PeDataReference, PeDelayImportLibrary,
-    PeDirectCall, PeExport, PeExportName, PeGuardCfFunction, PeImport, PeImportLibrary,
+    PeDirectCall, PeExport, PeExportName, PeGuardAddressTakenIatEntry, PeGuardCfFunction,
+    PeGuardEhContinuationTarget, PeGuardLongJumpTarget, PeImport, PeImportLibrary,
     PeRecoveredString, PeSection, PeStringEncoding, PeThunk, PeTlsCallback, RuntimeFunction,
 };
 

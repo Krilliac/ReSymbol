@@ -12,32 +12,36 @@ exception metadata, and derives conservative metadata-backed claims. Canonical `
 now carry an `AnalysisSession`: deterministic base analysis, an auditable plugin-run ledger, and
 separately validated plugin claims with a derived combined graph.
 
-The CLI writes package schema 9 and can inspect or export schemas 1 through 8 through explicit
+The CLI writes package schema 10 and can inspect or export schemas 1 through 9 through explicit
 compatibility paths. Schema 1 is migrated in memory by revalidating persisted metadata and
 rebuilding the base graph; schema 2 already contains direct-call and thunk recovery, and schema 3
 adds string/data recovery. Schema 4 adds read-only pointer control flow but predates legacy 24-byte
 RTTI base-class descriptor recovery. Schema 5 adds that RTTI form but predates transitive executable
 thunk-chain discovery. Schema 6 adds that closure but predates TLS callback discovery and
 callback-based thunk seeding; schema 7 adds TLS callbacks but predates modern delay-import
-recovery; and schema 8 adds delay imports but predates load-config GuardCF recovery. Older packages
+recovery; schema 8 adds delay imports but predates load-config GuardCF recovery; and schema 9 adds
+GuardCF functions but predates the modern Guard target inventories. Older packages
 do not embed executable bytes, so compatibility loading
 cannot reconstruct results that were never recorded. Reanalyzing the exact original binary is
 required for transitive thunk chains in schemas 1 through 5, 24-byte descriptors in schemas 1
 through 4, read-only function-pointer calls and thunks in schemas 2 and 3, strings/data references
 in schemas 1 and 2, TLS callbacks in schemas 1 through 6, delay imports in schemas 1 through 7,
-GuardCF functions in schemas 1 through 8, and
+GuardCF functions in schemas 1 through 8, Guard address-taken IAT, long-jump, and EH-continuation
+inventories in schemas 1 through 9, and
 all code recovery when starting from
 schema 1. Relabeled schema-6-only
 transitive base-thunk sources are rejected under schema 1-through-5 envelopes; schemas 1 through 6
 also reject schema-7 TLS callback state and callback-only base thunk seeds. Schemas 1 through 7 also
 reject the exact schema-8 base-analysis `delay_imports` inventory key and
-`directories.delay_imports` directory key. Schemas 8 and 9 both require that explicit inventory,
+`directories.delay_imports` directory key. Schemas 8 through 10 require that explicit inventory,
 even when empty.
 Schemas 1 through 8 reject schema-9 load-config/GuardCF fields,
-`directories.load_config`, and core `pe-guard-cf-function` claims; schema 9 requires an explicit
+`directories.load_config`, and core `pe-guard-cf-function` claims; schemas 9 and 10 require an explicit
 `guard_cf_functions` inventory even when empty.
+Schemas 1 through 9 reject schema-10 Guard target table-RVA and inventory fields; schema 10 requires
+explicit address-taken IAT, long-jump, and EH-continuation inventory arrays even when empty.
 
-For every supported package schema, 1 through 9, `resymbol inspect` can optionally accept the exact
+For every supported package schema, 1 through 10, `resymbol inspect` can optionally accept the exact
 original binary and require its size and SHA-256 to match before inspection data reaches stdout;
 failures report on stderr. Human inspection reports the canonical source path and a matched identity
 gate, while JSON remains pure package data. This is an identity check only: it does not rerun
@@ -76,6 +80,16 @@ ReSymbol hardening policy. Every structurally valid record, including one marked
 `FunctionEntry` claim and joins initial one-instruction thunk seeding. FID suppression describes CFG
 eligibility rather than whether the target is a function; export-suppressed RVAs must be 16-byte
 aligned. GFIDS does not cause a function-body sweep or name/extent inference.
+
+The later Guard address-taken IAT, long-jump, and EH-continuation tables are now implemented as
+bounded inventories. Their load-config field thresholds are 176, 192, and 280 bytes. GIAT,
+long-jump, and EH-continuation records use the GFIDS `4 + n` stride and require zero reserved
+metadata; GIAT RVAs must equal exact parsed conventional or delay-IAT slots. Long-jump and EH-continuation RVAs
+must be strictly increasing, unique, and file-backed executable addresses. Nonempty tables require
+their presence flags, every table has a 262,144-record cap, and all nonempty Guard tables must be
+fully backed, disjoint from the load-config directory, and pairwise disjoint. The inventories remain
+package/plugin-visible metadata only: they add no function claim or thunk seed because continuation
+and landing addresses are not necessarily function starts.
 
 A bounded modern PE32+ delay-import slice is now implemented from optional-header data-directory
 entry 13. It accepts an ordered sequence of 32-byte descriptors followed by an all-zero terminator
@@ -190,8 +204,8 @@ The first export checkpoint is implemented as a validated, debugger-neutral proj
 deterministic JSON output, a bounded human-readable Markdown report, PE-only
 Microsoft-linker-style MAP text, an exact-RSDS public-symbol PDB, and standalone IDAPython and
 Ghidra Java import scripts. Markdown is presentation-only rather than a stable interchange schema;
-JSON remains the machine-consumable artifact. New analyses write package schema 9, while export also
-accepts package schemas 1 through 8 through validated compatibility paths. The neutral projection is
+JSON remains the machine-consumable artifact. New analyses write package schema 10, while export also
+accepts package schemas 1 through 9 through validated compatibility paths. The neutral projection is
 independently schema 6; MAP and PDB add no schema fields, and no exporter rewrites its source
 package. Projection schema 5 correlates exact or valid content-interior data-reference targets with
 retained strings while excluding NUL terminators and misaligned UTF-16LE interiors; projection
@@ -199,7 +213,8 @@ schema 6 preserves function-pointer slot and resolved-target RVAs. TLS callback 
 existing function-entry and thunk shapes, so no TLS-specific projection field is added. Delay-load
 descriptor inventory remains package-only, while delay-IAT control flow reuses the existing import
 target with its slot RVA. GuardCF claims and supported seeded thunks reuse the existing shapes, so
-load-config/GFIDS inventory and suppression evidence remain package-only and projection schema 6 is unchanged. The scripts
+load-config/GFIDS inventory and suppression evidence remain package-only. The later Guard target
+inventories are also package-only and add no claims, so projection schema 6 is unchanged. The scripts
 bind to the exact loaded binary SHA-256, resolve addresses as loaded image base plus RVA, preserve
 user-authored names and existing function bodies, and continue past per-symbol application errors.
 They are deliberately narrower than the planned interactive debugger bridges: prototypes, types,
@@ -238,7 +253,7 @@ inputs are repository/source test data rather than portable runtime archive cont
 function-pointer calls and thunks, plus all-legacy and mixed 24/28-byte RTTI descriptor
 hierarchies, are covered by focused synthetic PE fixtures. Exact transitive thunk chains, connected
 cycles, disconnected-cycle rejection, bounded TLS callback discovery, modern delay-import recovery,
-and load-config GuardCF recovery are also synthetic-only coverage.
+load-config GuardCF recovery, and modern Guard target inventories are also synthetic-only coverage.
 These focused slices do not change the four corpus binaries, their semantic oracle, or their
 recorded hashes.
 
@@ -333,8 +348,8 @@ deterministic string-reference correlation, bounded dual-layout MSVC x64 RTTI/vf
 portable package, canonical package encoding, neutral JSON export projection, bounded Markdown
 report, initial MSVC fixture matrix, and related CLI
 portions are implemented. The unfinished parts of the bullets describe the remainder of this
-milestone. Broader load-config/security tables and semantics—including security cookies and
-check/dispatch pointers, address-taken-IAT, long-jump, EH-continuation, and SafeSEH metadata—remain
+milestone. Broader load-config/security tables and semantics—including security cookies,
+check/dispatch pointers, and SafeSEH metadata—remain
 planned, as do names/extents/body recovery beyond the current evidence, broader constants and
 compilers, and resource/coverage benchmarks.
 

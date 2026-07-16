@@ -29,7 +29,7 @@ The current alpha implements and tests an end-to-end, deliberately narrow analys
 - safe, bounded ingestion of PE32+ x86-64 binaries, including image metadata, sections,
   conventional imports, modern RVA-form delay imports, exports, forwarded exports, x64
   exception-directory (`RUNTIME_FUNCTION`) records, ordered TLS-directory callback entries, and
-  load-config GuardCF function-table records;
+  load-config GuardCF function, address-taken IAT, long-jump, and EH-continuation tables;
 - bounded discovery of modern MSVC x64 Rev1 RTTI and vftables from file-backed compiler metadata,
   including both legacy 24-byte and `BCD_HASPCHD` 28-byte base-class descriptors, validated
   class/type names, and contiguous executable slot candidates;
@@ -48,9 +48,10 @@ The current alpha implements and tests an end-to-end, deliberately narrow analys
   profile-sensitive semantic oracle covering imports, exports, unwind functions, direct calls,
   internal/import thunks, strings, data references, and modern RTTI/vftables; focused synthetic PE
   fixtures cover read-only pointer control flow, dual RTTI descriptor layouts, transitive thunk
-  chains, bounded TLS callback discovery, modern delay-load imports, and GuardCF function tables
-  without changing the four corpus binaries, their hashes, or their oracle; these repository/source
-  fixtures are analyzer test data and are not bundled in portable runtime archives;
+  chains, bounded TLS callback discovery, modern delay-load imports, GuardCF function tables, and
+  modern Guard address-taken IAT, long-jump, and EH-continuation inventories without changing the
+  four corpus binaries, their hashes, or their oracle; these repository/source fixtures are analyzer
+  test data and are not bundled in portable runtime archives;
 - conservative symbol-graph generation from exact export names, metadata-backed function
   boundaries, entry-point, GuardCF, and TLS-callback function-entry candidates, direct calls, thunks,
   recovered strings, and data references, with SHA-256 binary identity, evidence, provenance,
@@ -167,6 +168,20 @@ suppression describes CFG eligibility rather than whether the target is a functi
 export-suppressed targets must be 16-byte aligned. Claim evidence records both suppression booleans
 alongside the table index and raw metadata. ReSymbol does not sweep a GuardCF
 function body or infer a name or extent from GFIDS alone.
+
+Later PE32+ load-config versions expose three additional bounded Guard inventories. An internal size
+of at least 176 bytes exposes `GuardAddressTakenIatEntryTable` and its count, at least 192 bytes
+exposes `GuardLongJumpTargetTable` and its count, and at least 280 bytes exposes
+`GuardEHContinuationTable` and its count. A nonzero table/count pair requires its corresponding
+presence flag; a set flag with a zero pair is accepted as a versioned empty table. Address-taken IAT,
+long-jump, and EH-continuation records use the same `4 + n` stride selected by `GuardFlags`. Their
+`n` metadata bytes are reserved and must be zero. Address-taken IAT RVAs must name exact parsed
+conventional or delay IAT slots. Long-jump and EH-continuation RVAs must be strictly increasing,
+unique, and begin in file-backed executable data. Each table is capped at 262,144 entries and must be fully
+file-backed, disjoint from the declared load-config range, and pairwise disjoint from every other
+nonempty Guard table. These three inventories are retained for packages and `symbols.read` plugins;
+because they identify import slots or valid continuation/landing addresses rather than proven
+function starts, they create no `FunctionEntry` claims and do not seed thunk recovery.
 
 Modern PE32+ delay-import discovery reads optional-header data-directory entry 13 as ordered
 32-byte descriptors followed by an all-zero descriptor; the rest of the declared range must be
@@ -305,10 +320,10 @@ inspection data to stdout, ReSymbol validates the package and requires the suppl
 size and SHA-256 to match. Failures remain actionable on stderr. Human output then includes
 `source binary: <canonical-path>` and `identity gate: matched`.
 With `--json`, stdout remains the pure validated package JSON and does not gain those status lines.
-The gate works for every supported package schema, 1 through 9; it does not rerun analysis,
+The gate works for every supported package schema, 1 through 10; it does not rerun analysis,
 reconstruct missing legacy results, or rewrite either file.
 
-New analyses write package schema 9. `inspect` and `export` also accept schemas 1 through 8 through
+New analyses write package schema 10. `inspect` and `export` also accept schemas 1 through 9 through
 validated in-memory compatibility paths. Migration does not rewrite the source package or rerun
 analysis because `.resym` does not embed the executable bytes. Schema 1 therefore has no available
 recovered calls, thunks, strings, or data references. Schema 2 retains calls and thunks but predates
@@ -318,36 +333,44 @@ Schemas 1 through 4 all predate recovery of legacy 24-byte base-class descriptor
 that RTTI form but predates transitive executable thunk-chain discovery. Schema 6 records that
 thunk closure but predates TLS callback discovery and callback-based thunk seeding. Schema 7
 records TLS callbacks but predates modern delay-import recovery. Schema 8 records delay imports
-but predates load-config GuardCF recovery. Schemas 2 through 8 keep their
+but predates load-config GuardCF recovery. Schema 9 records GuardCF functions but predates the Guard
+address-taken IAT, long-jump, and EH-continuation inventories. Schemas 2 through 9 keep their
 already-recorded direct calls and thunks, but loading cannot synthesize a later result family. TLS
 callback recovery is unavailable for every schema 1-through-6 package, delay-import recovery is
 unavailable for every schema 1-through-7 package, and GuardCF recovery is unavailable for every
-schema 1-through-8 package. Reanalyze the exact original binary to produce schema 9 with all
-current recovery results. A schema 2 or 3 envelope containing a schema-4
+schema 1-through-8 package. The modern Guard target inventories are unavailable for every schema
+1-through-9 package. Reanalyze the exact original binary to produce schema 10 with all current
+recovery results. A schema 2 or 3 envelope containing a schema-4
 `function-pointer` target, or any schema 1-through-4 envelope
 containing an RTTI base record whose `class_hierarchy_descriptor_rva` is missing or null, is
 rejected rather than treated as a relabeled legacy package. A schema 1-through-5 envelope likewise
 cannot contain a base thunk source that is valid only through schema-6 transitive endpoint seeding.
 Schemas 1 through 6 likewise cannot contain schema-7 TLS callback records or callback-only base
 thunk seeds. Schemas 1 through 7 cannot contain the exact schema-8 base-analysis `delay_imports`
-inventory key or `directories.delay_imports` directory key. Schemas 8 and 9 always serialize the
+inventory key or `directories.delay_imports` directory key. Schemas 8 through 10 always serialize the
 `delay_imports` inventory, including an empty array, and reject a payload missing that marker so a
 legacy package cannot be upgraded by relabeling alone.
 Schemas 1 through 8 cannot contain schema-9 `load_config_size`, `guard_flags`,
 `guard_cf_function_table_rva`, or `guard_cf_functions` fields, the
-`directories.load_config` directory key, or core `pe-guard-cf-function` claims. Conversely, schema
-9 always serializes its `guard_cf_functions` inventory, including an empty array, and rejects a
+`directories.load_config` directory key, or core `pe-guard-cf-function` claims. Conversely, schemas
+9 and 10 always serialize the `guard_cf_functions` inventory, including an empty array, and reject a
 payload missing that marker so a schema-8 package cannot be upgraded by relabeling alone.
+Schemas 1 through 9 cannot contain any schema-10 Guard address-taken IAT, long-jump, or
+EH-continuation table-RVA or inventory field. Schema 10 always serializes
+`guard_address_taken_iat_entries`, `guard_long_jump_targets`, and
+`guard_eh_continuation_targets`, including empty arrays, and rejects a payload missing any marker.
 
 TLS callback fields were introduced in package schema 7's deterministic base analysis; package
-schema 8 adds the separate ordered delay-import directory and inventory, and package schema 9 adds
-load-config and GuardCF state. The independently
+schema 8 adds the separate ordered delay-import directory and inventory, package schema 9 adds
+load-config and GuardCF state, and package schema 10 adds the three modern Guard target inventories.
+The independently
 versioned neutral projection remains schema 6, and the plugin API and external wire handshake
 remain unchanged. A plugin granted `symbols.read` can observe these additive result families in its
 base-analysis JSON; a plugin without that permission still receives no base analysis.
 
 The `analyze` and `inspect` summaries report recovered strings, data references, direct calls,
-thunks, GuardCF record/function-candidate totals and FID-/export-suppressed counts, TLS callbacks, and delay-import
+thunks, GuardCF record/function-candidate totals and FID-/export-suppressed counts, Guard
+address-taken IAT entries, long-jump targets, EH-continuation targets, TLS callbacks, and delay-import
 libraries/symbols as well as discovered MSVC RTTI vftables,
 unique types, base-class
 records, and virtual slots. If a fixed string, data-reference, control-flow, TLS-callback, or RTTI
@@ -356,8 +379,8 @@ deterministic results remain available and the package records the truncation ex
 
 The Markdown output is a deterministic, bounded presentation report for people to review. It is
 not a stable interchange format; integrations should consume the neutral JSON projection instead.
-Without `--output`, it is written as `application.symbols.md` beside the package. Package schema 9
-is used by new analyses, export also accepts package schemas 1 through 8 through validated
+Without `--output`, it is written as `application.symbols.md` beside the package. Package schema 10
+is used by new analyses, export also accepts package schemas 1 through 9 through validated
 compatibility paths, and neutral projection schema 6 remains unchanged by this presentation-only
 format. Export does not rewrite the source package.
 
@@ -366,7 +389,7 @@ default for tools that support that format. It maps selected names to one-based 
 `section:offset` values and preferred-image-base-plus-RVA addresses. Its semicolon-prefixed exact
 SHA-256 and file-size comments are informational: a MAP file cannot check the binary loaded by a
 consumer, so compare the executable with the recorded identity before using the symbols. MAP adds
-no fields to package schema 9 or neutral projection schema 6, and it does not rewrite legacy source
+no fields to package schema 10 or neutral projection schema 6, and it does not rewrite legacy source
 packages accepted through compatibility paths. The header module name is the package filename stem;
 for a valid UTF-8 stem, unsupported/non-ASCII encoded bytes become `_` and the result is capped at
 255 bytes. A non-UTF-8 or otherwise unusable stem falls back to `resymbol_<sha12>`.
