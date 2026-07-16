@@ -209,6 +209,12 @@ the file picker:
 .\resymbol-workbench.exe .\path\to\application.exe
 ```
 
+After a project is open, use the persistent **Open Another...** header button, **File -> Open Binary
+or Package...**, the **Open Binary** workflow stage, Ctrl+O, **File -> Open Recent**, or drop one file
+onto the window to switch inputs. Unsaved review decisions pause replacement for an explicit
+create-new save, discard, or cancel choice; a replacement that fails to open leaves the current
+project and its review state intact.
+
 The workbench performs background core-only analysis and provides evidence, provenance, durable
 exact-claim review, plugin health, a bounded Reconstruction Graph, a static Address Space/protection
 assessment, and read-only debugger/sandbox readiness. The graph's root and synchronized selection
