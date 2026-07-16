@@ -3978,50 +3978,6 @@ impl WorkbenchApp {
                     );
                 });
 
-            ui.add_space(10.0);
-            ui.columns(2, |columns| {
-                workbench_card(colors).show(&mut columns[0], |ui| {
-                    ui.heading("Current binary binding");
-                    property_row(ui, "File", &binary_name, false);
-                    property_row(ui, "SHA-256", evidence.binary_id().as_str(), true);
-                    property_row(ui, "Size", &format_bytes(evidence.file_size()), false);
-                    ui.label(
-                        RichText::new(evidence.source_status().label())
-                            .color(colors.exact_extracted),
-                    );
-                    ui.label(
-                        RichText::new(binary_path)
-                            .small()
-                            .monospace()
-                            .color(colors.secondary_text),
-                    );
-                });
-                workbench_card(colors).show(&mut columns[1], |ui| {
-                    ui.heading("Static protection evidence");
-                    let (cue, color) = match evidence.protection_status() {
-                        ReadinessProtectionStatus::Available {
-                            findings: 0,
-                            requires_acknowledgement: false,
-                        } => ("[AVAILABLE]", colors.healthy),
-                        ReadinessProtectionStatus::Available { .. } => {
-                            ("[REVIEW]", colors.warning_conflict)
-                        }
-                        ReadinessProtectionStatus::ExactSourceRequired
-                        | ReadinessProtectionStatus::UnsupportedFormat => {
-                            ("[UNAVAILABLE]", colors.warning_conflict)
-                        }
-                    };
-                    ui.label(RichText::new(cue).strong().color(color));
-                    ui.label(evidence.protection_status().label());
-                    ui.label(
-                        RichText::new(
-                            "Protection findings are offline evidence, not permission to execute.",
-                        )
-                        .color(colors.secondary_text),
-                    );
-                });
-            });
-
             ui.add_space(12.0);
             ui.heading("Requested provider");
             ui.label(
@@ -4072,6 +4028,50 @@ impl WorkbenchApp {
                     .monospace()
                     .color(colors.secondary_text),
                 );
+            });
+
+            ui.add_space(10.0);
+            ui.columns(2, |columns| {
+                workbench_card(colors).show(&mut columns[0], |ui| {
+                    ui.heading("Current binary binding");
+                    property_row(ui, "File", &binary_name, false);
+                    property_row(ui, "SHA-256", evidence.binary_id().as_str(), true);
+                    property_row(ui, "Size", &format_bytes(evidence.file_size()), false);
+                    ui.label(
+                        RichText::new(evidence.source_status().label())
+                            .color(colors.exact_extracted),
+                    );
+                    ui.label(
+                        RichText::new(binary_path)
+                            .small()
+                            .monospace()
+                            .color(colors.secondary_text),
+                    );
+                });
+                workbench_card(colors).show(&mut columns[1], |ui| {
+                    ui.heading("Static protection evidence");
+                    let (cue, color) = match evidence.protection_status() {
+                        ReadinessProtectionStatus::Available {
+                            findings: 0,
+                            requires_acknowledgement: false,
+                        } => ("[AVAILABLE]", colors.healthy),
+                        ReadinessProtectionStatus::Available { .. } => {
+                            ("[REVIEW]", colors.warning_conflict)
+                        }
+                        ReadinessProtectionStatus::ExactSourceRequired
+                        | ReadinessProtectionStatus::UnsupportedFormat => {
+                            ("[UNAVAILABLE]", colors.warning_conflict)
+                        }
+                    };
+                    ui.label(RichText::new(cue).strong().color(color));
+                    ui.label(evidence.protection_status().label());
+                    ui.label(
+                        RichText::new(
+                            "Protection findings are offline evidence, not permission to execute.",
+                        )
+                        .color(colors.secondary_text),
+                    );
+                });
             });
 
             if let Some(error) = &self.readiness_error {
