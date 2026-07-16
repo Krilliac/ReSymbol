@@ -85,6 +85,12 @@ pub struct PeAnalysis {
     /// prior packages cannot acquire this recovery result by relabeling.
     #[serde(default)]
     pub load_config_xfg_anchors: PeLoadConfigXfgAnchors,
+    /// Checked GuardMemcpy pointer-slot anchor from the PE32+ load-config suffix.
+    ///
+    /// Schema 13 serializes this object even when the anchor is absent so
+    /// prior packages cannot acquire this recovery result by relabeling.
+    #[serde(default)]
+    pub load_config_guard_memcpy_anchor: PeLoadConfigGuardMemcpyAnchor,
     /// Exact `GuardFlags` value when the load configuration is large enough to contain it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guard_flags: Option<u32>,
@@ -227,6 +233,8 @@ struct UncheckedPeAnalysis {
     #[serde(default)]
     load_config_xfg_anchors: PeLoadConfigXfgAnchors,
     #[serde(default)]
+    load_config_guard_memcpy_anchor: PeLoadConfigGuardMemcpyAnchor,
+    #[serde(default)]
     guard_flags: Option<u32>,
     #[serde(default)]
     guard_cf_function_table_rva: Option<u32>,
@@ -296,6 +304,7 @@ impl TryFrom<UncheckedPeAnalysis> for PeAnalysis {
             load_config_size: value.load_config_size,
             load_config_security_anchors: value.load_config_security_anchors,
             load_config_xfg_anchors: value.load_config_xfg_anchors,
+            load_config_guard_memcpy_anchor: value.load_config_guard_memcpy_anchor,
             guard_flags: value.guard_flags,
             guard_cf_function_table_rva: value.guard_cf_function_table_rva,
             guard_cf_functions: value.guard_cf_functions,
@@ -516,6 +525,23 @@ impl PeLoadConfigXfgAnchors {
             && self.guard_xfg_dispatch_function_pointer_rva.is_none()
             && self.guard_xfg_table_dispatch_function_pointer_rva.is_none()
             && self.cast_guard_os_determined_failure_mode_rva.is_none()
+    }
+}
+
+/// Checked GuardMemcpy pointer-slot RVA advertised by the PE32+ load-config suffix.
+#[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeLoadConfigGuardMemcpyAnchor {
+    /// RVA of the eight-byte loader-managed GuardMemcpy function-pointer slot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard_memcpy_function_pointer_rva: Option<u32>,
+}
+
+impl PeLoadConfigGuardMemcpyAnchor {
+    /// Whether the load-config suffix advertises no nonzero GuardMemcpy pointer slot.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.guard_memcpy_function_pointer_rva.is_none()
     }
 }
 

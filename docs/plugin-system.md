@@ -431,6 +431,10 @@ Package schema 12 adds the always-present `load_config_xfg_anchors` object with 
 check, dispatch, and table-dispatch pointer-slot RVAs plus CastGuard OS-determined failure-mode
 storage. It follows the same no-dereference, no-claim, and no-thunk-seed contract and is visible only
 through `symbols.read` detached base-analysis JSON.
+Package schema 13 adds the always-present `load_config_guard_memcpy_anchor` object with the optional
+checked RVA of the loader-managed GuardMemcpy function-pointer slot. Its initial contents remain
+opaque; it adds no claims or thunk seeds and is visible only through `symbols.read` detached
+base-analysis JSON.
 
 #### Managed plugin author quickstart
 
@@ -534,6 +538,8 @@ Package schema 11's load-config security-anchor object is another additive `symb
 likewise leaves the plugin API, WIT/ABI, wire 1.0 handshake, and projection schema 6 unchanged.
 Package schema 12's XFG/CastGuard anchor object has the same additive boundary and likewise changes
 none of those independently versioned interfaces.
+Package schema 13's GuardMemcpy anchor object is additive on the same terms: the plugin API,
+WIT/ABI, wire 1.0 handshake, and neutral projection schema 6 remain unchanged.
 
 ### Tool-hosted bridges (planned host)
 

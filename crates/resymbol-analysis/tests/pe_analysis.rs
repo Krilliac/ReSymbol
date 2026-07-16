@@ -1,9 +1,10 @@
 use resymbol_analysis::{
     AnalysisError, AnalysisSession, BinaryAnalysis, ImportTarget, PeControlFlowTarget,
     PeDataReference, PeDirectCall, PeGuardAddressTakenIatEntry, PeGuardCfFunction,
-    PeGuardEhContinuationTarget, PeGuardLongJumpTarget, PeLoadConfigSecurityAnchors,
-    PeLoadConfigXfgAnchors, PeRecoveredString, PeStringEncoding, PeThunk, PeTlsCallback,
-    PluginRunRecord, PluginRunStatus, SessionValidationError, analyze_bytes, analyze_pe,
+    PeGuardEhContinuationTarget, PeGuardLongJumpTarget, PeLoadConfigGuardMemcpyAnchor,
+    PeLoadConfigSecurityAnchors, PeLoadConfigXfgAnchors, PeRecoveredString, PeStringEncoding,
+    PeThunk, PeTlsCallback, PluginRunRecord, PluginRunStatus, SessionValidationError,
+    analyze_bytes, analyze_pe,
 };
 use resymbol_core::{
     BinaryId, ClaimProducer, ClaimProvenance, Confidence, ControlFlowTarget, Evidence,
@@ -33,6 +34,7 @@ const LOAD_CONFIG_GUARD_XFG_CHECK_POINTER_FIELDS_SIZE: u32 = 288;
 const LOAD_CONFIG_GUARD_XFG_DISPATCH_POINTER_FIELDS_SIZE: u32 = 296;
 const LOAD_CONFIG_GUARD_XFG_TABLE_DISPATCH_POINTER_FIELDS_SIZE: u32 = 304;
 const LOAD_CONFIG_CAST_GUARD_FAILURE_MODE_FIELDS_SIZE: u32 = 312;
+const LOAD_CONFIG_GUARD_MEMCPY_POINTER_FIELDS_SIZE: u32 = 320;
 const GUARD_CF_FUNCTION_TABLE_RVA: u32 = 0x1480;
 const EXTENDED_GUARD_CF_FUNCTION_TABLE_RVA: u32 = 0x14a0;
 const GUARD_ADDRESS_TAKEN_IAT_TABLE_RVA: u32 = 0x14c0;
@@ -45,6 +47,7 @@ const GUARD_XFG_CHECK_FUNCTION_POINTER_RVA: u32 = 0x1540;
 const GUARD_XFG_DISPATCH_FUNCTION_POINTER_RVA: u32 = 0x1548;
 const GUARD_XFG_TABLE_DISPATCH_FUNCTION_POINTER_RVA: u32 = 0x1550;
 const CAST_GUARD_OS_DETERMINED_FAILURE_MODE_RVA: u32 = 0x1558;
+const GUARD_MEMCPY_FUNCTION_POINTER_RVA: u32 = 0x1560;
 const GUARD_CF_FUNCTION_LIMIT: u64 = 262_144;
 const IMAGE_GUARD_CF_FUNCTION_TABLE_PRESENT: u32 = 0x0000_0400;
 const IMAGE_GUARD_CF_EXPORT_SUPPRESSION_INFO_PRESENT: u32 = 0x0000_4000;
@@ -531,6 +534,29 @@ fn load_config_xfg_anchor_fixture() -> Vec<u8> {
         IMAGE_BASE + u64::from(GUARD_XFG_DISPATCH_FUNCTION_POINTER_RVA),
         IMAGE_BASE + u64::from(GUARD_XFG_TABLE_DISPATCH_FUNCTION_POINTER_RVA),
         IMAGE_BASE + u64::from(CAST_GUARD_OS_DETERMINED_FAILURE_MODE_RVA),
+    );
+    bytes
+}
+
+fn set_load_config_guard_memcpy_anchor(
+    bytes: &mut [u8],
+    directory_size: u32,
+    load_config_size: u32,
+    guard_memcpy_function_pointer_va: u64,
+) {
+    set_directory(bytes, 10, LOAD_CONFIG_DIRECTORY_RVA, directory_size);
+    let load_config = file_offset(LOAD_CONFIG_DIRECTORY_RVA);
+    put_u32(bytes, load_config, load_config_size);
+    put_u64(bytes, load_config + 312, guard_memcpy_function_pointer_va);
+}
+
+fn load_config_guard_memcpy_anchor_fixture() -> Vec<u8> {
+    let mut bytes = fixture();
+    set_load_config_guard_memcpy_anchor(
+        &mut bytes,
+        LOAD_CONFIG_GUARD_MEMCPY_POINTER_FIELDS_SIZE,
+        LOAD_CONFIG_GUARD_MEMCPY_POINTER_FIELDS_SIZE,
+        IMAGE_BASE + u64::from(GUARD_MEMCPY_FUNCTION_POINTER_RVA),
     );
     bytes
 }
@@ -1509,6 +1535,7 @@ fn analyzes_minimal_pe_with_imports_exports_and_runtime_functions() {
     assert_eq!(analysis.load_config_size, None);
     assert!(analysis.load_config_security_anchors.is_empty());
     assert!(analysis.load_config_xfg_anchors.is_empty());
+    assert!(analysis.load_config_guard_memcpy_anchor.is_empty());
     assert_eq!(analysis.guard_flags, None);
     assert_eq!(analysis.guard_cf_function_table_rva, None);
     assert!(analysis.guard_cf_functions.is_empty());
@@ -3049,6 +3076,247 @@ fn validated_deserialization_rejects_tampered_load_config_xfg_anchors() {
     unknown_inner_field["load_config_xfg_anchors"]["unexpected"] = serde_json::json!(1);
     let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(unknown_inner_field)
         .expect_err("unknown fields inside the XFG-anchor marker are rejected");
+    assert!(error.to_string().contains("unknown field"));
+}
+
+#[test]
+fn recovers_guard_memcpy_pointer_slot_without_inventing_control_flow_evidence() {
+    let baseline = analyze_pe(&fixture()).expect("valid baseline fixture");
+    let analysis = analyze_pe(&load_config_guard_memcpy_anchor_fixture())
+        .expect("valid GuardMemcpy function-pointer slot");
+
+    assert_eq!(
+        analysis.load_config_size,
+        Some(LOAD_CONFIG_GUARD_MEMCPY_POINTER_FIELDS_SIZE)
+    );
+    assert!(analysis.load_config_security_anchors.is_empty());
+    assert!(analysis.load_config_xfg_anchors.is_empty());
+    assert_eq!(
+        analysis.load_config_guard_memcpy_anchor,
+        PeLoadConfigGuardMemcpyAnchor {
+            guard_memcpy_function_pointer_rva: Some(GUARD_MEMCPY_FUNCTION_POINTER_RVA),
+        }
+    );
+    assert_eq!(analysis.guard_flags, Some(0));
+    assert_eq!(
+        analysis.symbol_graph.claims().len(),
+        baseline.symbol_graph.claims().len()
+    );
+    assert_eq!(analysis.thunks.len(), baseline.thunks.len());
+
+    let encoded = serde_json::to_string(&analysis).expect("serialize GuardMemcpy anchor");
+    assert!(encoded.contains("\"load_config_guard_memcpy_anchor\""));
+    assert!(encoded.contains("\"guard_memcpy_function_pointer_rva\""));
+    let decoded: resymbol_analysis::PeAnalysis =
+        serde_json::from_str(&encoded).expect("deserialize GuardMemcpy anchor");
+    assert_eq!(decoded, analysis);
+}
+
+#[test]
+fn respects_guard_memcpy_pointer_size_boundary_and_zero_semantics() {
+    for (load_config_size, expected) in [
+        (
+            LOAD_CONFIG_GUARD_MEMCPY_POINTER_FIELDS_SIZE - 1,
+            PeLoadConfigGuardMemcpyAnchor::default(),
+        ),
+        (
+            LOAD_CONFIG_GUARD_MEMCPY_POINTER_FIELDS_SIZE,
+            PeLoadConfigGuardMemcpyAnchor {
+                guard_memcpy_function_pointer_rva: Some(GUARD_MEMCPY_FUNCTION_POINTER_RVA),
+            },
+        ),
+    ] {
+        let mut bytes = fixture();
+        set_load_config_guard_memcpy_anchor(
+            &mut bytes,
+            LOAD_CONFIG_GUARD_MEMCPY_POINTER_FIELDS_SIZE,
+            load_config_size,
+            IMAGE_BASE + u64::from(GUARD_MEMCPY_FUNCTION_POINTER_RVA),
+        );
+        let analysis =
+            analyze_pe(&bytes).expect("bytes past the declared load-config size remain opaque");
+        assert_eq!(analysis.load_config_guard_memcpy_anchor, expected);
+        assert_eq!(analysis.guard_flags, Some(0));
+    }
+
+    let mut zero = fixture();
+    set_load_config_guard_memcpy_anchor(
+        &mut zero,
+        LOAD_CONFIG_GUARD_MEMCPY_POINTER_FIELDS_SIZE,
+        LOAD_CONFIG_GUARD_MEMCPY_POINTER_FIELDS_SIZE,
+        0,
+    );
+    let analysis = analyze_pe(&zero).expect("a zero GuardMemcpy VA means no advertised slot");
+    assert!(analysis.load_config_guard_memcpy_anchor.is_empty());
+}
+
+#[test]
+fn rejects_invalid_guard_memcpy_pointer_vas_and_layouts() {
+    for (label, pointer_va, field, reason) in [
+        (
+            "below image base",
+            IMAGE_BASE - 1,
+            "GuardMemcpyFunctionPointer",
+            "below preferred image base",
+        ),
+        (
+            "outside image",
+            IMAGE_BASE + 0x2000,
+            "GuardMemcpyFunctionPointer",
+            "outside the declared image",
+        ),
+        (
+            "header anchor",
+            IMAGE_BASE + 0x100,
+            "GuardMemcpy function-pointer slot",
+            "within one mapped section",
+        ),
+        (
+            "crosses section end",
+            IMAGE_BASE + 0x15fc,
+            "GuardMemcpy function-pointer slot",
+            "within one mapped section",
+        ),
+        (
+            "overlaps load config",
+            IMAGE_BASE + 0x14b8,
+            "GuardMemcpy function-pointer slot",
+            "overlaps the declared load-config directory",
+        ),
+    ] {
+        let mut bytes = fixture();
+        set_load_config_guard_memcpy_anchor(
+            &mut bytes,
+            LOAD_CONFIG_GUARD_MEMCPY_POINTER_FIELDS_SIZE,
+            LOAD_CONFIG_GUARD_MEMCPY_POINTER_FIELDS_SIZE,
+            pointer_va,
+        );
+        let error = analyze_pe(&bytes).expect_err("invalid GuardMemcpy anchor must be rejected");
+        assert!(
+            matches!(
+                &error,
+                AnalysisError::InvalidField {
+                    field: actual_field,
+                    reason: actual_reason,
+                } if *actual_field == field && actual_reason.contains(reason)
+            ),
+            "{label}: {error}"
+        );
+    }
+
+    let mut cross_family_overlap = fixture();
+    set_load_config_xfg_anchors(
+        &mut cross_family_overlap,
+        LOAD_CONFIG_GUARD_MEMCPY_POINTER_FIELDS_SIZE,
+        LOAD_CONFIG_GUARD_MEMCPY_POINTER_FIELDS_SIZE,
+        0,
+        0,
+        0,
+        IMAGE_BASE + u64::from(GUARD_MEMCPY_FUNCTION_POINTER_RVA),
+    );
+    let load_config = file_offset(LOAD_CONFIG_DIRECTORY_RVA);
+    put_u64(
+        &mut cross_family_overlap,
+        load_config + 312,
+        IMAGE_BASE + u64::from(GUARD_MEMCPY_FUNCTION_POINTER_RVA),
+    );
+    let error = analyze_pe(&cross_family_overlap)
+        .expect_err("schema-12 and schema-13 anchor ranges must remain disjoint");
+    assert!(matches!(
+        error,
+        AnalysisError::InvalidField {
+            field: "load-config security anchors",
+            reason,
+        } if reason.contains(
+            "CastGuard OS-determined failure-mode storage overlaps GuardMemcpy function-pointer slot"
+        )
+    ));
+
+    let mut virtual_tail = fixture();
+    put_u32(&mut virtual_tail, SECTION_OFFSET + 8, 0x800);
+    set_load_config_guard_memcpy_anchor(
+        &mut virtual_tail,
+        LOAD_CONFIG_GUARD_MEMCPY_POINTER_FIELDS_SIZE,
+        LOAD_CONFIG_GUARD_MEMCPY_POINTER_FIELDS_SIZE,
+        IMAGE_BASE + 0x17f8,
+    );
+    let analysis = analyze_pe(&virtual_tail)
+        .expect("an eight-byte GuardMemcpy slot may live wholly inside a mapped zero-fill tail");
+    assert_eq!(
+        analysis
+            .load_config_guard_memcpy_anchor
+            .guard_memcpy_function_pointer_rva,
+        Some(0x17f8)
+    );
+}
+
+#[test]
+fn validated_deserialization_rejects_tampered_guard_memcpy_anchor() {
+    let analysis = analyze_pe(&load_config_guard_memcpy_anchor_fixture())
+        .expect("valid GuardMemcpy function-pointer slot");
+    let original = serde_json::to_value(analysis).expect("serialize GuardMemcpy anchor");
+
+    let mut legacy_absence = original.clone();
+    legacy_absence
+        .as_object_mut()
+        .expect("analysis object")
+        .remove("load_config_guard_memcpy_anchor");
+    let decoded: resymbol_analysis::PeAnalysis = serde_json::from_value(legacy_absence)
+        .expect("legacy analyses default the GuardMemcpy-anchor object to empty");
+    assert!(decoded.load_config_guard_memcpy_anchor.is_empty());
+
+    let mut shortened = original.clone();
+    shortened["load_config_size"] =
+        serde_json::json!(LOAD_CONFIG_GUARD_MEMCPY_POINTER_FIELDS_SIZE - 1);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(shortened)
+        .expect_err("a retained GuardMemcpy anchor requires its load-config structure prefix");
+    assert!(
+        error
+            .to_string()
+            .contains("GuardMemcpy function-pointer slot")
+    );
+
+    let mut missing_directory = original.clone();
+    missing_directory["directories"]["load_config"] = serde_json::Value::Null;
+    missing_directory["load_config_size"] = serde_json::Value::Null;
+    missing_directory["guard_flags"] = serde_json::Value::Null;
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(missing_directory)
+        .expect_err("GuardMemcpy-anchor state cannot outlive its load-config directory");
+    assert!(error.to_string().contains("load-config security anchors"));
+
+    let mut header_anchor = original.clone();
+    header_anchor["load_config_guard_memcpy_anchor"]["guard_memcpy_function_pointer_rva"] =
+        serde_json::json!(0x100);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(header_anchor)
+        .expect_err("persisted GuardMemcpy anchors remain mapped into one section");
+    assert!(error.to_string().contains("within one mapped section"));
+
+    let mut directory_overlap = original.clone();
+    directory_overlap["load_config_guard_memcpy_anchor"]["guard_memcpy_function_pointer_rva"] =
+        serde_json::json!(0x14b8);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(directory_overlap)
+        .expect_err("persisted GuardMemcpy anchors remain disjoint from load config");
+    assert!(
+        error
+            .to_string()
+            .contains("overlaps the declared load-config")
+    );
+
+    let mut cross_family_overlap = original.clone();
+    cross_family_overlap["load_config_xfg_anchors"]["cast_guard_os_determined_failure_mode_rva"] =
+        serde_json::json!(GUARD_MEMCPY_FUNCTION_POINTER_RVA);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(cross_family_overlap)
+        .expect_err("persisted schema-12 and schema-13 anchor ranges remain disjoint");
+    assert!(
+        error
+            .to_string()
+            .contains("CastGuard OS-determined failure-mode storage overlaps GuardMemcpy")
+    );
+
+    let mut unknown_inner_field = original;
+    unknown_inner_field["load_config_guard_memcpy_anchor"]["unexpected"] = serde_json::json!(1);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(unknown_inner_field)
+        .expect_err("unknown fields inside the GuardMemcpy-anchor marker are rejected");
     assert!(error.to_string().contains("unknown field"));
 }
 

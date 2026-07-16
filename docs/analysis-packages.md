@@ -41,8 +41,8 @@ Every package contains four top-level fields:
 - `payload` contains one validated `AnalysisSession`: deterministic base analysis, a plugin-run
   ledger, and accepted plugin claims.
 
-This package envelope currently writes schema 12. The CLI can also inspect and export schemas 1
-through 11 through the compatibility paths described below, while other schema versions fail
+This package envelope currently writes schema 13. The CLI can also inspect and export schemas 1
+through 12 through the compatibility paths described below, while other schema versions fail
 explicitly. The debugger-neutral JSON produced by `resymbol export --format json` is a different
 artifact with its own schema version; its current projection is schema 6.
 
@@ -61,7 +61,7 @@ the bytes it names. ReSymbol fully validates the package, canonicalizes and read
 and requires its exact size and SHA-256 to match before emitting inspection output to stdout.
 Failures report on stderr. A successful human summary includes
 `source binary: <canonical-path>` and `identity gate: matched`. With `--json`, stdout stays pure
-package JSON and omits both status lines. This gate applies to supported schemas 1 through 12 but
+package JSON and omits both status lines. This gate applies to supported schemas 1 through 13 but
 performs no reanalysis, legacy-result reconstruction, or rewrite of either input.
 
 A package must not be applied to a loaded program until its SHA-256 identity has been compared with
@@ -108,13 +108,15 @@ Schema 7 records TLS callbacks but predates modern PE32+ delay-import recovery. 
 delay imports but predates load-config GuardCF recovery. Schema 9 records GuardCF functions but
 predates the Guard address-taken IAT, long-jump, and EH-continuation inventories. Schema 10 records
 those inventories but predates checked security-cookie and GuardCF check/dispatch pointer-slot
-anchors. Schema 11 records those anchors but predates checked XFG and CastGuard storage anchors. The
+anchors. Schema 11 records those anchors but predates checked XFG and CastGuard storage anchors.
+Schema 12 records XFG/CastGuard anchors but predates the checked GuardMemcpy pointer-slot anchor. The
 TLS callback result family is therefore
 reported as unavailable for every schema 1-through-6 package, delay imports are unavailable for
 schemas 1 through 7, and GuardCF recovery is unavailable for schemas 1 through 8. Modern Guard
 target inventories are unavailable for schemas 1 through 9, and load-config security anchors are
-unavailable for schemas 1 through 10, and XFG/CastGuard anchors are unavailable for schemas 1
-through 11. Reanalyze the exact original executable to create a schema 12 package with all current
+unavailable for schemas 1 through 10, XFG/CastGuard anchors are unavailable for schemas 1 through
+11, and the GuardMemcpy pointer-slot anchor is unavailable for schemas 1 through 12. Reanalyze the
+exact original executable to create a schema 13 package with all current
 recovery results. The
 compatibility reader explicitly
 rejects a schema 2 or 3 envelope whose base
@@ -125,23 +127,25 @@ post-schema-1 control-flow record; schemas 2 through 5 explicitly reject a deter
 source valid only through schema-6 transitive endpoint seeding. Changing only the envelope label is
 not migration. Schemas 1 through 6 also reject schema-7 TLS callback state and callback-only base
 thunk seeds. Schemas 1 through 7 reject the exact schema-8 base-analysis `delay_imports` inventory
-key and `directories.delay_imports` directory key. Schemas 8 through 12 reject a payload missing
+key and `directories.delay_imports` directory key. Schemas 8 through 13 reject a payload missing
 that explicit delay-import inventory marker.
 Schemas 1 through 8 reject schema-9 `load_config_size`, `guard_flags`,
 `guard_cf_function_table_rva`, and `guard_cf_functions` fields, the `directories.load_config` key,
-and core `pe-guard-cf-function` claims. Schemas 9 through 12 reject a payload missing the explicit
+and core `pe-guard-cf-function` claims. Schemas 9 through 13 reject a payload missing the explicit
 `guard_cf_functions` inventory marker, including when the correct inventory is empty.
 Schemas 1 through 9 reject schema-10 Guard address-taken IAT, long-jump, and EH-continuation table
-RVA or inventory fields. Schemas 10 through 12 reject a payload missing any of the explicit
+RVA or inventory fields. Schemas 10 through 13 reject a payload missing any of the explicit
 `guard_address_taken_iat_entries`, `guard_long_jump_targets`, or
 `guard_eh_continuation_targets` markers, including when the inventories are empty.
 Schemas 1 through 10 reject the schema-11 `load_config_security_anchors` base-analysis key. Schemas
-11 and 12 require that value to be an object, including `{}` when all three anchors are absent.
-Schemas 1 through 11 reject the schema-12 `load_config_xfg_anchors` key; schema 12 requires that
-value to be an object, including `{}` when all four anchors are absent.
+11 through 13 require that value to be an object, including `{}` when all three anchors are absent.
+Schemas 1 through 11 reject the schema-12 `load_config_xfg_anchors` key; schemas 12 and 13 require
+that value to be an object, including `{}` when all four anchors are absent. Schemas 1 through 12
+reject the schema-13 `load_config_guard_memcpy_anchor` key; schema 13 requires that value to be an
+object, including `{}` when the anchor is absent.
 Plugin-supplied exact thunk claims remain independent of the built-in base-analysis seed invariant.
 `inspect --json`, with or without the optional binary gate, emits only package JSON. For every
-legacy schema 1 through 11 it preserves the validated original representation rather than placing
+legacy schema 1 through 12 it preserves the validated original representation rather than placing
 the migrated current payload beneath a legacy schema label.
 
 ## Current `AnalysisSession` payload
@@ -170,19 +174,19 @@ The base analysis includes:
   TLS-directory, and load-config records;
 - a separate ordered delay-import inventory retaining the DLL name, descriptor RVA and exact
   attributes value, name/HMOD/IAT/INT base RVAs, optional BIAT/UIAT base RVAs, per-entry lookup/IAT
-  RVAs and hints/names or ordinals, and the timestamp, but not raw array contents; schemas 8 through 12
+  RVAs and hints/names or ordinals, and the timestamp, but not raw array contents; schemas 8 through 13
   always serialize this inventory, including an empty array, as an explicit compatibility marker;
 - x64 `RUNTIME_FUNCTION` entries as evidence-backed candidate function boundaries;
 - up to 4,096 ordered PE32+ TLS callback entries with duplicates preserved, their callback-table
   RVA, and an independent partial-scan flag;
 - PE32+ load-config state as `directories.load_config {rva,size}`, optional `load_config_size`,
   optional `guard_flags`, optional checked `guard_cf_function_table_rva`, and the ordered
-  `guard_cf_functions` records `{table_index,rva,metadata}`; schemas 9 through 12 always serialize that array,
+  `guard_cf_functions` records `{table_index,rva,metadata}`; schemas 9 through 13 always serialize that array,
   including when empty, as an explicit compatibility marker. Its length is the retained count;
   neither a separate count nor raw GFIDS table bytes are serialized;
 - optional checked table RVAs and ordered schema-10 inventories for Guard address-taken IAT entries
   `{table_index,iat_rva,metadata}`, long-jump targets `{table_index,target_rva,metadata}`, and
-  EH-continuation targets `{table_index,target_rva,metadata}`. Schemas 10 through 12 always serialize all three arrays,
+  EH-continuation targets `{table_index,target_rva,metadata}`. Schemas 10 through 13 always serialize all three arrays,
   including when empty; array length is the retained count and raw table bytes are not serialized;
 - a schema-11 `load_config_security_anchors` object with optional checked
   `security_cookie_rva`, `guard_cf_check_function_pointer_rva`, and
@@ -196,6 +200,10 @@ The base analysis includes:
   `cast_guard_os_determined_failure_mode_rva` fields. The object is always serialized, even as `{}`;
   it uses the same eight-byte mapped-storage and cross-family disjointness rules and likewise adds no
   claims or thunk seeds;
+- a schema-13 `load_config_guard_memcpy_anchor` object with optional checked
+  `guard_memcpy_function_pointer_rva`. The object is always serialized, even as `{}`; the field
+  names the loader-managed eight-byte pointer slot, not its initial contents, and follows the same
+  mapped-storage and cross-family disjointness rules without adding claims or thunk seeds;
 - bounded direct-call records with explicit internal-function, exact parsed import-IAT, or read-only
   function-pointer targets; one-instruction thunks may likewise target internal functions, exact
   parsed import-IAT slots, or read-only function-pointer slots, with a persisted partial-scan flag;
@@ -217,7 +225,9 @@ match the accepted claims.
 Plugins granted `symbols.read` receive the same detached base analysis as JSON, so schema-7
   sessions add the TLS directory and callback fields, schema-8 sessions add the delay-import
   directory and ordered inventory, schema-9 sessions add load-config and GuardCF state, and
-  schema-10 sessions add the three modern Guard target inventories. This is
+  schema-10 sessions add the three modern Guard target inventories, schema-11 adds the earlier
+  security anchors, schema-12 adds XFG/CastGuard anchors, and schema-13 adds the GuardMemcpy slot.
+  This is
 additive data inside the existing request payload: it does
 not change the plugin API or wire protocol 1.0, add a new assertion shape, or change neutral
 projection schema 6. Plugins without `symbols.read` still receive no base analysis.
@@ -304,19 +314,20 @@ and are visible to plugins with `symbols.read`. GIAT entries are import slots, w
 EH-continuation entries are valid landing/continuation addresses rather than necessarily function
 starts, so none of these records creates a `FunctionEntry` claim or seeds thunk recovery.
 
-### PE32+ load-config security/XFG storage-anchor boundary
+### PE32+ load-config security/XFG/GuardMemcpy storage-anchor boundary
 
 ReSymbol reads the preferred-image VAs for `SecurityCookie`, `GuardCFCheckFunctionPointer`, and
 `GuardCFDispatchFunctionPointer` only when the load-config internal size reaches 96, 120, and 128
 bytes. It reads `GuardXFGCheckFunctionPointer`, `GuardXFGDispatchFunctionPointer`,
 `GuardXFGTableDispatchFunctionPointer`, and `CastGuardOsDeterminedFailureMode` at internal sizes 288,
-296, 304, and 312 bytes. A zero VA records an absent anchor; every nonzero VA must convert to an RVA
-inside the declared image.
+296, 304, and 312 bytes, and `GuardMemcpyFunctionPointer` at internal size 320. A zero VA records
+an absent anchor; every nonzero VA must convert to an RVA inside the declared image.
 
 Every retained anchor names a full eight-byte range wholly inside one mapped section. Headers and
 cross-section ranges are rejected, while mapped zero-fill storage is accepted. Anchor ranges must
-be disjoint from the declared load-config directory and pairwise disjoint across both schema-11 and
-schema-12 families. These are storage locations, not recovered pointer values: ReSymbol does not
+be disjoint from the declared load-config directory and pairwise disjoint across the schema-11,
+schema-12, and schema-13 families. These are storage locations, not recovered pointer values:
+ReSymbol does not
 enforce section permissions, dereference or serialize initial contents, emit graph claims, or seed
 thunk recovery.
 
@@ -553,7 +564,7 @@ inspection of the exact original PE. It emits deterministic, bounded, pure-Rust 
 containing selected public function and global names and verbatim section headers. Same-RVA
 function/global collisions prefer the function; unnamed functions do not suppress globals. The
 writer does not synthesize private symbols, compilands, source lines, locals, prototypes, function
-extents, or type records, and it does not add fields to package schema 12 or neutral projection
+extents, or type records, and it does not add fields to package schema 13 or neutral projection
 schema 6. Generating the file requires no separately installed Visual Studio, DIA, LLVM, or
 compiler toolchain; Windows compatibility CI validates it with native and DIA-backed
 `llvm-pdbutil` reads and a direct DIA identity/public-symbol probe.
