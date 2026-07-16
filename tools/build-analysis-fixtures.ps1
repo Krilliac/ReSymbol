@@ -20,11 +20,24 @@ if (-not $OutputDirectory) {
 }
 $OutputDirectory = [System.IO.Path]::GetFullPath($OutputDirectory)
 
-foreach ($tool in @("cl.exe", "link.exe")) {
-    if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
-        throw "$tool is unavailable. Run from a VS 2022 x64 developer environment."
+function Resolve-VsToolPath {
+    param([Parameter(Mandatory = $true)][string]$Name)
+
+    foreach ($variable in @("VCToolsInstallDir", "VSCMD_ARG_HOST_ARCH", "VSCMD_ARG_TGT_ARCH")) {
+        if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($variable))) {
+            throw "$variable is unavailable. Run from a VS 2022 developer environment."
+        }
     }
+    $toolDirectory = Join-Path $env:VCToolsInstallDir "bin\Host$($env:VSCMD_ARG_HOST_ARCH)\$($env:VSCMD_ARG_TGT_ARCH)"
+    $toolPath = Join-Path $toolDirectory $Name
+    if (-not (Test-Path -LiteralPath $toolPath -PathType Leaf)) {
+        throw "$Name is unavailable at the active VS tool path: $toolPath"
+    }
+    return [System.IO.Path]::GetFullPath($toolPath)
 }
+
+$clPath = Resolve-VsToolPath "cl.exe"
+$linkPath = Resolve-VsToolPath "link.exe"
 
 function Normalize-Version {
     param([AllowNull()][string]$Value)
@@ -48,8 +61,6 @@ function Assert-ExactValue {
 }
 
 function Assert-RecordedToolchain {
-    $clPath = (Get-Command "cl.exe" -CommandType Application).Source
-    $linkPath = (Get-Command "link.exe" -CommandType Application).Source
     $clVersion = (Get-Item -LiteralPath $clPath).VersionInfo.FileVersion
     $linkVersion = (Get-Item -LiteralPath $linkPath).VersionInfo.FileVersion
 
@@ -152,7 +163,7 @@ function Build-Variant {
     if ($WithSymbols) {
         $compileArguments = @("/Z7") + $compileArguments
     }
-    Invoke-Checked -FilePath "cl.exe" -Arguments $compileArguments
+    Invoke-Checked -FilePath $clPath -Arguments $compileArguments
 
     $linkArguments = @(
         "/nologo",
@@ -181,7 +192,7 @@ function Build-Variant {
     }
     Push-Location $variantDirectory
     try {
-        Invoke-Checked -FilePath "link.exe" -Arguments $linkArguments
+        Invoke-Checked -FilePath $linkPath -Arguments $linkArguments
     } finally {
         Pop-Location
     }

@@ -10,7 +10,7 @@
 use std::io;
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus};
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 use rustix::process::{WaitId, WaitIdOptions, waitid};
 #[cfg(unix)]
 use rustix::{
@@ -102,19 +102,32 @@ impl ContainedChild {
 
     /// Polls the direct child without waiting for descendants.
     ///
-    /// Linux and macOS observe exit without reaping, terminate the still-stable
-    /// containment boundary, and only then collect the direct child's status.
+    /// Linux observes exit without reaping, terminates the still-stable
+    /// containment boundary, and only then collects the direct child's status.
+    /// macOS reaps the direct child first because hosted systems reject
+    /// `waitid(WNOWAIT)`, then immediately terminates its process group. A group
+    /// with surviving descendants retains its identifier after the leader exits.
     pub(crate) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         if let Some(status) = self.direct_child_status {
             return Ok(Some(status));
         }
 
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(target_os = "linux")]
         {
             if !self.observe_direct_child_exit(true)? {
                 return Ok(None);
             }
             self.reap_observed_direct_child().map(Some)
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let status = self.child.try_wait()?;
+            if let Some(status) = status {
+                self.direct_child_status = Some(status);
+                self.terminate()?;
+            }
+            Ok(status)
         }
 
         #[cfg(any(windows, all(unix, not(any(target_os = "linux", target_os = "macos")))))]
@@ -127,17 +140,26 @@ impl ContainedChild {
 
     /// Waits for and returns the direct child's exit status.
     ///
-    /// Linux and macOS retain the exited child until the containment boundary
-    /// has been terminated, preventing process-group identifier reuse.
+    /// Linux retains the exited child until the containment boundary has been
+    /// terminated. macOS reaps the leader and immediately terminates the group;
+    /// surviving descendants keep that process-group identifier allocated.
     pub(crate) fn wait(&mut self) -> io::Result<ExitStatus> {
         if let Some(status) = self.direct_child_status {
             return Ok(status);
         }
 
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(target_os = "linux")]
         {
             self.observe_direct_child_exit(false)?;
             self.reap_observed_direct_child()
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let status = self.child.wait()?;
+            self.direct_child_status = Some(status);
+            self.terminate()?;
+            Ok(status)
         }
 
         #[cfg(any(windows, all(unix, not(any(target_os = "linux", target_os = "macos")))))]
@@ -149,7 +171,7 @@ impl ContainedChild {
     }
 
     /// Observes direct-child exit without releasing its PID or process-group ID.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     fn observe_direct_child_exit(&self, nohang: bool) -> io::Result<bool> {
         let mut options = WaitIdOptions::EXITED | WaitIdOptions::NOWAIT;
         if nohang {
@@ -165,7 +187,7 @@ impl ContainedChild {
     }
 
     /// Terminates the still-stable containment boundary, then reaps its leader.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     fn reap_observed_direct_child(&mut self) -> io::Result<ExitStatus> {
         self.terminate()?;
         let status = self.child.wait()?;
