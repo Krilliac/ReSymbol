@@ -248,7 +248,9 @@ prereleases; breaking changes remain explicit.
   process/mode context. The controller validates an exact command-stage-kind-phase matrix before
   rollback or retaining failed ownership. Cleanup providers can additionally report a bounded
   `CleanupAttemptFailed` event with an exact incomplete receipt and advisory retryability; only a
-  later exact complete `Closed` receipt verifies cleanup and permits release.
+  later exact complete `Closed` receipt verifies cleanup and permits release. Effect-free rollback
+  restores the exact visible state while retaining its consumed state-generation watermark, so a
+  rejected transition's generation can never be reused.
 - Expanded exact public parser-boundary regressions for oversized PE header offsets, directory and
   table declarations, runtime-function counts, bounded PE strings, and CodeView payload and
   RSDS-record sizes. The matrix pins fail-fast errors before untrusted declared sizes can drive
