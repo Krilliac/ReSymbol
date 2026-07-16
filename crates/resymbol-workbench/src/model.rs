@@ -5,12 +5,10 @@
 //! records, but never reconciles claims independently or reorders the canonical
 //! projection.
 
-#[cfg(feature = "screenshot")]
-use std::path::Path;
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
@@ -34,7 +32,8 @@ use thiserror::Error;
 /// Exact identity and address-space metadata for the active binary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectIdentity {
-    pub path: PathBuf,
+    pub origin_path: PathBuf,
+    pub verified_source_path: Option<PathBuf>,
     pub display_name: String,
     pub sha256: BinaryId,
     pub file_size: u64,
@@ -42,6 +41,35 @@ pub struct ProjectIdentity {
     pub architecture: String,
     pub image_base: u64,
     pub image_size: u64,
+}
+
+impl ProjectIdentity {
+    /// Exact binary path when source bytes are verified, otherwise the opened
+    /// package or binary origin.
+    #[must_use]
+    pub fn active_binary_path(&self) -> &Path {
+        self.verified_source_path
+            .as_deref()
+            .unwrap_or(&self.origin_path)
+    }
+
+    /// Display-only path without Windows' canonical verbatim-path prefix.
+    /// The exact stored paths remain unchanged for identity and I/O binding.
+    #[must_use]
+    pub fn active_binary_path_display(&self) -> String {
+        display_path_without_verbatim_prefix(self.active_binary_path())
+    }
+}
+
+fn display_path_without_verbatim_prefix(path: &Path) -> String {
+    let rendered = path.to_string_lossy();
+    if let Some(rest) = rendered.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = rendered.strip_prefix(r"\\?\") {
+        rest.to_owned()
+    } else {
+        rendered.into_owned()
+    }
 }
 
 /// Epistemic status shown independently from confidence and producer identity.
@@ -323,18 +351,20 @@ impl LoadedProject {
         let (functions, function_details) =
             build_function_inventory(&projection.functions, combined_graph.claims())?;
         let binary = &projection.binary;
-        let path = snapshot
-            .verified_source_path()
-            .unwrap_or_else(|| snapshot.origin_path())
-            .to_path_buf();
-        let display_name = path
+        let origin_path = snapshot.origin_path().to_path_buf();
+        let verified_source_path = snapshot.verified_source_path().map(Path::to_path_buf);
+        let active_binary_path = verified_source_path
+            .as_deref()
+            .unwrap_or(origin_path.as_path());
+        let display_name = active_binary_path
             .file_name()
             .and_then(|name| name.to_str())
             .filter(|name| !name.is_empty())
             .unwrap_or("<memory>")
             .to_owned();
         let identity = ProjectIdentity {
-            path,
+            origin_path,
+            verified_source_path,
             display_name,
             sha256: binary.id.clone(),
             file_size: binary.file_size,
@@ -853,6 +883,15 @@ mod tests {
     fn checked_in_fixture_builds_one_bound_shared_model() {
         let project = loaded_fixture(STRIPPED_FIXTURE);
 
+        assert_eq!(project.identity.origin_path, project.snapshot.origin_path());
+        assert_eq!(
+            project.identity.verified_source_path.as_deref(),
+            project.snapshot.verified_source_path()
+        );
+        assert_eq!(
+            project.identity.active_binary_path(),
+            project.snapshot.origin_path()
+        );
         assert_eq!(
             &project.identity.sha256,
             project.snapshot.package().binary_sha256()
@@ -936,6 +975,12 @@ mod tests {
         );
         assert!(project.protection_assessment.unavailable_reason().is_some());
         assert!(!project.snapshot.has_verified_source());
+        assert_eq!(project.identity.origin_path, project.snapshot.origin_path());
+        assert!(project.identity.verified_source_path.is_none());
+        assert_eq!(
+            project.identity.active_binary_path(),
+            project.snapshot.origin_path()
+        );
         assert_eq!(
             project.static_address_space.binary_id,
             project.identity.sha256
@@ -946,13 +991,37 @@ mod tests {
             .expect("verify package source");
         let exact_project = LoadedProject::from_snapshot(verified).expect("verified package model");
         assert_eq!(
-            exact_project.identity.path,
+            exact_project.identity.origin_path,
+            exact_project.snapshot.origin_path()
+        );
+        assert_eq!(
+            exact_project.identity.verified_source_path.as_deref(),
+            exact_project.snapshot.verified_source_path()
+        );
+        assert_eq!(
+            exact_project.identity.active_binary_path(),
             exact_project
                 .snapshot
                 .verified_source_path()
                 .expect("verified source path")
         );
         assert_eq!(exact_project.identity.display_name, "fixture.exe");
+    }
+
+    #[test]
+    fn display_paths_hide_only_windows_verbatim_prefixes() {
+        assert_eq!(
+            display_path_without_verbatim_prefix(Path::new(r"\\?\C:\samples\fixture.exe")),
+            r"C:\samples\fixture.exe"
+        );
+        assert_eq!(
+            display_path_without_verbatim_prefix(Path::new(r"\\?\UNC\server\share\fixture.exe")),
+            r"\\server\share\fixture.exe"
+        );
+        assert_eq!(
+            display_path_without_verbatim_prefix(Path::new("relative/fixture.exe")),
+            "relative/fixture.exe"
+        );
     }
 
     #[test]

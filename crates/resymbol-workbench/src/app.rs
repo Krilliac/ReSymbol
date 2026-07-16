@@ -89,6 +89,12 @@ enum MainTab {
     Exports,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectAcceptance {
+    NewProject,
+    VerifiedSource,
+}
+
 impl MainTab {
     const ALL: [Self; 8] = [
         Self::Overview,
@@ -1343,7 +1349,7 @@ impl WorkbenchApp {
                         continue;
                     }
                     match result {
-                        Ok(project) => self.accept_project(project, false),
+                        Ok(project) => self.accept_project(project, ProjectAcceptance::NewProject),
                         Err(error) => {
                             self.stage = if self.project.is_some() {
                                 WorkflowStage::Review
@@ -1369,7 +1375,9 @@ impl WorkbenchApp {
                         continue;
                     }
                     match result {
-                        Ok(project) => self.accept_project(project, true),
+                        Ok(project) => {
+                            self.accept_project(project, ProjectAcceptance::VerifiedSource)
+                        }
                         Err(error) => {
                             self.stage = WorkflowStage::Review;
                             self.log(
@@ -1611,8 +1619,9 @@ impl WorkbenchApp {
         }
     }
 
-    fn accept_project(&mut self, project: LoadedProject, preserve_reviews: bool) {
-        let reviews_still_bound = preserve_reviews
+    fn accept_project(&mut self, project: LoadedProject, acceptance: ProjectAcceptance) {
+        let preserve_context = acceptance == ProjectAcceptance::VerifiedSource;
+        let reviews_still_bound = preserve_context
             && self.review.as_ref().is_some_and(|review| {
                 review
                     .ledger()
@@ -1683,7 +1692,7 @@ impl WorkbenchApp {
             .to_string_lossy()
             .into_owned();
         self.export_result = None;
-        self.analysis_path = Some(project.identity.path.clone());
+        self.analysis_path = Some(project.identity.active_binary_path().to_path_buf());
         self.selected_projection_index = selected_rva
             .and_then(|rva| {
                 project
@@ -3121,7 +3130,7 @@ impl WorkbenchApp {
                     .color(colors.secondary_text),
             );
             ui.label(
-                RichText::new(project.identity.path.display().to_string())
+                RichText::new(project.identity.active_binary_path_display())
                     .monospace()
                     .small()
                     .color(colors.secondary_text),
@@ -3341,45 +3350,49 @@ impl WorkbenchApp {
             .inner_margin(egui::Margin::same(10))
             .corner_radius(4)
             .show(ui, |ui| {
-                ui.columns(6, |columns| {
-                    property_row(
-                        &mut columns[0],
-                        "Preferred base",
-                        &format!("0x{:016X}", address_space.preferred_image_base),
-                        true,
-                    );
-                    property_row(
-                        &mut columns[1],
-                        "Image size",
-                        &format!("0x{:X}", address_space.image_size),
-                        true,
-                    );
-                    property_row(
-                        &mut columns[2],
-                        "Section / file align",
-                        &format!(
-                            "0x{:X} / 0x{:X}",
-                            address_space.section_alignment, address_space.file_alignment
-                        ),
-                        true,
-                    );
-                    property_row(
-                        &mut columns[3],
-                        "Entry RVA",
-                        &address_space.entry_point.map_or_else(
-                            || "none".to_owned(),
-                            |entry| format!("0x{:08X}", entry.get()),
-                        ),
-                        true,
-                    );
-                    property_row(
-                        &mut columns[4],
-                        "Regions",
-                        &address_space.regions().len().to_string(),
-                        false,
-                    );
-                    property_row(&mut columns[5], "Indicators", &indicator_text, false);
-                });
+                egui::Grid::new("static-address-space-summary")
+                    .num_columns(3)
+                    .spacing(egui::vec2(28.0, 10.0))
+                    .show(ui, |ui| {
+                        property_cell(
+                            ui,
+                            "Preferred base",
+                            &format!("0x{:016X}", address_space.preferred_image_base),
+                            true,
+                        );
+                        property_cell(
+                            ui,
+                            "Image size",
+                            &format!("0x{:X}", address_space.image_size),
+                            true,
+                        );
+                        property_cell(
+                            ui,
+                            "Section / file align",
+                            &format!(
+                                "0x{:X} / 0x{:X}",
+                                address_space.section_alignment, address_space.file_alignment
+                            ),
+                            true,
+                        );
+                        ui.end_row();
+                        property_cell(
+                            ui,
+                            "Entry RVA",
+                            &address_space.entry_point.map_or_else(
+                                || "none".to_owned(),
+                                |entry| format!("0x{:08X}", entry.get()),
+                            ),
+                            true,
+                        );
+                        property_cell(
+                            ui,
+                            "Regions",
+                            &address_space.regions().len().to_string(),
+                            false,
+                        );
+                        property_cell(ui, "Indicators", &indicator_text, false);
+                    });
             });
 
         let findings = project.protection_assessment.findings();
@@ -3979,7 +3992,7 @@ impl WorkbenchApp {
         let colors = self.preferences.theme.semantic_colors();
         let evidence = DebuggerReadinessEvidence::from_project(project);
         let binary_name = project.identity.display_name.clone();
-        let binary_path = project.identity.path.display().to_string();
+        let binary_path = project.identity.active_binary_path_display();
 
         ScrollArea::vertical().show(ui, |ui| {
             ui.heading("Debugger / Sandbox readiness");
@@ -4741,6 +4754,17 @@ fn summary_card(
 fn property_row(ui: &mut egui::Ui, label: &str, value: &str, monospace: bool) {
     ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new(format!("{label}:")).strong());
+        if monospace {
+            ui.label(RichText::new(value).monospace());
+        } else {
+            ui.label(value);
+        }
+    });
+}
+
+fn property_cell(ui: &mut egui::Ui, label: &str, value: &str, monospace: bool) {
+    ui.vertical(|ui| {
+        ui.label(RichText::new(label).small().strong());
         if monospace {
             ui.label(RichText::new(value).monospace());
         } else {
