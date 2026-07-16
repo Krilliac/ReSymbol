@@ -11,12 +11,17 @@ ReSymbol currently implements the non-executing foundation for debugger and sand
   sections;
 - backend-neutral target, capability, command, event, state-token, breakpoint, memory-read, and
   compare-before-write memory-mutation contracts;
-- a bounded control/raw-byte frame format for a future helper process; and
+- a bounded control/raw-byte frame format, identity-pinned directional handshake, exact protocol
+  version binding, strict typed command/event codec, and single-owner host-client seam;
+- a deterministic in-memory host that drives the real session and sandbox reducers for integration
+  tests without reading an artifact, opening a process, or executing target code; and
 - sandbox policy, attestation, failure, lifecycle, resource-limit, and cleanup-receipt data models.
 
-The Windows debugger host, AppContainer provider, Hyper-V provider, guest agent, live process attach,
-breakpoint engine, register access, memory access, and instruction editing are not implemented. The
-current types and UI must not be described as a working malware sandbox or live debugger.
+The Windows debugger host process, pipe transport, AppContainer provider, Hyper-V provider, guest
+agent, live process attach, breakpoint engine, register access, memory access, and instruction editing
+are not implemented. `InMemoryDebugHost` is a protocol test double, not a security boundary or a
+platform provider. The current types and UI must not be described as a working malware sandbox or
+live debugger.
 
 ## Ownership and thread affinity
 
@@ -32,7 +37,10 @@ Workbench UI thread
 ```
 
 - The UI owns product state and never receives a platform handle.
-- `DebugHostClient` calls are nonblocking from the UI thread. Its I/O thread owns pipe operations.
+- `DebugHostClient` is deliberately `!Send` and `!Sync`. One connection worker constructs and owns
+  it; UI code uses bounded queues. Its synchronous exchange calls are never made on the UI thread.
+- One client owns one connection and at most one session. It cannot release a session before the
+  reducer reports `Closed`, and it cannot disconnect while it still owns that session.
 - One `SessionWorker` owns every debug event, target process/thread, Job, profile, staging directory,
   provider, and cleanup transition for a session.
 - Provider and debug-event methods are worker-thread-only and non-hot-reloadable until close and
@@ -74,7 +82,31 @@ tests:
    states cannot return to a live state.
 7. Helper loss enters cleanup; it never implies that containment or cleanup succeeded.
 
-These are requirements for future execution, not claims about the current build.
+The pure reducers, typed client, and in-memory host now exercise these ordering and binding rules. They
+remain requirements for a future process-executing provider, not evidence that such a provider exists.
+
+## Implemented host seam
+
+The current seam is intentionally narrow:
+
+- a four-byte length prefix is validated before allocating a bounded control buffer;
+- controller and host roles, directions, nonzero challenge nonce, pinned build identities, offered
+  protocol version, response kind, and independent frame sequences are verified before commands;
+- malformed, reflected, duplicate, replayed, stale, cross-session, overlong, and unknown-field inputs
+  fail closed;
+- command IDs and event IDs are independent monotonic domains, while each synchronous response batch
+  must contain exactly one command result and only events correlated to that command;
+- session generations must advance one at a time, and a rejected command may not change client state;
+- only `Closed` sessions can be released, and sandbox closure requires the exact cleanup receipt that
+  the reducer validates; and
+- the client and transport expose value types only. Future process, pipe, token, Job, VM, and provider
+  handles stay opaque inside the owning host implementation.
+
+The JSON typed-control codec retains the 64 KiB control ceiling. Memory-write pairs and memory-read or
+memory-written event buffers are carried exactly once through the separately bounded raw channel, with
+an exact address and split descriptor in the control document. Inline/raw duplicates, mismatched
+lengths, and raw payloads on other message kinds are rejected. A future pipe transport must preserve
+that separation rather than increasing the control allocation.
 
 ## Local AppContainer boundary
 
