@@ -12,6 +12,7 @@ authors.workspace = true
 resymbol-analysis = { path = "../resymbol-analysis" }
 resymbol-core = { path = "../resymbol-core" }
 serde = { version = "1.0.219", features = ["derive"] }
+sha2 = "0.10.9"
 thiserror = "2.0.12"
 
 [dev-dependencies]

@@ -6,14 +6,17 @@
 
 mod address_space;
 pub mod host_wire;
+mod identity;
 mod protection;
 pub mod protocol;
 pub mod sandbox;
+mod session_machine;
 
 pub use address_space::{
     AddressRange, FileBacking, MemoryAccess, RelativeAddress, StaticAddressSpace,
     StaticAddressSpaceError, StaticRegion, StaticRegionKind,
 };
+pub use identity::SessionIdError;
 pub use protection::{
     EvidenceStrength, ProtectionEvidence, ProtectionFinding, ProtectionKind, ProtectionReport,
     ProtectionScanError, ProtectionSeverity, scan_pe_protections,
@@ -27,17 +30,20 @@ pub use protocol::{
     LiveToken, MAX_CAPABILITY_STATUSES, MAX_LAUNCH_ARGUMENT_BYTES, MAX_LAUNCH_ARGUMENTS,
     MAX_MEMORY_READ_BYTES, MAX_MEMORY_WRITE_BYTES, MAX_REASON_BYTES, MemoryAddress, OfflineTarget,
     ProcessId, ProtocolValidationError, ProtocolVersion, ReadViewToken, RunId, RunToken, SessionId,
-    SessionState, SnapshotId, StateGeneration, StateToken, StepKind, StopId, StopReason, StopToken,
-    ThreadId,
+    SessionState, SessionStateKind, SnapshotId, StateGeneration, StateToken, StepKind, StopId,
+    StopReason, StopToken, ThreadId,
 };
 pub use sandbox::{
-    AttestationMismatch, BoundedValueError, ChildProcessProfile, CleanupOutcome,
-    CleanupReceiptError, CleanupResidual, CleanupResidualKind, DiagnosticText, DynamicCodeProfile,
-    ExpectedSandboxAttestation, IsolationBoundary, PolicyDigest, PolicyDigestError,
+    AttestationMismatch, AuthenticatedChannelNonce, AuthenticatedChannelNonceError,
+    BoundedValueError, ChildProcessProfile, CleanupOutcome, CleanupReceiptError, CleanupResidual,
+    CleanupResidualKind, DiagnosticText, DifferencingDiskId, DynamicCodeProfile,
+    ExpectedSandboxAttestation, HelperBuildId, IsolationBoundary, PolicyDigest, PolicyDigestError,
     PolicyValidationError, ProcessMitigationProfile, ProviderUnavailable,
-    ProviderUnavailableReason, ResourceLimitError, RiskAcknowledgementId, SandboxAttestation,
-    SandboxCleanupReceipt, SandboxFailure, SandboxFailureKind, SandboxFailureStage,
-    SandboxFallbackPolicy, SandboxGuarantee, SandboxLifecycleEvent, SandboxLifecycleState,
-    SandboxNetworkMode, SandboxPolicy, SandboxProviderSelection, SandboxResourceLimits,
-    Win32kProfile,
+    ProviderUnavailableReason, ResourceLimitError, RiskAcknowledgementId,
+    SANDBOX_POLICY_DIGEST_VERSION, SandboxAttestation, SandboxCleanupReceipt, SandboxFailure,
+    SandboxFailureKind, SandboxFailureStage, SandboxGuarantee, SandboxLifecycleEvent,
+    SandboxLifecycleState, SandboxMachine, SandboxMachineError, SandboxNetworkMode, SandboxPolicy,
+    SandboxProviderDescriptor, SandboxProviderSelection, SandboxResourceLimits, SealedImageDigest,
+    SealedImageDigestError, SealedImageId, VmIsolationIdentity, Win32kProfile,
 };
+pub use session_machine::{SessionMachine, SessionMachineError};
