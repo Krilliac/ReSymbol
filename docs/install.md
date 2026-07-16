@@ -41,15 +41,16 @@ records, vftables, and executable virtual-slot targets. Recovered class/type nam
 and function-to-class relationships become evidence-bearing claims, and the result is written to a
 portable `.resym` package bound to the input's SHA-256 identity.
 
-On Windows x64, `resymbol-workbench.exe` opens a supported PE, runs the same core analysis away from
-the UI thread, and presents the exact identity, evidence- and provenance-first function review, a
-bounded Reconstruction Graph, and discovered plugin health. The graph roots at the PE entry point
-or a clearly labeled deterministic lowest-RVA navigation fallback, synchronizes function selection
-with the inspector, and draws only retained direct-call, thunk, and import relationships. Its visible
-bounded state makes large binary truncation explicit instead of suggesting complete call-graph
-recovery. This first desktop slice is core-only: plugin health is read-only and the GUI does not
-execute plugins or open an existing `.resym` package. It can create new `.resym`, neutral JSON,
-Markdown, and MAP artifacts, and it refuses to replace an existing destination. Its companion
+On Windows x64, `resymbol-workbench.exe` opens a supported PE or current `.resym` package, runs the
+same core analysis away from the UI thread, and presents exact identity, evidence, durable
+exact-claim review, a bounded Reconstruction Graph, and discovered plugin health. The graph roots at
+the PE entry point or a clearly labeled deterministic lowest-RVA navigation fallback, synchronizes
+function selection with the inspector, and draws only retained direct-call, thunk, and import
+relationships. Its visible bounded state makes large binary truncation explicit instead of
+suggesting complete call-graph recovery. Plugin health is read-only and the GUI does not execute
+plugins or migrate legacy packages. It creates new `.resym`, neutral JSON, Markdown, MAP,
+public-symbol PDB, IDA Python, and Ghidra Java artifacts, stores review decisions in a separate
+binary-bound create-new sidecar, and refuses to replace an existing destination. Its companion
 console is off by default; enable **View -> Companion console** to spawn live logs and typed
 workbench controls, then clear the same checkbox to close only that console session.
 

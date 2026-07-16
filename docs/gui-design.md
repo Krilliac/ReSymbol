@@ -309,10 +309,12 @@ eframe/egui 0.32.3 with the glow renderer is selected for the initial applicatio
 portable Windows archive is the first packaging target. Cross-platform release packaging remains a
 later validation task.
 
-The current slice has no GUI plugin execution, legacy-package opening, durable review decisions,
-**Accept**/**Keep as Alias**/**Reject** behavior, PDB or IDA/Ghidra GUI export, docking,
-disassembly/pseudocode views, editable or exhaustive control-flow graphing, live debugger bridge,
-debugger-host process, verified AppContainer/VM provider, multi-binary workspace, or remote
-collaboration. The backend-neutral debugger and sandbox contracts are foundations for those later
-features, not proof that they exist. Future choices must still be evaluated against startup size,
-portability, accessibility, crash isolation, exact identity, and the one-download product principle.
+The current slice has no GUI plugin execution, legacy-package migration, bulk-review workflow,
+docking, disassembly/pseudocode views, editable or exhaustive control-flow graphing, live debugger
+bridge, process-executing debugger host, verified AppContainer/VM provider, multi-binary workspace,
+or remote collaboration. Current-package opening, exact-claim Accept Primary/Keep as Alias/Reject,
+undo/redo, binary-bound review sidecars, and all six symbol export formats are implemented. The
+backend-neutral debugger and sandbox contracts are foundations for later live features, not proof
+that an operating-system boundary exists. Future choices must still be evaluated against startup
+size, portability, accessibility, crash isolation, exact identity, and the one-download product
+principle.

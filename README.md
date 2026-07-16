@@ -63,15 +63,17 @@ The current alpha implements and tests an end-to-end, deliberately narrow analys
   graph;
 - `resymbol analyze`, which writes a portable package, and `resymbol inspect`, which validates and
   summarizes a package or emits its JSON representation;
-- a Windows-first `resymbol-workbench.exe` desktop application that opens a supported PE, runs
-  core-only analysis in the background, and presents exact binary identity, evidence- and
-  provenance-first function review, a bounded Reconstruction Graph, and read-only plugin health.
+- a Windows-first `resymbol-workbench.exe` desktop application that opens a supported PE or current
+  `.resym` package, runs core-only analysis in the background, and presents exact binary identity,
+  durable provenance-first exact-claim review, a bounded Reconstruction Graph, and read-only plugin
+  health.
   The graph starts from the PE entry point or a clearly labeled deterministic lowest-RVA fallback,
   shares function selection with the table and inspector, and draws only retained direct-call,
-  thunk, and import relationships. The workbench creates new `.resym`, neutral JSON, Markdown, and
-  MAP artifacts without replacing an existing destination. Its separately spawned companion console
-  is off by default; enable it from **View -> Companion console** when live activity and typed control
-  are useful;
+  thunk, and import relationships. Accept Primary, Keep as Alias, Reject, rationale, undo, and redo
+  are stored in a binary-bound create-new sidecar. The workbench creates new `.resym`, neutral JSON,
+  Markdown, MAP, public-symbol PDB, IDA Python, and Ghidra Java artifacts without replacing an
+  existing destination. Its separately spawned companion console is off by default; enable it from
+  **View -> Companion console** when live activity and typed control are useful;
 - a deterministic, debugger-neutral export projection plus `resymbol export`, which writes the
   projection as JSON, renders a bounded human-readable Markdown report, emits deterministic
   Microsoft-linker-style MAP text for compatible tools, creates an exact-RSDS public-symbol PDB
@@ -342,13 +344,14 @@ On Windows, open the same supported PE in the desktop workbench:
 .\resymbol-workbench.exe application.exe
 ```
 
-The first desktop slice runs core analysis only. It exposes evidence, provenance, and plugin health
-for review. Its Reconstruction Graph roots at the PE entry point when available, otherwise at a
-clearly labeled deterministic lowest-RVA navigation fallback, synchronizes selection with the
-function inspector, and shows only relationships retained by analysis. Large graphs are rendered
-through an explicit bounded view rather than implying complete call-graph recovery. The workbench
-then creates new `.resym`, neutral JSON, Markdown, or MAP artifacts; it does not execute plugins,
-open an existing `.resym` package, or overwrite an output file.
+The desktop slice runs core analysis only. It exposes evidence, provenance, durable exact-claim
+review, and plugin health. Its Reconstruction Graph roots at the PE entry point when available,
+otherwise at a clearly labeled deterministic lowest-RVA navigation fallback, synchronizes selection
+with the function inspector, and shows only relationships retained by analysis. Large graphs are
+rendered through an explicit bounded view rather than implying complete call-graph recovery. The
+workbench opens current `.resym` packages and creates new `.resym`, neutral JSON, Markdown, MAP,
+public-symbol PDB, IDA Python, or Ghidra Java artifacts. It does not execute plugins, migrate legacy
+packages, or overwrite an output or review-sidecar file.
 
 The optional companion console starts only when **View -> Companion console** is checked. It mirrors
 timestamped workbench activity and accepts `help`, `status`, `open`, `tab`, `focus`, `theme`,

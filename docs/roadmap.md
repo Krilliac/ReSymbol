@@ -21,18 +21,19 @@ progress/warning/log surface, and evidence-first Reconstruction Graph. That grap
 entry point or a clearly labeled deterministic lowest-RVA navigation fallback, shares selection with
 the function review surfaces, and displays only retained direct-call, thunk, and import
 relationships. Explicit node/tier bounds keep large binaries responsive and visible as truncated
-rather than implying complete call-graph recovery. Through the existing shared package and export
-models the workbench can create new `.resym`, neutral JSON, bounded Markdown, and MAP files without
-replacing an existing destination.
+rather than implying complete call-graph recovery. Through the existing shared package, review, and
+export models the workbench can open current `.resym` packages, persist binary-bound exact-claim
+review sidecars with undo/redo, and create new `.resym`, neutral JSON, bounded Markdown, MAP,
+public-symbol PDB, IDA Python, and Ghidra Java files without replacing an existing destination.
 
 An off-by-default companion console can be spawned from the running workbench. It mirrors bounded
 timestamped activity and routes status, navigation, layout, export, and lifecycle commands back to
 the GUI event loop through private process pipes; it never becomes a second owner of analysis state.
 
-This is a foundation, not the completed workbench. GUI plugin execution, legacy-package opening,
-durable review decisions and **Accept**/**Keep as Alias**/**Reject**, PDB/IDA/Ghidra GUI export,
-docking, disassembly views, and an interactive debugger bridge remain planned. A portable Windows
-archive is the initial GUI packaging target; broader desktop packaging remains future validation.
+This is a foundation, not the completed workbench. GUI plugin execution, legacy-package migration,
+bulk review, docking, disassembly views, and an interactive debugger bridge remain planned. A
+portable Windows archive is the initial GUI packaging target; broader desktop packaging remains
+future validation.
 
 The CLI writes package schema 13 and can inspect or export schemas 1 through 12 through explicit
 compatibility paths. Schema 1 is migrated in memory by revalidating persisted metadata and
