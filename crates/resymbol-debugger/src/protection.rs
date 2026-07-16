@@ -395,20 +395,25 @@ fn scan_entry_point(
         } => Some((*table_index, name)),
         StaticRegionKind::Headers | StaticRegionKind::ImageGap => None,
     }) else {
-        let in_headers = rva < analysis.size_of_headers;
+        let in_header_mapping =
+            region.is_some_and(|region| matches!(&region.kind, StaticRegionKind::Headers));
         let file_backed = layout.file_offset_at(address).is_some();
         let executable = region.is_some_and(|region| region.access.executable);
         findings.push(ProtectionFinding {
             kind: ProtectionKind::EntryPointOutsideSection,
             severity: ProtectionSeverity::High,
             strength: EvidenceStrength::ExactArtifact,
-            title: if in_headers {
+            title: if file_backed {
                 "Entry point is inside the PE headers".to_owned()
+            } else if in_header_mapping {
+                "Entry point is inside loader-rounded PE header padding".to_owned()
             } else {
                 "Entry point is outside every declared section".to_owned()
             },
-            summary: if in_headers {
+            summary: if file_backed {
                 "The declared entry point resolves into the PE header range rather than a section. Treat live execution as anomalous and inspect the exact bytes before proceeding.".to_owned()
+            } else if in_header_mapping {
+                "The declared entry point resolves into loader-rounded padding in the PE header mapping rather than a section. No initializing file byte exists at that address.".to_owned()
             } else {
                 "The declared entry point resolves into an unclaimed image range rather than a section. No file-backed instruction stream can be inferred there from the section table.".to_owned()
             },
@@ -747,6 +752,32 @@ mod tests {
                 | ProtectionKind::EntryPointNonExecutableSection
                 | ProtectionKind::EntryPointWithoutFileBacking
         )));
+
+        pe.entry_point_rva = 0x800;
+        pe.sections = vec![text_section(0x200, 0x200)];
+        let layout =
+            StaticAddressSpace::from_validated_pe(&pe).expect("header-padding static layout");
+        let mut header_padding_findings = Vec::new();
+        scan_entry_point(&pe, &layout, &mut header_padding_findings)
+            .expect("header-padding entry scan");
+        let finding = header_padding_findings
+            .iter()
+            .find(|finding| finding.kind == ProtectionKind::EntryPointOutsideSection)
+            .expect("header padding must remain outside every section");
+        assert_eq!(
+            finding.title,
+            "Entry point is inside loader-rounded PE header padding"
+        );
+        assert!(matches!(
+            finding.evidence.as_slice(),
+            [ProtectionEvidence::EntryPointLocation {
+                rva: 0x800,
+                section_index: None,
+                section_name: None,
+                file_backed: false,
+                executable: false,
+            }]
+        ));
     }
 
     #[test]

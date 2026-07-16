@@ -759,10 +759,7 @@ mod tests {
         analysis.file_alignment = 3;
         assert!(matches!(
             StaticAddressSpace::from_pe(&analysis),
-            Err(StaticAddressSpaceError::InvalidAlignment {
-                field: "FileAlignment",
-                ..
-            })
+            Err(StaticAddressSpaceError::InvalidAnalysis(_))
         ));
 
         let mut analysis = synthetic_analysis();
