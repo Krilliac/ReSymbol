@@ -1043,6 +1043,46 @@ pub struct SandboxCleanupReceipt {
     pub residuals: Vec<CleanupResidual>,
 }
 
+/// Audited evidence from a cleanup attempt that failed without releasing
+/// sandbox ownership.
+///
+/// This is deliberately distinct from [`SandboxLifecycleEvent::Closed`]: an
+/// incomplete attempt records recoverable residuals but never proves cleanup
+/// completion or permits session release.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SandboxCleanupAttemptFailure {
+    pub failure: SandboxFailure,
+    pub receipt: SandboxCleanupReceipt,
+}
+
+impl SandboxCleanupAttemptFailure {
+    /// Validates the self-contained shape of failure evidence. Exact sandbox
+    /// ownership binding is validated separately against controller-held state.
+    pub fn validate(&self) -> Result<(), CleanupAttemptFailureError> {
+        if self.failure.stage != SandboxFailureStage::Cleanup {
+            return Err(CleanupAttemptFailureError::WrongStage);
+        }
+        if self.failure.kind != SandboxFailureKind::CleanupIncomplete {
+            return Err(CleanupAttemptFailureError::WrongKind);
+        }
+        if !self.failure.retryable {
+            return Err(CleanupAttemptFailureError::NotRetryable);
+        }
+        if self.failure.session_id != self.receipt.session_id
+            || self.failure.provider != self.receipt.provider
+        {
+            return Err(CleanupAttemptFailureError::FailureReceiptMismatch);
+        }
+        if self.receipt.outcome != CleanupOutcome::Incomplete {
+            return Err(CleanupAttemptFailureError::ReceiptNotIncomplete);
+        }
+        self.receipt
+            .validate_for_boundary(provider_boundary(&self.receipt.provider))?;
+        Ok(())
+    }
+}
+
 impl SandboxCleanupReceipt {
     pub fn validate_against(
         &self,
@@ -1112,6 +1152,22 @@ pub enum CleanupReceiptError {
     MissingResidual,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum CleanupAttemptFailureError {
+    #[error("cleanup-attempt failure must report the cleanup stage")]
+    WrongStage,
+    #[error("cleanup-attempt failure must report incomplete cleanup")]
+    WrongKind,
+    #[error("cleanup-attempt failure must remain retryable")]
+    NotRetryable,
+    #[error("cleanup-attempt failure and receipt bindings differ")]
+    FailureReceiptMismatch,
+    #[error("cleanup-attempt failure must carry an incomplete receipt")]
+    ReceiptNotIncomplete,
+    #[error(transparent)]
+    Receipt(#[from] CleanupReceiptError),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SandboxLifecycleState {
@@ -1135,6 +1191,7 @@ pub enum SandboxLifecycleEvent {
     Attested(SandboxAttestation),
     ProviderUnavailable(ProviderUnavailable),
     Failed(SandboxFailure),
+    CleanupAttemptFailed(SandboxCleanupAttemptFailure),
     Closed(SandboxCleanupReceipt),
 }
 
@@ -1517,6 +1574,17 @@ mod tests {
         }
     }
 
+    fn incomplete_receipt(expected: &ExpectedSandboxAttestation) -> SandboxCleanupReceipt {
+        let mut receipt = complete_receipt(expected);
+        receipt.outcome = CleanupOutcome::Incomplete;
+        receipt.network_torn_down = false;
+        receipt.residuals.push(CleanupResidual {
+            kind: CleanupResidualKind::Network,
+            detail: DiagnosticText::new("isolated switch cleanup pending").expect("detail"),
+        });
+        receipt
+    }
+
     fn vm_policy() -> SandboxPolicy {
         let session_id = SessionId::new(7).expect("session id");
         SandboxPolicy {
@@ -1648,6 +1716,82 @@ mod tests {
         receipt
             .validate_against(&expected)
             .expect("audited incomplete cleanup");
+    }
+
+    #[test]
+    fn cleanup_attempt_failure_requires_retryable_bounded_incomplete_evidence() {
+        let expected = expected_attestation();
+        let receipt = incomplete_receipt(&expected);
+        let attempt = SandboxCleanupAttemptFailure {
+            failure: SandboxFailure {
+                session_id: receipt.session_id,
+                provider: receipt.provider.clone(),
+                stage: SandboxFailureStage::Cleanup,
+                kind: SandboxFailureKind::CleanupIncomplete,
+                retryable: true,
+                detail: DiagnosticText::new("cleanup requires a retry").expect("detail"),
+            },
+            receipt,
+        };
+        attempt.validate().expect("exact incomplete attempt");
+
+        let mut wrong_stage = attempt.clone();
+        wrong_stage.failure.stage = SandboxFailureStage::Runtime;
+        assert_eq!(
+            wrong_stage.validate(),
+            Err(CleanupAttemptFailureError::WrongStage)
+        );
+
+        let mut wrong_kind = attempt.clone();
+        wrong_kind.failure.kind = SandboxFailureKind::HelperFailure;
+        assert_eq!(
+            wrong_kind.validate(),
+            Err(CleanupAttemptFailureError::WrongKind)
+        );
+
+        let mut not_retryable = attempt.clone();
+        not_retryable.failure.retryable = false;
+        assert_eq!(
+            not_retryable.validate(),
+            Err(CleanupAttemptFailureError::NotRetryable)
+        );
+
+        let mut mismatched = attempt.clone();
+        mismatched.failure.session_id = SessionId::new(99).expect("other session");
+        assert_eq!(
+            mismatched.validate(),
+            Err(CleanupAttemptFailureError::FailureReceiptMismatch)
+        );
+
+        let mut complete = attempt.clone();
+        complete.receipt = complete_receipt(&expected);
+        assert_eq!(
+            complete.validate(),
+            Err(CleanupAttemptFailureError::ReceiptNotIncomplete)
+        );
+
+        let mut missing_residual = attempt.clone();
+        missing_residual.receipt.residuals.clear();
+        assert_eq!(
+            missing_residual.validate(),
+            Err(CleanupAttemptFailureError::Receipt(
+                CleanupReceiptError::MissingResidual
+            ))
+        );
+
+        let mut oversized = attempt;
+        while oversized.receipt.residuals.len() <= MAX_CLEANUP_RESIDUALS {
+            oversized.receipt.residuals.push(CleanupResidual {
+                kind: CleanupResidualKind::Provider,
+                detail: DiagnosticText::new("provider cleanup pending").expect("detail"),
+            });
+        }
+        assert_eq!(
+            oversized.validate(),
+            Err(CleanupAttemptFailureError::Receipt(
+                CleanupReceiptError::TooManyResiduals
+            ))
+        );
     }
 
     #[test]
