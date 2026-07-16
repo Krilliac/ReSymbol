@@ -1558,7 +1558,7 @@ fn encode_u64(encoded: &mut Vec<u8>, value: u64) {
 
 fn sync_parent_directory(parent: &Path, path: &Path) -> Result<(), ReviewError> {
     #[cfg(not(unix))]
-    let _ = parent;
+    let _ = (parent, path);
     #[cfg(unix)]
     File::open(parent)
         .and_then(|directory| directory.sync_all())

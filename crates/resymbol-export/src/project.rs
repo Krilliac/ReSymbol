@@ -437,12 +437,14 @@ fn project_claim<'claims>(
                     let value = address_entry(functions, *rva, entity_count)?;
                     let represented = project_address_assertion(
                         claim.assertion(),
-                        name_selection,
-                        *size,
-                        attribution.clone(),
                         value,
-                        true,
-                        function_subject,
+                        AddressAssertionContext {
+                            name_selection,
+                            subject_size: *size,
+                            attribution: attribution.clone(),
+                            is_function: true,
+                            subject: function_subject,
+                        },
                         warnings,
                     )?;
                     if represented {
@@ -473,12 +475,14 @@ fn project_claim<'claims>(
             let value = address_entry(globals, *rva, entity_count)?;
             let _ = project_address_assertion(
                 claim.assertion(),
-                name_selection,
-                *size,
-                attribution,
                 value,
-                false,
-                ExportSubject::Global { rva: *rva },
+                AddressAssertionContext {
+                    name_selection,
+                    subject_size: *size,
+                    attribution,
+                    is_function: false,
+                    subject: ExportSubject::Global { rva: *rva },
+                },
                 warnings,
             )?;
             Ok(())
@@ -778,16 +782,27 @@ fn control_flow_function_rva(target: &ExportControlFlowTarget) -> Option<u64> {
     }
 }
 
-fn project_address_assertion<'claims>(
-    assertion: &'claims SymbolAssertion,
+struct AddressAssertionContext {
     name_selection: NameSelection,
     subject_size: Option<u64>,
     attribution: ExportAttribution,
-    value: &mut AddressAccumulator<'claims>,
     is_function: bool,
     subject: ExportSubject,
+}
+
+fn project_address_assertion<'claims>(
+    assertion: &'claims SymbolAssertion,
+    value: &mut AddressAccumulator<'claims>,
+    context: AddressAssertionContext,
     warnings: &mut WarningAccumulator,
 ) -> Result<bool, ExportError> {
+    let AddressAssertionContext {
+        name_selection,
+        subject_size,
+        attribution,
+        is_function,
+        subject,
+    } = context;
     let represented = match assertion {
         SymbolAssertion::Name { name } => {
             let represented = valid_text(name, MAX_NAME_BYTES);

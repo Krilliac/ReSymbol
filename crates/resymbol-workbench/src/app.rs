@@ -213,7 +213,7 @@ enum ActivityLevel {
 
 enum ReviewUiAction {
     Apply {
-        subject: ReviewSubject,
+        subject: Box<ReviewSubject>,
         action: DecisionAction,
     },
     Undo,
@@ -2569,7 +2569,7 @@ impl WorkbenchApp {
                             if accept.clicked() {
                                 pending_review_action = selected_subject.cloned().map(|subject| {
                                     ReviewUiAction::Apply {
-                                        subject,
+                                        subject: Box::new(subject),
                                         action: DecisionAction::AcceptPrimary,
                                     }
                                 });
@@ -2582,7 +2582,7 @@ impl WorkbenchApp {
                             if keep_alias.clicked() {
                                 pending_review_action = selected_subject.cloned().map(|subject| {
                                     ReviewUiAction::Apply {
-                                        subject,
+                                        subject: Box::new(subject),
                                         action: DecisionAction::KeepAlias,
                                     }
                                 });
@@ -2595,7 +2595,7 @@ impl WorkbenchApp {
                             if reject.clicked() {
                                 pending_review_action = selected_subject.cloned().map(|subject| {
                                     ReviewUiAction::Apply {
-                                        subject,
+                                        subject: Box::new(subject),
                                         action: DecisionAction::Reject,
                                     }
                                 });
