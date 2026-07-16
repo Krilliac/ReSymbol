@@ -7,7 +7,7 @@ $TargetDir = if ($env:CARGO_TARGET_DIR) {
 } else {
     Join-Path $RepositoryDir "target/resymbol-example-wasm"
 }
-$LockedArgs = if (Test-Path (Join-Path $ExampleDir "Cargo.lock")) {
+[string[]]$LockedArgs = if (Test-Path (Join-Path $ExampleDir "Cargo.lock")) {
     @("--locked")
 } else {
     @()
