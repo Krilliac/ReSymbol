@@ -47,9 +47,9 @@ use crate::{
     review_state::BoundReviewLedger,
     theme::{SemanticColors, ThemePreset},
     worker::{
-        MAX_OFFLINE_IMAGE_UI_READ_BYTES, OfflineImageReadAvailability, OfflineImageReadOutcome,
-        OfflineImageReadSpan, OperationGate, OperationId, OperationSequence, ServiceWorker,
-        WorkerCommand, WorkerEvent, WorkerExportKind,
+        MAX_OFFLINE_IMAGE_UI_READ_BYTES, OfflineImageReadAvailability, OfflineImageReadFailure,
+        OfflineImageReadOutcome, OfflineImageReadSpan, OperationGate, OperationId,
+        OperationSequence, ServiceWorker, WorkerCommand, WorkerEvent, WorkerExportKind,
     },
 };
 
@@ -306,6 +306,7 @@ struct PendingOfflineRead {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum OfflineReadPresentation {
     Outcome(OfflineImageReadOutcome),
+    Failure(OfflineImageReadFailure),
     Error(String),
 }
 
@@ -371,8 +372,8 @@ impl OfflineReadUiState {
 
         match result {
             Err(error) => {
-                let detail = bounded_message(error.to_string());
-                self.presentation = Some(OfflineReadPresentation::Error(detail.clone()));
+                let detail = bounded_message(offline_read_failure_text(&error));
+                self.presentation = Some(OfflineReadPresentation::Failure(error));
                 OfflineReadEventDisposition::Failed { detail }
             }
             Ok(outcome) => {
@@ -3886,6 +3887,15 @@ impl WorkbenchApp {
                 if let Some(presentation) = presentation {
                     ui.add_space(7.0);
                     match presentation {
+                        OfflineReadPresentation::Failure(error) => {
+                            ui.colored_label(
+                                colors.destructive_quarantined,
+                                format!(
+                                    "[FAILED CLOSED] {}",
+                                    bounded_message(offline_read_failure_text(&error))
+                                ),
+                            );
+                        }
                         OfflineReadPresentation::Error(error) => {
                             ui.colored_label(
                                 colors.destructive_quarantined,
@@ -3906,6 +3916,12 @@ impl WorkbenchApp {
                                     );
                                     ui.label(
                                         RichText::new(offline_lifecycle_text(&outcome))
+                                            .color(colors.secondary_text),
+                                    );
+                                    ui.label(
+                                        RichText::new(offline_binding_text(&outcome))
+                                            .monospace()
+                                            .small()
                                             .color(colors.secondary_text),
                                     );
                                     ScrollArea::both()
@@ -3946,6 +3962,12 @@ impl WorkbenchApp {
                                     );
                                     ui.label(
                                         RichText::new(offline_lifecycle_text(&outcome))
+                                            .color(colors.secondary_text),
+                                    );
+                                    ui.label(
+                                        RichText::new(offline_binding_text(&outcome))
+                                            .monospace()
+                                            .small()
                                             .color(colors.secondary_text),
                                     );
                                 }
@@ -5290,14 +5312,43 @@ fn offline_read_banner(display: OfflineReadDisplay<'_>, rva: u64) -> String {
     }
 }
 
-fn offline_lifecycle_status(complete: bool, capability_count: usize) -> String {
-    if complete {
-        format!(
-            "Lifecycle complete: {capability_count} capabilities probed; session closed, released, and control disconnected"
-        )
-    } else {
-        "Lifecycle incomplete: result is not safe to present".to_owned()
+fn offline_pipeline_failure_text(stage: &str, detail: &str) -> String {
+    format!("[PIPELINE:{stage}] {detail}")
+}
+
+fn offline_read_failure_text(error: &OfflineImageReadFailure) -> String {
+    match error {
+        OfflineImageReadFailure::Pipeline(failure) => {
+            offline_pipeline_failure_text(failure.stage(), failure.detail())
+        }
+        _ => error.to_string(),
     }
+}
+
+fn lifecycle_flag(value: bool) -> &'static str {
+    if value { "yes" } else { "no" }
+}
+
+fn offline_lifecycle_status(
+    complete: bool,
+    capability_count: usize,
+    session_opened: bool,
+    session_closed: bool,
+    session_released: bool,
+    control_disconnected: bool,
+) -> String {
+    let status = if complete {
+        "Lifecycle complete"
+    } else {
+        "Lifecycle incomplete; result is not safe to present"
+    };
+    format!(
+        "{status}: {capability_count} capabilities probed | opened={} | closed={} | released={} | disconnected={}",
+        lifecycle_flag(session_opened),
+        lifecycle_flag(session_closed),
+        lifecycle_flag(session_released),
+        lifecycle_flag(control_disconnected),
+    )
 }
 
 fn offline_lifecycle_text(outcome: &OfflineImageReadOutcome) -> String {
@@ -5305,7 +5356,25 @@ fn offline_lifecycle_text(outcome: &OfflineImageReadOutcome) -> String {
     format!(
         "Session {} | {}",
         lifecycle.session_id().get(),
-        offline_lifecycle_status(lifecycle.is_complete(), lifecycle.capability_count())
+        offline_lifecycle_status(
+            lifecycle.is_complete(),
+            lifecycle.capability_count(),
+            lifecycle.session_opened(),
+            lifecycle.session_closed(),
+            lifecycle.session_released(),
+            lifecycle.control_disconnected(),
+        )
+    )
+}
+
+fn offline_binding_text(outcome: &OfflineImageReadOutcome) -> String {
+    let binding = outcome.binding();
+    format!(
+        "Exact source {} | {} byte span at RVA 0x{:X} | {}",
+        short_hash(binding.identity().id.as_str()),
+        outcome.span().size(),
+        outcome.span().rva(),
+        binding.source_path().display(),
     )
 }
 
@@ -6100,6 +6169,36 @@ mod tests {
     }
 
     #[test]
+    fn offline_state_preserves_typed_worker_failures_for_safe_rendering() {
+        let (_source, project) = loaded_project_with_source();
+        let source = OfflineSourceBinding::from_project(&project).expect("source binding");
+        let binding = OfflineReadRequestBinding {
+            source: source.clone(),
+            span: OfflineImageReadSpan::new(0, 64).expect("span"),
+        };
+        let operation = OperationSequence::default().issue();
+        let mut state = OfflineReadUiState::default();
+        state.begin(operation, binding);
+
+        let disposition = state.accept(
+            operation,
+            Err(OfflineImageReadFailure::VerifiedSourceRequired),
+            Some(source),
+        );
+
+        assert!(matches!(
+            disposition,
+            OfflineReadEventDisposition::Failed { .. }
+        ));
+        assert_eq!(
+            state.presentation,
+            Some(OfflineReadPresentation::Failure(
+                OfflineImageReadFailure::VerifiedSourceRequired
+            ))
+        );
+    }
+
+    #[test]
     fn offline_success_and_unavailable_present_complete_lifecycle_evidence() {
         assert_eq!(
             offline_read_banner(OfflineReadDisplay::Available { byte_count: 64 }, 0x1234),
@@ -6115,14 +6214,22 @@ mod tests {
             ),
             "[RANGE UNAVAILABLE:offline-range-unavailable] RVA 0x2000: span crosses exact file backing"
         );
-        let lifecycle = offline_lifecycle_status(true, 14);
+        let lifecycle = offline_lifecycle_status(true, 14, true, true, true, true);
         assert_eq!(
             lifecycle,
-            "Lifecycle complete: 14 capabilities probed; session closed, released, and control disconnected"
+            "Lifecycle complete: 14 capabilities probed | opened=yes | closed=yes | released=yes | disconnected=yes"
         );
         assert_eq!(
-            offline_lifecycle_status(false, 14),
-            "Lifecycle incomplete: result is not safe to present"
+            offline_lifecycle_status(false, 14, true, false, true, false),
+            "Lifecycle incomplete; result is not safe to present: 14 capabilities probed | opened=yes | closed=no | released=yes | disconnected=no"
+        );
+        assert_eq!(
+            offline_pipeline_failure_text("offline read", "host rejected the span"),
+            "[PIPELINE:offline read] host rejected the span"
+        );
+        assert_eq!(
+            offline_read_failure_text(&OfflineImageReadFailure::VerifiedSourceRequired),
+            "the project has no exact identity-verified source snapshot"
         );
     }
 
