@@ -3413,9 +3413,8 @@ mod tests {
 
     #[test]
     fn reviewed_view_changes_live_without_mutating_the_project_snapshot() {
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join(
-            "../../fixtures/pe-x64-msvc/artifacts/milestone2-symbolized.exe",
-        );
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/pe-x64-msvc/artifacts/milestone2-symbolized.exe");
         let project = resymbol_app::AppServices::default()
             .analyze_binary(&fixture)
             .expect("checked-in fixture should analyze");
