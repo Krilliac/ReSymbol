@@ -205,9 +205,16 @@ fn exercise_runtime() {
             ..
         }
     ));
-    assert_eq!(
-        oversized.diagnostics().unwrap().stderr,
-        "oversized diagnostic\n"
+    // Closing stdout after the bounded prefix races the mock's BrokenPipe handler, which may append
+    // its own bounded error. The pre-limit diagnostic and configured cap are the stable contract.
+    let oversized_stderr = &oversized.diagnostics().unwrap().stderr;
+    assert!(
+        oversized_stderr.starts_with("oversized diagnostic\n"),
+        "the diagnostic emitted before the stream violation was lost: {oversized_stderr:?}"
+    );
+    assert!(
+        oversized_stderr.len() <= output_host.limits().max_stderr_bytes,
+        "captured stderr exceeded its configured limit"
     );
     let descendant_oversized = output_host
         .execute_trusted(&fixture.plugin, &fixture.request("descendant-oversized"))
