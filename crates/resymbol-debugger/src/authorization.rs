@@ -78,6 +78,7 @@ pub enum HostRiskOperation {
 
 /// Exact, non-authority description of one approved host launch.
 ///
+/// Create an intent before issuing its lease with [`HostLaunchIntent::new`].
 /// Sandboxed launches use provider attestation instead of a host-risk lease and
 /// are rejected by [`HostLaunchIntent::from_target`]. Executable and working
 /// directory paths are bound exactly as lexical values. This does not
@@ -94,6 +95,25 @@ pub struct HostLaunchIntent {
 }
 
 impl HostLaunchIntent {
+    /// Describes an approved host launch before its unpredictable lease ID is
+    /// issued. This value carries no authority by itself.
+    #[must_use]
+    pub fn new(
+        binary_id: BinaryId,
+        executable: impl Into<PathBuf>,
+        arguments: Vec<String>,
+        working_directory: Option<PathBuf>,
+        stop_before_entry: bool,
+    ) -> Self {
+        Self {
+            binary_id,
+            executable: executable.into(),
+            arguments,
+            working_directory,
+            stop_before_entry,
+        }
+    }
+
     pub fn from_target(target: &LaunchTarget) -> Result<Self, HostLaunchIntentError> {
         if !matches!(&target.environment, LaunchEnvironment::Host { .. }) {
             return Err(HostLaunchIntentError::SandboxedTarget);
@@ -105,6 +125,19 @@ impl HostLaunchIntent {
             working_directory: target.working_directory.clone(),
             stop_before_entry: target.stop_before_entry,
         })
+    }
+
+    /// Binds this exact approved intent to a freshly issued lease ID.
+    #[must_use]
+    pub fn into_target(self, risk_lease: HostRiskLeaseId) -> LaunchTarget {
+        LaunchTarget {
+            binary_id: self.binary_id,
+            executable: self.executable,
+            arguments: self.arguments,
+            working_directory: self.working_directory,
+            environment: LaunchEnvironment::Host { risk_lease },
+            stop_before_entry: self.stop_before_entry,
+        }
     }
 
     #[must_use]
@@ -225,6 +258,22 @@ impl HostRiskLeaseIssuer {
             verifier: verifier.clone(),
         };
         Ok((lease, verifier))
+    }
+
+    /// Atomically mints the authority pair and binds its unpredictable ID to
+    /// the exact approved launch fields.
+    pub fn issue_launch(
+        &mut self,
+        session_id: SessionId,
+        provisioning_epoch: ProvisioningEpoch,
+        intent: HostLaunchIntent,
+    ) -> Result<(LaunchTarget, HostRiskLease, HostRiskVerifier), AuthorizationIssuanceError> {
+        let operation = HostRiskOperation::Launch {
+            intent: intent.clone(),
+        };
+        let (lease, verifier) = self.issue(session_id, provisioning_epoch, operation)?;
+        let target = intent.into_target(lease.id().clone());
+        Ok((target, lease, verifier))
     }
 }
 
@@ -574,30 +623,35 @@ mod tests {
     fn trusted_issuers_return_unique_lease_and_verifier_pairs() {
         let session_id = SessionId::new(7).expect("session id");
         let epoch = ProvisioningEpoch::new("9".repeat(64)).expect("provisioning epoch");
-        let placeholder = HostRiskLeaseId::new("a".repeat(64)).expect("placeholder lease id");
-        let target = LaunchTarget {
-            binary_id: BinaryId::digest(b"issuer target"),
-            executable: PathBuf::from("sample.exe"),
-            arguments: Vec::new(),
-            working_directory: None,
-            environment: LaunchEnvironment::Host {
-                risk_lease: placeholder,
-            },
-            stop_before_entry: true,
-        };
-        let operation = HostRiskOperation::Launch {
-            intent: HostLaunchIntent::from_target(&target).expect("host target"),
-        };
+        let intent = HostLaunchIntent::new(
+            BinaryId::digest(b"issuer target"),
+            PathBuf::from("sample.exe"),
+            Vec::new(),
+            None,
+            true,
+        );
         let mut host_issuer = HostRiskLeaseIssuer::new().expect("host-risk issuer");
-        let (first, first_verifier) = host_issuer
-            .issue(session_id, epoch.clone(), operation.clone())
+        let (first_target, first, first_verifier) = host_issuer
+            .issue_launch(session_id, epoch.clone(), intent.clone())
             .expect("first host-risk grant");
-        let (second, second_verifier) = host_issuer
-            .issue(session_id, epoch, operation)
+        let (second_target, second, second_verifier) = host_issuer
+            .issue_launch(session_id, epoch, intent.clone())
             .expect("second host-risk grant");
         assert_eq!(first.id(), first_verifier.id());
         assert_eq!(second.id(), second_verifier.id());
         assert_ne!(first.id(), second.id());
+        assert_eq!(
+            HostLaunchIntent::from_target(&first_target).expect("issued host target"),
+            intent
+        );
+        assert!(matches!(
+            &first_target.environment,
+            LaunchEnvironment::Host { risk_lease } if risk_lease == first.id()
+        ));
+        assert!(matches!(
+            &second_target.environment,
+            LaunchEnvironment::Host { risk_lease } if risk_lease == second.id()
+        ));
 
         let binding = SandboxOwnershipBinding::new(
             session_id,

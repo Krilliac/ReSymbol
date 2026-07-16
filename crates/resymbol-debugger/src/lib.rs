@@ -88,5 +88,6 @@ pub use sandbox::{
     VmIsolationIdentity, Win32kProfile,
 };
 pub use session_machine::{
-    MAX_REGISTERED_AUTHORIZATION_LEASES, SessionMachine, SessionMachineError,
+    MAX_REGISTERED_AUTHORIZATION_LEASES, RemoteCommandCheckpoint, SessionMachine,
+    SessionMachineError,
 };

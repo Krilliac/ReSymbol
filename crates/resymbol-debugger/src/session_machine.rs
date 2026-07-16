@@ -74,11 +74,46 @@ enum ExecutionGate {
 
 /// Move-only, reducer-instance-bound transaction ticket for one remote command.
 ///
-/// The ticket is crate-private so only the audited host client can resolve a
-/// remote command. Its rollback image deliberately excludes command, run/stop,
-/// and one-use authority watermarks.
+/// Its fields stay private so an external host worker can resolve a command
+/// only through [`SessionMachine::commit_remote_command`] or
+/// [`SessionMachine::reject_remote_command`]. Its rollback image deliberately
+/// excludes command, run/stop, and one-use authority watermarks.
+///
+/// ```no_run
+/// use resymbol_debugger::{
+///     CommandEnvelope, CommandId, RemoteCommandCheckpoint, SessionMachine,
+///     SessionMachineError,
+/// };
+///
+/// fn begin(
+///     machine: &mut SessionMachine,
+///     command: &CommandEnvelope,
+/// ) -> Result<RemoteCommandCheckpoint, SessionMachineError> {
+///     machine.begin_remote_command(command)
+/// }
+///
+/// fn commit(
+///     machine: &mut SessionMachine,
+///     checkpoint: RemoteCommandCheckpoint,
+///     command_id: CommandId,
+/// ) -> Result<(), SessionMachineError> {
+///     machine
+///         .commit_remote_command(checkpoint, command_id)
+///         .map(|_| ())
+/// }
+///
+/// fn reject(
+///     machine: &mut SessionMachine,
+///     checkpoint: RemoteCommandCheckpoint,
+///     command_id: CommandId,
+/// ) -> Result<(), SessionMachineError> {
+///     machine
+///         .reject_remote_command(checkpoint, command_id)
+///         .map(|_| ())
+/// }
+/// ```
 #[derive(Debug)]
-pub(crate) struct RemoteCommandCheckpoint {
+pub struct RemoteCommandCheckpoint {
     reducer_instance: Arc<ReducerInstanceBinding>,
     command_id: CommandId,
     state: SessionState,
@@ -322,7 +357,7 @@ impl SessionMachine {
     /// allocation, the accepted command, and the exact post-accept state.
     /// Command IDs and consumed/cleared authority remain one-use even when the
     /// remote operation reports no effect.
-    pub(crate) fn begin_remote_command(
+    pub fn begin_remote_command(
         &mut self,
         envelope: &CommandEnvelope,
     ) -> Result<RemoteCommandCheckpoint, SessionMachineError> {
@@ -349,7 +384,7 @@ impl SessionMachine {
     /// Resolves a remote command whose response has been fully validated and
     /// whose effects must be retained, including a rejected sandbox operation
     /// that entered a cleanup-required failure state.
-    pub(crate) fn commit_remote_command(
+    pub fn commit_remote_command(
         &mut self,
         checkpoint: RemoteCommandCheckpoint,
         command_id: CommandId,
@@ -361,7 +396,7 @@ impl SessionMachine {
 
     /// Restores visible state after an exact, effect-free remote rejection
     /// without restoring command IDs, token allocation, or one-use authority.
-    pub(crate) fn reject_remote_command(
+    pub fn reject_remote_command(
         &mut self,
         checkpoint: RemoteCommandCheckpoint,
         command_id: CommandId,
@@ -1125,15 +1160,15 @@ mod tests {
         })
     }
 
-    fn host_launch_operation(
-        binary_id: BinaryId,
-        risk_lease: HostRiskLeaseId,
-    ) -> HostRiskOperation {
-        let DebugTargetRequest::Launch(target) = host_target(binary_id, risk_lease) else {
-            unreachable!("host target is a launch")
-        };
+    fn host_launch_operation(binary_id: BinaryId) -> HostRiskOperation {
         HostRiskOperation::Launch {
-            intent: HostLaunchIntent::from_target(&target).expect("host launch target"),
+            intent: HostLaunchIntent::new(
+                binary_id,
+                PathBuf::from("sample.exe"),
+                Vec::new(),
+                None,
+                true,
+            ),
         }
     }
 
@@ -1697,7 +1732,7 @@ mod tests {
                 risk_lease.clone(),
                 session_id(),
                 provisioning_epoch(),
-                host_launch_operation(binary.clone(), risk_lease.clone()),
+                host_launch_operation(binary.clone()),
             ))
             .expect("register host-risk lease");
         let initial = machine.state().state_token();
@@ -1713,6 +1748,41 @@ mod tests {
         machine
             .mark_stopped(StopReason::Initial, ThreadId::new(7).expect("thread id"))
             .expect("host initial stop");
+    }
+
+    #[test]
+    fn issuer_mints_an_exact_launch_target_that_registers_and_opens() {
+        let binary = BinaryId::digest(b"issuer-bound host target");
+        let intent = HostLaunchIntent::new(
+            binary.clone(),
+            PathBuf::from("sample.exe"),
+            vec!["--approved".to_owned()],
+            Some(PathBuf::from("approved-workdir")),
+            true,
+        );
+        let mut issuer = HostRiskLeaseIssuer::new().expect("host-risk issuer");
+        let (target, lease, verifier) = issuer
+            .issue_launch(session_id(), provisioning_epoch(), intent.clone())
+            .expect("issued host launch");
+        assert_eq!(
+            HostLaunchIntent::from_target(&target).expect("issued host target"),
+            intent
+        );
+        assert_eq!(lease.id(), verifier.id());
+
+        let mut machine = machine();
+        machine
+            .register_host_risk_lease(lease)
+            .expect("register issued host-risk lease");
+        let initial = machine.state().state_token();
+        machine
+            .accept_command(&command(
+                1,
+                initial,
+                DebugCommand::Open(DebugTargetRequest::Launch(target)),
+            ))
+            .expect("accept issuer-bound launch");
+        assert_eq!(machine.target_binary_id(), Some(&binary));
     }
 
     #[test]
@@ -1738,11 +1808,11 @@ mod tests {
     #[test]
     fn issuer_pair_cannot_register_the_same_grant_twice() {
         let binary = BinaryId::digest(b"unique host grant");
-        let placeholder = host_risk_lease_id('1');
-        let operation = host_launch_operation(binary, placeholder);
+        let intent =
+            HostLaunchIntent::new(binary, PathBuf::from("sample.exe"), Vec::new(), None, true);
         let mut issuer = HostRiskLeaseIssuer::new().expect("host-risk issuer");
-        let (lease, verifier) = issuer
-            .issue(session_id(), provisioning_epoch(), operation)
+        let (_target, lease, verifier) = issuer
+            .issue_launch(session_id(), provisioning_epoch(), intent)
             .expect("host-risk grant");
         let mut host_machine = machine();
         host_machine
@@ -1784,7 +1854,7 @@ mod tests {
                 lease_id.clone(),
                 session_id(),
                 provisioning_epoch(),
-                host_launch_operation(approved.clone(), lease_id.clone()),
+                host_launch_operation(approved.clone()),
             ))
             .expect("register host-risk lease");
 
@@ -1811,10 +1881,7 @@ mod tests {
                 host_risk_lease_id('c'),
                 session_id(),
                 provisioning_epoch(),
-                host_launch_operation(
-                    BinaryId::digest(b"approved host target"),
-                    host_risk_lease_id('c'),
-                ),
+                host_launch_operation(BinaryId::digest(b"approved host target")),
             )),
             Err(SessionMachineError::DuplicateAuthorizationLease)
         );
