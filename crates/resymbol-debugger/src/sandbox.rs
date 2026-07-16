@@ -8,6 +8,7 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use crate::identity::{ProvisioningEpoch, SessionId};
+use crate::protocol::ProcessIdentity;
 
 const MAX_PROVIDER_ID_BYTES: usize = 96;
 const MAX_ACK_ID_BYTES: usize = 128;
@@ -1020,6 +1021,11 @@ pub struct SandboxCleanupReceipt {
     pub provisioning_epoch: ProvisioningEpoch,
     pub provider: SandboxProviderSelection,
     pub policy_digest: PolicyDigest,
+    /// Exact target identity for cleanup inherited from an existing sandbox.
+    /// Provider-created launch cleanup has no separately trusted process
+    /// binding and therefore leaves this field absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process: Option<ProcessIdentity>,
     pub outcome: CleanupOutcome,
     pub process_tree_terminated_and_reaped: bool,
     pub handles_closed: bool,
@@ -1046,9 +1052,20 @@ impl SandboxCleanupReceipt {
             || self.provisioning_epoch != expected.provisioning_epoch
             || self.provider != expected.provider
             || self.policy_digest != expected.policy_digest
+            || self.process.is_some()
         {
             return Err(CleanupReceiptError::BindingMismatch);
         }
+        self.validate_for_boundary(expected.boundary)
+    }
+
+    /// Validates the provider-independent completion claims for a known
+    /// isolation boundary. Callers must validate the receipt's ownership
+    /// binding before invoking this helper.
+    pub(crate) fn validate_for_boundary(
+        &self,
+        boundary: IsolationBoundary,
+    ) -> Result<(), CleanupReceiptError> {
         if self.residuals.len() > MAX_CLEANUP_RESIDUALS {
             return Err(CleanupReceiptError::TooManyResiduals);
         }
@@ -1058,7 +1075,7 @@ impl SandboxCleanupReceipt {
             && self.registry_rolled_back
             && self.network_torn_down
             && self.owned_paths_deleted;
-        let provider_clean = match expected.boundary {
+        let provider_clean = match boundary {
             IsolationBoundary::UserMode => {
                 self.appcontainer_profile_deleted == Some(true)
                     && self.differencing_disk_discarded.is_none()
@@ -1484,6 +1501,7 @@ mod tests {
             provisioning_epoch: expected.provisioning_epoch.clone(),
             provider: expected.provider.clone(),
             policy_digest: expected.policy_digest.clone(),
+            process: None,
             outcome: CleanupOutcome::Complete,
             process_tree_terminated_and_reaped: true,
             handles_closed: true,

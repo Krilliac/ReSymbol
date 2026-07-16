@@ -15,8 +15,9 @@ use crate::protocol::{
     StateGeneration, StateToken, StopId, StopReason, StopToken, ThreadId,
 };
 use crate::sandbox::{
-    ExpectedSandboxAttestation, HelperBuildId, PolicyValidationError, SandboxAttestation,
-    SandboxCleanupReceipt, SandboxLifecycleState, SandboxMachine, SandboxMachineError,
+    CleanupOutcome, ExpectedSandboxAttestation, HelperBuildId, PolicyValidationError,
+    SandboxAttestation, SandboxCleanupReceipt, SandboxLifecycleState, SandboxMachine,
+    SandboxMachineError, provider_boundary,
 };
 
 pub const MAX_REGISTERED_AUTHORIZATION_LEASES: usize = 64;
@@ -413,16 +414,47 @@ impl SessionMachine {
     ) -> Result<&SessionState, SessionMachineError> {
         self.require_state("complete close", &[SessionStateKind::Closing])?;
         let next = self.next_state_token()?;
-        match (&mut self.sandbox, receipt) {
-            (Some(sandbox), Some(receipt)) => {
+        match (&mut self.sandbox, &self.inherited_sandbox, receipt) {
+            (Some(sandbox), None, Some(receipt)) => {
                 sandbox.close(receipt)?;
             }
-            (Some(_), None) => return Err(SessionMachineError::MissingCleanupReceipt),
-            (None, Some(_)) => return Err(SessionMachineError::UnexpectedCleanupReceipt),
-            (None, None) => {}
+            (None, Some(binding), Some(receipt)) => {
+                Self::validate_inherited_cleanup(binding, receipt)?;
+            }
+            (Some(_), None, None) | (None, Some(_), None) => {
+                return Err(SessionMachineError::MissingCleanupReceipt);
+            }
+            (None, None, Some(_)) => {
+                return Err(SessionMachineError::UnexpectedCleanupReceipt);
+            }
+            (None, None, None) => {}
+            (Some(_), Some(_), _) => {
+                return Err(SessionMachineError::ConflictingSandboxOwnership);
+            }
         }
         self.transition_to(SessionState::Closed { token: next })?;
         Ok(&self.state)
+    }
+
+    fn validate_inherited_cleanup(
+        binding: &SandboxOwnershipBinding,
+        receipt: &SandboxCleanupReceipt,
+    ) -> Result<(), SessionMachineError> {
+        if receipt.session_id != binding.session_id()
+            || &receipt.provisioning_epoch != binding.provisioning_epoch()
+            || &receipt.provider != binding.provider()
+            || &receipt.policy_digest != binding.policy_digest()
+            || receipt.process.as_ref() != Some(binding.process())
+        {
+            return Err(SessionMachineError::InheritedCleanupReceiptMismatch);
+        }
+        receipt
+            .validate_for_boundary(provider_boundary(binding.provider()))
+            .map_err(SandboxMachineError::Cleanup)?;
+        if receipt.outcome != CleanupOutcome::Complete {
+            return Err(SandboxMachineError::CleanupIncomplete.into());
+        }
+        Ok(())
     }
 
     fn accept_open(&mut self, target: DebugTargetRequest) -> Result<(), SessionMachineError> {
@@ -707,6 +739,10 @@ pub enum SessionMachineError {
     MissingCleanupReceipt,
     #[error("non-sandbox close unexpectedly carried a cleanup receipt")]
     UnexpectedCleanupReceipt,
+    #[error("inherited sandbox cleanup receipt does not match the exact ownership binding")]
+    InheritedCleanupReceiptMismatch,
+    #[error("session contains conflicting sandbox ownership records")]
+    ConflictingSandboxOwnership,
     #[error("failure message must be nonempty, single-line, and bounded")]
     InvalidFailureMessage,
     #[error("stop identifier exhausted its u64 space")]
@@ -869,6 +905,7 @@ mod tests {
             provisioning_epoch: expected.provisioning_epoch.clone(),
             provider: expected.provider.clone(),
             policy_digest: expected.policy_digest.clone(),
+            process: None,
             outcome: CleanupOutcome::Complete,
             process_tree_terminated_and_reaped: true,
             handles_closed: true,
@@ -879,6 +916,34 @@ mod tests {
             appcontainer_profile_deleted: Some(true),
             differencing_disk_discarded: None,
             control_channel_closed: None,
+            terminated_processes: 1,
+            residuals: Vec::new(),
+        }
+    }
+
+    fn inherited_cleanup_receipt(binding: &SandboxOwnershipBinding) -> SandboxCleanupReceipt {
+        let (appcontainer_profile_deleted, differencing_disk_discarded, control_channel_closed) =
+            match provider_boundary(binding.provider()) {
+                IsolationBoundary::UserMode => (Some(true), None, None),
+                IsolationBoundary::Hypervisor => (None, Some(true), Some(true)),
+            };
+        SandboxCleanupReceipt {
+            receipt_id: CleanupReceiptId::new("inherited-cleanup-11").expect("receipt id"),
+            session_id: binding.session_id(),
+            provisioning_epoch: binding.provisioning_epoch().clone(),
+            provider: binding.provider().clone(),
+            policy_digest: binding.policy_digest().clone(),
+            process: Some(binding.process().clone()),
+            outcome: CleanupOutcome::Complete,
+            process_tree_terminated_and_reaped: true,
+            handles_closed: true,
+            file_system_rolled_back: true,
+            registry_rolled_back: true,
+            network_torn_down: true,
+            owned_paths_deleted: true,
+            appcontainer_profile_deleted,
+            differencing_disk_discarded,
+            control_channel_closed,
             terminated_processes: 1,
             residuals: Vec::new(),
         }
@@ -1443,6 +1508,94 @@ mod tests {
             )),
             Err(SessionMachineError::ProvisioningEpochMismatch)
         );
+    }
+
+    #[test]
+    fn inherited_sandbox_close_requires_exact_fresh_cleanup_and_rejects_replay() {
+        let process = process_identity(7000, 40, b"inherited cleanup image");
+        let binding = SandboxOwnershipBinding::new(
+            session_id(),
+            process.clone(),
+            AttachMode::Debug,
+            SandboxProviderSelection::LocalAppContainer,
+            PolicyDigest::new("7".repeat(64)).expect("policy digest"),
+            provisioning_epoch(),
+        );
+        let lease_id = ownership_lease_id('7');
+        let mut machine = machine();
+        machine
+            .register_sandbox_ownership_lease(SandboxOwnershipLease::new(
+                lease_id.clone(),
+                binding.clone(),
+            ))
+            .expect("register ownership lease");
+        let initial = machine.state().state_token();
+        machine
+            .accept_command(&command(
+                1,
+                initial,
+                DebugCommand::Open(attach_target(AttachScope::OwnedSandbox {
+                    process,
+                    ownership_lease: lease_id,
+                })),
+            ))
+            .expect("open inherited sandbox");
+        machine
+            .mark_stopped(StopReason::Initial, ThreadId::new(9).expect("thread id"))
+            .expect("initial stop");
+        let stopped = machine.state().state_token();
+        machine
+            .accept_command(&command(2, stopped, DebugCommand::Close { state: stopped }))
+            .expect("begin inherited close");
+
+        assert_eq!(
+            machine.complete_close(None),
+            Err(SessionMachineError::MissingCleanupReceipt)
+        );
+
+        let exact = inherited_cleanup_receipt(&binding);
+        let mut mismatches = Vec::new();
+
+        let mut wrong_session = exact.clone();
+        wrong_session.session_id = SessionId::new(12).expect("other session");
+        mismatches.push(wrong_session);
+
+        let mut stale_epoch = exact.clone();
+        stale_epoch.provisioning_epoch =
+            ProvisioningEpoch::new("8".repeat(64)).expect("stale epoch");
+        mismatches.push(stale_epoch);
+
+        let mut wrong_provider = exact.clone();
+        wrong_provider.provider = SandboxProviderSelection::HyperV;
+        mismatches.push(wrong_provider);
+
+        let mut wrong_policy = exact.clone();
+        wrong_policy.policy_digest = PolicyDigest::new("9".repeat(64)).expect("other policy");
+        mismatches.push(wrong_policy);
+
+        let mut wrong_process = exact.clone();
+        wrong_process.process = Some(process_identity(7000, 41, b"inherited cleanup image"));
+        mismatches.push(wrong_process);
+
+        for mismatch in mismatches {
+            assert_eq!(
+                machine.complete_close(Some(&mismatch)),
+                Err(SessionMachineError::InheritedCleanupReceiptMismatch)
+            );
+            assert_eq!(machine.state().kind(), SessionStateKind::Closing);
+        }
+
+        machine
+            .complete_close(Some(&exact))
+            .expect("exact cleanup closes inherited sandbox");
+        assert_eq!(machine.state().kind(), SessionStateKind::Closed);
+        assert!(matches!(
+            machine.complete_close(Some(&exact)),
+            Err(SessionMachineError::InvalidTransition {
+                from: SessionStateKind::Closed,
+                action: "complete close",
+            })
+        ));
     }
 
     #[test]
