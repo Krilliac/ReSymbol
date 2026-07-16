@@ -37,7 +37,7 @@ use crate::{
         ReconstructionGraph, ReconstructionGraphView, ReconstructionGraphViewNode,
     },
     model::{
-        FunctionFilter, FunctionSort, FunctionSortKey, FunctionStatus, LoadedProject,
+        FunctionFilter, FunctionRow, FunctionSort, FunctionSortKey, FunctionStatus, LoadedProject,
         ProtectionAssessment, SortDirection,
     },
     readiness::{
@@ -46,6 +46,11 @@ use crate::{
     },
     review_state::BoundReviewLedger,
     theme::{SemanticColors, ThemePreset},
+    ui_policy::{
+        CycleDirection, DEFAULT_INSPECTOR_PANEL_WIDTH, DEFAULT_PROJECT_PANEL_WIDTH,
+        MainTabPresentation, RowNavigation, cycle_index, function_table_layout,
+        main_tab_presentation, navigate_visible_selection, shell_chrome_layout,
+    },
     worker::{
         MAX_OFFLINE_IMAGE_UI_READ_BYTES, OfflineImageReadAvailability, OfflineImageReadFailure,
         OfflineImageReadOutcome, OfflineImageReadSpan, OperationGate, OperationId,
@@ -58,6 +63,7 @@ const MAX_ACTIVITY_ENTRIES: usize = 512;
 const MAX_ACTIVITY_MESSAGE_BYTES: usize = 512;
 const OFFLINE_READ_SIZES: [u32; 5] = [16, 32, 64, 128, MAX_OFFLINE_IMAGE_UI_READ_BYTES];
 const OFFLINE_HEX_ROW_BYTES: usize = 16;
+const FUNCTION_KEYBOARD_PAGE_ROWS: usize = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkflowStage {
@@ -120,6 +126,32 @@ impl MainTab {
             Self::AddressSpace => "Address Space",
             Self::DebuggerSandbox => "Debugger / Sandbox",
             Self::Exports => "Exports",
+        }
+    }
+
+    const fn compact_label(self) -> &'static str {
+        match self {
+            Self::Overview => "Overview",
+            Self::Functions => "Functions",
+            Self::Types => "Types",
+            Self::Relationships => "Relations",
+            Self::Graph => "Graph",
+            Self::AddressSpace => "Address",
+            Self::DebuggerSandbox => "Sandbox",
+            Self::Exports => "Exports",
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Overview => 0,
+            Self::Functions => 1,
+            Self::Types => 2,
+            Self::Relationships => 3,
+            Self::Graph => 4,
+            Self::AddressSpace => 5,
+            Self::DebuggerSandbox => 6,
+            Self::Exports => 7,
         }
     }
 
@@ -452,6 +484,9 @@ pub struct WorkbenchApp {
     analysis_path: Option<PathBuf>,
     function_filter: FunctionFilter,
     function_sort: FunctionSort,
+    function_search_focus_requested: bool,
+    function_row_focus_target: Option<usize>,
+    function_focused_row_id: Option<egui::Id>,
     selected_projection_index: Option<usize>,
     selected_review_subject: Option<ReviewSubject>,
     graph_root_rva: Option<u64>,
@@ -552,6 +587,9 @@ impl WorkbenchApp {
             analysis_path: None,
             function_filter: FunctionFilter::default(),
             function_sort: FunctionSort::default(),
+            function_search_focus_requested: false,
+            function_row_focus_target: None,
+            function_focused_row_id: None,
             selected_projection_index: None,
             selected_review_subject: None,
             graph_root_rva: None,
@@ -629,7 +667,7 @@ impl WorkbenchApp {
             app.stage = WorkflowStage::Review;
             app.main_tab = match tab.as_str() {
                 "overview" => MainTab::Overview,
-                "functions" => MainTab::Functions,
+                "functions" | "functions-focused" => MainTab::Functions,
                 "graph" => MainTab::Graph,
                 "address-space" | "memory-map" => MainTab::AddressSpace,
                 "debugger-sandbox" | "readiness" => MainTab::DebuggerSandbox,
@@ -640,6 +678,9 @@ impl WorkbenchApp {
                 _ => panic!("unsupported screenshot tab {tab:?}"),
             };
             app.project = Some(project);
+            if tab == "functions-focused" {
+                app.function_row_focus_target = app.selected_projection_index;
+            }
             if app.main_tab == MainTab::DebuggerSandbox {
                 app.queue_sandbox_readiness_probe()
                     .unwrap_or_else(|error| panic!("cannot queue readiness capture: {error}"));
@@ -2077,10 +2118,97 @@ impl WorkbenchApp {
         }
     }
 
+    fn select_main_tab(&mut self, tab: MainTab) {
+        self.main_tab = tab;
+        self.stage = if tab == MainTab::Exports {
+            WorkflowStage::Export
+        } else if self.project.is_some() {
+            WorkflowStage::Review
+        } else {
+            WorkflowStage::Open
+        };
+        if tab != MainTab::Functions {
+            self.function_row_focus_target = None;
+            self.function_focused_row_id = None;
+        }
+    }
+
+    fn cycle_main_tab(&mut self, direction: CycleDirection) {
+        let Some(next_index) = cycle_index(self.main_tab.index(), MainTab::ALL.len(), direction)
+        else {
+            return;
+        };
+        self.select_main_tab(MainTab::ALL[next_index]);
+    }
+
+    fn navigate_function_selection(&mut self, navigation: RowNavigation) {
+        let Some(project) = &self.project else {
+            return;
+        };
+        let visible = project.visible_function_indices(&self.function_filter, self.function_sort);
+        let visible_projection_indices = visible
+            .iter()
+            .map(|index| project.functions[*index].projection_index)
+            .collect::<Vec<_>>();
+        let Some(next) = navigate_visible_selection(
+            &visible_projection_indices,
+            self.selected_projection_index,
+            navigation,
+            FUNCTION_KEYBOARD_PAGE_ROWS,
+        ) else {
+            return;
+        };
+        let next_rva = project.functions.get(next).map(|row| row.rva);
+        self.selected_projection_index = Some(next);
+        self.graph_root_rva = next_rva;
+        self.function_row_focus_target = Some(next);
+    }
+
     fn handle_inputs(&mut self, context: &egui::Context) {
         if self.close_confirmation_open {
             return;
         }
+        let (tab_cycle, focus_function_search, row_navigation) = context.input(|input| {
+            let command = input.modifiers.command;
+            let tab_cycle = if command && input.key_pressed(Key::Tab) {
+                Some(if input.modifiers.shift {
+                    CycleDirection::Previous
+                } else {
+                    CycleDirection::Next
+                })
+            } else {
+                None
+            };
+            let focus_function_search = command && input.key_pressed(Key::F);
+            let row_navigation = if command || input.modifiers.alt || input.pointer.any_pressed() {
+                None
+            } else if input.key_pressed(Key::ArrowUp) {
+                Some(RowNavigation::Previous)
+            } else if input.key_pressed(Key::ArrowDown) {
+                Some(RowNavigation::Next)
+            } else if input.key_pressed(Key::PageUp) {
+                Some(RowNavigation::PagePrevious)
+            } else if input.key_pressed(Key::PageDown) {
+                Some(RowNavigation::PageNext)
+            } else if input.key_pressed(Key::Home) {
+                Some(RowNavigation::First)
+            } else if input.key_pressed(Key::End) {
+                Some(RowNavigation::Last)
+            } else {
+                None
+            };
+            (tab_cycle, focus_function_search, row_navigation)
+        });
+        if let Some(direction) = tab_cycle {
+            self.cycle_main_tab(direction);
+        }
+        if focus_function_search && self.project.is_some() {
+            self.select_main_tab(MainTab::Functions);
+            self.function_search_focus_requested = true;
+            self.function_row_focus_target = None;
+            self.function_focused_row_id = None;
+        }
+
         let (open_shortcut, load_review_shortcut, save_review_shortcut, save_review_as_shortcut) =
             context.input(|input| {
                 let command = input.modifiers.command;
@@ -2133,7 +2261,12 @@ impl WorkbenchApp {
                     || input.key_pressed(Key::Y));
             (undo, redo)
         });
-        if !context.wants_keyboard_input()
+        let function_row_owns_keyboard = self
+            .function_focused_row_id
+            .is_some_and(|id| context.memory(|memory| memory.has_focus(id)));
+        let another_widget_owns_keyboard =
+            context.wants_keyboard_input() && !function_row_owns_keyboard;
+        if !another_widget_owns_keyboard
             && !self.project_operation.is_pending()
             && !self.review_operation.is_pending()
             && !self.export_operation.is_pending()
@@ -2142,6 +2275,15 @@ impl WorkbenchApp {
                 self.apply_review_ui_action(ReviewUiAction::Undo);
             } else if redo_review {
                 self.apply_review_ui_action(ReviewUiAction::Redo);
+            }
+        }
+
+        if !another_widget_owns_keyboard
+            && self.main_tab == MainTab::Functions
+            && !self.project_operation.is_pending()
+        {
+            if let Some(navigation) = row_navigation {
+                self.navigate_function_selection(navigation);
             }
         }
 
@@ -2161,6 +2303,8 @@ impl WorkbenchApp {
 
     fn show_header(&mut self, context: &egui::Context) {
         let colors = self.preferences.theme.semantic_colors();
+        let viewport = context.screen_rect().size();
+        let chrome = shell_chrome_layout(viewport.x, viewport.y);
         egui::TopBottomPanel::top("workbench_header")
             .exact_height(112.0)
             .frame(
@@ -2204,22 +2348,47 @@ impl WorkbenchApp {
                             .inner_margin(egui::Margin::symmetric(10, 5))
                             .corner_radius(4)
                             .show(ui, |ui| {
-                                ui.label(RichText::new(&project.identity.display_name).strong());
+                                if chrome.compact_header {
+                                    ui.set_max_width(280.0);
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(&project.identity.display_name).strong(),
+                                        )
+                                        .truncate(),
+                                    )
+                                    .on_hover_text(&project.identity.display_name);
+                                } else {
+                                    ui.label(
+                                        RichText::new(&project.identity.display_name).strong(),
+                                    );
+                                }
                                 ui.horizontal(|ui| {
                                     ui.label(
-                                        RichText::new("[EXACT] Exact identity")
+                                        RichText::new(if chrome.compact_header {
+                                            "[EXACT] Identity bound"
+                                        } else {
+                                            "[EXACT] Exact identity"
+                                        })
                                             .color(colors.exact_extracted),
-                                    );
-                                    ui.label(
-                                        RichText::new(short_hash(project.identity.sha256.as_str()))
-                                            .monospace()
-                                            .small()
-                                            .color(colors.secondary_text),
                                     )
                                     .on_hover_text(format!(
                                         "SHA-256 {}",
                                         project.identity.sha256.as_str()
                                     ));
+                                    if !chrome.compact_header {
+                                        ui.label(
+                                            RichText::new(short_hash(
+                                                project.identity.sha256.as_str(),
+                                            ))
+                                            .monospace()
+                                            .small()
+                                            .color(colors.secondary_text),
+                                        )
+                                        .on_hover_text(format!(
+                                            "SHA-256 {}",
+                                            project.identity.sha256.as_str()
+                                        ));
+                                    }
                                 });
                             });
                     } else if let Some(path) = &self.analysis_path {
@@ -2352,7 +2521,7 @@ impl WorkbenchApp {
     fn show_project_panel(&mut self, context: &egui::Context) {
         let colors = self.preferences.theme.semantic_colors();
         egui::SidePanel::left("project_navigation")
-            .default_width(220.0)
+            .default_width(DEFAULT_PROJECT_PANEL_WIDTH)
             .width_range(170.0..=360.0)
             .resizable(true)
             .frame(
@@ -2526,7 +2695,7 @@ impl WorkbenchApp {
     fn show_inspector(&mut self, context: &egui::Context) {
         let colors = self.preferences.theme.semantic_colors();
         let panel = egui::SidePanel::right("contextual_inspector")
-            .default_width(330.0)
+            .default_width(DEFAULT_INSPECTOR_PANEL_WIDTH)
             .width_range(260.0..=520.0)
             .resizable(true)
             .frame(
@@ -3035,9 +3204,11 @@ impl WorkbenchApp {
 
     fn show_activity_panel(&mut self, context: &egui::Context) {
         let colors = self.preferences.theme.semantic_colors();
+        let viewport = context.screen_rect().size();
+        let chrome = shell_chrome_layout(viewport.x, context.available_rect().height());
         let panel = egui::TopBottomPanel::bottom("activity_and_diagnostics")
-            .default_height(190.0)
-            .height_range(110.0..=420.0)
+            .default_height(chrome.activity_default_height)
+            .height_range(chrome.activity_min_height..=chrome.activity_max_height)
             .resizable(true)
             .frame(
                 egui::Frame::new()
@@ -3047,24 +3218,43 @@ impl WorkbenchApp {
             );
         let is_open = self.preferences.bottom_panel_open;
         let contents = |ui: &mut egui::Ui| {
-            ui.horizontal(|ui| {
-                for tab in ActivityTab::ALL {
-                    ui.selectable_value(&mut self.activity_tab, tab, tab.label());
-                }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.small_button("Hide").clicked() {
-                        self.preferences.bottom_panel_open = false;
-                    }
-                    let mut console_enabled = self.console_host.is_enabled();
-                    let console_toggle = ui.add_enabled(
-                        cfg!(target_os = "windows") && !cfg!(feature = "screenshot"),
-                        egui::Checkbox::new(&mut console_enabled, "Companion console"),
-                    );
-                    if console_toggle.changed() {
-                        self.set_console_enabled(console_enabled);
-                    }
+            if chrome.compact_header {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Activity").strong());
+                    egui::ComboBox::from_id_salt("activity_tab_compact_selector")
+                        .selected_text(self.activity_tab.label())
+                        .width(180.0)
+                        .show_ui(ui, |ui| {
+                            for tab in ActivityTab::ALL {
+                                ui.selectable_value(&mut self.activity_tab, tab, tab.label());
+                            }
+                        });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.small_button("Hide").clicked() {
+                            self.preferences.bottom_panel_open = false;
+                        }
+                    });
                 });
-            });
+            } else {
+                ui.horizontal(|ui| {
+                    for tab in ActivityTab::ALL {
+                        ui.selectable_value(&mut self.activity_tab, tab, tab.label());
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.small_button("Hide").clicked() {
+                            self.preferences.bottom_panel_open = false;
+                        }
+                        let mut console_enabled = self.console_host.is_enabled();
+                        let console_toggle = ui.add_enabled(
+                            cfg!(target_os = "windows") && !cfg!(feature = "screenshot"),
+                            egui::Checkbox::new(&mut console_enabled, "Companion console"),
+                        );
+                        if console_toggle.changed() {
+                            self.set_console_enabled(console_enabled);
+                        }
+                    });
+                });
+            }
             ui.separator();
             match self.activity_tab {
                 ActivityTab::Progress => self.show_progress(ui),
@@ -3213,6 +3403,91 @@ impl WorkbenchApp {
         });
     }
 
+    fn show_main_tab_bar(&mut self, ui: &mut egui::Ui) {
+        let hidden_panel_menu = !self.preferences.left_panel_open
+            || !self.preferences.right_panel_open
+            || !self.preferences.bottom_panel_open;
+        let panel_menu_reserve = if hidden_panel_menu { 76.0 } else { 0.0 };
+        let tab_bar_width = (ui.available_width() - panel_menu_reserve).max(180.0);
+        let presentation = main_tab_presentation(tab_bar_width, MainTab::ALL.len());
+        let mut selected_tab = self.main_tab;
+
+        ui.horizontal(|ui| {
+            ui.allocate_ui_with_layout(
+                egui::vec2(tab_bar_width, 32.0),
+                Layout::left_to_right(Align::Center),
+                |ui| match presentation {
+                    MainTabPresentation::Full | MainTabPresentation::Compact => {
+                        ui.spacing_mut().item_spacing.x = presentation.spacing();
+                        let button_width = presentation
+                            .button_width()
+                            .expect("button presentations have a width");
+                        for tab in MainTab::ALL {
+                            let label = if presentation == MainTabPresentation::Compact {
+                                tab.compact_label()
+                            } else {
+                                tab.label()
+                            };
+                            let response = ui.add_sized(
+                                [button_width, 32.0],
+                                egui::Button::selectable(selected_tab == tab, label)
+                                    .corner_radius(4),
+                            );
+                            let response = if presentation == MainTabPresentation::Compact {
+                                response.on_hover_text(tab.label())
+                            } else {
+                                response
+                            };
+                            response.widget_info(|| {
+                                egui::WidgetInfo::selected(
+                                    egui::WidgetType::Button,
+                                    true,
+                                    selected_tab == tab,
+                                    tab.label(),
+                                )
+                            });
+                            if response.clicked() {
+                                selected_tab = tab;
+                            }
+                        }
+                    }
+                    MainTabPresentation::Menu => {
+                        ui.label(RichText::new("View").strong());
+                        egui::ComboBox::from_id_salt("main_tab_overflow_selector")
+                            .selected_text(selected_tab.label())
+                            .width((tab_bar_width - 54.0).clamp(140.0, 300.0))
+                            .show_ui(ui, |ui| {
+                                for tab in MainTab::ALL {
+                                    ui.selectable_value(&mut selected_tab, tab, tab.label());
+                                }
+                            });
+                    }
+                },
+            );
+
+            if hidden_panel_menu {
+                ui.menu_button("Panels", |ui| {
+                    if !self.preferences.left_panel_open && ui.button("Show project").clicked() {
+                        self.preferences.left_panel_open = true;
+                        ui.close();
+                    }
+                    if !self.preferences.right_panel_open && ui.button("Show inspector").clicked() {
+                        self.preferences.right_panel_open = true;
+                        ui.close();
+                    }
+                    if !self.preferences.bottom_panel_open && ui.button("Show activity").clicked() {
+                        self.preferences.bottom_panel_open = true;
+                        ui.close();
+                    }
+                });
+            }
+        });
+
+        if selected_tab != self.main_tab {
+            self.select_main_tab(selected_tab);
+        }
+    }
+
     fn show_central(&mut self, context: &egui::Context) {
         let colors = self.preferences.theme.semantic_colors();
         egui::CentralPanel::default()
@@ -3222,43 +3497,7 @@ impl WorkbenchApp {
                     .inner_margin(egui::Margin::same(12)),
             )
             .show(context, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    for tab in MainTab::ALL {
-                        if ui
-                            .add_sized(
-                                [112.0, 32.0],
-                                egui::Button::selectable(self.main_tab == tab, tab.label())
-                                    .corner_radius(4),
-                            )
-                            .clicked()
-                        {
-                            self.main_tab = tab;
-                            self.stage = if tab == MainTab::Exports {
-                                WorkflowStage::Export
-                            } else if self.project.is_some() {
-                                WorkflowStage::Review
-                            } else {
-                                WorkflowStage::Open
-                            };
-                        }
-                    }
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if !self.preferences.right_panel_open
-                            && ui.button("Show inspector").clicked()
-                        {
-                            self.preferences.right_panel_open = true;
-                        }
-                        if !self.preferences.left_panel_open && ui.button("Show project").clicked()
-                        {
-                            self.preferences.left_panel_open = true;
-                        }
-                        if !self.preferences.bottom_panel_open
-                            && ui.button("Show activity").clicked()
-                        {
-                            self.preferences.bottom_panel_open = true;
-                        }
-                    });
-                });
+                self.show_main_tab_bar(ui);
                 ui.separator();
 
                 if self.project.is_none() {
@@ -4000,14 +4239,19 @@ impl WorkbenchApp {
             .inner_margin(egui::Margin::symmetric(10, 6))
             .corner_radius(4)
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
+                let search_width = (ui.available_width() * 0.42).clamp(150.0, 300.0);
+                ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new("Search").strong());
-                    ui.add(
+                    let search = ui.add(
                         TextEdit::singleline(&mut self.function_filter.search)
                             .id_salt("function_search")
-                            .desired_width(300.0)
+                            .desired_width(search_width)
                             .hint_text("name, RVA, status, or source"),
                     );
+                    if self.function_search_focus_requested {
+                        search.request_focus();
+                        self.function_search_focus_requested = false;
+                    }
                     egui::ComboBox::from_id_salt("function_status_filter")
                         .selected_text(if self.function_filter.statuses.is_empty() {
                             "All statuses".to_owned()
@@ -4042,9 +4286,16 @@ impl WorkbenchApp {
                         );
                     });
                 });
+                ui.small(
+                    "Keyboard: Ctrl+F searches; Up/Down, Page Up/Page Down, Home, and End navigate rows; Ctrl+Tab changes view.",
+                );
             });
 
         let visible = project.visible_function_indices(&self.function_filter, self.function_sort);
+        let visible_projection_indices = visible
+            .iter()
+            .map(|index| project.functions[*index].projection_index)
+            .collect::<Vec<_>>();
         ui.label(
             RichText::new(format!(
                 "Showing {} of {} functions",
@@ -4056,95 +4307,160 @@ impl WorkbenchApp {
         );
         let mut selected = None;
         let mut sort = self.function_sort;
+        let table_layout = function_table_layout(ui.available_width());
+        if table_layout.horizontal_overflow {
+            ui.small("Scroll horizontally to review all six Function columns.");
+        }
         let available_height = ui.available_height();
-        TableBuilder::new(ui)
-            .striped(true)
-            .resizable(true)
-            .sense(Sense::click())
-            .min_scrolled_height(available_height)
-            .column(Column::initial(145.0).at_least(125.0))
-            .column(Column::initial(105.0).at_least(95.0))
-            .column(Column::remainder().at_least(180.0))
-            .column(Column::initial(145.0).at_least(120.0))
-            .column(Column::initial(175.0).at_least(130.0))
-            .column(Column::initial(90.0).at_least(75.0))
-            .header(30.0, |mut header| {
-                header.col(|ui| {
-                    ui.strong("Status");
-                });
-                header.col(|ui| sort_header(ui, "RVA", FunctionSortKey::Rva, &mut sort));
-                header.col(|ui| {
-                    sort_header(ui, "Reconstructed name", FunctionSortKey::Name, &mut sort)
-                });
-                header.col(|ui| {
-                    sort_header(ui, "Confidence", FunctionSortKey::Confidence, &mut sort)
-                });
-                header.col(|ui| sort_header(ui, "Source", FunctionSortKey::Source, &mut sort));
-                header.col(|ui| sort_header(ui, "Size", FunctionSortKey::Size, &mut sort));
+        let viewport_width = ui.available_width();
+        let focus_target = self.function_row_focus_target;
+        let scroll_to_row = focus_target.and_then(|target| {
+            visible_projection_indices
+                .iter()
+                .position(|projection_index| *projection_index == target)
+        });
+        let mut focused_row_id = self
+            .function_focused_row_id
+            .filter(|id| ui.memory(|memory| memory.has_focus(*id)));
+        ScrollArea::horizontal()
+            .id_salt("function_results_horizontal")
+            .auto_shrink([false, false])
+            .max_height(available_height)
+            .scroll_bar_visibility(if table_layout.horizontal_overflow {
+                egui::scroll_area::ScrollBarVisibility::AlwaysVisible
+            } else {
+                egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded
             })
-            .body(|body| {
-                body.rows(28.0, visible.len(), |mut table_row| {
-                    let row_index = visible[table_row.index()];
-                    let row = &project.functions[row_index];
-                    table_row
-                        .set_selected(self.selected_projection_index == Some(row.projection_index));
-                    table_row.col(|ui| {
-                        if status_badge(ui, row.status, colors).clicked() {
-                            selected = Some(row.projection_index);
-                        }
-                    });
-                    table_row.col(|ui| {
-                        if ui
-                            .selectable_label(
-                                false,
-                                RichText::new(format!("0x{:08X}", row.rva)).monospace(),
-                            )
-                            .clicked()
-                        {
-                            selected = Some(row.projection_index);
-                        }
-                    });
-                    table_row.col(|ui| {
-                        if ui
-                            .selectable_label(false, RichText::new(&row.display_name).monospace())
-                            .clicked()
-                        {
-                            selected = Some(row.projection_index);
-                        }
-                    });
-                    table_row.col(|ui| {
-                        if let Some(confidence) = row.confidence {
-                            ui.add(
-                                egui::ProgressBar::new(confidence as f32)
-                                    .desired_width(ui.available_width())
-                                    .text(format!("{:.0}%", confidence * 100.0))
-                                    .fill(status_color(row.status, colors)),
+            .show(ui, |ui| {
+                ui.set_width(table_layout.content_width().max(viewport_width));
+                let body_height = (ui.available_height() - 30.0).max(28.0);
+                let mut table = TableBuilder::new(ui)
+                    .id_salt("function_results")
+                    .striped(true)
+                    .sense(Sense::click())
+                    .min_scrolled_height(body_height)
+                    .max_scroll_height(body_height)
+                    .column(Column::exact(table_layout.widths[0]))
+                    .column(Column::exact(table_layout.widths[1]))
+                    .column(Column::exact(table_layout.widths[2]))
+                    .column(Column::exact(table_layout.widths[3]))
+                    .column(Column::exact(table_layout.widths[4]))
+                    .column(Column::exact(table_layout.widths[5]));
+                if let Some(row) = scroll_to_row {
+                    table = table.scroll_to_row(row, Some(Align::Center));
+                }
+                table
+                    .header(30.0, |mut header| {
+                        header.col(|ui| {
+                            ui.strong("Status");
+                        });
+                        header.col(|ui| sort_header(ui, "RVA", FunctionSortKey::Rva, &mut sort));
+                        header.col(|ui| {
+                            sort_header(ui, "Reconstructed name", FunctionSortKey::Name, &mut sort)
+                        });
+                        header.col(|ui| {
+                            sort_header(ui, "Confidence", FunctionSortKey::Confidence, &mut sort)
+                        });
+                        header.col(|ui| {
+                            sort_header(ui, "Source", FunctionSortKey::Source, &mut sort)
+                        });
+                        header.col(|ui| sort_header(ui, "Size", FunctionSortKey::Size, &mut sort));
+                    })
+                    .body(|body| {
+                        body.rows(28.0, visible.len(), |mut table_row| {
+                            let visible_index = table_row.index();
+                            let row_index = visible[visible_index];
+                            let row = &project.functions[row_index];
+                            let is_selected =
+                                self.selected_projection_index == Some(row.projection_index);
+                            table_row.set_selected(is_selected);
+                            table_row.col(|ui| {
+                                status_badge(ui, row.status, colors);
+                            });
+                            table_row.col(|ui| {
+                                ui.label(RichText::new(format!("0x{:08X}", row.rva)).monospace());
+                            });
+                            table_row.col(|ui| {
+                                ui.add(
+                                    egui::Label::new(RichText::new(&row.display_name).monospace())
+                                        .truncate(),
+                                )
+                                .on_hover_text(&row.display_name);
+                            });
+                            table_row.col(|ui| {
+                                if let Some(confidence) = row.confidence {
+                                    ui.add(
+                                        egui::ProgressBar::new(confidence as f32)
+                                            .desired_width(ui.available_width())
+                                            .text(format!("{:.0}%", confidence * 100.0))
+                                            .fill(status_color(row.status, colors)),
+                                    );
+                                } else {
+                                    ui.label("--");
+                                }
+                            });
+                            table_row.col(|ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&row.source).color(colors.secondary_text),
+                                    )
+                                    .truncate(),
+                                )
+                                .on_hover_text(&row.source);
+                            });
+                            table_row.col(|ui| {
+                                ui.label(
+                                    RichText::new(row.size.map_or_else(
+                                        || "--".to_owned(),
+                                        |size| format!("0x{size:X}"),
+                                    ))
+                                    .monospace(),
+                                );
+                            });
+
+                            let row_response = table_row.response().on_hover_text(
+                                "Select this function and update the evidence inspector",
                             );
-                        } else {
-                            ui.label("--");
-                        }
+                            let accessible_label = function_row_accessible_label(
+                                row,
+                                visible_index + 1,
+                                visible.len(),
+                                is_selected,
+                            );
+                            row_response.widget_info(|| {
+                                egui::WidgetInfo::selected(
+                                    egui::WidgetType::SelectableLabel,
+                                    true,
+                                    is_selected,
+                                    &accessible_label,
+                                )
+                            });
+                            if focus_target == Some(row.projection_index) {
+                                row_response.request_focus();
+                            }
+                            if row_response.clicked() {
+                                row_response.request_focus();
+                                selected = Some(row.projection_index);
+                            }
+                            if row_response.has_focus() {
+                                focused_row_id = Some(row_response.id);
+                                row_response
+                                    .ctx
+                                    .layer_painter(row_response.layer_id)
+                                    .with_clip_rect(row_response.interact_rect)
+                                    .rect_stroke(
+                                        row_response.rect.shrink(1.0),
+                                        1,
+                                        egui::Stroke::new(2.0, colors.focus),
+                                        egui::StrokeKind::Inside,
+                                    );
+                            }
+                        });
                     });
-                    table_row.col(|ui| {
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(&row.source).color(colors.secondary_text),
-                            )
-                            .truncate(),
-                        )
-                        .on_hover_text(&row.source);
-                    });
-                    table_row.col(|ui| {
-                        ui.label(
-                            RichText::new(
-                                row.size
-                                    .map_or_else(|| "--".to_owned(), |size| format!("0x{size:X}")),
-                            )
-                            .monospace(),
-                        );
-                    });
-                });
             });
         self.function_sort = sort;
+        self.function_row_focus_target = None;
+        self.function_focused_row_id = focused_row_id;
         if let Some(index) = selected {
             self.selected_projection_index = Some(index);
             self.graph_root_rva = project.functions.get(index).map(|row| row.rva);
@@ -5144,12 +5460,31 @@ fn status_badge(
         FunctionStatus::AutomaticFallback => "[--]",
     };
     let text = format!("{prefix} {}", status.label());
-    ui.add(
-        egui::Label::new(RichText::new(&text).color(status_color(status, colors)))
-            .truncate()
-            .sense(Sense::click()),
+    ui.add(egui::Label::new(RichText::new(&text).color(status_color(status, colors))).truncate())
+        .on_hover_text(text)
+}
+
+fn function_row_accessible_label(
+    row: &FunctionRow,
+    visible_row: usize,
+    visible_count: usize,
+    is_selected: bool,
+) -> String {
+    let confidence = row.confidence.map_or_else(
+        || "unavailable".to_owned(),
+        |value| format!("{:.0} percent", value * 100.0),
+    );
+    let size = row
+        .size
+        .map_or_else(|| "unavailable".to_owned(), |value| format!("0x{value:X}"));
+    format!(
+        "Function {visible_row} of {visible_count}: {}; RVA 0x{:08X}; status {}; confidence {confidence}; source {}; size {size}; selected {}",
+        row.display_name,
+        row.rva,
+        row.status.label(),
+        row.source,
+        if is_selected { "yes" } else { "no" },
     )
-    .on_hover_text(text)
 }
 
 fn status_color(status: FunctionStatus, colors: SemanticColors) -> egui::Color32 {
@@ -6043,6 +6378,21 @@ mod tests {
             };
             assert_eq!(tab.workflow_stage(), expected);
         }
+    }
+
+    #[test]
+    fn function_row_accessibility_label_carries_visible_identity_and_state() {
+        let (_source, project) = loaded_project_with_source();
+        let row = project.functions.first().expect("projected function");
+
+        let label = function_row_accessible_label(row, 1, project.functions.len(), true);
+
+        assert!(label.starts_with(&format!("Function 1 of {}:", project.functions.len())));
+        assert!(label.contains(&row.display_name));
+        assert!(label.contains(&format!("RVA 0x{:08X}", row.rva)));
+        assert!(label.contains(row.status.label()));
+        assert!(label.contains(&row.source));
+        assert!(label.ends_with("selected yes"));
     }
 
     #[test]

@@ -111,14 +111,21 @@ jobs:
         env:
           GALLIUM_DRIVER: llvmpipe
           LIBGL_ALWAYS_SOFTWARE: "1"
-        run: >-
-          ./tools/capture-workbench.ps1
-          -SkipBuild
-          -OutputDirectory "${{ runner.temp }}/workbench-captures"
+        run: |
+          ./tools/capture-workbench.ps1 `
+            -SkipBuild `
+            -OutputDirectory "${{ runner.temp }}/workbench-captures/standard"
+          ./tools/capture-workbench.ps1 `
+            -SkipBuild `
+            -OutputDirectory "${{ runner.temp }}/workbench-captures/keyboard-minimum" `
+            -CaptureWidth 1024 `
+            -CaptureHeight 680 `
+            -CaptureTabs functions-focused
 
       # Human-reviewed references live under docs/images. CI regenerates review artifacts and
-      # validates format, dimensions, completeness, and manifest metadata, but intentionally does
-      # not pixel-compare them or claim rendering equivalence.
+      # validates format, dimensions, completeness, and manifest metadata. The additional minimum-
+      # viewport capture proves the compact tab selector and keyboard-focused Function row remain
+      # renderable, but CI intentionally does not pixel-compare or claim rendering equivalence.
       - name: Upload workbench captures
         uses: actions/upload-artifact@v4
         with:

@@ -8,6 +8,14 @@ prereleases; breaking changes remain explicit.
 
 ### Added
 
+- Added a responsive, keyboard-first workbench navigation slice. The default 1440x900 review shell
+  keeps all eight main views on one compact row and fits all six Function columns with both side
+  panels open; the documented 1024x680 minimum uses an explicit all-view selector and a labeled
+  horizontal Function-table overflow instead of hiding controls, while compact identity/activity
+  chrome preserves a usable row viewport. Ctrl+Tab and Ctrl+Shift+Tab cycle views, Ctrl+F focuses
+  Function search, and stable Up/Down, Page Up/Page Down, Home, and End
+  navigation follows the active filter and sort with a distinct focus outline and accessible row
+  state. Visual CI also captures the focused minimum-viewport state.
 - Added durable exact-claim review to the desktop workbench. Function name proposals retain their
   complete-claim fingerprint and provenance, while Accept Primary, Keep as Alias, Reject, optional
   rationale annotations, undo, and redo update a binary-bound ledger. Strict sidecar load,
