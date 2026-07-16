@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/resymbol-analysis",
+    "crates/resymbol-app",
     "crates/resymbol-cli",
     "crates/resymbol-core",
     "crates/resymbol-export",
@@ -9,6 +10,7 @@ members = [
     "crates/resymbol-plugin-api",
     "crates/resymbol-plugin-runtime",
     "crates/resymbol-plugin-state",
+    "crates/resymbol-workbench",
 ]
 resolver = "3"
 

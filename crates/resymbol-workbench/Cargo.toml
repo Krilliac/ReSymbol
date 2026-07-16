@@ -1,0 +1,24 @@
+[package]
+name = "resymbol-workbench"
+description = "Native ReSymbol analysis and review workbench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+eframe = { version = "=0.32.3", default-features = false, features = ["accesskit", "default_fonts", "glow", "persistence", "wayland", "x11"] }
+egui_extras = { version = "=0.32.3", default-features = false }
+png = "=0.18.1"
+resymbol-analysis = { path = "../resymbol-analysis" }
+resymbol-app = { path = "../resymbol-app" }
+resymbol-core = { path = "../resymbol-core" }
+resymbol-export = { path = "../resymbol-export" }
+rfd = { version = "=0.15.4", default-features = false, features = ["xdg-portal", "async-std"] }
+serde = { version = "1.0.219", features = ["derive"] }
+tempfile = "3.20.0"
+
+[lints]
+workspace = true

@@ -139,6 +139,14 @@ jobs:
       - name: Select pinned Rust toolchain
         run: rustup show active-toolchain
 
+      - name: Install Linux desktop build dependencies
+        if: runner.os == 'Linux'
+        run: >-
+          sudo apt-get update && sudo apt-get install --yes
+          pkg-config libx11-dev libxcursor-dev libxi-dev libxrandr-dev
+          libxkbcommon-dev libxkbcommon-x11-dev libgl1-mesa-dev
+          libegl1-mesa-dev libwayland-dev libgl1-mesa-dri xvfb
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -148,8 +156,62 @@ jobs:
       - name: Run tests
         run: cargo test --locked --workspace --all-features
 
-      - name: Build CLI and disposable native host
-        run: cargo build --locked --bin resymbol --bin resymbol-native-host
+      - name: Build CLI, workbench, and disposable native host
+        run: >-
+          cargo build --locked
+          --bin resymbol --bin resymbol-workbench --bin resymbol-native-host
+
+      - name: Smoke-test workbench command surface
+        run: cargo run --locked --bin resymbol-workbench -- --version
+
+      - name: Render real workbench README captures
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          fixture="fixtures/pe-x64-msvc/artifacts/milestone2-symbolized.exe"
+          captures="target/readme-captures"
+          mkdir -p "$captures"
+          render_capture() {
+            local name="$1"
+            local theme="$2"
+            local view="$3"
+            xvfb-run --auto-servernum --server-args="-screen 0 1600x1000x24" \
+              env LIBGL_ALWAYS_SOFTWARE=1 WINIT_UNIX_BACKEND=x11 \
+              target/debug/resymbol-workbench \
+              --open "$fixture" --safe-mode --theme "$theme" --view "$view" \
+              --capture "$captures/$name"
+          }
+          render_capture workbench-graphite.png graphite functions
+          render_capture workbench-light.png light overview
+          render_capture workbench-ida.png ida relationships
+          render_capture workbench-classic-debugger.png classic functions
+          python3 - <<'PY'
+          from pathlib import Path
+          import struct
+
+          expected = {"workbench-graphite.png", "workbench-light.png", "workbench-ida.png", "workbench-classic-debugger.png"}
+          captures = Path("target/readme-captures")
+          found = {path.name for path in captures.glob("*.png")}
+          if found != expected:
+              raise SystemExit(f"capture set mismatch: expected {sorted(expected)}, found {sorted(found)}")
+          for path in sorted(captures.glob("*.png")):
+              header = path.read_bytes()[:24]
+              if header[:8] != b"\x89PNG\r\n\x1a\n" or header[12:16] != b"IHDR":
+                  raise SystemExit(f"{path} is not a valid PNG")
+              width, height = struct.unpack(">II", header[16:24])
+              if (width, height) != (1440, 900):
+                  raise SystemExit(f"{path} is {width}x{height}, expected 1440x900")
+              print(f"validated {path}: {width}x{height}")
+          PY
+
+      - name: Upload real workbench README captures
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: workbench-readme-captures
+          path: target/readme-captures/*.png
+          if-no-files-found: error
 
       - name: Smoke-test C11 and C++11 native plugins
         if: runner.os != 'Windows'
