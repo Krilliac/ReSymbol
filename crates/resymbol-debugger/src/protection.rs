@@ -676,7 +676,7 @@ mod tests {
 
         let section = |name: [u8; 8]| PeSection {
             name: String::from_utf8_lossy(&name)
-                .trim_end_matches(' ')
+                .trim_end_matches('\0')
                 .to_owned(),
             raw_name: name,
             virtual_address: 0x1000,
@@ -686,7 +686,7 @@ mod tests {
             characteristics: 0x6000_0020,
         };
         assert_eq!(
-            packer_section_assessment(&section(*b"UPX0    ")),
+            packer_section_assessment(&section(*b"UPX0\0\0\0\0")),
             Some((
                 "UPX",
                 ProtectionSeverity::Warning,
@@ -694,13 +694,13 @@ mod tests {
             ))
         );
         assert_eq!(
-            packer_section_assessment(&section(*b".adata  ")),
+            packer_section_assessment(&section(*b".adata\0\0")),
             Some((
                 "ASPack-style layouts",
                 ProtectionSeverity::Notice,
                 EvidenceStrength::Heuristic,
             ))
         );
-        assert_eq!(packer_section_assessment(&section(*b".text   ")), None);
+        assert_eq!(packer_section_assessment(&section(*b".text\0\0\0")), None);
     }
 }
