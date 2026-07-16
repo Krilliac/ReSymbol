@@ -1316,6 +1316,25 @@ impl WorkbenchApp {
                 }
             }
         };
+        let updated_orphaned_decisions = if reviews_still_bound {
+            match self
+                .review
+                .as_ref()
+                .expect("a preserved review ledger is present")
+                .orphaned_count(project.session())
+            {
+                Ok(count) => count,
+                Err(error) => {
+                    self.log(
+                        ActivityLevel::Error,
+                        format!("Project review ledger could not be reprojected: {error}"),
+                    );
+                    return;
+                }
+            }
+        } else {
+            0
+        };
         let function_count = project.functions.len();
         let warning_count = project.projection.warnings.len();
         let protection_count = project.protection_assessment.findings().len();
@@ -1344,8 +1363,8 @@ impl WorkbenchApp {
             self.review_destination = default_review_path(&project).to_string_lossy().into_owned();
             self.review_result = None;
             self.review = Some(review);
-            self.review_orphaned_decisions = 0;
         }
+        self.review_orphaned_decisions = updated_orphaned_decisions;
         self.project = Some(project);
         self.stage = WorkflowStage::Review;
         self.main_tab = MainTab::Overview;

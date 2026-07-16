@@ -473,7 +473,7 @@ mod tests {
             size: 21,
             format: BinaryFormat::Pe,
             architecture: "x86_64".to_owned(),
-            image_base: 0x1400_0000_0,
+            image_base: 0x0001_4000_0000,
         };
         let ledger = ReviewLedger::new(&identity);
         let directory = tempdir().expect("temporary directory");

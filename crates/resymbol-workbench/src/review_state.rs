@@ -91,8 +91,7 @@ impl BoundReviewLedger {
         self.ledger.can_redo()
     }
 
-    #[cfg(test)]
-    fn orphaned_count(&self, session: &AnalysisSession) -> Result<usize, ReviewStateError> {
+    pub fn orphaned_count(&self, session: &AnalysisSession) -> Result<usize, ReviewStateError> {
         self.ledger
             .orphaned_decision_count(session)
             .map_err(|error| ReviewStateError::Binding(error.to_string()))
