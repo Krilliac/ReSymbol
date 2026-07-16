@@ -2048,8 +2048,8 @@ mod tests {
         CleanupResidualKind, DynamicCodeProfile, ExpectedSandboxAttestation, IsolationBoundary,
         PolicyDigest, ProcessMitigationProfile, ProviderUnavailable, ProviderUnavailableReason,
         SandboxCleanupAttemptFailure, SandboxFailure, SandboxFailureKind, SandboxGuarantee,
-        SandboxNetworkMode, SandboxPolicy, SandboxPolicyApprovalId, SandboxProviderSelection,
-        SandboxResourceLimits, Win32kProfile,
+        SandboxMachineError, SandboxNetworkMode, SandboxPolicy, SandboxPolicyApprovalId,
+        SandboxProviderSelection, SandboxResourceLimits, Win32kProfile,
     };
 
     const TEST_SANDBOX_FAILURE_DETAIL: &str = "sandbox helper failed with cleanup still required";
@@ -3675,8 +3675,10 @@ mod tests {
         let stopped = forged.session_state().unwrap().state_token();
         assert_eq!(
             forged.submit(DebugCommand::Close { state: stopped }),
-            Err(DebugHostClientError::CleanupReceipt(
-                CleanupReceiptError::BindingMismatch
+            Err(DebugHostClientError::SessionMachine(
+                SessionMachineError::Sandbox(SandboxMachineError::Cleanup(
+                    CleanupReceiptError::BindingMismatch
+                ))
             ))
         );
         assert_eq!(forged.connection_state(), ClientConnectionState::Failed);

@@ -136,9 +136,10 @@ spans are rejected without a memory-read event.
 
 `OfflineImageDebugHost` advertises only `OfflineAnalysis` and supports only capability probing, that
 exact offline open, bounded RVA reads, and close. Dump, snapshot, observe, attach, launch, execution,
-write, register, breakpoint, terminate, and sandbox operations are rejected through the same opaque
-remote-command checkpoint path. Rejections restore visible reducer state while retaining command and
-authority-consumption watermarks, and emit only a correlated rejected command result. This host
+write, register, breakpoint, terminate, and sandbox operations are rejected through the same
+crate-private, host-owned remote-command transaction path. Rejections restore visible reducer
+state while retaining command and authority-consumption watermarks, and emit only a correlated
+rejected command result. This host
 never emits sandbox attestation, lifecycle, or cleanup evidence. Graceful shutdown and the mandatory
 non-panicking abort/drop paths close only the in-process control boundary; they do not claim target
 or sandbox cleanup.
@@ -210,8 +211,9 @@ The current seam is intentionally narrow:
   validated `CleanupAttemptFailed` event carrying its incomplete receipt. Every rejected command
   still consumes its command identifier and any presented one-use authority without cloning the
   reducer or lease;
-- the audited host client owns a crate-private, move-only remote-command transaction ticket bound
-  to the exact reducer instance, command ID, and post-accept state. Exactly one transaction may be
+- the audited crate-internal client and host implementations own crate-private, move-only
+  remote-command transaction tickets bound to the exact reducer instance, command ID, and
+  post-accept state. Exactly one transaction may be
   active. An effect-free rejection restores only ordinary visible state, while validated success
   and cleanup-required sandbox failure explicitly commit their retained effects. Stale, foreign,
   mismatched, already-resolved, and post-effect rollback attempts fail closed; command, run/stop,

@@ -1384,6 +1384,21 @@ mod tests {
     }
 
     #[test]
+    fn debug_output_is_bounded_and_omits_snapshot_bytes() {
+        let image = verified_fixture();
+        let rendered = format!("{image:?}");
+
+        assert!(
+            rendered.len() < 2_048,
+            "debug output was unexpectedly large"
+        );
+        assert!(rendered.contains("snapshot_len"));
+        assert!(rendered.contains("region_count"));
+        assert!(!rendered.contains("bytes: ["));
+        assert!(!rendered.contains("analysis:"));
+    }
+
+    #[test]
     fn exact_header_and_section_prefix_reads_map_to_snapshot_offsets() {
         let image = verified_fixture();
         assert_eq!(image.read_rva(MemoryAddress::new(0), 2).unwrap(), b"MZ");
