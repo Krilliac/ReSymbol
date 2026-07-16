@@ -28,7 +28,8 @@ use crate::protocol::{
 };
 use crate::sandbox::{
     AttestationMismatch, CleanupReceiptError, DiagnosticText, HelperBuildId, SandboxAttestation,
-    SandboxCleanupReceipt, SandboxLifecycleEvent, SandboxLifecycleState,
+    SandboxCleanupReceipt, SandboxFailureStage, SandboxLifecycleEvent, SandboxLifecycleState,
+    SandboxProviderSelection,
 };
 use crate::session_machine::RemoteCommandCheckpoint;
 use crate::{SessionMachine, SessionMachineError};
@@ -131,6 +132,7 @@ struct ResponseEvidence {
     memory_written: bool,
     breakpoint_changed: bool,
     sandbox_event: bool,
+    sandbox_rejection_diagnostic: Option<SandboxRejectionDiagnostic>,
 }
 
 impl ResponseEvidence {
@@ -143,6 +145,21 @@ impl ResponseEvidence {
             || self.breakpoint_changed
             || self.sandbox_event
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SandboxRejectionDiagnostic {
+    ProviderUnavailable,
+    Failed {
+        stage: SandboxFailureStage,
+        detail: DiagnosticText,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RejectedResponseDisposition {
+    RollBack,
+    RetainCleanupRequiredFailure,
 }
 
 impl<T: HostFrameExchange> DebugHostClient<T> {
@@ -829,20 +846,29 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
         let outcome = outcome.ok_or(DebugHostClientError::MissingCommandResult { command_id })?;
         match &outcome {
             CommandOutcome::Rejected { .. } => {
-                if evidence.has_effect() {
-                    return Err(DebugHostClientError::RejectedCommandProducedEvidence {
-                        command_id,
-                    });
-                }
-                session.reducer.reject_remote_command(checkpoint)?;
-                if session.reducer.state() != &session.verified_state {
-                    return Err(DebugHostClientError::ReducerStateMismatch {
-                        expected: session.verified_state.clone(),
-                        actual: session.reducer.state().clone(),
-                    });
+                match classify_rejected_response(envelope, &session.reducer, &evidence)? {
+                    RejectedResponseDisposition::RollBack => {
+                        session.reducer.reject_remote_command(checkpoint)?;
+                        if session.reducer.state() != &session.verified_state {
+                            return Err(DebugHostClientError::ReducerStateMismatch {
+                                expected: session.verified_state.clone(),
+                                actual: session.reducer.state().clone(),
+                            });
+                        }
+                    }
+                    RejectedResponseDisposition::RetainCleanupRequiredFailure => {
+                        session.verified_state = session.reducer.state().clone();
+                        session.sandbox_cleanup_verified = false;
+                    }
                 }
             }
             CommandOutcome::Succeeded => {
+                if evidence.sandbox_rejection_diagnostic.is_some() {
+                    return Err(DebugHostClientError::UnexpectedCommandEvidence {
+                        command_id,
+                        evidence: "sandbox-rejection-diagnostic",
+                    });
+                }
                 if required_command_state.is_some() && !evidence.command_state_observed {
                     return Err(DebugHostClientError::MissingCommandState { command_id });
                 }
@@ -1020,7 +1046,6 @@ fn validate_sandbox_lifecycle(
             evidence: "sandbox-lifecycle",
         });
     }
-    evidence.sandbox_event = true;
     match lifecycle {
         SandboxLifecycleEvent::State { session_id, state } => {
             require_sandbox_session(reducer, *session_id)?;
@@ -1030,27 +1055,37 @@ fn validate_sandbox_lifecycle(
                     actual: *state,
                 });
             }
+            evidence.sandbox_event = true;
         }
         SandboxLifecycleEvent::Attested(actual) => {
             accept_attestation_event(reducer, actual, evidence)?;
         }
         SandboxLifecycleEvent::ProviderUnavailable(unavailable) => {
             require_sandbox_session(reducer, unavailable.session_id)?;
-            let expected = reducer
-                .expected_attestation()
+            let expected_provider = expected_sandbox_provider(reducer)
                 .ok_or(DebugHostClientError::UnexpectedSandboxEvidence)?;
-            if unavailable.provider != expected.provider {
+            if &unavailable.provider != expected_provider {
                 return Err(DebugHostClientError::UnexpectedSandboxProvider);
             }
+            observe_sandbox_rejection_diagnostic(
+                evidence,
+                SandboxRejectionDiagnostic::ProviderUnavailable,
+            )?;
         }
         SandboxLifecycleEvent::Failed(failure) => {
             require_sandbox_session(reducer, failure.session_id)?;
-            let expected = reducer
-                .expected_attestation()
+            let expected_provider = expected_sandbox_provider(reducer)
                 .ok_or(DebugHostClientError::UnexpectedSandboxEvidence)?;
-            if failure.provider != expected.provider {
+            if &failure.provider != expected_provider {
                 return Err(DebugHostClientError::UnexpectedSandboxProvider);
             }
+            observe_sandbox_rejection_diagnostic(
+                evidence,
+                SandboxRejectionDiagnostic::Failed {
+                    stage: failure.stage,
+                    detail: failure.detail.clone(),
+                },
+            )?;
         }
         SandboxLifecycleEvent::Closed(receipt) => {
             require_sandbox_session(reducer, receipt.session_id)?;
@@ -1070,9 +1105,35 @@ fn validate_sandbox_lifecycle(
                 return Err(DebugHostClientError::UnexpectedSandboxEvidence);
             }
             evidence.cleanup_receipt = Some(receipt.clone());
+            evidence.sandbox_event = true;
         }
     }
     Ok(())
+}
+
+fn observe_sandbox_rejection_diagnostic(
+    evidence: &mut ResponseEvidence,
+    diagnostic: SandboxRejectionDiagnostic,
+) -> Result<(), DebugHostClientError> {
+    if evidence.sandbox_rejection_diagnostic.is_some() {
+        Err(DebugHostClientError::DuplicateCommandEvidence {
+            evidence: "sandbox-rejection-diagnostic",
+        })
+    } else {
+        evidence.sandbox_rejection_diagnostic = Some(diagnostic);
+        Ok(())
+    }
+}
+
+fn expected_sandbox_provider(reducer: &SessionMachine) -> Option<&SandboxProviderSelection> {
+    reducer
+        .expected_attestation()
+        .map(|expected| &expected.provider)
+        .or_else(|| {
+            reducer
+                .inherited_sandbox()
+                .map(|binding| binding.provider())
+        })
 }
 
 fn is_sandboxed_open(command: &DebugCommand) -> bool {
@@ -1108,6 +1169,66 @@ fn command_allows_sandbox_lifecycle(
                 | DebugCommand::Terminate { .. }
                 | DebugCommand::Close { .. }
         ),
+    }
+}
+
+fn classify_rejected_response(
+    envelope: &CommandEnvelope,
+    reducer: &SessionMachine,
+    evidence: &ResponseEvidence,
+) -> Result<RejectedResponseDisposition, DebugHostClientError> {
+    let invalid = || DebugHostClientError::RejectedCommandProducedEvidence {
+        command_id: envelope.command_id,
+    };
+    match &evidence.sandbox_rejection_diagnostic {
+        None => {
+            if evidence.has_effect() {
+                Err(invalid())
+            } else {
+                Ok(RejectedResponseDisposition::RollBack)
+            }
+        }
+        Some(SandboxRejectionDiagnostic::ProviderUnavailable) => {
+            if is_sandboxed_open(&envelope.command) && !evidence.has_effect() {
+                Ok(RejectedResponseDisposition::RollBack)
+            } else {
+                Err(invalid())
+            }
+        }
+        Some(SandboxRejectionDiagnostic::Failed { stage, .. })
+            if matches!(
+                *stage,
+                SandboxFailureStage::Policy | SandboxFailureStage::Discovery
+            ) =>
+        {
+            if is_sandboxed_open(&envelope.command) && !evidence.has_effect() {
+                Ok(RejectedResponseDisposition::RollBack)
+            } else {
+                Err(invalid())
+            }
+        }
+        Some(SandboxRejectionDiagnostic::Failed { detail, .. }) => {
+            let exact_failed_state = matches!(
+                reducer.state(),
+                SessionState::Failed { message, .. } if message.as_str() == detail.as_str()
+            );
+            let cleanup_state_preserved = reducer.sandbox_state()
+                == Some(SandboxLifecycleState::Cleanup)
+                || reducer.inherited_sandbox().is_some();
+            let cleanup_required = reducer.requires_cleanup_receipt() && cleanup_state_preserved;
+            if evidence.state_changed
+                && exact_failed_state
+                && cleanup_required
+                && evidence.cleanup_receipt.is_none()
+                && !evidence.memory_read
+                && !evidence.memory_written
+                && !evidence.breakpoint_changed
+            {
+                Ok(RejectedResponseDisposition::RetainCleanupRequiredFailure)
+            } else {
+                Err(invalid())
+            }
+        }
     }
 }
 
@@ -1868,14 +1989,17 @@ mod tests {
     use crate::protocol::{
         AttachMode, AttachScope, AttachTarget, LaunchEnvironment, LaunchTarget,
         MAX_MEMORY_READ_BYTES, MemoryAddress, OfflineTarget, ProcessId, ProcessIdentity,
-        ProcessStartKey, ReadViewToken, StateGeneration, StopReason, ThreadId,
+        ProcessStartKey, ReadViewToken, RunId, RunToken, StateGeneration, StopReason, ThreadId,
     };
     use crate::sandbox::{
         ChildProcessProfile, CleanupOutcome, CleanupReceiptId, DynamicCodeProfile,
         ExpectedSandboxAttestation, IsolationBoundary, PolicyDigest, ProcessMitigationProfile,
+        ProviderUnavailable, ProviderUnavailableReason, SandboxFailure, SandboxFailureKind,
         SandboxGuarantee, SandboxNetworkMode, SandboxPolicy, SandboxPolicyApprovalId,
         SandboxProviderSelection, SandboxResourceLimits, Win32kProfile,
     };
+
+    const TEST_SANDBOX_FAILURE_DETAIL: &str = "sandbox helper failed with cleanup still required";
 
     fn session_id() -> SessionId {
         SessionId::new(17).expect("session id")
@@ -2138,6 +2262,15 @@ mod tests {
         WrongCleanup,
         InheritedCleanup,
         WrongInheritedCleanup,
+        ProviderUnavailableRejection,
+        FailedRejection,
+        WrongFailureProvider,
+        FailureWithStateEffect,
+        ProvisioningFailureThenCleanup,
+        RuntimeFailureThenCleanup,
+        InheritedCleanupFailure,
+        WrongInheritedCleanupFailure,
+        FailureReportedAsSuccess,
     }
 
     struct ScriptedHost {
@@ -2287,8 +2420,272 @@ mod tests {
                         )?;
                     }
                 }
+                ScriptedAttack::ProviderUnavailableRejection
+                | ScriptedAttack::FailedRejection
+                | ScriptedAttack::WrongFailureProvider
+                | ScriptedAttack::FailureWithStateEffect
+                | ScriptedAttack::FailureReportedAsSuccess => {
+                    let prior = envelope.expected_state.ok_or_else(|| {
+                        HostTransportError::protocol("sandbox open omitted prior state")
+                    })?;
+                    let mut event_state = prior;
+                    if matches!(self.attack, ScriptedAttack::FailureWithStateEffect) {
+                        let DebugCommand::Open(target) = &envelope.command else {
+                            return Err(HostTransportError::protocol(
+                                "state-effect script requires sandbox open",
+                            ));
+                        };
+                        event_state = next_state_token(prior, 1);
+                        self.push_scripted_event(
+                            &mut batch,
+                            envelope.command_id,
+                            session_id,
+                            event_state,
+                            DebugEvent::StateChanged(SessionState::Opening {
+                                token: event_state,
+                                target: target.clone(),
+                            }),
+                        )?;
+                    }
+                    let lifecycle = match self.attack {
+                        ScriptedAttack::ProviderUnavailableRejection => {
+                            SandboxLifecycleEvent::ProviderUnavailable(ProviderUnavailable {
+                                session_id,
+                                provider: SandboxProviderSelection::LocalAppContainer,
+                                reason: ProviderUnavailableReason::FeatureDisabled,
+                                retryable: false,
+                                detail: DiagnosticText::new(
+                                    "Local AppContainer support is disabled",
+                                )
+                                .expect("bounded provider diagnostic"),
+                            })
+                        }
+                        ScriptedAttack::FailedRejection
+                        | ScriptedAttack::FailureWithStateEffect
+                        | ScriptedAttack::FailureReportedAsSuccess => test_sandbox_failure(
+                            session_id,
+                            SandboxProviderSelection::LocalAppContainer,
+                            SandboxFailureStage::Discovery,
+                        ),
+                        ScriptedAttack::WrongFailureProvider => test_sandbox_failure(
+                            session_id,
+                            SandboxProviderSelection::HyperV,
+                            SandboxFailureStage::Discovery,
+                        ),
+                        ScriptedAttack::ForgedAttestation
+                        | ScriptedAttack::MissingCleanup
+                        | ScriptedAttack::WrongCleanup
+                        | ScriptedAttack::InheritedCleanup
+                        | ScriptedAttack::WrongInheritedCleanup
+                        | ScriptedAttack::ProvisioningFailureThenCleanup
+                        | ScriptedAttack::RuntimeFailureThenCleanup
+                        | ScriptedAttack::InheritedCleanupFailure
+                        | ScriptedAttack::WrongInheritedCleanupFailure => {
+                            unreachable!("handled elsewhere")
+                        }
+                    };
+                    self.push_scripted_event(
+                        &mut batch,
+                        envelope.command_id,
+                        session_id,
+                        event_state,
+                        DebugEvent::SandboxLifecycle(lifecycle),
+                    )?;
+                    let outcome = if matches!(self.attack, ScriptedAttack::FailureReportedAsSuccess)
+                    {
+                        CommandOutcome::Succeeded
+                    } else {
+                        CommandOutcome::Rejected {
+                            code: "sandbox-open-failed".into(),
+                            message: "sandbox provider did not open a target".into(),
+                        }
+                    };
+                    self.push_scripted_event(
+                        &mut batch,
+                        envelope.command_id,
+                        session_id,
+                        event_state,
+                        DebugEvent::CommandResult {
+                            command_id: envelope.command_id,
+                            outcome,
+                        },
+                    )?;
+                }
+                ScriptedAttack::ProvisioningFailureThenCleanup
+                | ScriptedAttack::RuntimeFailureThenCleanup
+                | ScriptedAttack::InheritedCleanupFailure
+                | ScriptedAttack::WrongInheritedCleanupFailure => {
+                    if matches!(
+                        self.attack,
+                        ScriptedAttack::InheritedCleanupFailure
+                            | ScriptedAttack::WrongInheritedCleanupFailure
+                    ) {
+                        self.scripted_cleanup_required_failure(
+                            &mut batch,
+                            envelope,
+                            session_id,
+                            SandboxFailureStage::Cleanup,
+                        )?;
+                    } else if matches!(&envelope.command, DebugCommand::Close { .. }) {
+                        self.scripted_exact_close(&mut batch, envelope, session_id)?;
+                    } else {
+                        let stage = match self.attack {
+                            ScriptedAttack::ProvisioningFailureThenCleanup => {
+                                SandboxFailureStage::Provisioning
+                            }
+                            ScriptedAttack::RuntimeFailureThenCleanup => {
+                                SandboxFailureStage::Runtime
+                            }
+                            ScriptedAttack::InheritedCleanupFailure => {
+                                unreachable!("handled as cleanup failure")
+                            }
+                            ScriptedAttack::WrongInheritedCleanupFailure => {
+                                unreachable!("handled as forged cleanup failure")
+                            }
+                            _ => unreachable!("matched resource-owning failure"),
+                        };
+                        self.scripted_cleanup_required_failure(
+                            &mut batch, envelope, session_id, stage,
+                        )?;
+                    }
+                }
             }
             Ok(batch)
+        }
+
+        fn scripted_cleanup_required_failure(
+            &mut self,
+            batch: &mut Vec<HostFrame>,
+            envelope: &CommandEnvelope,
+            session_id: SessionId,
+            stage: SandboxFailureStage,
+        ) -> Result<(), HostTransportError> {
+            let prior = envelope
+                .expected_state
+                .ok_or_else(|| HostTransportError::protocol("failure omitted prior state"))?;
+            let operation_token = next_state_token(prior, 1);
+            let operation_state = match (&envelope.command, stage) {
+                (DebugCommand::Open(target), SandboxFailureStage::Provisioning) => {
+                    SessionState::Opening {
+                        token: operation_token,
+                        target: target.clone(),
+                    }
+                }
+                (DebugCommand::Continue { .. }, SandboxFailureStage::Runtime) => {
+                    SessionState::Running {
+                        token: RunToken {
+                            state: operation_token,
+                            run_id: RunId::new(1).expect("test run id"),
+                        },
+                    }
+                }
+                (DebugCommand::Close { .. }, SandboxFailureStage::Cleanup) => {
+                    SessionState::Closing {
+                        token: operation_token,
+                    }
+                }
+                _ => {
+                    return Err(HostTransportError::protocol(
+                        "failure stage did not match the scripted command",
+                    ));
+                }
+            };
+            self.push_scripted_event(
+                batch,
+                envelope.command_id,
+                session_id,
+                operation_token,
+                DebugEvent::StateChanged(operation_state),
+            )?;
+            self.push_scripted_event(
+                batch,
+                envelope.command_id,
+                session_id,
+                operation_token,
+                DebugEvent::SandboxLifecycle(test_sandbox_failure(
+                    session_id,
+                    if matches!(self.attack, ScriptedAttack::WrongInheritedCleanupFailure) {
+                        SandboxProviderSelection::HyperV
+                    } else {
+                        SandboxProviderSelection::LocalAppContainer
+                    },
+                    stage,
+                )),
+            )?;
+            let failed_token = next_state_token(prior, 2);
+            self.push_scripted_event(
+                batch,
+                envelope.command_id,
+                session_id,
+                failed_token,
+                DebugEvent::StateChanged(SessionState::Failed {
+                    token: failed_token,
+                    message: TEST_SANDBOX_FAILURE_DETAIL.into(),
+                }),
+            )?;
+            self.push_scripted_event(
+                batch,
+                envelope.command_id,
+                session_id,
+                failed_token,
+                DebugEvent::CommandResult {
+                    command_id: envelope.command_id,
+                    outcome: CommandOutcome::Rejected {
+                        code: "sandbox-cleanup-required".into(),
+                        message: "sandbox operation failed and requires cleanup".into(),
+                    },
+                },
+            )
+        }
+
+        fn scripted_exact_close(
+            &mut self,
+            batch: &mut Vec<HostFrame>,
+            envelope: &CommandEnvelope,
+            session_id: SessionId,
+        ) -> Result<(), HostTransportError> {
+            let prior = envelope
+                .expected_state
+                .ok_or_else(|| HostTransportError::protocol("close omitted prior state"))?;
+            let closing_token = next_state_token(prior, 1);
+            self.push_scripted_event(
+                batch,
+                envelope.command_id,
+                session_id,
+                closing_token,
+                DebugEvent::StateChanged(SessionState::Closing {
+                    token: closing_token,
+                }),
+            )?;
+            self.push_scripted_event(
+                batch,
+                envelope.command_id,
+                session_id,
+                closing_token,
+                DebugEvent::SandboxLifecycle(SandboxLifecycleEvent::Closed(test_cleanup_receipt(
+                    &expected_sandbox_attestation(),
+                ))),
+            )?;
+            let closed_token = next_state_token(prior, 2);
+            self.push_scripted_event(
+                batch,
+                envelope.command_id,
+                session_id,
+                closed_token,
+                DebugEvent::StateChanged(SessionState::Closed {
+                    token: closed_token,
+                }),
+            )?;
+            self.push_scripted_event(
+                batch,
+                envelope.command_id,
+                session_id,
+                closed_token,
+                DebugEvent::CommandResult {
+                    command_id: envelope.command_id,
+                    outcome: CommandOutcome::Succeeded,
+                },
+            )
         }
 
         fn push_scripted_event(
@@ -2347,10 +2744,20 @@ mod tests {
                 .map_err(HostTransportError::from)
         }
 
-        fn release_session(&mut self, _session_id: SessionId) -> Result<(), HostTransportError> {
-            Err(HostTransportError::protocol(
-                "adversarial host cannot release a session",
-            ))
+        fn release_session(&mut self, actual_session: SessionId) -> Result<(), HostTransportError> {
+            if matches!(
+                self.attack,
+                ScriptedAttack::ProvisioningFailureThenCleanup
+                    | ScriptedAttack::RuntimeFailureThenCleanup
+                    | ScriptedAttack::InheritedCleanup
+            ) && actual_session == session_id()
+            {
+                Ok(())
+            } else {
+                Err(HostTransportError::protocol(
+                    "adversarial host cannot release a session",
+                ))
+            }
         }
 
         fn shutdown_control(
@@ -2560,6 +2967,22 @@ mod tests {
         }
     }
 
+    fn test_sandbox_failure(
+        session_id: SessionId,
+        provider: SandboxProviderSelection,
+        stage: SandboxFailureStage,
+    ) -> SandboxLifecycleEvent {
+        SandboxLifecycleEvent::Failed(SandboxFailure {
+            session_id,
+            provider,
+            stage,
+            kind: SandboxFailureKind::HelperFailure,
+            retryable: true,
+            detail: DiagnosticText::new(TEST_SANDBOX_FAILURE_DETAIL)
+                .expect("bounded sandbox failure"),
+        })
+    }
+
     fn scripted_client(attack: ScriptedAttack) -> DebugHostClient<ScriptedHost> {
         DebugHostClient::connect(
             ScriptedHost::new(attack),
@@ -2766,6 +3189,259 @@ mod tests {
         assert_eq!(
             client.abandon_session().unwrap().kind(),
             SessionStateKind::Idle
+        );
+    }
+
+    #[test]
+    fn exact_provider_unavailable_rejection_rolls_back_without_cleanup_claim() {
+        let mut client = scripted_client(ScriptedAttack::ProviderUnavailableRejection);
+        client
+            .begin_session(session_id(), provisioning_epoch(), helper_build())
+            .unwrap();
+
+        let receipt = client
+            .submit(DebugCommand::Open(sandbox_target()))
+            .expect("exact provider diagnostic is a valid rejection");
+        assert!(matches!(receipt.outcome, CommandOutcome::Rejected { .. }));
+        assert!(receipt.events.iter().any(|event| matches!(
+            &event.event,
+            DebugEvent::SandboxLifecycle(SandboxLifecycleEvent::ProviderUnavailable(
+                unavailable
+            )) if unavailable.session_id == session_id()
+                && unavailable.provider == SandboxProviderSelection::LocalAppContainer
+                && unavailable.reason == ProviderUnavailableReason::FeatureDisabled
+        )));
+        assert_eq!(
+            client.connection_state(),
+            ClientConnectionState::SessionOpen
+        );
+        assert_eq!(
+            client.session_state().map(SessionState::kind),
+            Some(SessionStateKind::Idle)
+        );
+        let session = client.session.as_ref().expect("session remains owned");
+        assert!(session.reducer.expected_attestation().is_none());
+        assert!(!session.sandbox_cleanup_verified);
+        assert_eq!(
+            client.release_closed_session(),
+            Err(DebugHostClientError::SessionNotClosed {
+                state: SessionStateKind::Idle,
+            })
+        );
+
+        let second = client
+            .submit(DebugCommand::Open(sandbox_target()))
+            .expect("connection remains usable after exact rejection");
+        assert!(matches!(second.outcome, CommandOutcome::Rejected { .. }));
+    }
+
+    #[test]
+    fn exact_discovery_failure_rejection_is_diagnostic_only() {
+        let mut client = scripted_client(ScriptedAttack::FailedRejection);
+        client
+            .begin_session(session_id(), provisioning_epoch(), helper_build())
+            .unwrap();
+
+        let receipt = client
+            .submit(DebugCommand::Open(sandbox_target()))
+            .expect("discovery failure is rollback-safe");
+        assert!(matches!(receipt.outcome, CommandOutcome::Rejected { .. }));
+        assert!(receipt.events.iter().any(|event| matches!(
+            &event.event,
+            DebugEvent::SandboxLifecycle(SandboxLifecycleEvent::Failed(failure))
+                if failure.stage == SandboxFailureStage::Discovery
+                    && failure.detail.as_str() == TEST_SANDBOX_FAILURE_DETAIL
+        )));
+        assert_eq!(
+            client.session_state().map(SessionState::kind),
+            Some(SessionStateKind::Idle)
+        );
+        assert_eq!(
+            client.connection_state(),
+            ClientConnectionState::SessionOpen
+        );
+    }
+
+    #[test]
+    fn mismatched_or_effectful_rollback_diagnostics_poison_the_connection() {
+        let mut wrong_provider = scripted_client(ScriptedAttack::WrongFailureProvider);
+        wrong_provider
+            .begin_session(session_id(), provisioning_epoch(), helper_build())
+            .unwrap();
+        assert_eq!(
+            wrong_provider.submit(DebugCommand::Open(sandbox_target())),
+            Err(DebugHostClientError::UnexpectedSandboxProvider)
+        );
+        assert_eq!(
+            wrong_provider.connection_state(),
+            ClientConnectionState::Failed
+        );
+
+        let mut extra_effect = scripted_client(ScriptedAttack::FailureWithStateEffect);
+        extra_effect
+            .begin_session(session_id(), provisioning_epoch(), helper_build())
+            .unwrap();
+        assert!(matches!(
+            extra_effect.submit(DebugCommand::Open(sandbox_target())),
+            Err(DebugHostClientError::RejectedCommandProducedEvidence { command_id })
+                if command_id.get() == 1
+        ));
+        assert_eq!(
+            extra_effect.connection_state(),
+            ClientConnectionState::Failed
+        );
+        assert_eq!(
+            extra_effect.session_state().map(SessionState::kind),
+            Some(SessionStateKind::Idle)
+        );
+    }
+
+    #[test]
+    fn provisioning_failure_retains_cleanup_ownership_until_exact_close() {
+        let mut client = scripted_client(ScriptedAttack::ProvisioningFailureThenCleanup);
+        client
+            .begin_session(session_id(), provisioning_epoch(), helper_build())
+            .unwrap();
+
+        let receipt = client
+            .submit(DebugCommand::Open(sandbox_target()))
+            .expect("resource-owning failure is represented exactly");
+        assert!(matches!(receipt.outcome, CommandOutcome::Rejected { .. }));
+        assert_eq!(
+            client.session_state().map(SessionState::kind),
+            Some(SessionStateKind::Failed)
+        );
+        assert_eq!(
+            client.connection_state(),
+            ClientConnectionState::SessionOpen
+        );
+        let session = client
+            .session
+            .as_ref()
+            .expect("failed session remains owned");
+        assert!(session.reducer.expected_attestation().is_some());
+        assert_eq!(
+            session.reducer.sandbox_state(),
+            Some(SandboxLifecycleState::Cleanup)
+        );
+        assert!(!session.sandbox_cleanup_verified);
+
+        let failed = client.session_state().expect("failed state").state_token();
+        let close = client
+            .submit(DebugCommand::Close { state: failed })
+            .expect("cleanup-required failure can close with exact receipt");
+        assert_eq!(close.outcome, CommandOutcome::Succeeded);
+        assert_eq!(
+            client.session_state().map(SessionState::kind),
+            Some(SessionStateKind::Closed)
+        );
+        assert!(
+            client
+                .session
+                .as_ref()
+                .expect("closed session remains owned until release")
+                .sandbox_cleanup_verified
+        );
+        client.release_closed_session().expect("verified release");
+        assert_eq!(client.connection_state(), ClientConnectionState::Connected);
+    }
+
+    #[test]
+    fn runtime_failure_retains_cleanup_ownership_and_rejects_success_claim() {
+        let mut client = scripted_client(ScriptedAttack::RuntimeFailureThenCleanup);
+        prime_sandbox_stopped(&mut client);
+        let SessionState::Stopped { token: stop, .. } = client
+            .session_state()
+            .expect("primed stopped state")
+            .clone()
+        else {
+            panic!("primed session must be stopped");
+        };
+        let receipt = client
+            .submit(DebugCommand::Continue { stop })
+            .expect("runtime failure remains cleanup-capable");
+        assert!(matches!(receipt.outcome, CommandOutcome::Rejected { .. }));
+        assert_eq!(
+            client.session_state().map(SessionState::kind),
+            Some(SessionStateKind::Failed)
+        );
+        let failed = client.session_state().expect("failed state").state_token();
+        client
+            .submit(DebugCommand::Close { state: failed })
+            .expect("runtime failure can close with exact cleanup");
+        client.release_closed_session().expect("verified release");
+
+        let mut contradictory = scripted_client(ScriptedAttack::FailureReportedAsSuccess);
+        contradictory
+            .begin_session(session_id(), provisioning_epoch(), helper_build())
+            .unwrap();
+        assert!(matches!(
+            contradictory.submit(DebugCommand::Open(sandbox_target())),
+            Err(DebugHostClientError::UnexpectedCommandEvidence {
+                evidence: "sandbox-rejection-diagnostic",
+                ..
+            })
+        ));
+        assert_eq!(
+            contradictory.connection_state(),
+            ClientConnectionState::Failed
+        );
+    }
+
+    #[test]
+    fn inherited_cleanup_failure_retains_exact_ownership_for_retry() {
+        let mut client = scripted_client(ScriptedAttack::InheritedCleanupFailure);
+        prime_inherited_observing(&mut client);
+        let observing = client
+            .session_state()
+            .expect("inherited observing state")
+            .state_token();
+        let failure = client
+            .submit(DebugCommand::Close { state: observing })
+            .expect("exact inherited cleanup failure remains representable");
+        assert!(matches!(failure.outcome, CommandOutcome::Rejected { .. }));
+        assert_eq!(
+            client.session_state().map(SessionState::kind),
+            Some(SessionStateKind::Failed)
+        );
+        let session = client
+            .session
+            .as_ref()
+            .expect("inherited session remains owned");
+        assert!(session.reducer.inherited_sandbox().is_some());
+        assert!(session.reducer.requires_cleanup_receipt());
+        assert!(!session.sandbox_cleanup_verified);
+        assert_eq!(
+            client.connection_state(),
+            ClientConnectionState::SessionOpen
+        );
+
+        client.transport.attack = ScriptedAttack::InheritedCleanup;
+        let failed = client.session_state().expect("failed state").state_token();
+        client
+            .submit(DebugCommand::Close { state: failed })
+            .expect("exact inherited receipt closes after failure");
+        assert_eq!(
+            client.session_state().map(SessionState::kind),
+            Some(SessionStateKind::Closed)
+        );
+        client.release_closed_session().expect("verified release");
+        assert_eq!(client.connection_state(), ClientConnectionState::Connected);
+
+        let mut forged = scripted_client(ScriptedAttack::WrongInheritedCleanupFailure);
+        prime_inherited_observing(&mut forged);
+        let observing = forged
+            .session_state()
+            .expect("inherited observing state")
+            .state_token();
+        assert_eq!(
+            forged.submit(DebugCommand::Close { state: observing }),
+            Err(DebugHostClientError::UnexpectedSandboxProvider)
+        );
+        assert_eq!(forged.connection_state(), ClientConnectionState::Failed);
+        assert_eq!(
+            forged.session_state().map(SessionState::kind),
+            Some(SessionStateKind::Observing)
         );
     }
 
