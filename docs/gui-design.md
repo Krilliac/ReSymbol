@@ -150,10 +150,12 @@ The complete approved inspector model contains:
 - an annotation field; and
 - relevant diagnostics or links to the full log.
 
-**Accept**, **Keep as Alias**, **Reject**, annotations, undo/redo, and decision history are not
-implemented in this slice. When added, review actions must create durable decisions with provenance
-and must not destructively erase the underlying alternatives. Those requirements must be satisfied
-before bulk review is considered complete.
+The inspector implements **Accept Primary**, **Keep as Alias**, and **Reject** for exact name claims.
+Each proposal displays its retained producer, method, run identifier, evidence, and complete-claim
+SHA-256 fingerprint. Decisions and optional rationale annotations enter a binary-bound ledger with
+undo/redo history; non-name claims remain explicitly read-only. Sidecar loads, create-new saves, and
+reviewed-projection rebuilds run on the bounded service worker, and stale operation or ledger results
+cannot replace current UI state. Bulk review remains future work.
 
 An evidence percentage is shown only when its producer defines that quantity. The UI must not imply
 that evidence scores are universally additive or that adding the displayed values computes the
@@ -185,13 +187,16 @@ never mutates widgets or analysis state directly; the UI event loop remains the 
 ## Export experience
 
 The implemented GUI consumes the same validated `AnalysisSession`, `.resym` package envelope, and
-neutral export projection as the CLI; it has no independent reconciliation path. The first slice
+neutral export projection as the CLI; it has no independent reconciliation path. Active review
+decisions are projected through the shared application service before review-aware exports. The GUI
 writes only new files and refuses to replace an existing destination. It can create:
 
 - a canonical `.resym` package;
 - the debugger-neutral JSON projection;
 - the bounded Markdown review report; and
-- Microsoft-linker-style MAP output.
+- Microsoft-linker-style MAP output;
+- an exact-RSDS public-symbol PDB; and
+- identity-gated IDA Python and Ghidra Java import scripts.
 
 The broader export surface should show:
 
@@ -202,14 +207,11 @@ The broader export surface should show:
 - existing-file/create-new behavior; and
 - a reviewable summary before writing.
 
-IDA/Ghidra script export and the existing exact-RSDS public-symbol PDB CLI target are not exposed in
-the GUI yet. When those formats are added, their target capability panels should differ without
-changing shared reconciliation. A future PDB panel must require selection of the
-exact original PE, show that its SHA-256 matches the package, and report the unambiguous RSDS
-GUID+age gate before enabling the write action. It must describe the current output as public
-function/global names only, without implying that types, private symbols, source lines, or
-function extents are present. An interactive debugger bridge may add preview and selective
-application, but it must still use the core identity and projection rules.
+The PDB panel requires the exact verified original PE and describes the current output as public
+function/global names only, without implying that types, private symbols, source lines, or function
+extents are present. IDA and Ghidra scripts retain their identity gate. An interactive debugger
+bridge may add preview and selective application, but it must still use the core identity and
+projection rules.
 
 The first slice opens and analyzes binaries; it does not open legacy `.resym` packages. Supporting
 legacy package review must use the CLI's explicit compatibility paths and must not relabel missing

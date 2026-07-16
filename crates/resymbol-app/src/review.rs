@@ -25,8 +25,11 @@ pub const MAX_REVIEW_DECISIONS: usize = 262_144;
 /// Maximum encoded JSON bytes accepted for one review sidecar.
 pub const MAX_REVIEW_SIDECAR_BYTES: u64 = 128 * 1024 * 1024;
 
-const MAX_REVIEWER_BYTES: usize = 1_024;
-const MAX_ANNOTATION_BYTES: usize = 16_384;
+/// Maximum UTF-8 bytes accepted for one reviewer identity.
+pub const MAX_REVIEWER_BYTES: usize = 1_024;
+
+/// Maximum UTF-8 bytes accepted for one review annotation or rationale.
+pub const MAX_REVIEW_ANNOTATION_BYTES: usize = 16_384;
 const REVIEW_ACCEPT_METHOD: &str = "review.accept";
 
 /// A stable logical key for one exact name claim.
@@ -249,7 +252,7 @@ impl DecisionAction {
         if let Self::Annotation { text } = self {
             validate_text(
                 text,
-                MAX_ANNOTATION_BYTES,
+                MAX_REVIEW_ANNOTATION_BYTES,
                 ReviewValidationError::InvalidAnnotation,
             )?;
         }
@@ -674,8 +677,55 @@ impl ReviewLedger {
     /// Windows, so readers observe either the previous valid ledger or the new
     /// valid ledger, never a partially written JSON document.
     pub fn save_atomic(&self, path: impl AsRef<Path>) -> Result<(), ReviewError> {
-        self.validate().map_err(ReviewError::InvalidLedger)?;
         let path = path.as_ref();
+        let (temporary, parent) = self.stage_sidecar(path)?;
+        temporary.persist(path).map_err(|error| ReviewError::Io {
+            operation: "replace",
+            path: path.to_path_buf(),
+            source: error.error,
+        })?;
+
+        #[cfg(not(unix))]
+        let _ = parent;
+        #[cfg(unix)]
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|source| ReviewError::Io {
+                operation: "synchronize parent directory for",
+                path: path.to_path_buf(),
+                source,
+            })?;
+        Ok(())
+    }
+
+    /// Publish a completely staged sidecar without replacing an existing path.
+    ///
+    /// Validation, encoding, flushing, and the encoded-size gate all complete
+    /// before the operating system's create-new publication step. Existing
+    /// files, directories, and links are never replaced or truncated.
+    pub fn save_new(&self, path: impl AsRef<Path>) -> Result<(), ReviewError> {
+        let path = path.as_ref();
+        let (temporary, _) = self.stage_sidecar(path)?;
+        match temporary.persist_noclobber(path) {
+            Ok(_) => Ok(()),
+            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(ReviewError::TargetAlreadyExists {
+                    path: path.to_path_buf(),
+                })
+            }
+            Err(error) => Err(ReviewError::Io {
+                operation: "publish new",
+                path: path.to_path_buf(),
+                source: error.error,
+            }),
+        }
+    }
+
+    fn stage_sidecar<'a>(
+        &self,
+        path: &'a Path,
+    ) -> Result<(tempfile::NamedTempFile, &'a Path), ReviewError> {
+        self.validate().map_err(ReviewError::InvalidLedger)?;
         let parent = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -731,21 +781,7 @@ impl ReviewLedger {
                 limit: MAX_REVIEW_SIDECAR_BYTES,
             });
         }
-        temporary.persist(path).map_err(|error| ReviewError::Io {
-            operation: "replace",
-            path: path.to_path_buf(),
-            source: error.error,
-        })?;
-
-        #[cfg(unix)]
-        File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|source| ReviewError::Io {
-                operation: "synchronize parent directory for",
-                path: path.to_path_buf(),
-                source,
-            })?;
-        Ok(())
+        Ok((temporary, parent))
     }
 
     /// Project the session through applied review decisions without mutating it.
@@ -1006,6 +1042,8 @@ pub enum ReviewError {
     },
     #[error("review sidecar `{path}` exceeds the encoded size limit of {limit} bytes")]
     SidecarTooLarge { path: PathBuf, limit: u64 },
+    #[error("review sidecar target `{path}` already exists")]
+    TargetAlreadyExists { path: PathBuf },
     #[error("review ledger is invalid: {0}")]
     InvalidLedger(#[from] ReviewValidationError),
     #[error("analysis session is invalid: {0}")]

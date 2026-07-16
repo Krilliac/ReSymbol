@@ -313,6 +313,29 @@ fn atomic_save_replaces_and_strict_load_rejects_drift() {
 }
 
 #[test]
+fn create_new_save_never_replaces_an_existing_sidecar() {
+    let (session, claims) = fixture(0, &[("candidate", 0.75)]);
+    let directory = tempdir().expect("temporary directory");
+    let path = directory.path().join("fixture.review.json");
+    let mut first = ReviewLedger::for_session(&session).expect("valid first ledger");
+    first
+        .accept_primary(&claims[0], None)
+        .expect("first review decision");
+    first.save_new(&path).expect("first create-new save");
+    let original = fs::read(&path).expect("read first sidecar");
+
+    let mut second = first.clone();
+    second
+        .annotate(&claims[0], "must not replace the first sidecar", None)
+        .expect("second review decision");
+    assert!(matches!(
+        second.save_new(&path),
+        Err(ReviewError::TargetAlreadyExists { .. })
+    ));
+    assert_eq!(fs::read(&path).expect("read preserved sidecar"), original);
+}
+
+#[test]
 fn projection_reports_and_ignores_orphaned_exact_claims() {
     let (full_session, claims) = fixture(0, &[("available", 0.9), ("missing", 0.8)]);
     let (reduced_session, _) = fixture(0, &[("available", 0.9)]);

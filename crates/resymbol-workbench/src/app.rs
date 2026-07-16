@@ -10,7 +10,9 @@ use std::{fs::OpenOptions, io::BufWriter, path::Path};
 use eframe::egui::{self, Align, Key, Layout, RichText, ScrollArea, Sense, TextEdit};
 use egui_extras::{Column, TableBuilder};
 use resymbol_analysis::BinaryAnalysis;
-use resymbol_app::ExportFormat;
+use resymbol_app::{
+    DecisionAction, ExportFormat, MAX_REVIEW_ANNOTATION_BYTES, MAX_REVIEWER_BYTES, ReviewSubject,
+};
 use resymbol_core::{
     DiscoveredPlugin, PluginDiscoveryOptions, PluginDiscoveryReport, discover_plugins,
     plugin_api::PluginHealthState,
@@ -34,6 +36,7 @@ use crate::{
         FunctionFilter, FunctionSort, FunctionSortKey, FunctionStatus, LoadedProject,
         ProtectionAssessment, SortDirection,
     },
+    review_state::BoundReviewLedger,
     theme::{SemanticColors, ThemePreset},
     worker::{
         OperationGate, OperationSequence, ServiceWorker, WorkerCommand, WorkerEvent,
@@ -197,6 +200,17 @@ enum ActivityLevel {
     Error,
 }
 
+enum ReviewUiAction {
+    Apply {
+        subject: ReviewSubject,
+        action: DecisionAction,
+    },
+    Undo,
+    Redo,
+    Save(PathBuf),
+    Load(PathBuf),
+}
+
 impl ActivityLevel {
     const fn label(self) -> &'static str {
         match self {
@@ -227,11 +241,13 @@ pub struct WorkbenchApp {
     operation_sequence: OperationSequence,
     project_operation: OperationGate,
     export_operation: OperationGate,
+    review_operation: OperationGate,
     worker_disconnected: bool,
     analysis_path: Option<PathBuf>,
     function_filter: FunctionFilter,
     function_sort: FunctionSort,
     selected_projection_index: Option<usize>,
+    selected_review_subject: Option<ReviewSubject>,
     graph_root_rva: Option<u64>,
     reconstruction_graph: Option<ReconstructionGraph>,
     activity: Vec<ActivityEntry>,
@@ -246,6 +262,13 @@ pub struct WorkbenchApp {
     screenshot_frame_count: u8,
     #[cfg(feature = "screenshot")]
     screenshot_requested: bool,
+    review: Option<BoundReviewLedger>,
+    review_reviewer: String,
+    review_rationale: String,
+    review_destination: String,
+    review_result: Option<Result<String, String>>,
+    pending_review_rollback: Option<BoundReviewLedger>,
+    review_orphaned_decisions: usize,
 }
 
 impl WorkbenchApp {
@@ -271,14 +294,12 @@ impl WorkbenchApp {
         };
         preferences.theme.apply(&creation_context.egui_ctx);
         #[cfg(feature = "screenshot")]
-        creation_context
-            .egui_ctx
-            .style_mut(|style| {
-                style.animation_time = 0.0;
-                // Floating scrollbars expand when the pointer happens to overlap them. Captures
-                // must not depend on the host cursor position, so keep their width fixed.
-                style.spacing.scroll = egui::style::ScrollStyle::solid();
-            });
+        creation_context.egui_ctx.style_mut(|style| {
+            style.animation_time = 0.0;
+            // Floating scrollbars expand when the pointer happens to overlap them. Captures
+            // must not depend on the host cursor position, so keep their width fixed.
+            style.spacing.scroll = egui::style::ScrollStyle::solid();
+        });
         #[cfg(feature = "screenshot")]
         for panel_id in [
             "project_navigation",
@@ -310,11 +331,13 @@ impl WorkbenchApp {
             operation_sequence: OperationSequence::default(),
             project_operation: OperationGate::default(),
             export_operation: OperationGate::default(),
+            review_operation: OperationGate::default(),
             worker_disconnected: false,
             analysis_path: None,
             function_filter: FunctionFilter::default(),
             function_sort: FunctionSort::default(),
             selected_projection_index: None,
+            selected_review_subject: None,
             graph_root_rva: None,
             reconstruction_graph: None,
             activity: Vec::new(),
@@ -330,6 +353,13 @@ impl WorkbenchApp {
             screenshot_frame_count: 0,
             #[cfg(feature = "screenshot")]
             screenshot_requested: false,
+            review: None,
+            review_reviewer: String::new(),
+            review_rationale: String::new(),
+            review_destination: String::new(),
+            review_result: None,
+            pending_review_rollback: None,
+            review_orphaned_decisions: 0,
         };
         app.log(
             ActivityLevel::Info,
@@ -365,6 +395,11 @@ impl WorkbenchApp {
             app.export_destination = default_export_path(&project, app.export_kind)
                 .to_string_lossy()
                 .into_owned();
+            app.review_destination = default_review_path(&project).to_string_lossy().into_owned();
+            app.review = Some(
+                BoundReviewLedger::for_session(project.session())
+                    .unwrap_or_else(|error| panic!("cannot bind screenshot review state: {error}")),
+            );
             app.analysis_path = Some(path.clone());
             app.stage = WorkflowStage::Review;
             app.main_tab = match tab.as_str() {
@@ -703,6 +738,22 @@ impl WorkbenchApp {
     }
 
     fn start_analysis(&mut self, path: PathBuf) -> Result<String, String> {
+        if self.project_operation.is_pending() {
+            return Err("a project operation is already running".to_owned());
+        }
+        if self.export_operation.is_pending() || self.review_operation.is_pending() {
+            return Err("wait for the current export or review operation first".to_owned());
+        }
+        if self
+            .review
+            .as_ref()
+            .is_some_and(BoundReviewLedger::is_dirty)
+        {
+            return Err(
+                "the current project has unsaved review decisions; save them to a new sidecar before replacing the project"
+                    .to_owned(),
+            );
+        }
         let operation = self.operation_sequence.issue();
         let command = if is_package_path(&path) {
             WorkerCommand::OpenPackage {
@@ -739,6 +790,9 @@ impl WorkbenchApp {
         if self.project_operation.is_pending() {
             return Err("wait for the current project operation before exporting".to_owned());
         }
+        if self.review_operation.is_pending() {
+            return Err("wait for the current review save or load before exporting".to_owned());
+        }
         let project = self
             .project
             .as_ref()
@@ -749,11 +803,18 @@ impl WorkbenchApp {
                     .to_owned(),
             );
         }
+        let reviews = self
+            .review
+            .as_ref()
+            .ok_or_else(|| "the current project has no bound review ledger".to_owned())?
+            .ledger()
+            .clone();
 
         let operation = self.operation_sequence.issue();
         self.service_worker.submit(WorkerCommand::Export {
             operation,
             project: Arc::clone(&project.snapshot),
+            reviews,
             kind: kind.worker_kind(),
             path: path.clone(),
         })?;
@@ -768,6 +829,9 @@ impl WorkbenchApp {
         if self.project_operation.is_pending() {
             return Err("a project operation is already running".to_owned());
         }
+        if self.review_operation.is_pending() {
+            return Err("wait for the current review save or load first".to_owned());
+        }
         let project = self
             .project
             .as_ref()
@@ -775,11 +839,18 @@ impl WorkbenchApp {
         if project.snapshot.has_verified_source() {
             return Err("the exact source binary is already verified".to_owned());
         }
+        let reviews = self
+            .review
+            .as_ref()
+            .ok_or_else(|| "the current project has no bound review ledger".to_owned())?
+            .ledger()
+            .clone();
 
         let operation = self.operation_sequence.issue();
         self.service_worker.submit(WorkerCommand::VerifySource {
             operation,
             project: Arc::clone(&project.snapshot),
+            reviews,
             path: path.clone(),
         })?;
         self.project_operation.begin(operation);
@@ -789,6 +860,200 @@ impl WorkbenchApp {
         );
         self.log(ActivityLevel::Info, &message);
         Ok(message)
+    }
+
+    fn queue_review_save(&mut self, path: PathBuf) -> Result<String, String> {
+        if path.as_os_str().is_empty() {
+            return Err("choose a review sidecar destination".to_owned());
+        }
+        if self.project_operation.is_pending() {
+            return Err("wait for the current project operation before saving reviews".to_owned());
+        }
+        if self.review_operation.is_pending() {
+            return Err("a review save or load is already running".to_owned());
+        }
+        let review = self
+            .review
+            .as_ref()
+            .ok_or_else(|| "open a project before saving reviews".to_owned())?;
+        if review.persisted_path() == Some(path.as_path()) {
+            return Err(
+                "choose a new sidecar path; an existing loaded or saved sidecar is never replaced"
+                    .to_owned(),
+            );
+        }
+        let ledger = review.ledger().clone();
+        let operation = self.operation_sequence.issue();
+        self.service_worker.submit(WorkerCommand::SaveReview {
+            operation,
+            ledger,
+            path: path.clone(),
+        })?;
+        self.review_operation.begin(operation);
+        self.review_result = None;
+        let message = format!("Queued create-new review save to {}", path.display());
+        self.log(ActivityLevel::Info, &message);
+        Ok(message)
+    }
+
+    fn queue_review_load(&mut self, path: PathBuf) -> Result<String, String> {
+        if path.as_os_str().is_empty() {
+            return Err("choose a review sidecar to load".to_owned());
+        }
+        if self.project_operation.is_pending() {
+            return Err("wait for the current project operation before loading reviews".to_owned());
+        }
+        if self.export_operation.is_pending() {
+            return Err("wait for the current export before loading reviews".to_owned());
+        }
+        if self.review_operation.is_pending() {
+            return Err("a review save or load is already running".to_owned());
+        }
+        if self
+            .review
+            .as_ref()
+            .is_some_and(BoundReviewLedger::is_dirty)
+        {
+            return Err(
+                "the current ledger has unsaved decisions; save them before loading another sidecar"
+                    .to_owned(),
+            );
+        }
+        let project = self
+            .project
+            .as_ref()
+            .ok_or_else(|| "open a project before loading reviews".to_owned())?;
+        let operation = self.operation_sequence.issue();
+        self.service_worker.submit(WorkerCommand::LoadReview {
+            operation,
+            project: Arc::clone(&project.snapshot),
+            path: path.clone(),
+        })?;
+        self.review_operation.begin(operation);
+        self.review_result = None;
+        let message = format!("Queued bound review sidecar load from {}", path.display());
+        self.log(ActivityLevel::Info, &message);
+        Ok(message)
+    }
+
+    fn queue_review_projection(
+        &mut self,
+        next: BoundReviewLedger,
+        description: String,
+    ) -> Result<String, String> {
+        if self.project_operation.is_pending() {
+            return Err("wait for the current project operation before reviewing".to_owned());
+        }
+        if self.export_operation.is_pending() {
+            return Err("wait for the current export before changing reviews".to_owned());
+        }
+        if self.review_operation.is_pending() {
+            return Err("a review operation is already running".to_owned());
+        }
+        let project = self
+            .project
+            .as_ref()
+            .ok_or_else(|| "open a project before reviewing claims".to_owned())?;
+        let operation = self.operation_sequence.issue();
+        self.service_worker.submit(WorkerCommand::ApplyReview {
+            operation,
+            project: Arc::clone(&project.snapshot),
+            ledger: next.ledger().clone(),
+        })?;
+        self.pending_review_rollback = self.review.replace(next);
+        self.review_operation.begin(operation);
+        self.review_result = None;
+        self.log(ActivityLevel::Info, &description);
+        Ok(description)
+    }
+
+    fn apply_review_ui_action(&mut self, action: ReviewUiAction) {
+        match action {
+            ReviewUiAction::Apply { subject, action } => {
+                let reviewer = self.review_reviewer.clone();
+                let rationale = self.review_rationale.clone();
+                let result = self
+                    .review
+                    .as_ref()
+                    .ok_or_else(|| "the current project has no bound review ledger".to_owned())
+                    .and_then(|review| {
+                        let mut next = review.clone();
+                        next.apply_disposition(&subject, action.clone(), &reviewer, &rationale)
+                            .map_err(|error| error.to_string())?;
+                        Ok(next)
+                    });
+                match result {
+                    Ok(next) => {
+                        let message = format!(
+                            "Applying {} to exact name claim `{}`",
+                            decision_action_label(&action),
+                            subject.name()
+                        );
+                        match self.queue_review_projection(next, message) {
+                            Ok(_) => self.review_rationale.clear(),
+                            Err(error) => {
+                                self.review_result = Some(Err(error.clone()));
+                                self.log(
+                                    ActivityLevel::Error,
+                                    format!("Review decision failed: {error}"),
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        self.review_result = Some(Err(error.clone()));
+                        self.log(
+                            ActivityLevel::Error,
+                            format!("Review decision failed: {error}"),
+                        );
+                    }
+                }
+            }
+            ReviewUiAction::Undo => {
+                let next = self
+                    .review
+                    .clone()
+                    .and_then(|mut next| next.undo().then_some(next));
+                let result = next.map(|next| {
+                    self.queue_review_projection(
+                        next,
+                        "Applying review undo to the active projection".to_owned(),
+                    )
+                });
+                if let Some(Err(error)) = result {
+                    self.review_result = Some(Err(error.clone()));
+                    self.log(ActivityLevel::Error, format!("Review undo failed: {error}"));
+                }
+            }
+            ReviewUiAction::Redo => {
+                let next = self
+                    .review
+                    .clone()
+                    .and_then(|mut next| next.redo().then_some(next));
+                let result = next.map(|next| {
+                    self.queue_review_projection(
+                        next,
+                        "Applying review redo to the active projection".to_owned(),
+                    )
+                });
+                if let Some(Err(error)) = result {
+                    self.review_result = Some(Err(error.clone()));
+                    self.log(ActivityLevel::Error, format!("Review redo failed: {error}"));
+                }
+            }
+            ReviewUiAction::Save(path) => {
+                if let Err(error) = self.queue_review_save(path) {
+                    self.review_result = Some(Err(error.clone()));
+                    self.log(ActivityLevel::Error, format!("Review save failed: {error}"));
+                }
+            }
+            ReviewUiAction::Load(path) => {
+                if let Err(error) = self.queue_review_load(path) {
+                    self.review_result = Some(Err(error.clone()));
+                    self.log(ActivityLevel::Error, format!("Review load failed: {error}"));
+                }
+            }
+        }
     }
 
     fn poll_service_worker(&mut self) {
@@ -801,6 +1066,10 @@ impl WorkbenchApp {
                         self.worker_disconnected = true;
                         self.project_operation.invalidate();
                         self.export_operation.invalidate();
+                        self.review_operation.invalidate();
+                        if let Some(previous) = self.pending_review_rollback.take() {
+                            self.review = Some(previous);
+                        }
                         self.log(ActivityLevel::Error, error);
                     }
                     break;
@@ -808,8 +1077,7 @@ impl WorkbenchApp {
             };
 
             match event {
-                WorkerEvent::ProjectOpened { operation, result }
-                | WorkerEvent::SourceVerified { operation, result } => {
+                WorkerEvent::ProjectOpened { operation, result } => {
                     if !self.project_operation.finish(operation) {
                         self.log(
                             ActivityLevel::Warning,
@@ -821,7 +1089,7 @@ impl WorkbenchApp {
                         continue;
                     }
                     match result {
-                        Ok(project) => self.accept_project(project),
+                        Ok(project) => self.accept_project(project, false),
                         Err(error) => {
                             self.stage = if self.project.is_some() {
                                 WorkflowStage::Review
@@ -831,6 +1099,28 @@ impl WorkbenchApp {
                             self.log(
                                 ActivityLevel::Error,
                                 format!("Project open failed: {error}"),
+                            );
+                        }
+                    }
+                }
+                WorkerEvent::SourceVerified { operation, result } => {
+                    if !self.project_operation.finish(operation) {
+                        self.log(
+                            ActivityLevel::Warning,
+                            format!(
+                                "Ignored stale source verification for operation {}",
+                                operation.get()
+                            ),
+                        );
+                        continue;
+                    }
+                    match result {
+                        Ok(project) => self.accept_project(project, true),
+                        Err(error) => {
+                            self.stage = WorkflowStage::Review;
+                            self.log(
+                                ActivityLevel::Error,
+                                format!("Source verification failed: {error}"),
                             );
                         }
                     }
@@ -864,11 +1154,168 @@ impl WorkbenchApp {
                         }
                     }
                 }
+                WorkerEvent::ReviewSaved { operation, result } => {
+                    if !self.review_operation.finish(operation) {
+                        self.log(
+                            ActivityLevel::Warning,
+                            format!(
+                                "Ignored stale review-save result for operation {}",
+                                operation.get()
+                            ),
+                        );
+                        continue;
+                    }
+                    match result {
+                        Ok(outcome) => {
+                            let current = self.review.as_mut().is_some_and(|review| {
+                                review.mark_saved(&outcome.ledger, outcome.path.clone())
+                            });
+                            let message = if current {
+                                format!("Saved review sidecar to {}", outcome.path.display())
+                            } else {
+                                format!(
+                                    "Saved an earlier review snapshot to {}; newer in-memory decisions remain unsaved",
+                                    outcome.path.display()
+                                )
+                            };
+                            self.review_destination = outcome.path.to_string_lossy().into_owned();
+                            self.review_result = Some(Ok(message.clone()));
+                            self.log(ActivityLevel::Success, message);
+                        }
+                        Err(error) => {
+                            self.review_result = Some(Err(error.clone()));
+                            self.log(ActivityLevel::Error, format!("Review save failed: {error}"));
+                        }
+                    }
+                }
+                WorkerEvent::ReviewApplied {
+                    operation,
+                    ledger,
+                    result,
+                } => {
+                    if !self.review_operation.finish(operation) {
+                        self.log(
+                            ActivityLevel::Warning,
+                            format!(
+                                "Ignored stale reviewed-projection result for operation {}",
+                                operation.get()
+                            ),
+                        );
+                        continue;
+                    }
+                    let ledger_is_current = self
+                        .review
+                        .as_ref()
+                        .is_some_and(|review| review.ledger() == &ledger);
+                    if !ledger_is_current {
+                        if let Some(previous) = self.pending_review_rollback.take() {
+                            self.review = Some(previous);
+                        }
+                        self.log(
+                            ActivityLevel::Warning,
+                            "Ignored reviewed projection for a superseded ledger snapshot",
+                        );
+                        continue;
+                    }
+                    match result {
+                        Ok(outcome) => {
+                            self.pending_review_rollback = None;
+                            self.review_orphaned_decisions = outcome.orphaned_decisions;
+                            self.accept_reviewed_project(outcome.project);
+                            let message = "Review decision applied to the active projection";
+                            self.review_result = Some(Ok(message.to_owned()));
+                            self.log(ActivityLevel::Success, message);
+                        }
+                        Err(error) => {
+                            if let Some(previous) = self.pending_review_rollback.take() {
+                                self.review = Some(previous);
+                            }
+                            self.review_result = Some(Err(error.clone()));
+                            self.log(
+                                ActivityLevel::Error,
+                                format!(
+                                    "Reviewed projection failed; decision rolled back: {error}"
+                                ),
+                            );
+                        }
+                    }
+                }
+                WorkerEvent::ReviewLoaded { operation, result } => {
+                    if !self.review_operation.finish(operation) {
+                        self.log(
+                            ActivityLevel::Warning,
+                            format!(
+                                "Ignored stale review-load result for operation {}",
+                                operation.get()
+                            ),
+                        );
+                        continue;
+                    }
+                    match result {
+                        Ok(outcome) => {
+                            let bound = BoundReviewLedger::from_loaded(
+                                outcome.project.session(),
+                                outcome.ledger,
+                                outcome.path.clone(),
+                            )
+                            .map_err(|error| error.to_string());
+                            match bound {
+                                Ok(review) => {
+                                    self.review = Some(review);
+                                    self.pending_review_rollback = None;
+                                    self.review_orphaned_decisions = outcome.orphaned_decisions;
+                                    self.review_destination =
+                                        outcome.path.to_string_lossy().into_owned();
+                                    self.accept_reviewed_project(outcome.project);
+                                    let message = format!(
+                                        "Loaded review sidecar from {} ({} orphaned decision(s))",
+                                        outcome.path.display(),
+                                        outcome.orphaned_decisions
+                                    );
+                                    self.review_result = Some(Ok(message.clone()));
+                                    self.log(ActivityLevel::Success, message);
+                                }
+                                Err(error) => {
+                                    self.review_result = Some(Err(error.clone()));
+                                    self.log(
+                                        ActivityLevel::Error,
+                                        format!("Review load failed: {error}"),
+                                    );
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            self.review_result = Some(Err(error.clone()));
+                            self.log(ActivityLevel::Error, format!("Review load failed: {error}"));
+                        }
+                    }
+                }
             }
         }
     }
 
-    fn accept_project(&mut self, project: LoadedProject) {
+    fn accept_project(&mut self, project: LoadedProject, preserve_reviews: bool) {
+        let reviews_still_bound = preserve_reviews
+            && self.review.as_ref().is_some_and(|review| {
+                review
+                    .ledger()
+                    .validate_for_binary(project.session().base_analysis().identity())
+                    .is_ok()
+            });
+        let replacement_reviews = if reviews_still_bound {
+            None
+        } else {
+            match BoundReviewLedger::for_session(project.session()) {
+                Ok(review) => Some(review),
+                Err(error) => {
+                    self.log(
+                        ActivityLevel::Error,
+                        format!("Project review ledger could not be bound: {error}"),
+                    );
+                    return;
+                }
+            }
+        };
         let function_count = project.functions.len();
         let warning_count = project.projection.warnings.len();
         let protection_count = project.protection_assessment.findings().len();
@@ -878,16 +1325,27 @@ impl WorkbenchApp {
             .unavailable_reason()
             .map(ToOwned::to_owned);
         self.export_operation.invalidate();
+        self.review_operation.invalidate();
+        self.pending_review_rollback = None;
         self.export_destination = default_export_path(&project, self.export_kind)
             .to_string_lossy()
             .into_owned();
         self.export_result = None;
         self.analysis_path = Some(project.identity.path.clone());
         self.selected_projection_index = project.functions.first().map(|row| row.projection_index);
+        if !reviews_still_bound {
+            self.selected_review_subject = None;
+        }
         let reconstruction_graph = ReconstructionGraph::from_project(&project);
         self.graph_root_rva = reconstruction_graph.default_root().map(|root| root.rva);
         self.reconstruction_graph = Some(reconstruction_graph);
         self.function_filter = FunctionFilter::default();
+        if let Some(review) = replacement_reviews {
+            self.review_destination = default_review_path(&project).to_string_lossy().into_owned();
+            self.review_result = None;
+            self.review = Some(review);
+            self.review_orphaned_decisions = 0;
+        }
         self.project = Some(project);
         self.stage = WorkflowStage::Review;
         self.main_tab = MainTab::Overview;
@@ -911,6 +1369,47 @@ impl WorkbenchApp {
         );
     }
 
+    fn accept_reviewed_project(&mut self, project: LoadedProject) {
+        let Some(current) = self.project.as_ref() else {
+            self.log(
+                ActivityLevel::Warning,
+                "Ignored reviewed projection because no project is open",
+            );
+            return;
+        };
+        if current.identity.sha256 != project.identity.sha256
+            || current.identity.file_size != project.identity.file_size
+        {
+            self.log(
+                ActivityLevel::Warning,
+                "Ignored reviewed projection for a different project identity",
+            );
+            return;
+        }
+
+        let selected_rva = self
+            .selected_projection_index
+            .and_then(|index| current.functions.get(index))
+            .map(|row| row.rva);
+        let previous_graph_root = self.graph_root_rva;
+        let reconstruction_graph = ReconstructionGraph::from_project(&project);
+        self.selected_projection_index = selected_rva
+            .and_then(|rva| {
+                project
+                    .functions
+                    .iter()
+                    .find(|row| row.rva == rva)
+                    .map(|row| row.projection_index)
+            })
+            .or_else(|| project.functions.first().map(|row| row.projection_index));
+        self.graph_root_rva = previous_graph_root
+            .filter(|rva| project.functions.iter().any(|row| row.rva == *rva))
+            .or_else(|| reconstruction_graph.default_root().map(|root| root.rva));
+        self.reconstruction_graph = Some(reconstruction_graph);
+        self.export_result = None;
+        self.project = Some(project);
+    }
+
     fn choose_binary(&mut self, _context: &egui::Context) {
         let Some(path) = rfd::FileDialog::new()
             .set_title("Open a PE32+ x86-64 binary or current ReSymbol package")
@@ -926,10 +1425,65 @@ impl WorkbenchApp {
     }
 
     fn handle_inputs(&mut self, context: &egui::Context) {
-        let open_shortcut =
-            context.input(|input| input.modifiers.command && input.key_pressed(Key::O));
+        let (open_shortcut, load_review_shortcut, save_review_shortcut, save_review_as_shortcut) =
+            context.input(|input| {
+                let command = input.modifiers.command;
+                (
+                    command && !input.modifiers.shift && input.key_pressed(Key::O),
+                    command && input.modifiers.shift && input.key_pressed(Key::O),
+                    command && !input.modifiers.shift && input.key_pressed(Key::S),
+                    command && input.modifiers.shift && input.key_pressed(Key::S),
+                )
+            });
         if open_shortcut {
             self.choose_binary(context);
+        }
+        if save_review_shortcut && self.review.is_some() {
+            self.apply_review_ui_action(ReviewUiAction::Save(PathBuf::from(
+                self.review_destination.trim(),
+            )));
+        } else if save_review_as_shortcut && self.review.is_some() {
+            if let Some(path) = rfd::FileDialog::new()
+                .set_title("Create a new ReSymbol review sidecar")
+                .add_filter("ReSymbol review", &["json"])
+                .set_file_name("project.review.json")
+                .save_file()
+            {
+                self.apply_review_ui_action(ReviewUiAction::Save(path));
+            }
+        } else if load_review_shortcut
+            && self
+                .review
+                .as_ref()
+                .is_some_and(|review| !review.is_dirty())
+        {
+            if let Some(path) = rfd::FileDialog::new()
+                .set_title("Load a binary-bound ReSymbol review sidecar")
+                .add_filter("ReSymbol review", &["json"])
+                .pick_file()
+            {
+                self.apply_review_ui_action(ReviewUiAction::Load(path));
+            }
+        }
+
+        let (undo_review, redo_review) = context.input(|input| {
+            let command = input.modifiers.command;
+            let undo = command && !input.modifiers.shift && input.key_pressed(Key::Z);
+            let redo = command
+                && ((input.modifiers.shift && input.key_pressed(Key::Z))
+                    || input.key_pressed(Key::Y));
+            (undo, redo)
+        });
+        if !context.wants_keyboard_input()
+            && !self.project_operation.is_pending()
+            && !self.review_operation.is_pending()
+            && !self.export_operation.is_pending()
+        {
+            if undo_review {
+                self.apply_review_ui_action(ReviewUiAction::Undo);
+            } else if redo_review {
+                self.apply_review_ui_action(ReviewUiAction::Redo);
+            }
         }
 
         let dropped = context.input(|input| {
@@ -1244,8 +1798,37 @@ impl WorkbenchApp {
                     self.show_plugin_list(ui);
                 });
                 ui.separator();
-                ui.label(RichText::new("Project settings").weak());
-                ui.small("Durable review decisions are not implemented in this slice.");
+                ui.label(RichText::new("Review sidecar").strong());
+                if let Some(review) = &self.review {
+                    let state = if review.is_dirty() { "UNSAVED" } else { "CLEAN" };
+                    let state_color = if review.is_dirty() {
+                        colors.warning_conflict
+                    } else {
+                        colors.healthy
+                    };
+                    ui.label(RichText::new(format!(
+                        "[{state}] {} applied / {} history / {} redo",
+                        review.applied_count(),
+                        review.history_count(),
+                        review.redo_count()
+                    )).color(state_color));
+                    if self.review_orphaned_decisions != 0 {
+                        ui.label(
+                            RichText::new(format!(
+                                "[ORPHANED] {} exact claim decision(s) are retained but not applied",
+                                self.review_orphaned_decisions
+                            ))
+                            .color(colors.warning_conflict),
+                        );
+                    }
+                    if let Some(path) = review.persisted_path() {
+                        ui.small(format!("Last sidecar: {}", path.display()));
+                    } else {
+                        ui.small("Use the Evidence inspector to save or load review history.");
+                    }
+                } else {
+                    ui.small("Open a project to create an exact binary-bound review ledger.");
+                }
             });
     }
 
@@ -1284,6 +1867,7 @@ impl WorkbenchApp {
                     .inner_margin(egui::Margin::same(12)),
             );
         let is_open = self.preferences.right_panel_open;
+        let mut pending_review_action = None;
         let contents = |ui: &mut egui::Ui| {
             ui.horizontal(|ui| {
                 ui.heading("Evidence inspector");
@@ -1384,6 +1968,19 @@ impl WorkbenchApp {
                 }
 
                 if let Some(detail) = project.function_detail(index) {
+                    let selected_is_available = self.selected_review_subject.as_ref().is_some_and(
+                        |selected| {
+                            detail.claims.iter().any(|claim| {
+                                claim.review_subject().is_some_and(|subject| subject == selected)
+                            })
+                        },
+                    );
+                    if !selected_is_available {
+                        self.selected_review_subject = detail
+                            .claims
+                            .iter()
+                            .find_map(|claim| claim.review_subject().cloned());
+                    }
                     ui.add_space(10.0);
                     ui.label(
                         RichText::new(format!("Claims and provenance ({})", detail.claims.len()))
@@ -1396,7 +1993,28 @@ impl WorkbenchApp {
                             .inner_margin(egui::Margin::symmetric(8, 5))
                             .corner_radius(4)
                             .show(ui, |ui| {
-                                ui.collapsing(format!("{:?}: {}", claim.kind, claim.value), |ui| {
+                                if let Some(subject) = claim.review_subject() {
+                                    let selected = self.selected_review_subject.as_ref()
+                                        == Some(subject);
+                                    let response = ui
+                                        .selectable_label(
+                                            selected,
+                                            RichText::new(format!(
+                                                "[NAME CLAIM] {}",
+                                                claim.value
+                                            ))
+                                            .monospace(),
+                                        )
+                                        .on_hover_text(
+                                            "Select this exact fingerprinted name claim for review",
+                                        );
+                                    if response.clicked() {
+                                        self.selected_review_subject = Some(subject.clone());
+                                    }
+                                } else {
+                                    ui.label(format!("{:?}: {}", claim.kind, claim.value));
+                                }
+                                ui.collapsing("Evidence details", |ui| {
                                     ui.label(format!(
                                         "Confidence: {:.1}%",
                                         claim.confidence * 100.0
@@ -1448,12 +2066,289 @@ impl WorkbenchApp {
                     .corner_radius(4)
                     .show(ui, |ui| {
                         ui.label(RichText::new("Review decisions").strong());
-                        ui.label(
-                            RichText::new("Read-only evidence mode").color(colors.secondary_text),
+                        let review_busy = self.project_operation.is_pending()
+                            || self.review_operation.is_pending()
+                            || self.export_operation.is_pending();
+                        let selected_subject = self.selected_review_subject.as_ref();
+                        let (current, history, can_undo, can_redo, dirty, persisted_path) = self
+                            .review
+                            .as_ref()
+                            .map_or_else(
+                                || {
+                                    (
+                                        None,
+                                        Vec::new(),
+                                        false,
+                                        false,
+                                        false,
+                                        None,
+                                    )
+                                },
+                                |review| {
+                                    let ledger = review.ledger();
+                                    let current = selected_subject.and_then(|subject| {
+                                        ledger.latest_disposition(subject).map(|decision| {
+                                            format!(
+                                                "#{} {} by {}",
+                                                decision.sequence(),
+                                                decision_action_label(decision.action()),
+                                                decision.reviewer().unwrap_or("anonymous reviewer")
+                                            )
+                                        })
+                                    });
+                                    let applied_count = ledger.applied_history().len();
+                                    let history = selected_subject.map_or_else(Vec::new, |subject| {
+                                        ledger
+                                            .history()
+                                            .iter()
+                                            .enumerate()
+                                            .rev()
+                                            .filter(|(_, decision)| decision.subject() == subject)
+                                            .take(8)
+                                            .map(|(history_index, decision)| {
+                                                let state = if history_index < applied_count {
+                                                    "APPLIED"
+                                                } else {
+                                                    "REDO"
+                                                };
+                                                format!(
+                                                    "[{state}] #{} {}",
+                                                    decision.sequence(),
+                                                    decision_history_label(decision.action())
+                                                )
+                                            })
+                                            .collect::<Vec<_>>()
+                                    });
+                                    (
+                                        current,
+                                        history,
+                                        review.can_undo(),
+                                        review.can_redo(),
+                                        review.is_dirty(),
+                                        review
+                                            .persisted_path()
+                                            .map(|path| path.to_path_buf()),
+                                    )
+                                },
+                            );
+
+                        match selected_subject {
+                            Some(subject) => {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "Selected exact name: {}",
+                                        subject.name()
+                                    ))
+                                    .monospace(),
+                                );
+                                ui.small(format!(
+                                    "Claim SHA-256 {}",
+                                    subject.claim_sha256()
+                                ));
+                            }
+                            None => {
+                                ui.label(
+                                    RichText::new(
+                                        "Select a [NAME CLAIM] above; non-name claims remain read-only",
+                                    )
+                                    .color(colors.secondary_text),
+                                );
+                            }
+                        }
+                        ui.label(current.map_or_else(
+                            || "Current disposition: none".to_owned(),
+                            |value| format!("Current disposition: {value}"),
+                        ));
+
+                        if history.is_empty() {
+                            ui.small("No history for the selected claim");
+                        } else {
+                            ui.collapsing("Selected claim history", |ui| {
+                                for entry in history {
+                                    ui.label(RichText::new(entry).monospace().small());
+                                }
+                            });
+                        }
+
+                        ui.separator();
+                        ui.label("Reviewer (optional)");
+                        let reviewer = ui.add(
+                            TextEdit::singleline(&mut self.review_reviewer)
+                                .char_limit(MAX_REVIEWER_BYTES)
+                                .hint_text("Name or handle")
+                                .desired_width(ui.available_width()),
                         );
-                        ui.small(
-                            "Durable Accept / Alias / Reject history is the next review slice.",
+                        if reviewer.changed() {
+                            truncate_utf8_bytes(&mut self.review_reviewer, MAX_REVIEWER_BYTES);
+                        }
+                        ui.small(format!(
+                            "{} / {} UTF-8 bytes",
+                            self.review_reviewer.len(),
+                            MAX_REVIEWER_BYTES
+                        ));
+
+                        ui.label("Rationale (optional audit annotation)");
+                        let rationale = ui.add(
+                            TextEdit::multiline(&mut self.review_rationale)
+                                .char_limit(MAX_REVIEW_ANNOTATION_BYTES)
+                                .hint_text("Evidence-based reason retained as an annotation")
+                                .desired_rows(2)
+                                .desired_width(ui.available_width()),
                         );
+                        if rationale.changed() {
+                            truncate_utf8_bytes(
+                                &mut self.review_rationale,
+                                MAX_REVIEW_ANNOTATION_BYTES,
+                            );
+                        }
+                        ui.small(format!(
+                            "{} / {} UTF-8 bytes",
+                            self.review_rationale.len(),
+                            MAX_REVIEW_ANNOTATION_BYTES
+                        ));
+
+                        let can_decide = selected_subject.is_some()
+                            && self.review.is_some()
+                            && !review_busy;
+                        ui.horizontal_wrapped(|ui| {
+                            let accept = ui
+                                .add_enabled(can_decide, egui::Button::new("Accept Primary"))
+                                .on_hover_text(
+                                    "Promote the selected exact name claim to the reviewed primary",
+                                );
+                            if accept.clicked() {
+                                pending_review_action = selected_subject.cloned().map(|subject| {
+                                    ReviewUiAction::Apply {
+                                        subject,
+                                        action: DecisionAction::AcceptPrimary,
+                                    }
+                                });
+                            }
+                            let keep_alias = ui
+                                .add_enabled(can_decide, egui::Button::new("Keep as Alias"))
+                                .on_hover_text(
+                                    "Keep this selected existing name claim as an alternate; arbitrary new aliases are not invented",
+                                );
+                            if keep_alias.clicked() {
+                                pending_review_action = selected_subject.cloned().map(|subject| {
+                                    ReviewUiAction::Apply {
+                                        subject,
+                                        action: DecisionAction::KeepAlias,
+                                    }
+                                });
+                            }
+                            let reject = ui
+                                .add_enabled(can_decide, egui::Button::new("Reject"))
+                                .on_hover_text(
+                                    "Reject this exact claim; a rationale is retained when supplied",
+                                );
+                            if reject.clicked() {
+                                pending_review_action = selected_subject.cloned().map(|subject| {
+                                    ReviewUiAction::Apply {
+                                        subject,
+                                        action: DecisionAction::Reject,
+                                    }
+                                });
+                            }
+                        });
+
+                        ui.horizontal(|ui| {
+                            let undo = ui
+                                .add_enabled(can_undo && !review_busy, egui::Button::new("Undo"))
+                                .on_hover_text("Undo review history (Ctrl+Z outside text fields)");
+                            if undo.clicked() {
+                                pending_review_action = Some(ReviewUiAction::Undo);
+                            }
+                            let redo = ui
+                                .add_enabled(can_redo && !review_busy, egui::Button::new("Redo"))
+                                .on_hover_text(
+                                    "Redo review history (Ctrl+Shift+Z or Ctrl+Y outside text fields)",
+                                );
+                            if redo.clicked() {
+                                pending_review_action = Some(ReviewUiAction::Redo);
+                            }
+                            ui.label(if dirty { "[UNSAVED]" } else { "[CLEAN]" });
+                        });
+
+                        ui.separator();
+                        ui.label(RichText::new("Review sidecar").strong());
+                        ui.add(
+                            TextEdit::singleline(&mut self.review_destination)
+                                .desired_width(ui.available_width()),
+                        );
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.button("Choose new...").clicked() {
+                                let default = PathBuf::from(&self.review_destination);
+                                let mut dialog = rfd::FileDialog::new()
+                                    .set_title("Create a new ReSymbol review sidecar")
+                                    .add_filter("ReSymbol review", &["json"]);
+                                if let Some(parent) = default.parent() {
+                                    dialog = dialog.set_directory(parent);
+                                }
+                                if let Some(name) =
+                                    default.file_name().and_then(|name| name.to_str())
+                                {
+                                    dialog = dialog.set_file_name(name);
+                                }
+                                if let Some(path) = dialog.save_file() {
+                                    self.review_destination =
+                                        path.to_string_lossy().into_owned();
+                                }
+                            }
+                            let destination = PathBuf::from(self.review_destination.trim());
+                            let destination_is_known_existing =
+                                persisted_path.as_ref() == Some(&destination);
+                            let can_save = self.review.is_some()
+                                && !review_busy
+                                && !self.review_destination.trim().is_empty()
+                                && !destination_is_known_existing;
+                            let save = ui
+                                .add_enabled(can_save, egui::Button::new("Save New"))
+                                .on_hover_text(if destination_is_known_existing {
+                                    "Choose a new path; the loaded or previously saved sidecar is never replaced"
+                                } else {
+                                    "Create a new sidecar; an existing path is never replaced"
+                                });
+                            if save.clicked() {
+                                pending_review_action = Some(ReviewUiAction::Save(destination));
+                            }
+                            let can_load = self.review.is_some() && !review_busy && !dirty;
+                            let load = ui
+                                .add_enabled(can_load, egui::Button::new("Load..."))
+                                .on_hover_text(if dirty {
+                                    "Save unsaved decisions before loading another sidecar"
+                                } else {
+                                    "Load a strictly validated sidecar bound to this exact binary"
+                                });
+                            if load.clicked() {
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .set_title("Load a ReSymbol review sidecar")
+                                    .add_filter("ReSymbol review", &["json"])
+                                    .pick_file()
+                                {
+                                    pending_review_action = Some(ReviewUiAction::Load(path));
+                                }
+                            }
+                        });
+                        if let Some(path) = persisted_path {
+                            ui.small(format!("Last loaded/saved: {}", path.display()));
+                        }
+                        if self.review_operation.is_pending() {
+                            ui.small("Review operation running on the bounded worker...");
+                        }
+                        if let Some(result) = &self.review_result {
+                            match result {
+                                Ok(message) => {
+                                    ui.colored_label(colors.healthy, format!("[OK] {message}"));
+                                }
+                                Err(error) => {
+                                    ui.colored_label(
+                                        colors.destructive_quarantined,
+                                        format!("[ERROR] {error}"),
+                                    );
+                                }
+                            }
+                        }
                     });
             });
         };
@@ -1461,6 +2356,9 @@ impl WorkbenchApp {
             panel.show(context, contents);
         } else {
             panel.show_animated(context, is_open, contents);
+        }
+        if let Some(action) = pending_review_action {
+            self.apply_review_ui_action(action);
         }
     }
 
@@ -2858,6 +3756,7 @@ impl WorkbenchApp {
             let exact_source_ready = project.snapshot.has_verified_source();
             let can_export = !self.export_operation.is_pending()
                 && !self.project_operation.is_pending()
+                && !self.review_operation.is_pending()
                 && (self.export_kind != ExportKind::Pdb || exact_source_ready);
             let action_label = if self.export_operation.is_pending() {
                 "Exporting...".to_owned()
@@ -2925,6 +3824,7 @@ impl eframe::App for WorkbenchApp {
         if !cfg!(feature = "screenshot")
             && (self.project_operation.is_pending()
                 || self.export_operation.is_pending()
+                || self.review_operation.is_pending()
                 || self.console_host.is_enabled())
         {
             context.request_repaint_after(std::time::Duration::from_millis(100));
@@ -3161,7 +4061,7 @@ fn format_bytes(bytes: u64) -> String {
 
 fn export_kind_description(kind: ExportKind) -> &'static str {
     match kind {
-        ExportKind::Package => "Canonical loss-aware analysis package",
+        ExportKind::Package => "Canonical analysis package; review history stays in its sidecar",
         ExportKind::NeutralJson => "Debugger-neutral structured symbol projection",
         ExportKind::Markdown => "Bounded human-review report",
         ExportKind::Map => "Microsoft-linker-style public symbol map",
@@ -3640,6 +4540,35 @@ const fn panel_state(open: bool) -> &'static str {
     if open { "shown" } else { "hidden" }
 }
 
+const fn decision_action_label(action: &DecisionAction) -> &'static str {
+    match action {
+        DecisionAction::AcceptPrimary => "Accept Primary",
+        DecisionAction::KeepAlias => "Keep as Alias",
+        DecisionAction::Reject => "Reject",
+        DecisionAction::Annotation { .. } => "Annotation",
+    }
+}
+
+fn decision_history_label(action: &DecisionAction) -> String {
+    match action {
+        DecisionAction::Annotation { text } => {
+            format!("Annotation: {}", bounded_text_preview(text, 96))
+        }
+        _ => decision_action_label(action).to_owned(),
+    }
+}
+
+fn bounded_text_preview(value: &str, maximum_bytes: usize) -> String {
+    if value.len() <= maximum_bytes {
+        return value.to_owned();
+    }
+    let mut end = maximum_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &value[..end])
+}
+
 fn is_package_path(path: &std::path::Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
@@ -3667,6 +4596,31 @@ fn default_export_path(project: &LoadedProject, kind: ExportKind) -> PathBuf {
     let mut path = project.snapshot.origin_path().to_path_buf();
     path.set_file_name(file_name);
     path
+}
+
+fn default_review_path(project: &LoadedProject) -> PathBuf {
+    let digest = project.identity.sha256.as_str();
+    let stem = project
+        .snapshot
+        .origin_path()
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .map_or_else(|| format!("resymbol_{}", &digest[..12]), ToOwned::to_owned);
+    let mut path = project.snapshot.origin_path().to_path_buf();
+    path.set_file_name(format!("{stem}.review.json"));
+    path
+}
+
+fn truncate_utf8_bytes(value: &mut String, maximum_bytes: usize) {
+    if value.len() <= maximum_bytes {
+        return;
+    }
+    let mut end = maximum_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
 }
 
 fn bounded_message(mut message: String) -> String {
