@@ -20,8 +20,8 @@ pub use types::{
     PeAnalysis, PeControlFlowTarget, PeDataDirectories, PeDataReference, PeDelayImportLibrary,
     PeDirectCall, PeExport, PeExportName, PeGuardAddressTakenIatEntry, PeGuardCfFunction,
     PeGuardEhContinuationTarget, PeGuardLongJumpTarget, PeImport, PeImportLibrary,
-    PeLoadConfigSecurityAnchors, PeRecoveredString, PeSection, PeStringEncoding, PeThunk,
-    PeTlsCallback, RuntimeFunction,
+    PeLoadConfigSecurityAnchors, PeLoadConfigXfgAnchors, PeRecoveredString, PeSection,
+    PeStringEncoding, PeThunk, PeTlsCallback, RuntimeFunction,
 };
 
 /// Detect and analyze a supported binary container.

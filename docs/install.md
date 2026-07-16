@@ -13,7 +13,8 @@ CMake, Visual Studio, LLVM, DIA, or another compiler to run an official archive.
 The current analyzer accepts native Windows x86-64 PE32+ input. It safely extracts image and section
 metadata, conventional imports, modern RVA-form delay imports, exports, forwarded exports, x64
 exception-directory records, ordered TLS callback records, and load-config GuardCF function,
-address-taken IAT, long-jump, and EH-continuation records. Exact export names, metadata-backed `RUNTIME_FUNCTION` ranges, GuardCF function records,
+address-taken IAT, long-jump, and EH-continuation records, plus checked security-cookie, GuardCF,
+XFG, and CastGuard storage anchors. Exact export names, metadata-backed `RUNTIME_FUNCTION` ranges, GuardCF function records,
 and retained TLS callback slots become evidence-bearing symbol-graph claims.
 It also performs a bounded pure-Rust x86-64 control-flow-guided block sweep inside fully file-backed
 exception ranges and checks seeded executable candidates for one-instruction internal, import,
@@ -209,7 +210,7 @@ Inspection validates the package first and emits no inspection data to stdout un
 file's exact size and SHA-256 match; failures report on stderr. Human output includes
 `source binary: <canonical-path>` and `identity gate: matched` after a successful check. JSON mode
 emits only the validated package JSON, with neither status line mixed into stdout. This works for
-supported package schemas 1 through 10 and only verifies identity: it does not rerun analysis, fill
+supported package schemas 1 through 12 and only verifies identity: it does not rerun analysis, fill
 in results absent from an older schema, or rewrite the package or binary.
 
 Both `analyze` and `inspect` report recovered direct-call, thunk, string, data-reference, GuardCF
@@ -258,6 +259,16 @@ table must be fully backed, disjoint from the load-config directory, and pairwis
 other Guard tables. The three inventories are package/plugin data only: import slots and valid
 continuation addresses do not become function-entry claims or thunk seeds.
 
+The load-config also exposes checked storage anchors. Internal sizes 96, 120, and 128 expose
+`SecurityCookie`, `GuardCFCheckFunctionPointer`, and `GuardCFDispatchFunctionPointer`; sizes 288,
+296, 304, and 312 expose `GuardXFGCheckFunctionPointer`, `GuardXFGDispatchFunctionPointer`,
+`GuardXFGTableDispatchFunctionPointer`, and `CastGuardOsDeterminedFailureMode`. A zero VA is absent;
+each nonzero VA is converted to an in-image RVA whose full eight-byte range lies in one mapped
+section. Header or cross-section storage, load-config overlap, and pairwise overlap across both
+anchor families are rejected, while mapped zero-fill storage is valid. ReSymbol neither enforces
+section permissions nor dereferences initial contents, and these anchors create no claim or thunk
+seed.
+
 For PE32+ inputs, modern delay-import discovery reads optional-header data-directory entry 13 as
 ordered 32-byte descriptors ending in an all-zero descriptor, followed only by all-zero padding in
 the rest of the declared range. ReSymbol accepts only the RVA-based
@@ -279,7 +290,7 @@ Malformation and shared-budget exhaustion are hard errors, never partial delay-i
 Delay-IAT slots feed the existing `ImportIat` call/thunk target and outrank
 read-only function-pointer fallback; the richer inventory is not added to the neutral projection.
 
-New analyses write package schema 11. `inspect` and `export` can also open schemas 1 through 10.
+New analyses write package schema 12. `inspect` and `export` can also open schemas 1 through 11.
 Schema 1 is migrated into a validated current in-memory session and its base graph is rebuilt;
 schemas 2 through 8 use explicit compatibility paths. None rewrites the legacy package. Because
 `.resym` does not contain the original executable, compatibility loading cannot run missing
@@ -292,11 +303,14 @@ that closure but lacks TLS callback discovery and callback-based thunk seeding. 
 TLS callback discovery but lacks modern delay-import recovery. Schema 8 retains delay imports but
 lacks load-config GuardCF recovery. Schema 9 retains GuardCF functions but lacks the Guard
 address-taken IAT, long-jump, and EH-continuation inventories. Schema 10 retains those inventories
-but lacks checked security-cookie and GuardCF check/dispatch pointer-slot anchors. Schemas 2 through 10 retain their stored direct calls and thunks,
+but lacks checked security-cookie and GuardCF check/dispatch pointer-slot anchors. Schema 11 retains
+those anchors but lacks checked XFG and CastGuard storage anchors. Schemas 2 through 11 retain their
+stored direct calls and thunks,
 but omitted result families remain unavailable. Schemas 1 through 7 therefore report delay imports
 unavailable, schemas 1 through 8 report GuardCF unavailable, schemas 1 through 9 report modern
-Guard target inventories unavailable, and schemas 1 through 10 report load-config security anchors
-unavailable. Analyze the exact original binary again to create schema 11
+Guard target inventories unavailable, schemas 1 through 10 report load-config security anchors
+unavailable, and schemas 1 through 11 report XFG/CastGuard anchors unavailable. Analyze the exact
+original binary again to create schema 12
 with all current results. Relabeling a schema-4 pointer target beneath a
 schema 2 or 3
 envelope is rejected, as is placing an RTTI base record with
@@ -304,16 +318,18 @@ a missing or null `class_hierarchy_descriptor_rva` beneath any schema 1-through-
 schema 1-through-5 envelope also cannot contain a deterministic base thunk source that depends on
 schema-6 transitive endpoint seeding. Schemas 1 through 6 also reject schema-7 TLS callback state
 and callback-only base thunk seeds. Schemas 1 through 7 reject the exact schema-8 base-analysis
-`delay_imports` inventory key and `directories.delay_imports` directory key. Schemas 8 through 11 always
+`delay_imports` inventory key and `directories.delay_imports` directory key. Schemas 8 through 12 always
 serialize the delay-import inventory, even when empty, and reject a payload missing that marker.
 Schemas 1 through 8 reject schema-9 load-config/GuardCF fields,
-`directories.load_config`, and core `pe-guard-cf-function` claims. Schemas 9 through 11 always serialize the
+`directories.load_config`, and core `pe-guard-cf-function` claims. Schemas 9 through 12 always serialize the
 `guard_cf_functions` inventory, even when empty, and reject a payload missing that marker.
-Schemas 1 through 9 reject schema-10 Guard target table-RVA and inventory fields. Schemas 10 and 11 always
+Schemas 1 through 9 reject schema-10 Guard target table-RVA and inventory fields. Schemas 10 through 12 always
 serialize the address-taken IAT, long-jump, and EH-continuation inventory arrays, even when empty,
 and reject a payload missing any marker.
-Schemas 1 through 10 reject the schema-11 `load_config_security_anchors` object. Schema 11 always
-serializes that object, even when empty, and rejects a missing or non-object marker.
+Schemas 1 through 10 reject the schema-11 `load_config_security_anchors` object. Schemas 11 and 12
+always serialize that object, even when empty, and reject a missing or non-object marker. Schemas 1
+through 11 reject schema-12 `load_config_xfg_anchors`; schema 12 always serializes that object, even
+when empty, and rejects a missing or non-object marker.
 
 Export a package to a specific destination with `--output`:
 
@@ -333,8 +349,8 @@ Without `--output`, those formats write `application.symbols.json`, `application
 `application.map`, `application.pdb`, `application.ida.py`, and
 `ReSymbolImport_<first-12-binary-sha256>.java` beside the package, respectively. Markdown is a
 deterministic presentation report for human review, not a stable machine-interchange format; use
-JSON for integrations. New analyses write `.resym` package schema 11; export also accepts package
-schemas 1 through 10 through validated compatibility paths without rewriting them. The current
+JSON for integrations. New analyses write `.resym` package schema 12; export also accepts package
+schemas 1 through 11 through validated compatibility paths without rewriting them. The current
 neutral projection is independently schema 6, and MAP/PDB add no schema fields. Projection schema
 5 correlates exact or content-interior data-reference targets with retained strings, excluding NUL
 terminators and requiring UTF-16LE code-unit alignment; projection schema 6 adds explicit
@@ -344,7 +360,8 @@ correlation does not prove the target is not a string. Delay-import inventory is
 delay-IAT calls and thunks reuse the existing import target containing the slot RVA, so projection
 schema 6 remains unchanged. Load-config/GFIDS inventory and suppression evidence are likewise
 package-only; GuardCF claims and supported seeded thunks reuse existing shapes, so projection schema 6 remains unchanged.
-The later Guard target inventories are also package-only and add no claims or projection fields.
+The later Guard target inventories and both load-config storage-anchor families are also package-only
+and add no claims or projection fields.
 A custom
 Ghidra filename
 must use a lowercase `.java` extension and a valid conservative Java-identifier stem; the generated

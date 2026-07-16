@@ -427,6 +427,10 @@ checked security-cookie and GuardCF check/dispatch pointer-slot storage RVAs. Sl
 dereferenced or serialized, and the object emits no claims or thunk seeds. It is additive detached
 JSON visible only with `symbols.read`; plugins without that permission still receive no base
 analysis.
+Package schema 12 adds the always-present `load_config_xfg_anchors` object with optional checked XFG
+check, dispatch, and table-dispatch pointer-slot RVAs plus CastGuard OS-determined failure-mode
+storage. It follows the same no-dereference, no-claim, and no-thunk-seed contract and is visible only
+through `symbols.read` detached base-analysis JSON.
 
 #### Managed plugin author quickstart
 
@@ -528,6 +532,8 @@ or control-flow target shape. They are additive `symbols.read` state and leave t
 WIT/ABI, wire 1.0 handshake, and projection schema 6 unchanged.
 Package schema 11's load-config security-anchor object is another additive `symbols.read` field and
 likewise leaves the plugin API, WIT/ABI, wire 1.0 handshake, and projection schema 6 unchanged.
+Package schema 12's XFG/CastGuard anchor object has the same additive boundary and likewise changes
+none of those independently versioned interfaces.
 
 ### Tool-hosted bridges (planned host)
 

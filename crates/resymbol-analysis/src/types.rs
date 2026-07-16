@@ -79,6 +79,12 @@ pub struct PeAnalysis {
     /// prior packages cannot acquire this recovery result by relabeling.
     #[serde(default)]
     pub load_config_security_anchors: PeLoadConfigSecurityAnchors,
+    /// Checked XFG and CastGuard storage anchors from the later PE32+ load-config prefix.
+    ///
+    /// Schema 12 serializes this object even when every anchor is absent so
+    /// prior packages cannot acquire this recovery result by relabeling.
+    #[serde(default)]
+    pub load_config_xfg_anchors: PeLoadConfigXfgAnchors,
     /// Exact `GuardFlags` value when the load configuration is large enough to contain it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guard_flags: Option<u32>,
@@ -219,6 +225,8 @@ struct UncheckedPeAnalysis {
     #[serde(default)]
     load_config_security_anchors: PeLoadConfigSecurityAnchors,
     #[serde(default)]
+    load_config_xfg_anchors: PeLoadConfigXfgAnchors,
+    #[serde(default)]
     guard_flags: Option<u32>,
     #[serde(default)]
     guard_cf_function_table_rva: Option<u32>,
@@ -287,6 +295,7 @@ impl TryFrom<UncheckedPeAnalysis> for PeAnalysis {
             runtime_functions: value.runtime_functions,
             load_config_size: value.load_config_size,
             load_config_security_anchors: value.load_config_security_anchors,
+            load_config_xfg_anchors: value.load_config_xfg_anchors,
             guard_flags: value.guard_flags,
             guard_cf_function_table_rva: value.guard_cf_function_table_rva,
             guard_cf_functions: value.guard_cf_functions,
@@ -478,6 +487,35 @@ impl PeLoadConfigSecurityAnchors {
         self.security_cookie_rva.is_none()
             && self.guard_cf_check_function_pointer_rva.is_none()
             && self.guard_cf_dispatch_function_pointer_rva.is_none()
+    }
+}
+
+/// Checked storage RVAs advertised by the PE32+ load-config XFG/CastGuard suffix.
+#[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeLoadConfigXfgAnchors {
+    /// RVA of the eight-byte slot patched with the XFG check function pointer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard_xfg_check_function_pointer_rva: Option<u32>,
+    /// RVA of the eight-byte slot patched with the XFG dispatch function pointer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard_xfg_dispatch_function_pointer_rva: Option<u32>,
+    /// RVA of the eight-byte slot patched with the XFG table-dispatch function pointer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard_xfg_table_dispatch_function_pointer_rva: Option<u32>,
+    /// RVA of the eight-byte CastGuard OS-determined failure-mode storage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cast_guard_os_determined_failure_mode_rva: Option<u32>,
+}
+
+impl PeLoadConfigXfgAnchors {
+    /// Whether the load-config suffix advertises no nonzero XFG/CastGuard anchor.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.guard_xfg_check_function_pointer_rva.is_none()
+            && self.guard_xfg_dispatch_function_pointer_rva.is_none()
+            && self.guard_xfg_table_dispatch_function_pointer_rva.is_none()
+            && self.cast_guard_os_determined_failure_mode_rva.is_none()
     }
 }
 

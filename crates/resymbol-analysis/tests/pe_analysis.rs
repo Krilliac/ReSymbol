@@ -2,8 +2,8 @@ use resymbol_analysis::{
     AnalysisError, AnalysisSession, BinaryAnalysis, ImportTarget, PeControlFlowTarget,
     PeDataReference, PeDirectCall, PeGuardAddressTakenIatEntry, PeGuardCfFunction,
     PeGuardEhContinuationTarget, PeGuardLongJumpTarget, PeLoadConfigSecurityAnchors,
-    PeRecoveredString, PeStringEncoding, PeThunk, PeTlsCallback, PluginRunRecord, PluginRunStatus,
-    SessionValidationError, analyze_bytes, analyze_pe,
+    PeLoadConfigXfgAnchors, PeRecoveredString, PeStringEncoding, PeThunk, PeTlsCallback,
+    PluginRunRecord, PluginRunStatus, SessionValidationError, analyze_bytes, analyze_pe,
 };
 use resymbol_core::{
     BinaryId, ClaimProducer, ClaimProvenance, Confidence, ControlFlowTarget, Evidence,
@@ -29,6 +29,10 @@ const LOAD_CONFIG_GUARD_FIELDS_SIZE: u32 = 148;
 const LOAD_CONFIG_GUARD_ADDRESS_TAKEN_IAT_FIELDS_SIZE: u32 = 176;
 const LOAD_CONFIG_GUARD_LONG_JUMP_FIELDS_SIZE: u32 = 192;
 const LOAD_CONFIG_GUARD_EH_CONTINUATION_FIELDS_SIZE: u32 = 280;
+const LOAD_CONFIG_GUARD_XFG_CHECK_POINTER_FIELDS_SIZE: u32 = 288;
+const LOAD_CONFIG_GUARD_XFG_DISPATCH_POINTER_FIELDS_SIZE: u32 = 296;
+const LOAD_CONFIG_GUARD_XFG_TABLE_DISPATCH_POINTER_FIELDS_SIZE: u32 = 304;
+const LOAD_CONFIG_CAST_GUARD_FAILURE_MODE_FIELDS_SIZE: u32 = 312;
 const GUARD_CF_FUNCTION_TABLE_RVA: u32 = 0x1480;
 const EXTENDED_GUARD_CF_FUNCTION_TABLE_RVA: u32 = 0x14a0;
 const GUARD_ADDRESS_TAKEN_IAT_TABLE_RVA: u32 = 0x14c0;
@@ -37,6 +41,10 @@ const GUARD_EH_CONTINUATION_TABLE_RVA: u32 = 0x1500;
 const SECURITY_COOKIE_RVA: u32 = 0x1520;
 const GUARD_CF_CHECK_FUNCTION_POINTER_RVA: u32 = 0x1528;
 const GUARD_CF_DISPATCH_FUNCTION_POINTER_RVA: u32 = 0x1530;
+const GUARD_XFG_CHECK_FUNCTION_POINTER_RVA: u32 = 0x1540;
+const GUARD_XFG_DISPATCH_FUNCTION_POINTER_RVA: u32 = 0x1548;
+const GUARD_XFG_TABLE_DISPATCH_FUNCTION_POINTER_RVA: u32 = 0x1550;
+const CAST_GUARD_OS_DETERMINED_FAILURE_MODE_RVA: u32 = 0x1558;
 const GUARD_CF_FUNCTION_LIMIT: u64 = 262_144;
 const IMAGE_GUARD_CF_FUNCTION_TABLE_PRESENT: u32 = 0x0000_0400;
 const IMAGE_GUARD_CF_EXPORT_SUPPRESSION_INFO_PRESENT: u32 = 0x0000_4000;
@@ -475,6 +483,54 @@ fn load_config_security_anchor_fixture() -> Vec<u8> {
         IMAGE_BASE + u64::from(SECURITY_COOKIE_RVA),
         IMAGE_BASE + u64::from(GUARD_CF_CHECK_FUNCTION_POINTER_RVA),
         IMAGE_BASE + u64::from(GUARD_CF_DISPATCH_FUNCTION_POINTER_RVA),
+    );
+    bytes
+}
+
+fn set_load_config_xfg_anchors(
+    bytes: &mut [u8],
+    directory_size: u32,
+    load_config_size: u32,
+    guard_xfg_check_function_pointer_va: u64,
+    guard_xfg_dispatch_function_pointer_va: u64,
+    guard_xfg_table_dispatch_function_pointer_va: u64,
+    cast_guard_os_determined_failure_mode_va: u64,
+) {
+    set_directory(bytes, 10, LOAD_CONFIG_DIRECTORY_RVA, directory_size);
+    let load_config = file_offset(LOAD_CONFIG_DIRECTORY_RVA);
+    put_u32(bytes, load_config, load_config_size);
+    put_u64(
+        bytes,
+        load_config + 280,
+        guard_xfg_check_function_pointer_va,
+    );
+    put_u64(
+        bytes,
+        load_config + 288,
+        guard_xfg_dispatch_function_pointer_va,
+    );
+    put_u64(
+        bytes,
+        load_config + 296,
+        guard_xfg_table_dispatch_function_pointer_va,
+    );
+    put_u64(
+        bytes,
+        load_config + 304,
+        cast_guard_os_determined_failure_mode_va,
+    );
+}
+
+fn load_config_xfg_anchor_fixture() -> Vec<u8> {
+    let mut bytes = fixture();
+    set_load_config_xfg_anchors(
+        &mut bytes,
+        LOAD_CONFIG_CAST_GUARD_FAILURE_MODE_FIELDS_SIZE,
+        LOAD_CONFIG_CAST_GUARD_FAILURE_MODE_FIELDS_SIZE,
+        IMAGE_BASE + u64::from(GUARD_XFG_CHECK_FUNCTION_POINTER_RVA),
+        IMAGE_BASE + u64::from(GUARD_XFG_DISPATCH_FUNCTION_POINTER_RVA),
+        IMAGE_BASE + u64::from(GUARD_XFG_TABLE_DISPATCH_FUNCTION_POINTER_RVA),
+        IMAGE_BASE + u64::from(CAST_GUARD_OS_DETERMINED_FAILURE_MODE_RVA),
     );
     bytes
 }
@@ -1452,6 +1508,7 @@ fn analyzes_minimal_pe_with_imports_exports_and_runtime_functions() {
     assert_eq!(analysis.directories.load_config, None);
     assert_eq!(analysis.load_config_size, None);
     assert!(analysis.load_config_security_anchors.is_empty());
+    assert!(analysis.load_config_xfg_anchors.is_empty());
     assert_eq!(analysis.guard_flags, None);
     assert_eq!(analysis.guard_cf_function_table_rva, None);
     assert!(analysis.guard_cf_functions.is_empty());
@@ -2598,6 +2655,400 @@ fn validated_deserialization_rejects_tampered_load_config_security_anchors() {
     unknown_inner_field["load_config_security_anchors"]["unexpected"] = serde_json::json!(1);
     let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(unknown_inner_field)
         .expect_err("unknown fields inside the security-anchor marker are rejected");
+    assert!(error.to_string().contains("unknown field"));
+}
+
+#[test]
+fn recovers_load_config_xfg_anchors_without_inventing_control_flow_evidence() {
+    let baseline = analyze_pe(&fixture()).expect("valid baseline fixture");
+    let analysis =
+        analyze_pe(&load_config_xfg_anchor_fixture()).expect("valid load-config XFG anchors");
+
+    assert_eq!(
+        analysis.load_config_size,
+        Some(LOAD_CONFIG_CAST_GUARD_FAILURE_MODE_FIELDS_SIZE)
+    );
+    assert!(analysis.load_config_security_anchors.is_empty());
+    assert_eq!(
+        analysis.load_config_xfg_anchors,
+        PeLoadConfigXfgAnchors {
+            guard_xfg_check_function_pointer_rva: Some(GUARD_XFG_CHECK_FUNCTION_POINTER_RVA),
+            guard_xfg_dispatch_function_pointer_rva: Some(GUARD_XFG_DISPATCH_FUNCTION_POINTER_RVA,),
+            guard_xfg_table_dispatch_function_pointer_rva: Some(
+                GUARD_XFG_TABLE_DISPATCH_FUNCTION_POINTER_RVA,
+            ),
+            cast_guard_os_determined_failure_mode_rva: Some(
+                CAST_GUARD_OS_DETERMINED_FAILURE_MODE_RVA,
+            ),
+        }
+    );
+    assert_eq!(analysis.guard_flags, Some(0));
+    assert_eq!(
+        analysis.symbol_graph.claims().len(),
+        baseline.symbol_graph.claims().len()
+    );
+    assert_eq!(analysis.thunks.len(), baseline.thunks.len());
+
+    let encoded = serde_json::to_string(&analysis).expect("serialize XFG anchors");
+    assert!(encoded.contains("\"load_config_xfg_anchors\""));
+    let decoded: resymbol_analysis::PeAnalysis =
+        serde_json::from_str(&encoded).expect("deserialize XFG anchors");
+    assert_eq!(decoded, analysis);
+}
+
+#[test]
+fn respects_each_load_config_xfg_anchor_size_boundary() {
+    for (load_config_size, expected) in [
+        (
+            LOAD_CONFIG_GUARD_XFG_CHECK_POINTER_FIELDS_SIZE - 1,
+            PeLoadConfigXfgAnchors::default(),
+        ),
+        (
+            LOAD_CONFIG_GUARD_XFG_CHECK_POINTER_FIELDS_SIZE,
+            PeLoadConfigXfgAnchors {
+                guard_xfg_check_function_pointer_rva: Some(GUARD_XFG_CHECK_FUNCTION_POINTER_RVA),
+                ..PeLoadConfigXfgAnchors::default()
+            },
+        ),
+        (
+            LOAD_CONFIG_GUARD_XFG_DISPATCH_POINTER_FIELDS_SIZE - 1,
+            PeLoadConfigXfgAnchors {
+                guard_xfg_check_function_pointer_rva: Some(GUARD_XFG_CHECK_FUNCTION_POINTER_RVA),
+                ..PeLoadConfigXfgAnchors::default()
+            },
+        ),
+        (
+            LOAD_CONFIG_GUARD_XFG_DISPATCH_POINTER_FIELDS_SIZE,
+            PeLoadConfigXfgAnchors {
+                guard_xfg_check_function_pointer_rva: Some(GUARD_XFG_CHECK_FUNCTION_POINTER_RVA),
+                guard_xfg_dispatch_function_pointer_rva: Some(
+                    GUARD_XFG_DISPATCH_FUNCTION_POINTER_RVA,
+                ),
+                ..PeLoadConfigXfgAnchors::default()
+            },
+        ),
+        (
+            LOAD_CONFIG_GUARD_XFG_TABLE_DISPATCH_POINTER_FIELDS_SIZE - 1,
+            PeLoadConfigXfgAnchors {
+                guard_xfg_check_function_pointer_rva: Some(GUARD_XFG_CHECK_FUNCTION_POINTER_RVA),
+                guard_xfg_dispatch_function_pointer_rva: Some(
+                    GUARD_XFG_DISPATCH_FUNCTION_POINTER_RVA,
+                ),
+                ..PeLoadConfigXfgAnchors::default()
+            },
+        ),
+        (
+            LOAD_CONFIG_GUARD_XFG_TABLE_DISPATCH_POINTER_FIELDS_SIZE,
+            PeLoadConfigXfgAnchors {
+                guard_xfg_check_function_pointer_rva: Some(GUARD_XFG_CHECK_FUNCTION_POINTER_RVA),
+                guard_xfg_dispatch_function_pointer_rva: Some(
+                    GUARD_XFG_DISPATCH_FUNCTION_POINTER_RVA,
+                ),
+                guard_xfg_table_dispatch_function_pointer_rva: Some(
+                    GUARD_XFG_TABLE_DISPATCH_FUNCTION_POINTER_RVA,
+                ),
+                ..PeLoadConfigXfgAnchors::default()
+            },
+        ),
+        (
+            LOAD_CONFIG_CAST_GUARD_FAILURE_MODE_FIELDS_SIZE - 1,
+            PeLoadConfigXfgAnchors {
+                guard_xfg_check_function_pointer_rva: Some(GUARD_XFG_CHECK_FUNCTION_POINTER_RVA),
+                guard_xfg_dispatch_function_pointer_rva: Some(
+                    GUARD_XFG_DISPATCH_FUNCTION_POINTER_RVA,
+                ),
+                guard_xfg_table_dispatch_function_pointer_rva: Some(
+                    GUARD_XFG_TABLE_DISPATCH_FUNCTION_POINTER_RVA,
+                ),
+                ..PeLoadConfigXfgAnchors::default()
+            },
+        ),
+        (
+            LOAD_CONFIG_CAST_GUARD_FAILURE_MODE_FIELDS_SIZE,
+            PeLoadConfigXfgAnchors {
+                guard_xfg_check_function_pointer_rva: Some(GUARD_XFG_CHECK_FUNCTION_POINTER_RVA),
+                guard_xfg_dispatch_function_pointer_rva: Some(
+                    GUARD_XFG_DISPATCH_FUNCTION_POINTER_RVA,
+                ),
+                guard_xfg_table_dispatch_function_pointer_rva: Some(
+                    GUARD_XFG_TABLE_DISPATCH_FUNCTION_POINTER_RVA,
+                ),
+                cast_guard_os_determined_failure_mode_rva: Some(
+                    CAST_GUARD_OS_DETERMINED_FAILURE_MODE_RVA,
+                ),
+            },
+        ),
+    ] {
+        let mut bytes = fixture();
+        set_load_config_xfg_anchors(
+            &mut bytes,
+            LOAD_CONFIG_CAST_GUARD_FAILURE_MODE_FIELDS_SIZE,
+            load_config_size,
+            IMAGE_BASE + u64::from(GUARD_XFG_CHECK_FUNCTION_POINTER_RVA),
+            IMAGE_BASE + u64::from(GUARD_XFG_DISPATCH_FUNCTION_POINTER_RVA),
+            IMAGE_BASE + u64::from(GUARD_XFG_TABLE_DISPATCH_FUNCTION_POINTER_RVA),
+            IMAGE_BASE + u64::from(CAST_GUARD_OS_DETERMINED_FAILURE_MODE_RVA),
+        );
+        let analysis =
+            analyze_pe(&bytes).expect("bytes past the declared load-config size remain opaque");
+        assert_eq!(analysis.load_config_xfg_anchors, expected);
+        assert_eq!(analysis.guard_flags, Some(0));
+    }
+}
+
+#[test]
+fn rejects_invalid_load_config_xfg_anchor_vas_and_layouts() {
+    for (label, field, check_va, dispatch_va, table_dispatch_va, cast_guard_va, reason) in [
+        (
+            "below image base",
+            "GuardXFGCheckFunctionPointer",
+            IMAGE_BASE - 1,
+            0,
+            0,
+            0,
+            "below preferred image base",
+        ),
+        (
+            "outside image",
+            "CastGuardOsDeterminedFailureMode",
+            0,
+            0,
+            0,
+            IMAGE_BASE + 0x2000,
+            "outside the declared image",
+        ),
+        (
+            "header anchor",
+            "Guard XFG check-function pointer slot",
+            IMAGE_BASE + 0x100,
+            0,
+            0,
+            0,
+            "within one mapped section",
+        ),
+        (
+            "crosses section end",
+            "Guard XFG check-function pointer slot",
+            IMAGE_BASE + 0x15fc,
+            0,
+            0,
+            0,
+            "within one mapped section",
+        ),
+        (
+            "overlaps load config",
+            "Guard XFG check-function pointer slot",
+            IMAGE_BASE + 0x14b0,
+            0,
+            0,
+            0,
+            "overlaps the declared load-config directory",
+        ),
+    ] {
+        let mut bytes = fixture();
+        set_load_config_xfg_anchors(
+            &mut bytes,
+            LOAD_CONFIG_CAST_GUARD_FAILURE_MODE_FIELDS_SIZE,
+            LOAD_CONFIG_CAST_GUARD_FAILURE_MODE_FIELDS_SIZE,
+            check_va,
+            dispatch_va,
+            table_dispatch_va,
+            cast_guard_va,
+        );
+        let error = analyze_pe(&bytes).expect_err("invalid XFG anchor must be rejected");
+        assert!(
+            matches!(
+                &error,
+                AnalysisError::InvalidField {
+                    field: actual_field,
+                    reason: actual_reason,
+                } if *actual_field == field && actual_reason.contains(reason)
+            ),
+            "{label}: {error}"
+        );
+    }
+
+    let mut pairwise_overlap = fixture();
+    set_load_config_xfg_anchors(
+        &mut pairwise_overlap,
+        LOAD_CONFIG_CAST_GUARD_FAILURE_MODE_FIELDS_SIZE,
+        LOAD_CONFIG_CAST_GUARD_FAILURE_MODE_FIELDS_SIZE,
+        IMAGE_BASE + u64::from(GUARD_XFG_CHECK_FUNCTION_POINTER_RVA),
+        IMAGE_BASE + u64::from(GUARD_XFG_CHECK_FUNCTION_POINTER_RVA + 4),
+        0,
+        0,
+    );
+    let error = analyze_pe(&pairwise_overlap)
+        .expect_err("XFG-anchor storage ranges must be pairwise disjoint");
+    assert!(matches!(
+        error,
+        AnalysisError::InvalidField {
+            field: "load-config security anchors",
+            reason,
+        } if reason.contains(
+            "Guard XFG check-function pointer slot overlaps Guard XFG dispatch-function pointer slot"
+        )
+    ));
+
+    let mut cross_family_overlap = fixture();
+    set_load_config_xfg_anchors(
+        &mut cross_family_overlap,
+        LOAD_CONFIG_CAST_GUARD_FAILURE_MODE_FIELDS_SIZE,
+        LOAD_CONFIG_CAST_GUARD_FAILURE_MODE_FIELDS_SIZE,
+        IMAGE_BASE + u64::from(SECURITY_COOKIE_RVA),
+        0,
+        0,
+        0,
+    );
+    let load_config = file_offset(LOAD_CONFIG_DIRECTORY_RVA);
+    put_u64(
+        &mut cross_family_overlap,
+        load_config + 88,
+        IMAGE_BASE + u64::from(SECURITY_COOKIE_RVA),
+    );
+    let error = analyze_pe(&cross_family_overlap)
+        .expect_err("schema-11 and schema-12 anchor ranges must remain disjoint");
+    assert!(matches!(
+        error,
+        AnalysisError::InvalidField {
+            field: "load-config security anchors",
+            reason,
+        } if reason.contains("security cookie overlaps Guard XFG check-function pointer slot")
+    ));
+
+    let mut virtual_tail = fixture();
+    put_u32(&mut virtual_tail, SECTION_OFFSET + 8, 0x800);
+    set_load_config_xfg_anchors(
+        &mut virtual_tail,
+        LOAD_CONFIG_GUARD_XFG_CHECK_POINTER_FIELDS_SIZE,
+        LOAD_CONFIG_GUARD_XFG_CHECK_POINTER_FIELDS_SIZE,
+        IMAGE_BASE + 0x17f8,
+        0,
+        0,
+        0,
+    );
+    let analysis = analyze_pe(&virtual_tail)
+        .expect("an eight-byte XFG anchor may live wholly inside a mapped zero-fill tail");
+    assert_eq!(
+        analysis
+            .load_config_xfg_anchors
+            .guard_xfg_check_function_pointer_rva,
+        Some(0x17f8)
+    );
+}
+
+#[test]
+fn validated_deserialization_rejects_tampered_load_config_xfg_anchors() {
+    let analysis =
+        analyze_pe(&load_config_xfg_anchor_fixture()).expect("valid load-config XFG anchors");
+    let original = serde_json::to_value(analysis).expect("serialize XFG anchors");
+
+    let mut legacy_absence = original.clone();
+    legacy_absence
+        .as_object_mut()
+        .expect("analysis object")
+        .remove("load_config_xfg_anchors");
+    let decoded: resymbol_analysis::PeAnalysis = serde_json::from_value(legacy_absence)
+        .expect("legacy analyses default the XFG-anchor object to empty");
+    assert!(decoded.load_config_xfg_anchors.is_empty());
+
+    for (field, shortened_size, expected_field) in [
+        (
+            "guard_xfg_check_function_pointer_rva",
+            LOAD_CONFIG_GUARD_XFG_CHECK_POINTER_FIELDS_SIZE - 1,
+            "Guard XFG check-function pointer slot",
+        ),
+        (
+            "guard_xfg_dispatch_function_pointer_rva",
+            LOAD_CONFIG_GUARD_XFG_DISPATCH_POINTER_FIELDS_SIZE - 1,
+            "Guard XFG dispatch-function pointer slot",
+        ),
+        (
+            "guard_xfg_table_dispatch_function_pointer_rva",
+            LOAD_CONFIG_GUARD_XFG_TABLE_DISPATCH_POINTER_FIELDS_SIZE - 1,
+            "Guard XFG table-dispatch function-pointer slot",
+        ),
+        (
+            "cast_guard_os_determined_failure_mode_rva",
+            LOAD_CONFIG_CAST_GUARD_FAILURE_MODE_FIELDS_SIZE - 1,
+            "CastGuard OS-determined failure-mode storage",
+        ),
+    ] {
+        let mut shortened = original.clone();
+        shortened["load_config_size"] = serde_json::json!(shortened_size);
+        for other_field in [
+            "guard_xfg_check_function_pointer_rva",
+            "guard_xfg_dispatch_function_pointer_rva",
+            "guard_xfg_table_dispatch_function_pointer_rva",
+            "cast_guard_os_determined_failure_mode_rva",
+        ] {
+            if other_field != field {
+                shortened["load_config_xfg_anchors"]
+                    .as_object_mut()
+                    .expect("XFG-anchor object")
+                    .remove(other_field);
+            }
+        }
+        let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(shortened)
+            .expect_err("retained XFG anchor requires its load-config structure prefix");
+        assert!(
+            error.to_string().contains(expected_field),
+            "{field}: {error}"
+        );
+    }
+
+    let mut missing_directory = original.clone();
+    missing_directory["directories"]["load_config"] = serde_json::Value::Null;
+    missing_directory["load_config_size"] = serde_json::Value::Null;
+    missing_directory["guard_flags"] = serde_json::Value::Null;
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(missing_directory)
+        .expect_err("XFG-anchor state cannot outlive its load-config directory");
+    assert!(error.to_string().contains("load-config security anchors"));
+
+    let mut header_anchor = original.clone();
+    header_anchor["load_config_xfg_anchors"]["guard_xfg_check_function_pointer_rva"] =
+        serde_json::json!(0x100);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(header_anchor)
+        .expect_err("persisted XFG anchors remain mapped into one section");
+    assert!(error.to_string().contains("within one mapped section"));
+
+    let mut directory_overlap = original.clone();
+    directory_overlap["load_config_xfg_anchors"]["guard_xfg_check_function_pointer_rva"] =
+        serde_json::json!(0x14b0);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(directory_overlap)
+        .expect_err("persisted XFG anchors remain disjoint from the load-config directory");
+    assert!(
+        error
+            .to_string()
+            .contains("overlaps the declared load-config")
+    );
+
+    let mut pairwise_overlap = original.clone();
+    pairwise_overlap["load_config_xfg_anchors"]["guard_xfg_dispatch_function_pointer_rva"] =
+        serde_json::json!(GUARD_XFG_CHECK_FUNCTION_POINTER_RVA);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(pairwise_overlap)
+        .expect_err("persisted XFG-anchor ranges remain pairwise disjoint");
+    assert!(
+        error
+            .to_string()
+            .contains("Guard XFG check-function pointer slot overlaps")
+    );
+
+    let mut cross_family_overlap = original.clone();
+    cross_family_overlap["load_config_security_anchors"]["security_cookie_rva"] =
+        serde_json::json!(GUARD_XFG_CHECK_FUNCTION_POINTER_RVA);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(cross_family_overlap)
+        .expect_err("persisted schema-11 and schema-12 anchor ranges remain disjoint");
+    assert!(
+        error
+            .to_string()
+            .contains("security cookie overlaps Guard XFG check-function pointer slot")
+    );
+
+    let mut unknown_inner_field = original;
+    unknown_inner_field["load_config_xfg_anchors"]["unexpected"] = serde_json::json!(1);
+    let error = serde_json::from_value::<resymbol_analysis::PeAnalysis>(unknown_inner_field)
+        .expect_err("unknown fields inside the XFG-anchor marker are rejected");
     assert!(error.to_string().contains("unknown field"));
 }
 

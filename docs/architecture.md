@@ -5,7 +5,8 @@ preserve. ReSymbol is in early development; sections marked as design describe t
 not necessarily behavior implemented in the current checkout.
 
 The current implementation covers bounded PE32+ x86-64 ingestion, including ordered TLS callback,
-load-config GuardCF and modern Guard target-table inventories, and modern RVA-form delay-import
+load-config GuardCF and modern Guard target-table inventories, checked security/XFG/CastGuard
+storage anchors, and modern RVA-form delay-import
 discovery, a conservative metadata-derived
 symbol graph, modern
 MSVC x64 Rev1 RTTI/vftable
@@ -153,6 +154,16 @@ cap and all nonempty Guard tables must be fully backed, disjoint from the load-c
 and pairwise disjoint. These inventories are deterministic package/plugin state only: they add no
 graph claim and no thunk seed because a valid continuation or landing address is not necessarily a
 function start.
+
+The same synthetic fixture family covers checked load-config storage anchors. The earlier
+`SecurityCookie`, `GuardCFCheckFunctionPointer`, and `GuardCFDispatchFunctionPointer` fields become
+available at internal sizes 96, 120, and 128 bytes. The later `GuardXFGCheckFunctionPointer`,
+`GuardXFGDispatchFunctionPointer`, `GuardXFGTableDispatchFunctionPointer`, and
+`CastGuardOsDeterminedFailureMode` fields become available at 288, 296, 304, and 312 bytes. Zero VAs
+are absent; nonzero preferred-image VAs become checked RVAs. Each full eight-byte range must occupy
+one mapped section, may live in mapped zero-fill, and must be disjoint from the load-config directory
+and every other retained anchor across both families. Headers and cross-section ranges are rejected.
+Permissions and initial contents remain opaque, and anchors add neither claims nor thunk seeds.
 
 Modern PE32+ delay-import discovery is likewise proven with focused synthetic fixtures without
 regenerating that corpus. Optional-header data-directory entry 13 is a fully file-backed sequence of
@@ -335,8 +346,9 @@ remain package-only, while calls and thunks through delay-IAT slots use the exis
 target containing the slot RVA. Load-config/GFIDS inventory and suppression evidence are also
 package-only; GuardCF claims and any supported seeded thunks reuse the existing attributed shapes.
 The later Guard target inventories are also package-only and deliberately produce no claims.
-Load-config security-cookie and GuardCF pointer-slot anchors are likewise package-only and add no
-claims or thunk seeds. Package schema 11 therefore leaves neutral projection schema 6 unchanged.
+Load-config security-cookie, GuardCF, XFG, and CastGuard storage anchors are likewise package-only
+and add no claims or thunk seeds. Package schema 12 therefore leaves neutral projection schema 6
+unchanged.
 
 The first writers serialize the projection as JSON, render bounded Markdown or
 Microsoft-linker-style MAP text, emit an exact-RSDS public-symbol PDB, or generate self-contained
@@ -590,7 +602,7 @@ A plugin declares a supported API range. Unsupported plugins are marked incompat
 loaded optimistically. Schema migrations are explicit and must preserve provenance. Before 1.0,
 breaking changes are expected, but they still require version bumps and release notes.
 
-The current CLI writes analysis-package schema 11 and can inspect or export schemas 1 through 10
+The current CLI writes analysis-package schema 12 and can inspect or export schemas 1 through 11
 through explicit compatibility paths. It migrates schema 1 into a validated current session,
 rebuilds the base graph from persisted legacy metadata, and never rewrites the source package.
 Schema 2 already records direct calls and thunks but predates recovered strings and data references;
@@ -600,15 +612,16 @@ recovery; schema 5 records that RTTI form but predates transitive executable thu
 schema 6 records that closure but predates TLS callback discovery and callback-based thunk seeding;
 schema 7 records TLS callbacks but predates modern delay-import recovery; schema 8 records delay
 imports but predates load-config GuardCF recovery; schema 9 records GuardCF functions but
-predates the modern Guard target inventories; and schema 10 records those inventories but predates
-load-config security-anchor recovery.
+predates the modern Guard target inventories; schema 10 records those inventories but predates
+load-config security-anchor recovery; and schema 11 records those earlier anchors but predates XFG
+and CastGuard storage-anchor recovery.
 Because a package omits the analyzed binary bytes, compatibility loading cannot recreate absent
 recovery results. Schemas 1 through 6 report TLS callbacks unavailable; obtaining every current
 result also requires treating delay imports as unavailable in schemas 1 through 7, GuardCF recovery
 as unavailable in schemas 1 through 8, and the Guard address-taken IAT, long-jump, and
 EH-continuation inventories as unavailable in schemas 1 through 9, and load-config security
-anchors as unavailable in schemas 1 through 10, then reanalyzing the exact original binary into
-schema 11.
+anchors as unavailable in schemas 1 through 10, and XFG/CastGuard anchors as unavailable in schemas
+1 through 11, then reanalyzing the exact original binary into schema 12.
 Schemas 2 and 3 are also semantically gated against relabeled schema-4 `function-pointer` targets.
 All schemas 1 through 4 are semantically gated against relabeled schema-5 base-class records whose
 `class_hierarchy_descriptor_rva` is missing or null. Schemas 1 through 5 reject a deterministic
@@ -616,25 +629,27 @@ base thunk source that is valid only under schema-6 transitive endpoint seeding.
 Schemas 1 through 6 reject schema-7 TLS fields, core `pe-tls-callback` claims, and callback-only
 base thunk seeds rather than accepting a relabeled package.
 Schemas 1 through 7 likewise reject the exact schema-8 base-analysis `delay_imports` inventory key
-and `directories.delay_imports` directory key. Schemas 8 through 11 always serialize the delay-import
+and `directories.delay_imports` directory key. Schemas 8 through 12 always serialize the delay-import
 inventory, including an empty array, and reject a payload missing that marker so relabeling alone
 cannot upgrade a legacy package.
 Schemas 1 through 8 reject schema-9 `load_config_size`, `guard_flags`,
 `guard_cf_function_table_rva`, and `guard_cf_functions` fields, the `directories.load_config` key,
-and core `pe-guard-cf-function` claims. Schemas 9 through 11 always serialize the GuardCF inventory,
+and core `pe-guard-cf-function` claims. Schemas 9 through 12 always serialize the GuardCF inventory,
 including an empty array, and reject a payload missing that marker.
-Schemas 1 through 9 reject schema-10 Guard target table-RVA and inventory fields. Schemas 10 and 11
+Schemas 1 through 9 reject schema-10 Guard target table-RVA and inventory fields. Schemas 10 through 12
 always serialize the address-taken IAT, long-jump, and EH-continuation inventory arrays, including
 empty arrays, and reject a payload missing any marker.
-Schemas 1 through 10 reject the schema-11 `load_config_security_anchors` object. Current schema 11
-always serializes that object, including `{}` when every anchor is absent, and rejects missing or
-non-object markers.
+Schemas 1 through 10 reject the schema-11 `load_config_security_anchors` object. Schemas 11 and 12
+always serialize that object, including `{}` when every anchor is absent, and reject missing or
+non-object markers. Schemas 1 through 11 reject schema-12 `load_config_xfg_anchors`; current schema
+12 always serializes that object, including `{}` when all four anchors are absent, and rejects a
+missing or non-object marker.
 The independently versioned debugger-neutral projection is schema 6; its string-reference
 correlation and exact per-hop thunk relationships are derived from already validated claims and
-therefore do not require a projection-schema change or legacy package rewrite. Package schema 11 and
-neutral projection schema 6 remain independent compatibility domains. Package schema 11 also leaves
+therefore do not require a projection-schema change or legacy package rewrite. Package schema 12 and
+neutral projection schema 6 remain independent compatibility domains. Package schema 12 also leaves
 the plugin API and external wire protocol 1.0 unchanged. Plugins with `symbols.read` can observe the
-TLS, delay-import, load-config/GuardCF, modern Guard target, and load-config security-anchor fields
+TLS, delay-import, load-config/GuardCF, modern Guard target, and both load-config anchor families
 in detached base-analysis JSON; plugins without
 that permission receive
 no base analysis.

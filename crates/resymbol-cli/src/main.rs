@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use resymbol_analysis::{
     AnalysisSession, BinaryAnalysis, PeAnalysis, PeControlFlowTarget, PeLoadConfigSecurityAnchors,
-    PluginRunRecord, PluginRunStatus, analyze_bytes,
+    PeLoadConfigXfgAnchors, PluginRunRecord, PluginRunStatus, analyze_bytes,
 };
 use resymbol_core::{
     BinaryId, ClaimProvenance, Confidence, DiscoveredPlugin, Evidence, PLUGIN_DISABLED_SENTINEL,
@@ -51,6 +51,7 @@ const DELAY_IMPORT_SCHEMA_VERSION: u32 = 8;
 const GUARD_CF_SCHEMA_VERSION: u32 = 9;
 const GUARD_TARGET_TABLE_SCHEMA_VERSION: u32 = 10;
 const LOAD_CONFIG_SECURITY_ANCHOR_SCHEMA_VERSION: u32 = 11;
+const LOAD_CONFIG_XFG_ANCHOR_SCHEMA_VERSION: u32 = 12;
 const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 
 #[derive(Debug, Parser)]
@@ -361,6 +362,7 @@ fn inspect(args: InspectArgs) -> Result<()> {
             guard_cf: loaded.guard_cf_availability,
             guard_target_tables: loaded.guard_target_table_availability,
             load_config_security_anchors: loaded.load_config_security_anchor_availability,
+            load_config_xfg_anchors: loaded.load_config_xfg_anchor_availability,
         },
     )?;
 
@@ -528,6 +530,12 @@ enum LoadConfigSecurityAnchorAvailability {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoadConfigXfgAnchorAvailability {
+    Recorded,
+    Unavailable(u32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct AnalysisFeatureAvailability {
     code_recovery: CodeRecoveryAvailability,
     transitive_thunk_recovery: TransitiveThunkRecoveryAvailability,
@@ -538,6 +546,7 @@ struct AnalysisFeatureAvailability {
     guard_cf: GuardCfAvailability,
     guard_target_tables: GuardTargetTableAvailability,
     load_config_security_anchors: LoadConfigSecurityAnchorAvailability,
+    load_config_xfg_anchors: LoadConfigXfgAnchorAvailability,
 }
 
 impl AnalysisFeatureAvailability {
@@ -551,6 +560,7 @@ impl AnalysisFeatureAvailability {
         guard_cf: GuardCfAvailability::Recorded,
         guard_target_tables: GuardTargetTableAvailability::Recorded,
         load_config_security_anchors: LoadConfigSecurityAnchorAvailability::Recorded,
+        load_config_xfg_anchors: LoadConfigXfgAnchorAvailability::Recorded,
     };
 }
 
@@ -582,6 +592,17 @@ impl LoadConfigSecurityAnchorAvailability {
             Self::Recorded => None,
             Self::Unavailable(schema_version) => Some(format!(
                 "PE load-config security anchors: unavailable (schema {schema_version} package predates security-cookie and GuardCF pointer-slot recovery; reanalyze the exact original binary)"
+            )),
+        }
+    }
+}
+
+impl LoadConfigXfgAnchorAvailability {
+    fn export_summary_line(self) -> Option<String> {
+        match self {
+            Self::Recorded => None,
+            Self::Unavailable(schema_version) => Some(format!(
+                "PE load-config XFG/CastGuard anchors: unavailable (schema {schema_version} package predates XFG and CastGuard storage-anchor recovery; reanalyze the exact original binary)"
             )),
         }
     }
@@ -620,6 +641,7 @@ struct LoadedAnalysisPackage {
     guard_cf_availability: GuardCfAvailability,
     guard_target_table_availability: GuardTargetTableAvailability,
     load_config_security_anchor_availability: LoadConfigSecurityAnchorAvailability,
+    load_config_xfg_anchor_availability: LoadConfigXfgAnchorAvailability,
     legacy_inspection_source: Option<ResymPackage<Value>>,
 }
 
@@ -696,9 +718,21 @@ fn read_analysis_package(
         }
         _ => bail!("unsupported analysis package schema {schema_version}"),
     };
+    let load_config_xfg_anchor_availability = match schema_version {
+        1..=11 => LoadConfigXfgAnchorAvailability::Unavailable(schema_version),
+        LOAD_CONFIG_XFG_ANCHOR_SCHEMA_VERSION..=CURRENT_SCHEMA_VERSION => {
+            LoadConfigXfgAnchorAvailability::Recorded
+        }
+        _ => bail!("unsupported analysis package schema {schema_version}"),
+    };
     let legacy_inspection_source = (preserve_legacy_inspection_source
         && schema_version < CURRENT_SCHEMA_VERSION)
         .then(|| package.clone());
+    if schema_version >= LOAD_CONFIG_XFG_ANCHOR_SCHEMA_VERSION {
+        require_v12_load_config_xfg_anchor_marker(package.payload(), schema_version)?;
+    } else {
+        reject_pre_v12_load_config_xfg_anchor_semantics(package.payload(), schema_version)?;
+    }
     if schema_version >= LOAD_CONFIG_SECURITY_ANCHOR_SCHEMA_VERSION {
         require_v11_load_config_security_anchor_marker(package.payload(), schema_version)?;
     } else {
@@ -741,7 +775,8 @@ fn read_analysis_package(
         8 => serde_json::from_value(payload).context("cannot decode schema-v8 analysis payload"),
         9 => serde_json::from_value(payload).context("cannot decode schema-v9 analysis payload"),
         10 => serde_json::from_value(payload).context("cannot decode schema-v10 analysis payload"),
-        11 => serde_json::from_value(payload).context("cannot decode current analysis payload"),
+        11 => serde_json::from_value(payload).context("cannot decode schema-v11 analysis payload"),
+        12 => serde_json::from_value(payload).context("cannot decode current analysis payload"),
         _ => bail!("unsupported analysis package schema {schema_version}"),
     })?;
     if (2..TRANSITIVE_THUNK_CHAIN_SCHEMA_VERSION).contains(&schema_version) {
@@ -761,8 +796,47 @@ fn read_analysis_package(
         guard_cf_availability,
         guard_target_table_availability,
         load_config_security_anchor_availability,
+        load_config_xfg_anchor_availability,
         legacy_inspection_source,
     })
+}
+
+fn require_v12_load_config_xfg_anchor_marker(payload: &Value, schema_version: u32) -> Result<()> {
+    debug_assert!(schema_version >= LOAD_CONFIG_XFG_ANCHOR_SCHEMA_VERSION);
+    let Some(analysis) = payload
+        .pointer("/base_analysis/analysis")
+        .and_then(Value::as_object)
+    else {
+        return Ok(());
+    };
+    if !analysis
+        .get("load_config_xfg_anchors")
+        .is_some_and(Value::is_object)
+    {
+        bail!(
+            "package schema {schema_version} requires an explicit load_config_xfg_anchors object, even when every anchor is absent; a legacy package without that marker cannot be migrated by changing only its envelope label, so reanalyze the exact original binary"
+        );
+    }
+    Ok(())
+}
+
+fn reject_pre_v12_load_config_xfg_anchor_semantics(
+    payload: &Value,
+    schema_version: u32,
+) -> Result<()> {
+    debug_assert!((1..LOAD_CONFIG_XFG_ANCHOR_SCHEMA_VERSION).contains(&schema_version));
+    let Some(analysis) = payload
+        .pointer("/base_analysis/analysis")
+        .and_then(Value::as_object)
+    else {
+        return Ok(());
+    };
+    if analysis.contains_key("load_config_xfg_anchors") {
+        bail!(
+            "package schema {schema_version} predates PE load-config XFG/CastGuard anchor recovery but its base analysis contains schema-12 XFG or CastGuard storage-anchor semantics; legacy envelopes cannot be relabeled, so reanalyze the exact original binary"
+        );
+    }
+    Ok(())
 }
 
 fn require_v11_load_config_security_anchor_marker(
@@ -1342,6 +1416,7 @@ impl SchemaV1PeAnalysis {
             runtime_functions: self.runtime_functions,
             load_config_size: None,
             load_config_security_anchors: PeLoadConfigSecurityAnchors::default(),
+            load_config_xfg_anchors: PeLoadConfigXfgAnchors::default(),
             guard_flags: None,
             guard_cf_function_table_rva: None,
             guard_cf_functions: Vec::new(),
@@ -1506,6 +1581,12 @@ fn export(args: ExportArgs) -> Result<()> {
     }
     if let Some(line) = package_data
         .load_config_security_anchor_availability
+        .export_summary_line()
+    {
+        println!("{line}");
+    }
+    if let Some(line) = package_data
+        .load_config_xfg_anchor_availability
         .export_summary_line()
     {
         println!("{line}");
@@ -2621,6 +2702,7 @@ fn print_analysis_summary(analysis: &BinaryAnalysis, availability: AnalysisFeatu
         guard_cf: guard_cf_availability,
         guard_target_tables: guard_target_table_availability,
         load_config_security_anchors: load_config_security_anchor_availability,
+        load_config_xfg_anchors: load_config_xfg_anchor_availability,
     } = availability;
     let identity = analysis.identity();
     println!("size: {} bytes", identity.size);
@@ -2692,6 +2774,11 @@ fn print_analysis_summary(analysis: &BinaryAnalysis, availability: AnalysisFeatu
                 pe,
                 load_config_security_anchor_availability,
             ) {
+                println!("{line}");
+            }
+            for line in
+                load_config_xfg_anchor_summary_lines(pe, load_config_xfg_anchor_availability)
+            {
                 println!("{line}");
             }
             println!("{}", guard_cf_summary_line(pe, guard_cf_availability));
@@ -2868,6 +2955,54 @@ fn load_config_security_anchor_summary_lines(
             ),
             format!(
                 "GuardCF dispatch-function pointer slot: unavailable (not recorded by schema {schema_version}; reanalyze the exact original binary)"
+            ),
+        ],
+    }
+}
+
+fn load_config_xfg_anchor_summary_lines(
+    pe: &resymbol_analysis::PeAnalysis,
+    availability: LoadConfigXfgAnchorAvailability,
+) -> [String; 4] {
+    let recorded_line = |label: &str, rva: Option<u32>| match rva {
+        Some(rva) => format!("{label}: RVA {rva:#x}"),
+        None => format!("{label}: absent"),
+    };
+    match availability {
+        LoadConfigXfgAnchorAvailability::Recorded => [
+            recorded_line(
+                "Guard XFG check-function pointer slot",
+                pe.load_config_xfg_anchors
+                    .guard_xfg_check_function_pointer_rva,
+            ),
+            recorded_line(
+                "Guard XFG dispatch-function pointer slot",
+                pe.load_config_xfg_anchors
+                    .guard_xfg_dispatch_function_pointer_rva,
+            ),
+            recorded_line(
+                "Guard XFG table-dispatch function-pointer slot",
+                pe.load_config_xfg_anchors
+                    .guard_xfg_table_dispatch_function_pointer_rva,
+            ),
+            recorded_line(
+                "CastGuard OS-determined failure-mode storage",
+                pe.load_config_xfg_anchors
+                    .cast_guard_os_determined_failure_mode_rva,
+            ),
+        ],
+        LoadConfigXfgAnchorAvailability::Unavailable(schema_version) => [
+            format!(
+                "Guard XFG check-function pointer slot: unavailable (not recorded by schema {schema_version}; reanalyze the exact original binary)"
+            ),
+            format!(
+                "Guard XFG dispatch-function pointer slot: unavailable (not recorded by schema {schema_version}; reanalyze the exact original binary)"
+            ),
+            format!(
+                "Guard XFG table-dispatch function-pointer slot: unavailable (not recorded by schema {schema_version}; reanalyze the exact original binary)"
+            ),
+            format!(
+                "CastGuard OS-determined failure-mode storage: unavailable (not recorded by schema {schema_version}; reanalyze the exact original binary)"
             ),
         ],
     }
@@ -4455,6 +4590,61 @@ entrypoint = "Plugin.dll"
     }
 
     #[test]
+    fn load_config_xfg_anchor_summaries_distinguish_current_and_legacy_data() {
+        let analysis = analyze_bytes(&pe_fixture()).expect("analyze PE fixture");
+        let BinaryAnalysis::Pe(mut pe) = analysis else {
+            panic!("PE analysis expected");
+        };
+        assert_eq!(
+            load_config_xfg_anchor_summary_lines(&pe, LoadConfigXfgAnchorAvailability::Recorded,),
+            [
+                "Guard XFG check-function pointer slot: absent",
+                "Guard XFG dispatch-function pointer slot: absent",
+                "Guard XFG table-dispatch function-pointer slot: absent",
+                "CastGuard OS-determined failure-mode storage: absent",
+            ]
+        );
+
+        pe.load_config_xfg_anchors = PeLoadConfigXfgAnchors {
+            guard_xfg_check_function_pointer_rva: Some(0x1540),
+            guard_xfg_dispatch_function_pointer_rva: Some(0x1548),
+            guard_xfg_table_dispatch_function_pointer_rva: Some(0x1550),
+            cast_guard_os_determined_failure_mode_rva: Some(0x1558),
+        };
+        assert_eq!(
+            load_config_xfg_anchor_summary_lines(&pe, LoadConfigXfgAnchorAvailability::Recorded,),
+            [
+                "Guard XFG check-function pointer slot: RVA 0x1540",
+                "Guard XFG dispatch-function pointer slot: RVA 0x1548",
+                "Guard XFG table-dispatch function-pointer slot: RVA 0x1550",
+                "CastGuard OS-determined failure-mode storage: RVA 0x1558",
+            ]
+        );
+        assert_eq!(
+            LoadConfigXfgAnchorAvailability::Recorded.export_summary_line(),
+            None
+        );
+
+        let availability = LoadConfigXfgAnchorAvailability::Unavailable(11);
+        assert_eq!(
+            load_config_xfg_anchor_summary_lines(&pe, availability),
+            [
+                "Guard XFG check-function pointer slot: unavailable (not recorded by schema 11; reanalyze the exact original binary)",
+                "Guard XFG dispatch-function pointer slot: unavailable (not recorded by schema 11; reanalyze the exact original binary)",
+                "Guard XFG table-dispatch function-pointer slot: unavailable (not recorded by schema 11; reanalyze the exact original binary)",
+                "CastGuard OS-determined failure-mode storage: unavailable (not recorded by schema 11; reanalyze the exact original binary)",
+            ]
+        );
+        assert_eq!(
+            availability.export_summary_line(),
+            Some(
+                "PE load-config XFG/CastGuard anchors: unavailable (schema 11 package predates XFG and CastGuard storage-anchor recovery; reanalyze the exact original binary)"
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
     fn guard_cf_stays_additive_for_symbols_read_and_projection() {
         let base_analysis = analyze_bytes(&pe_guard_cf_fixture()).expect("analyze GuardCF fixture");
         let BinaryAnalysis::Pe(pe) = &base_analysis else {
@@ -5035,7 +5225,7 @@ entrypoint = "Plugin.dll"
 
         let package: ResymPackage<AnalysisSession> =
             read_file_bound(&output).expect("read bound package");
-        assert_eq!(CURRENT_SCHEMA_VERSION, 11);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 12);
         assert_eq!(package.schema_version(), CURRENT_SCHEMA_VERSION);
         assert_eq!(
             package.binary_sha256(),
@@ -5098,7 +5288,18 @@ entrypoint = "Plugin.dll"
         .expect("JSON inspection serializes validated package");
     }
 
+    fn strip_schema_v12_load_config_xfg_anchor_semantics(value: &mut Value) {
+        value
+            .pointer_mut("/payload/base_analysis/analysis")
+            .and_then(Value::as_object_mut)
+            .expect("serialized PE analysis object")
+            .remove("load_config_xfg_anchors");
+    }
+
     fn strip_schema_v11_load_config_security_anchor_semantics(value: &mut Value) {
+        // Every schema predating the original load-config security anchors also
+        // predates the XFG/CastGuard suffix. Cascade the newer strip first.
+        strip_schema_v12_load_config_xfg_anchor_semantics(value);
         value
             .pointer_mut("/payload/base_analysis/analysis")
             .and_then(Value::as_object_mut)
@@ -5370,6 +5571,10 @@ entrypoint = "Plugin.dll"
         assert_eq!(
             loaded.load_config_security_anchor_availability,
             LoadConfigSecurityAnchorAvailability::Recorded
+        );
+        assert_eq!(
+            loaded.load_config_xfg_anchor_availability,
+            LoadConfigXfgAnchorAvailability::Recorded
         );
 
         let verified = verify_inspection_binary(&loaded, &binary_path)
@@ -5722,6 +5927,10 @@ entrypoint = "Plugin.dll"
             decoded.load_config_security_anchor_availability,
             LoadConfigSecurityAnchorAvailability::Unavailable(1)
         );
+        assert_eq!(
+            decoded.load_config_xfg_anchor_availability,
+            LoadConfigXfgAnchorAvailability::Unavailable(1)
+        );
         let BinaryAnalysis::Pe(pe) = decoded.package.payload().base_analysis() else {
             panic!("PE analysis expected");
         };
@@ -5729,6 +5938,8 @@ entrypoint = "Plugin.dll"
         assert!(pe.delay_imports.is_empty());
         assert!(pe.directories.load_config.is_none());
         assert!(pe.load_config_size.is_none());
+        assert!(pe.load_config_security_anchors.is_empty());
+        assert!(pe.load_config_xfg_anchors.is_empty());
         assert!(pe.guard_flags.is_none());
         assert!(pe.guard_cf_function_table_rva.is_none());
         assert!(pe.guard_cf_functions.is_empty());
@@ -6330,16 +6541,16 @@ entrypoint = "Plugin.dll"
     }
 
     #[test]
-    fn cli_rejects_schema_v12_before_decoding_the_analysis_payload() {
+    fn cli_rejects_schema_v13_before_decoding_the_analysis_payload() {
         let temp = tempfile::tempdir().expect("create temporary directory");
-        let path = temp.path().join("schema-v12.resym");
+        let path = temp.path().join("schema-v13.resym");
         let base_analysis = analyze_bytes(&pe_fixture()).expect("analyze PE fixture");
         let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
             .expect("create base-only session");
         let package = ResymPackage::from_bound_payload("0.1.0-future", session)
             .expect("create current package value");
         let mut value = serde_json::to_value(package).expect("serialize package value");
-        value["schema_version"] = serde_json::json!(12);
+        value["schema_version"] = serde_json::json!(13);
         value["payload"] = serde_json::json!("not an analysis session");
         fs::write(
             &path,
@@ -6348,13 +6559,147 @@ entrypoint = "Plugin.dll"
         .expect("write future package");
 
         let error = match read_analysis_package(&path, false) {
-            Ok(_) => panic!("schema 12 must be rejected"),
+            Ok(_) => panic!("schema 13 must be rejected"),
             Err(error) => error,
         };
         let diagnostic = format!("{error:#}");
-        assert!(diagnostic.contains("unsupported package schema 12"));
-        assert!(diagnostic.contains("schemas 1 through 11"));
+        assert!(diagnostic.contains("unsupported package schema 13"));
+        assert!(diagnostic.contains("schemas 1 through 12"));
         assert!(!diagnostic.contains("analysis payload"));
+    }
+
+    #[test]
+    fn schema_v12_requires_an_explicit_xfg_anchor_object_marker() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let base_analysis = analyze_bytes(&pe_fixture()).expect("analyze PE fixture");
+        let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
+            .expect("create base-only session");
+        let package = ResymPackage::from_bound_payload("0.1.0-schema12", session)
+            .expect("create current package value");
+        let current = serde_json::to_value(package).expect("serialize current package value");
+        let marker = current
+            .pointer("/payload/base_analysis/analysis/load_config_xfg_anchors")
+            .and_then(Value::as_object)
+            .expect("schema 12 serializes the XFG-anchor object marker");
+        assert!(
+            marker.is_empty(),
+            "the marker is an empty object when every anchor is absent"
+        );
+
+        for (label, replacement) in [
+            ("missing", None),
+            ("null", Some(Value::Null)),
+            ("array", Some(Value::Array(Vec::new()))),
+            ("string", Some(Value::String("legacy".to_owned()))),
+        ] {
+            let mut invalid = current.clone();
+            let analysis = invalid
+                .pointer_mut("/payload/base_analysis/analysis")
+                .and_then(Value::as_object_mut)
+                .expect("serialized PE analysis object");
+            match replacement {
+                Some(value) => {
+                    analysis.insert("load_config_xfg_anchors".to_owned(), value);
+                }
+                None => {
+                    analysis.remove("load_config_xfg_anchors");
+                }
+            }
+            let path = temp.path().join(format!("schema-v12-{label}-marker.resym"));
+            fs::write(
+                &path,
+                serde_json::to_vec(&invalid).expect("encode invalid marker package"),
+            )
+            .expect("write invalid marker package");
+
+            let error = match read_analysis_package(&path, false) {
+                Ok(_) => panic!("schema 12 must reject a {label} XFG-anchor marker"),
+                Err(error) => error,
+            };
+            let diagnostic = format!("{error:#}");
+            assert!(diagnostic.contains("package schema 12 requires an explicit"));
+            assert!(diagnostic.contains("load_config_xfg_anchors object"));
+            assert!(diagnostic.contains("cannot be migrated by changing only its envelope label"));
+            assert!(!diagnostic.contains("schema-11"));
+            assert!(!diagnostic.contains("analysis payload"));
+        }
+    }
+
+    #[test]
+    fn pre_v12_xfg_anchor_gate_rejects_exact_base_shape_but_ignores_lookalikes() {
+        for schema_version in 1..LOAD_CONFIG_XFG_ANCHOR_SCHEMA_VERSION {
+            let payload = serde_json::json!({
+                "base_analysis": {
+                    "analysis": {"load_config_xfg_anchors": {}}
+                },
+                "plugin_claims": []
+            });
+            let error = reject_pre_v12_load_config_xfg_anchor_semantics(&payload, schema_version)
+                .expect_err("an exact schema-12 XFG-anchor shape rejects a legacy envelope");
+            let diagnostic = error.to_string();
+            assert!(diagnostic.contains(&format!("package schema {schema_version}")));
+            assert!(diagnostic.contains("schema-12"));
+            assert!(diagnostic.contains("cannot be relabeled"));
+
+            for allowed in [
+                serde_json::json!({
+                    "base_analysis": {"analysis": {
+                        "extension": {"load_config_xfg_anchors": {}}
+                    }},
+                    "plugin_claims": []
+                }),
+                serde_json::json!({
+                    "base_analysis": {"analysis": {}},
+                    "plugin_claims": [{"load_config_xfg_anchors": {}}]
+                }),
+                serde_json::json!({
+                    "base_analysis": {
+                        "load_config_xfg_anchors": {},
+                        "analysis": {"load_config_xfg_anchor": {}}
+                    },
+                    "plugin_claims": []
+                }),
+            ] {
+                reject_pre_v12_load_config_xfg_anchor_semantics(&allowed, schema_version)
+                    .expect("nested, plugin-owned, and lookalike names are not base schema fields");
+            }
+        }
+    }
+
+    #[test]
+    fn cli_runs_the_pre_v12_xfg_anchor_gate_before_all_older_gates_and_decoding() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let base_analysis = analyze_bytes(&pe_fixture()).expect("analyze PE fixture");
+        let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
+            .expect("create base-only session");
+        let package = ResymPackage::from_bound_payload("0.1.0-schema12", session)
+            .expect("create current package value");
+        let current = serde_json::to_value(package).expect("serialize current package value");
+
+        for schema_version in 1..LOAD_CONFIG_XFG_ANCHOR_SCHEMA_VERSION {
+            let mut value = current.clone();
+            value["schema_version"] = serde_json::json!(schema_version);
+            let path = temp.path().join(format!(
+                "relabeled-xfg-anchor-schema-{schema_version}.resym"
+            ));
+            fs::write(
+                &path,
+                serde_json::to_vec(&value).expect("encode relabeled package"),
+            )
+            .expect("write relabeled package");
+
+            let error = match read_analysis_package(&path, false) {
+                Ok(_) => panic!("schema {schema_version} must reject schema-12 anchor state"),
+                Err(error) => error,
+            };
+            let diagnostic = format!("{error:#}");
+            assert!(diagnostic.contains("schema-12"));
+            assert!(!diagnostic.contains("schema-11"));
+            assert!(!diagnostic.contains("schema-10"));
+            assert!(!diagnostic.contains("schema-9 GuardCF semantics"));
+            assert!(!diagnostic.contains("schema-8 delay-import semantics"));
+            assert!(!diagnostic.contains("cannot decode schema"));
+        }
     }
 
     #[test]
@@ -6365,7 +6710,9 @@ entrypoint = "Plugin.dll"
             .expect("create base-only session");
         let package = ResymPackage::from_bound_payload("0.1.0-schema11", session)
             .expect("create current package value");
-        let current = serde_json::to_value(package).expect("serialize current package value");
+        let mut current = serde_json::to_value(package).expect("serialize current package value");
+        current["schema_version"] = serde_json::json!(11);
+        strip_schema_v12_load_config_xfg_anchor_semantics(&mut current);
         let marker = current
             .pointer("/payload/base_analysis/analysis/load_config_security_anchors")
             .and_then(Value::as_object)
@@ -6412,6 +6759,40 @@ entrypoint = "Plugin.dll"
             assert!(!diagnostic.contains("schema-10"));
             assert!(!diagnostic.contains("analysis payload"));
         }
+    }
+
+    #[test]
+    fn schema_v12_still_requires_the_schema_v11_security_anchor_marker() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let path = temp
+            .path()
+            .join("schema-v12-without-security-anchor-marker.resym");
+        let base_analysis = analyze_bytes(&pe_fixture()).expect("analyze PE fixture");
+        let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
+            .expect("create base-only session");
+        let package = ResymPackage::from_bound_payload("0.1.0-schema12", session)
+            .expect("create current package value");
+        let mut value = serde_json::to_value(package).expect("serialize current package value");
+        value
+            .pointer_mut("/payload/base_analysis/analysis")
+            .and_then(Value::as_object_mut)
+            .expect("serialized PE analysis object")
+            .remove("load_config_security_anchors");
+        fs::write(
+            &path,
+            serde_json::to_vec(&value).expect("encode missing-marker package"),
+        )
+        .expect("write missing-marker package");
+
+        let error = match read_analysis_package(&path, false) {
+            Ok(_) => panic!("schema 12 must retain the schema-11 security-anchor marker"),
+            Err(error) => error,
+        };
+        let diagnostic = format!("{error:#}");
+        assert!(diagnostic.contains("package schema 12 requires an explicit"));
+        assert!(diagnostic.contains("load_config_security_anchors object"));
+        assert!(!diagnostic.contains("load_config_xfg_anchors object"));
+        assert!(!diagnostic.contains("analysis payload"));
     }
 
     #[test]
@@ -6466,7 +6847,8 @@ entrypoint = "Plugin.dll"
             .expect("create base-only session");
         let package = ResymPackage::from_bound_payload("0.1.0-schema11", session)
             .expect("create current package value");
-        let current = serde_json::to_value(package).expect("serialize current package value");
+        let mut current = serde_json::to_value(package).expect("serialize current package value");
+        strip_schema_v12_load_config_xfg_anchor_semantics(&mut current);
 
         for schema_version in 1..LOAD_CONFIG_SECURITY_ANCHOR_SCHEMA_VERSION {
             let mut value = current.clone();
@@ -6494,7 +6876,7 @@ entrypoint = "Plugin.dll"
     }
 
     #[test]
-    fn schemas_v10_and_v11_require_all_explicit_guard_target_inventory_markers() {
+    fn schemas_v10_through_v12_require_all_explicit_guard_target_inventory_markers() {
         let temp = tempfile::tempdir().expect("create temporary directory");
         let base_analysis = analyze_bytes(&pe_fixture()).expect("analyze PE fixture");
         let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
@@ -6502,11 +6884,13 @@ entrypoint = "Plugin.dll"
         let package = ResymPackage::from_bound_payload("0.1.0-schema10", session)
             .expect("create current package value");
         let current = serde_json::to_value(package).expect("serialize current package value");
-        for schema_version in [10, 11] {
+        for schema_version in [10, 11, 12] {
             let mut schema_value = current.clone();
             schema_value["schema_version"] = serde_json::json!(schema_version);
             if schema_version == 10 {
                 strip_schema_v11_load_config_security_anchor_semantics(&mut schema_value);
+            } else if schema_version == 11 {
+                strip_schema_v12_load_config_xfg_anchor_semantics(&mut schema_value);
             }
             for marker in [
                 "guard_address_taken_iat_entries",
@@ -6641,7 +7025,7 @@ entrypoint = "Plugin.dll"
     }
 
     #[test]
-    fn schemas_v9_through_v11_require_an_explicit_guard_cf_inventory_marker() {
+    fn schemas_v9_through_v12_require_an_explicit_guard_cf_inventory_marker() {
         let temp = tempfile::tempdir().expect("create temporary directory");
         let base_analysis = analyze_bytes(&pe_fixture()).expect("analyze PE fixture");
         let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
@@ -6650,13 +7034,15 @@ entrypoint = "Plugin.dll"
             .expect("create current package value");
         let current = serde_json::to_value(package).expect("serialize current package value");
 
-        for schema_version in [9, 10, 11] {
+        for schema_version in [9, 10, 11, 12] {
             let mut value = current.clone();
             value["schema_version"] = serde_json::json!(schema_version);
             if schema_version == 9 {
                 strip_schema_v10_guard_target_semantics(&mut value);
             } else if schema_version == 10 {
                 strip_schema_v11_load_config_security_anchor_semantics(&mut value);
+            } else if schema_version == 11 {
+                strip_schema_v12_load_config_xfg_anchor_semantics(&mut value);
             }
             assert_eq!(
                 value.pointer("/payload/base_analysis/analysis/guard_cf_functions"),
@@ -6820,6 +7206,66 @@ entrypoint = "Plugin.dll"
     }
 
     #[test]
+    fn schema_v11_keeps_security_anchors_but_reports_xfg_anchors_unavailable() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let path = temp.path().join("schema-v11.resym");
+        let output = temp.path().join("schema-v11.json");
+        let base_analysis = analyze_bytes(&pe_fixture()).expect("analyze PE fixture");
+        let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
+            .expect("create base-only session");
+        let package = ResymPackage::from_bound_payload("0.1.0-schema11", session)
+            .expect("create current package value");
+        let mut value = serde_json::to_value(package).expect("serialize current package value");
+        value["schema_version"] = serde_json::json!(11);
+        strip_schema_v12_load_config_xfg_anchor_semantics(&mut value);
+        assert_eq!(
+            value.pointer("/payload/base_analysis/analysis/load_config_security_anchors"),
+            Some(&serde_json::json!({})),
+            "schema 11 retains its explicit security-anchor marker"
+        );
+        fs::write(
+            &path,
+            serde_json::to_vec(&value).expect("encode schema-v11 package"),
+        )
+        .expect("write schema-v11 package");
+
+        let decoded = read_analysis_package(&path, true).expect("decode schema-v11 package");
+        assert_eq!(decoded.package.schema_version(), 11);
+        assert_eq!(
+            decoded.load_config_security_anchor_availability,
+            LoadConfigSecurityAnchorAvailability::Recorded
+        );
+        assert_eq!(
+            decoded.load_config_xfg_anchor_availability,
+            LoadConfigXfgAnchorAvailability::Unavailable(11)
+        );
+        assert!(decoded.legacy_inspection_source.is_some());
+        assert_legacy_inspection_json_preserved_and_reopens(&decoded, &value, temp.path());
+        let BinaryAnalysis::Pe(pe) = decoded.package.payload().base_analysis() else {
+            panic!("PE analysis expected");
+        };
+        assert!(pe.load_config_security_anchors.is_empty());
+        assert!(pe.load_config_xfg_anchors.is_empty());
+
+        export(ExportArgs {
+            package: path,
+            format: ExportFormat::Json,
+            output: Some(output.clone()),
+            binary: None,
+        })
+        .expect("JSON export accepts schema 11");
+        let projection: Value =
+            serde_json::from_slice(&fs::read(output).expect("read schema-v11 projection"))
+                .expect("schema-v11 projection JSON is valid");
+        assert_eq!(projection["schema_version"], 6);
+        assert!(
+            !serde_json::to_string(&projection)
+                .expect("serialize projection")
+                .contains("load_config_xfg_anchors")
+        );
+    }
+
+    #[test]
     fn schema_v10_keeps_guard_targets_but_reports_security_anchors_unavailable() {
         let temp = tempfile::tempdir().expect("create temporary directory");
         let path = temp.path().join("schema-v10.resym");
@@ -6848,11 +7294,21 @@ entrypoint = "Plugin.dll"
             decoded.load_config_security_anchor_availability,
             LoadConfigSecurityAnchorAvailability::Unavailable(10)
         );
+        assert_eq!(
+            decoded.load_config_xfg_anchor_availability,
+            LoadConfigXfgAnchorAvailability::Unavailable(10)
+        );
+        assert_eq!(
+            decoded.load_config_xfg_anchor_availability,
+            LoadConfigXfgAnchorAvailability::Unavailable(10)
+        );
         assert!(decoded.legacy_inspection_source.is_some());
         let BinaryAnalysis::Pe(pe) = decoded.package.payload().base_analysis() else {
             panic!("PE analysis expected");
         };
         assert!(pe.load_config_security_anchors.is_empty());
+        assert!(pe.load_config_xfg_anchors.is_empty());
+        assert!(pe.load_config_xfg_anchors.is_empty());
         assert_eq!(
             serde_json::from_str::<Value>(
                 &decoded
@@ -7031,7 +7487,7 @@ entrypoint = "Plugin.dll"
     }
 
     #[test]
-    fn schemas_v8_through_v11_require_the_explicit_delay_import_inventory_marker() {
+    fn schemas_v8_through_v12_require_the_explicit_delay_import_inventory_marker() {
         let temp = tempfile::tempdir().expect("create temporary directory");
         let base_analysis = analyze_bytes(&pe_fixture()).expect("analyze PE fixture");
         let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
@@ -7039,7 +7495,7 @@ entrypoint = "Plugin.dll"
         let package = ResymPackage::from_bound_payload("0.1.0-schema10", session)
             .expect("create current package value");
         let current = serde_json::to_value(package).expect("serialize current package value");
-        for schema_version in [8, 9, 10, 11] {
+        for schema_version in [8, 9, 10, 11, 12] {
             let mut value = current.clone();
             value["schema_version"] = serde_json::json!(schema_version);
             if schema_version == 8 {
@@ -7048,6 +7504,8 @@ entrypoint = "Plugin.dll"
                 strip_schema_v10_guard_target_semantics(&mut value);
             } else if schema_version == 10 {
                 strip_schema_v11_load_config_security_anchor_semantics(&mut value);
+            } else if schema_version == 11 {
+                strip_schema_v12_load_config_xfg_anchor_semantics(&mut value);
             }
             assert_eq!(
                 value.pointer("/payload/base_analysis/analysis/delay_imports"),

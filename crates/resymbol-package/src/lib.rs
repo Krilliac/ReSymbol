@@ -26,7 +26,7 @@ use thiserror::Error;
 pub use resymbol_core::{BinaryId, ClaimValidationError};
 
 /// The package schema written by this crate.
-pub const CURRENT_SCHEMA_VERSION: u32 = 11;
+pub const CURRENT_SCHEMA_VERSION: u32 = 12;
 
 /// Default maximum encoded or decoded package size: 64 MiB.
 pub const DEFAULT_MAX_PACKAGE_BYTES: usize = 64 * 1024 * 1024;
@@ -730,7 +730,7 @@ mod tests {
                 "\"generator_version\":\"0.1.0-test\",",
                 "\"payload\":{\"label\":\"fixture\",",
                 "\"metadata\":{\"alpha\":\"first\",\"zeta\":\"last\"},",
-                "\"values\":[1,2,3]},\"schema_version\":11}"
+                "\"values\":[1,2,3]},\"schema_version\":12}"
             )
         );
 
@@ -742,13 +742,13 @@ mod tests {
     #[test]
     fn unsupported_schema_is_reported_before_payload_decoding() {
         let bytes = format!(
-            "{{\"schema_version\":12,\"generator_version\":\"0.1.0\",\"binary_sha256\":\"{DIGEST_A}\",\"payload\":\"not the requested type\"}}"
+            "{{\"schema_version\":13,\"generator_version\":\"0.1.0\",\"binary_sha256\":\"{DIGEST_A}\",\"payload\":\"not the requested type\"}}"
         );
         let error = from_slice::<TestPayload>(bytes.as_bytes()).expect_err("schema is unsupported");
         assert!(matches!(
             error,
             PackageError::UnsupportedSchema {
-                found: 12,
+                found: 13,
                 minimum: CURRENT_SCHEMA_VERSION,
                 maximum: CURRENT_SCHEMA_VERSION,
             }
@@ -758,7 +758,7 @@ mod tests {
     #[test]
     fn unknown_envelope_fields_are_rejected() {
         let bytes = format!(
-            "{{\"schema_version\":11,\"generator_version\":\"0.1.0\",\"binary_sha256\":\"{DIGEST_A}\",\"payload\":null,\"unexpected\":true}}"
+            "{{\"schema_version\":12,\"generator_version\":\"0.1.0\",\"binary_sha256\":\"{DIGEST_A}\",\"payload\":null,\"unexpected\":true}}"
         );
         let error = from_slice::<Value>(bytes.as_bytes()).expect_err("unknown field is rejected");
         assert!(matches!(&error, PackageError::Deserialize(_)));
@@ -792,7 +792,7 @@ mod tests {
     #[test]
     fn invalid_binary_identity_is_actionable() {
         let bytes = br#"{
-            "schema_version": 11,
+            "schema_version": 12,
             "generator_version": "0.1.0",
             "binary_sha256": "not-a-sha256",
             "payload": null
@@ -826,14 +826,14 @@ mod tests {
     #[test]
     fn explicit_compatibility_range_can_accept_a_newer_envelope() {
         let bytes = format!(
-            "{{\"schema_version\":12,\"generator_version\":\"0.2.0\",\"binary_sha256\":\"{DIGEST_A}\",\"payload\":42}}"
+            "{{\"schema_version\":13,\"generator_version\":\"0.2.0\",\"binary_sha256\":\"{DIGEST_A}\",\"payload\":42}}"
         );
-        let compatibility = SchemaCompatibility::inclusive(11, 12).expect("valid range");
+        let compatibility = SchemaCompatibility::inclusive(12, 13).expect("valid range");
         let options = PackageOptions::new(1024, compatibility).expect("valid options");
         let decoded =
             from_slice_with_options::<u64>(bytes.as_bytes(), options).expect("schema is accepted");
 
-        assert_eq!(decoded.schema_version(), 12);
+        assert_eq!(decoded.schema_version(), 13);
         assert_eq!(*decoded.payload(), 42);
     }
 
@@ -1108,6 +1108,32 @@ mod tests {
     }
 
     #[test]
+    fn schema_v11_requires_explicit_read_compatibility_and_remains_decodable() {
+        let bytes = format!(
+            "{{\"schema_version\":11,\"generator_version\":\"0.1.0-alpha.11\",\"binary_sha256\":\"{DIGEST_A}\",\"payload\":42}}"
+        );
+        let error = from_slice::<u64>(bytes.as_bytes())
+            .expect_err("the default policy accepts only newly emitted packages");
+        assert!(matches!(
+            error,
+            PackageError::UnsupportedSchema {
+                found: 11,
+                minimum: CURRENT_SCHEMA_VERSION,
+                maximum: CURRENT_SCHEMA_VERSION,
+            }
+        ));
+
+        let compatibility = SchemaCompatibility::inclusive(1, CURRENT_SCHEMA_VERSION)
+            .expect("valid compatibility range");
+        let options = PackageOptions::new(1024, compatibility).expect("valid options");
+        let decoded = from_slice_with_options::<u64>(bytes.as_bytes(), options)
+            .expect("schema 11 is accepted explicitly");
+
+        assert_eq!(decoded.schema_version(), 11);
+        assert_eq!(*decoded.payload(), 42);
+    }
+
+    #[test]
     fn consistency_helpers_detect_wrong_binary() {
         let package = package();
         let expected = BinaryId::from_sha256(DIGEST_B).expect("valid test digest");
@@ -1144,7 +1170,7 @@ mod tests {
     #[test]
     fn bound_decode_rejects_envelope_payload_identity_mismatch() {
         let bytes = format!(
-            "{{\"schema_version\":11,\"generator_version\":\"0.1.0\",\"binary_sha256\":\"{DIGEST_A}\",\"payload\":{{\"binary_id\":\"{DIGEST_B}\",\"value\":7}}}}"
+            "{{\"schema_version\":12,\"generator_version\":\"0.1.0\",\"binary_sha256\":\"{DIGEST_A}\",\"payload\":{{\"binary_id\":\"{DIGEST_B}\",\"value\":7}}}}"
         );
         let error =
             from_slice_bound::<BoundPayload>(bytes.as_bytes()).expect_err("binding must fail");

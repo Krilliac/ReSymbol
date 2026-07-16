@@ -74,7 +74,9 @@ After a successful write, the CLI prints the destination, binary SHA-256, projec
 and a bounded summary of projection warning groups. For schemas 1 through 6 it also reports TLS
 callback recovery as unavailable; for schemas 1 through 7 it reports delay-import recovery as
 unavailable; for schemas 1 through 8 it reports GuardCF recovery as unavailable; and for schemas 1
-through 9 it reports the modern Guard target inventories as unavailable. These
+through 9 it reports the modern Guard target inventories as unavailable; for schemas 1 through 10
+it reports the earlier load-config security anchors as unavailable; and for schemas 1 through 11
+it reports XFG/CastGuard anchors as unavailable. These
 diagnostics direct the user to reanalyze the exact original binary.
 Inspect the warnings before applying a script; the output file is still created when a deliberate
 lossy reduction is safe and diagnosed.
@@ -120,7 +122,7 @@ added deterministic string correlation to each data reference. Schema 6 adds the
 projection schema is independent from the `.resym` package-envelope schema; consumers must validate
 the version of the artifact they are actually reading.
 
-The CLI can export package schemas 1 through 10 through validated in-memory compatibility paths.
+The CLI can export package schemas 1 through 11 through validated in-memory compatibility paths.
 Migration neither rewrites the package nor reruns analysis: the package does not embed executable
 bytes. Schema 1 therefore has no available direct calls, thunks, strings, or data references.
 Schema 2 retains its persisted calls and thunks but predates strings and data references. Schema 3
@@ -132,22 +134,25 @@ discovery and callback-based thunk seeding. Schema 7 records TLS callbacks but p
 delay-import recovery. Schema 8 records delay imports but predates load-config GuardCF recovery.
 Schema 9 records GuardCF functions but predates the Guard address-taken IAT, long-jump, and
 EH-continuation inventories. Schema 10 records those inventories but predates checked
-security-cookie and GuardCF check/dispatch pointer-slot anchors. Reanalyze the exact original binary
-to produce schema 11 before expecting all current recovery
+security-cookie and GuardCF check/dispatch pointer-slot anchors. Schema 11 records those anchors but
+predates XFG and CastGuard storage anchors. Reanalyze the exact original binary to produce schema 12
+before expecting all current recovery
 relationships in the export. Schemas 1 through 4 reject
 relabeled RTTI base records whose `class_hierarchy_descriptor_rva` is missing or null, and schemas 1
 through 5 reject a deterministic base thunk source valid only through schema-6 endpoint seeding.
 Schemas 1 through 6 reject schema-7 TLS fields, core `pe-tls-callback` claims, and callback-only
 base thunk seeds rather than accepting a relabeled package. Schemas 1 through 7 likewise reject
-schema-8 delay-import directory and inventory fields, while schemas 8 through 11 require the explicit
+schema-8 delay-import directory and inventory fields, while schemas 8 through 12 require the explicit
 `delay_imports` inventory even when empty.
 Schemas 1 through 8 reject schema-9 load-config/GuardCF fields,
-`directories.load_config`, and core `pe-guard-cf-function` claims; schemas 9 through 11 require an explicit
+`directories.load_config`, and core `pe-guard-cf-function` claims; schemas 9 through 12 require an explicit
 `guard_cf_functions` inventory even when empty.
 Schemas 1 through 9 reject schema-10 Guard address-taken IAT, long-jump, and EH-continuation
-table-RVA and inventory fields; schemas 10 and 11 require all three inventory arrays even when empty.
-Schemas 1 through 10 reject the schema-11 `load_config_security_anchors` object; schema 11 requires
-that object even when every anchor is absent.
+table-RVA and inventory fields; schemas 10 through 12 require all three inventory arrays even when
+empty. Schemas 1 through 10 reject the schema-11 `load_config_security_anchors` object; schemas 11
+and 12 require that object even when every anchor is absent. Schemas 1 through 11 reject the
+schema-12 `load_config_xfg_anchors` object; schema 12 requires it even when all four anchors are
+absent.
 
 Entries are emitted in stable order. Name and range conflicts are resolved conservatively, and
 colliding selected names receive deterministic output suffixes rather than silently referring to
@@ -361,7 +366,7 @@ schema-6 JSON record.
 Markdown is a human-facing presentation format, not a stable interchange contract. Its wording,
 table layout, and section organization may evolve between alpha releases. Tools should consume the
 `json` output and validate its `schema_version` instead of parsing the report. New analyses write
-package schema 11; export also accepts package schemas 1 through 10 through validated compatibility
+package schema 12; export also accepts package schemas 1 through 11 through validated compatibility
 paths without rewriting them. The current neutral projection is schema 6, and adding this writer
 changes neither independently versioned domain.
 
@@ -391,8 +396,8 @@ resymbol export application.resym --format map
 The default destination is `application.map`. This is a deterministic text export, not a claim that
 every debugger or linker will accept it. ReSymbol currently rejects non-PE sessions and
 projections, mismatched session/projection binary fields, selected symbol RVAs outside real PE
-sections, and a nonzero entry point outside those sections. New analyses write package schema 11;
-export also accepts package schemas 1 through 10 through validated compatibility paths without
+sections, and a nonzero entry point outside those sections. New analyses write package schema 12;
+export also accepts package schemas 1 through 11 through validated compatibility paths without
 rewriting them. The current neutral projection is schema 6, and MAP adds no schema fields.
 
 The writer emits the PE timestamp and preferred load address, one group for each final PE section,
