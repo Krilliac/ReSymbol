@@ -549,12 +549,16 @@ and process access of the launching account. Manifest permissions govern ReSymbo
 operations; they are not restrictions enforced by the operating system. A fingerprint identifies
 reviewed local bytes, not a publisher, and mutable plugin files leave a check-to-launch window.
 Process-tree ownership is lifecycle containment, not authority sandboxing. On Windows ReSymbol uses
-a narrow native boundary to create the child atomically inside a preconfigured kill-on-close Job
-Object, allows inheritance of only its three standard-stream handles, verifies Job membership, and
-has no spawn-then-assign fallback. Linux `waitid(WNOWAIT)` and macOS `kqueue` exit notifications let
-ReSymbol terminate a still-stable process group before reaping its leader. On POSIX a hostile
-plugin/helper or descendant can deliberately leave its process group or session. Only trust
-artifacts whose code and publisher you would run directly.
+a narrow native boundary to create the child atomically inside a preconfigured Job Object,
+explicitly terminates that Job during normal cleanup, retains kill-on-close as an abrupt-parent
+fallback when no out-of-scope process holds a duplicate, allows inheritance of only its three
+standard-stream handles, verifies Job membership, and has no spawn-then-assign fallback. This does
+not defend against an active same-account process with sufficient process/handle rights: it can
+duplicate or remotely close ReSymbol's handles and terminate or tamper with the parent. That actor
+requires a separate OS authority boundary. Linux `waitid(WNOWAIT)` and macOS `kqueue` exit
+notifications let ReSymbol terminate a still-stable process group before reaping its leader. On
+POSIX a hostile plugin/helper or descendant can deliberately leave its process group or session.
+Only trust artifacts whose code and publisher you would run directly.
 Official archives bundle both helpers beside `resymbol`; the Windows archive also places
 `resymbol-workbench.exe` beside `resymbol.exe`. Linux archives pair the static musl main executable
 with a GNU native helper built on Ubuntu 22.04 for glibc 2.35 or newer so it can load ordinary glibc

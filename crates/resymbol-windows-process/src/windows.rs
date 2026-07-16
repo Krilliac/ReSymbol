@@ -13,6 +13,8 @@ use std::{
     path::{Path, PathBuf},
     process::ExitStatus,
     ptr::{null, null_mut},
+    thread,
+    time::{Duration, Instant},
 };
 
 use windows_sys::Win32::{
@@ -32,7 +34,7 @@ use windows_sys::Win32::{
         JobObjects::{
             CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
             JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-            SetInformationJobObject,
+            SetInformationJobObject, TerminateJobObject,
         },
         Pipes::CreatePipe,
         Threading::{
@@ -47,6 +49,8 @@ use windows_sys::Win32::{
 };
 
 const WINDOWS_MAX_COMMAND_LINE_UNITS: usize = 32_767;
+const FAIL_CLOSED_REAP_TIMEOUT: Duration = Duration::from_secs(2);
+const FAIL_CLOSED_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Standard-stream behavior supported by the atomic contained launcher.
 ///
@@ -163,7 +167,7 @@ impl ContainedCommand {
 
     /// Creates the process with Job and handle-list attributes already applied.
     ///
-    /// The returned child is the sole owner of the anonymous Job handle. There
+    /// The returned child owns ReSymbol's anonymous Job handle. There
     /// is no suspended or post-spawn assignment path: unsupported systems and
     /// any attribute-list failure fail closed before `CreateProcessW` succeeds.
     pub fn spawn(&mut self) -> io::Result<ContainedChild> {
@@ -213,6 +217,9 @@ impl ContainedChild {
     }
 
     pub fn wait(&mut self) -> io::Result<ExitStatus> {
+        // Match std::process::Child::wait: a child waiting for stdin EOF must
+        // not deadlock merely because the caller left its piped writer attached.
+        drop(self.stdin.take());
         // SAFETY: `self.process` is a live owned process handle for the entire call.
         match unsafe { WaitForSingleObject(raw_handle(&self.process), INFINITE) } {
             WAIT_OBJECT_0 => process_exit_status(&self.process),
@@ -233,19 +240,31 @@ impl ContainedChild {
         }
     }
 
-    /// Closes the sole Job handle, applying `KILL_ON_JOB_CLOSE` to the tree.
+    /// Explicitly terminates the Job and then closes ReSymbol's Job handle.
+    ///
+    /// Explicit termination keeps ordinary cleanup authoritative even if
+    /// hostile same-account code duplicated the handle. `KILL_ON_JOB_CLOSE`
+    /// remains the abrupt-parent fallback when no out-of-scope process retains
+    /// a duplicate.
     pub fn terminate_tree(&mut self) -> io::Result<()> {
-        drop(self.job.take());
-        Ok(())
+        let Some(job) = self.job.take() else {
+            return Ok(());
+        };
+        // SAFETY: `job` is ReSymbol's live Job handle. All processes currently
+        // assigned to the Job receive the fixed non-success termination code.
+        let result = unsafe { TerminateJobObject(raw_handle(&job), 1) };
+        let error = (result == FALSE).then(|| last_error("terminate contained process Job"));
+        drop(job);
+        error.map_or(Ok(()), Err)
     }
 }
 
 impl Drop for ContainedChild {
     fn drop(&mut self) {
-        // OwnedHandle closes the sole Job handle before closing the process
-        // handle because fields are dropped in declaration order. Explicitly
-        // take it here so that invariant remains obvious if fields are reordered.
-        drop(self.job.take());
+        // Make normal unwinding authoritative even if another process duplicated
+        // the Job handle. The configured close limit remains the crash fallback
+        // when no out-of-scope process retains a duplicate.
+        let _ = self.terminate_tree();
     }
 }
 
@@ -446,22 +465,53 @@ fn spawn_contained(command: &ContainedCommand) -> io::Result<ContainedChild> {
 
 fn fail_closed_child(mut child: ContainedChild, error: io::Error) -> io::Error {
     // The protocol writer is still private to this stack frame, so the process
-    // cannot receive ReSymbol input. Close the Job first, target the direct child
-    // defensively, and reap it before returning the launch failure.
+    // cannot receive ReSymbol input. Close our writer, terminate the Job first,
+    // target the direct child defensively, and make only a bounded reap attempt.
+    drop(child.stdin.take());
     let tree_error = child.terminate_tree().err();
     let direct_error = child.kill().err();
-    let wait_error = child.wait().err();
+    let reap_error = wait_for_exit_bounded(&mut child, FAIL_CLOSED_REAP_TIMEOUT).err();
     let mut message = error.to_string();
     for (label, cleanup_error) in [
         ("Job termination", tree_error),
-        ("direct-child termination", direct_error),
-        ("direct-child reap", wait_error),
+        // A failed TerminateProcess is harmless if the bounded poll proves the
+        // child exited. Otherwise retain both failures in the diagnostic.
+        (
+            "direct-child termination",
+            reap_error.as_ref().and(direct_error),
+        ),
+        ("bounded direct-child reap", reap_error),
     ] {
         if let Some(cleanup_error) = cleanup_error {
             message.push_str(&format!("; {label} also failed: {cleanup_error}"));
         }
     }
     io::Error::new(error.kind(), message)
+}
+
+fn wait_for_exit_bounded(child: &mut ContainedChild, timeout: Duration) -> io::Result<ExitStatus> {
+    let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "bounded child-reap timeout exceeds the platform clock",
+        )
+    })?;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "contained direct child did not exit within {} ms after fail-closed termination",
+                    timeout.as_millis()
+                ),
+            ));
+        }
+        thread::sleep(FAIL_CLOSED_POLL_INTERVAL.min(deadline.duration_since(now)));
+    }
 }
 
 fn create_kill_on_close_job() -> io::Result<OwnedHandle> {
@@ -886,8 +936,26 @@ fn last_error(context: &str) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{ContainedCommand, command_line};
-    use std::{ffi::OsString, io, os::windows::ffi::OsStringExt as _};
+    use super::{
+        ContainedChild, ContainedCommand, Stdio, command_line, owned_handle_from_created,
+        raw_handle, wait_for_exit_bounded,
+    };
+    use std::{
+        ffi::OsString,
+        io::{self, Read as _},
+        os::windows::{ffi::OsStringExt as _, io::OwnedHandle},
+        process,
+        sync::mpsc,
+        thread,
+        time::{Duration, Instant},
+    };
+    use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle, FALSE};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    const FIXTURE_MODE: &str = "RESYMBOL_WINDOWS_PROCESS_UNIT_FIXTURE";
+    const LONG_RUNNING_FIXTURE: &str = "windows::tests::long_running_fixture";
+    const NORMAL_EXIT_FIXTURE: &str = "windows::tests::normal_exit_fixture";
+    const STDIN_EOF_FIXTURE: &str = "windows::tests::stdin_eof_fixture";
 
     #[test]
     fn embedded_argument_nul_is_rejected_before_process_creation() {
@@ -907,5 +975,147 @@ mod tests {
             .expect_err("relative application path must be rejected");
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(error.to_string().contains("absolute"));
+    }
+
+    #[test]
+    fn duplicated_job_handle_does_not_defeat_explicit_tree_termination() {
+        let mut child = spawn_fixture(LONG_RUNNING_FIXTURE, "long-running", Stdio::null());
+        let duplicate = duplicate_job_handle(&child);
+
+        child
+            .terminate_tree()
+            .expect("explicitly terminate Job while a duplicate handle survives");
+        let status = wait_for_exit_bounded(&mut child, Duration::from_secs(2))
+            .expect("explicit Job termination must stop the long-running child");
+        assert_eq!(status.code(), Some(1));
+        drop(duplicate);
+    }
+
+    #[test]
+    fn terminate_after_normal_exit_preserves_status() {
+        let mut child = spawn_fixture(NORMAL_EXIT_FIXTURE, "normal-exit", Stdio::null());
+        let status = child.wait().expect("wait for normal fixture exit");
+        assert!(status.success());
+
+        child
+            .terminate_tree()
+            .expect("terminate empty Job after direct-child exit");
+        assert_eq!(child.wait().expect("re-read direct-child status"), status);
+    }
+
+    #[test]
+    fn explicit_tree_termination_is_idempotent() {
+        let mut child = spawn_fixture(LONG_RUNNING_FIXTURE, "long-running", Stdio::null());
+        child.terminate_tree().expect("first Job termination");
+        child.terminate_tree().expect("second Job termination");
+        let status = wait_for_exit_bounded(&mut child, Duration::from_secs(2))
+            .expect("terminated child must become signaled");
+        assert_eq!(status.code(), Some(1));
+    }
+
+    #[test]
+    fn wait_closes_attached_piped_stdin_to_deliver_eof() {
+        let mut child = spawn_fixture(STDIN_EOF_FIXTURE, "stdin-eof", Stdio::piped());
+        let started = Instant::now();
+        let status = child.wait().expect("wait should deliver stdin EOF");
+
+        assert!(status.success(), "EOF fixture exited {status}");
+        assert!(child.take_stdin().is_none());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "wait did not promptly close the attached stdin writer"
+        );
+    }
+
+    #[test]
+    fn bounded_reap_reports_timeout_without_hanging() {
+        let mut child = spawn_fixture(LONG_RUNNING_FIXTURE, "long-running", Stdio::null());
+        let started = Instant::now();
+        let error = wait_for_exit_bounded(&mut child, Duration::from_millis(25))
+            .expect_err("live child must exceed the synthetic reap deadline");
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        child
+            .terminate_tree()
+            .expect("clean up timeout fixture Job");
+        wait_for_exit_bounded(&mut child, Duration::from_secs(2))
+            .expect("cleanup fixture must exit after Job termination");
+    }
+
+    #[test]
+    fn long_running_fixture() {
+        if fixture_mode() == Some("long-running") {
+            thread::sleep(Duration::from_secs(30));
+        }
+    }
+
+    #[test]
+    fn normal_exit_fixture() {}
+
+    #[test]
+    fn stdin_eof_fixture() {
+        if fixture_mode() != Some("stdin-eof") {
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let result = io::stdin().read_to_end(&mut bytes).map(|_| bytes);
+            let _ = sender.send(result);
+        });
+        match receiver.recv_timeout(Duration::from_secs(1)) {
+            Ok(Ok(bytes)) => assert!(bytes.is_empty()),
+            Ok(Err(error)) => panic!("read piped stdin: {error}"),
+            Err(_) => process::exit(88),
+        }
+        reader.join().expect("stdin reader thread");
+    }
+
+    fn fixture_mode() -> Option<&'static str> {
+        match std::env::var(FIXTURE_MODE).as_deref() {
+            Ok("long-running") => Some("long-running"),
+            Ok("normal-exit") => Some("normal-exit"),
+            Ok("stdin-eof") => Some("stdin-eof"),
+            _ => None,
+        }
+    }
+
+    fn spawn_fixture(test_name: &str, mode: &str, stdin: Stdio) -> ContainedChild {
+        let mut command = ContainedCommand::new(
+            std::env::current_exe().expect("resolve exact unit-test executable"),
+        );
+        command
+            .args(["--exact", test_name, "--nocapture"])
+            .env(FIXTURE_MODE, mode)
+            .stdin(stdin)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command.spawn().expect("spawn contained unit-test fixture")
+    }
+
+    fn duplicate_job_handle(child: &ContainedChild) -> OwnedHandle {
+        let source = child
+            .job
+            .as_ref()
+            .expect("contained child owns a Job handle");
+        let mut duplicate = std::ptr::null_mut();
+        // SAFETY: both pseudo process handles denote this process, `source` is a
+        // live Job handle, and `duplicate` is writable storage. Success transfers
+        // one independent real-handle ownership reference to this test.
+        let result = unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                raw_handle(source),
+                GetCurrentProcess(),
+                &mut duplicate,
+                0,
+                FALSE,
+                DUPLICATE_SAME_ACCESS,
+            )
+        };
+        assert_ne!(result, FALSE, "duplicate contained Job handle");
+        // SAFETY: successful DuplicateHandle returned one newly owned real handle.
+        unsafe { owned_handle_from_created(duplicate) }.expect("own duplicate Job handle")
     }
 }

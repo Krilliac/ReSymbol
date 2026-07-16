@@ -216,10 +216,14 @@ process group or Windows Job Object. It terminates the whole owned tree when the
 completes, a deadline expires, a stdout/stderr capture worker fails, or the runtime guard drops, so
 ordinary descendants cannot retain capture pipes after their parent exits. This is lifecycle
 containment, not a filesystem, network, credential, process-authority, or general OS sandbox.
-Windows uses a narrow native boundary to create the child atomically inside a preconfigured
-kill-on-close Job Object through `STARTUPINFOEX`. The same creation call allows inheritance of only
-the exact stdin, stdout, and stderr handles, and ReSymbol verifies membership before exposing the
-child; unsupported attributes fail closed with no spawn-then-assign fallback. Linux observes exit
+Windows uses a narrow native boundary to create the child atomically inside a preconfigured Job
+Object through `STARTUPINFOEX`. Normal cleanup explicitly terminates the Job; kill-on-close is an
+abrupt-parent fallback when no out-of-scope process retains a duplicate. The same creation call
+allows inheritance of only the exact stdin, stdout, and stderr handles, and ReSymbol verifies
+membership before exposing the child; unsupported attributes fail closed with no spawn-then-assign
+fallback. This does not defend against an active same-account process with sufficient
+process/handle rights: it can duplicate or remotely close ReSymbol's handles and terminate or
+tamper with the parent. That actor requires a separate OS authority boundary. Linux observes exit
 with `waitid(WNOWAIT)` and macOS uses a `kqueue` `NOTE_EXIT` process filter, so both terminate the
 still-stable process group before reaping its leader. On POSIX a hostile plugin/helper or descendant
 can deliberately leave its process group or session and escape later group termination.

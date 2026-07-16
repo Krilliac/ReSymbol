@@ -397,11 +397,15 @@ eventually designed. A child process is a crash boundary, not an OS security san
 sandboxing remains separate work. The current runner owns ordinary descendants through POSIX
 process groups or Windows Job Objects and terminates the tree on direct-child completion, deadline,
 stdout/stderr capture failure, or runtime drop. This lifecycle containment does not restrict ambient
-authority. Windows creates the child atomically inside a preconfigured kill-on-close Job, allows
-inheritance of only its exact standard-stream handles, verifies Job membership, and has no
-spawn-then-assign fallback. A hostile POSIX plugin/helper or descendant can deliberately leave its
-process group or session. Linux and macOS otherwise observe direct-child exit without reaping and
-terminate the stable group before collecting the leader's status.
+authority. Windows creates the child atomically inside a preconfigured Job, explicitly terminates
+that Job during normal cleanup, retains kill-on-close as an abrupt-parent fallback when no
+out-of-scope process holds a duplicate, allows inheritance of only its exact standard-stream
+handles, verifies Job membership, and has no spawn-then-assign fallback. This does not defend
+against an active same-account process with sufficient process/handle rights: it can duplicate or
+remotely close ReSymbol's handles and terminate or tamper with the parent. That actor requires a
+separate OS authority boundary. A hostile POSIX plugin/helper or descendant can deliberately leave
+its process group or session. Linux and macOS otherwise observe direct-child exit without reaping
+and terminate the stable group before collecting the leader's status.
 
 ## Milestone 2: useful native-binary MVP
 
