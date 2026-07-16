@@ -121,6 +121,72 @@ fn inspect_binary_gate_keeps_stdout_pure_and_inputs_unchanged() {
 }
 
 #[test]
+fn export_summarizes_both_loss_domains_and_strict_mode_creates_no_output() {
+    let temp = tempfile::tempdir().expect("create temporary directory");
+    let binary = fixture_binary();
+    let package = temp.path().join("loss-policy.resym");
+    let plugins = temp.path().join("plugins");
+
+    let analyzed = run(Command::new(cli())
+        .arg("--safe-mode")
+        .arg("--plugin-dir")
+        .arg(&plugins)
+        .arg("analyze")
+        .arg(&binary)
+        .arg("--output")
+        .arg(&package));
+    assert!(
+        analyzed.status.success(),
+        "analysis failed: {}",
+        String::from_utf8_lossy(&analyzed.stderr)
+    );
+
+    let json_output = temp.path().join("symbols.json");
+    let exported = run(Command::new(cli())
+        .arg("export")
+        .arg(&package)
+        .arg("--format")
+        .arg("json")
+        .arg("--output")
+        .arg(&json_output));
+    assert!(
+        exported.status.success(),
+        "JSON export failed: {}",
+        String::from_utf8_lossy(&exported.stderr)
+    );
+    let stdout = String::from_utf8(exported.stdout).expect("export stdout is UTF-8");
+    assert!(stdout.contains("neutral warnings:"));
+    assert!(stdout.contains("target loss: 0 item(s), 0 occurrence(s)"));
+    assert!(json_output.is_file());
+
+    let strict_output = temp.path().join("strict.map");
+    let rejected = run(Command::new(cli())
+        .arg("export")
+        .arg(&package)
+        .arg("--format")
+        .arg("map")
+        .arg("--output")
+        .arg(&strict_output)
+        .arg("--fail-on-loss"));
+    assert!(!rejected.status.success());
+    assert!(rejected.stdout.is_empty());
+    let stderr = String::from_utf8(rejected.stderr).expect("export stderr is UTF-8");
+    assert!(stderr.contains("--fail-on-loss rejected export"));
+    assert!(stderr.contains("neutral warnings:"));
+    assert!(stderr.contains("target loss:"));
+    assert!(!strict_output.exists());
+    assert!(
+        fs::read_dir(temp.path())
+            .expect("read export directory")
+            .all(|entry| !entry
+                .expect("read export directory entry")
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".resymbol-export-"))
+    );
+}
+
+#[test]
 fn invalid_package_fails_before_a_missing_binary_is_opened() {
     let temp = tempfile::tempdir().expect("create temporary directory");
     let package = temp.path().join("invalid.resym");

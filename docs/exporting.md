@@ -6,12 +6,12 @@ Microsoft-linker-style MAP text, an exact-RSDS public-symbol PDB, or a self-cont
 for IDA or Ghidra.
 
 ```console
-resymbol export PACKAGE --format json [--output PATH]
-resymbol export PACKAGE --format markdown [--output PATH]
-resymbol export PACKAGE --format map [--output PATH]
-resymbol export PACKAGE --format pdb --binary EXACT_ORIGINAL_PE [--output PATH]
-resymbol export PACKAGE --format ida-python [--output PATH]
-resymbol export PACKAGE --format ghidra-java [--output PATH]
+resymbol export PACKAGE --format json [--output PATH] [--fail-on-loss]
+resymbol export PACKAGE --format markdown [--output PATH] [--fail-on-loss]
+resymbol export PACKAGE --format map [--output PATH] [--fail-on-loss]
+resymbol export PACKAGE --format pdb --binary EXACT_ORIGINAL_PE [--output PATH] [--fail-on-loss]
+resymbol export PACKAGE --format ida-python [--output PATH] [--fail-on-loss]
+resymbol export PACKAGE --format ghidra-java [--output PATH] [--fail-on-loss]
 ```
 
 The current formats are deliberately small and auditable. JSON is the machine-consumable
@@ -71,7 +71,8 @@ reduces that graph to a bounded export projection. The projection is tied to one
 SHA-256 and uses RVAs rather than assuming a process or debugger load address.
 
 After a successful write, the CLI prints the destination, binary SHA-256, projected entity counts,
-and a bounded summary of projection warning groups. For schemas 1 through 6 it also reports TLS
+and separate bounded summaries for neutral projection warnings and target-specific export loss.
+For schemas 1 through 6 it also reports TLS
 callback recovery as unavailable; for schemas 1 through 7 it reports delay-import recovery as
 unavailable; for schemas 1 through 8 it reports GuardCF recovery as unavailable; and for schemas 1
 through 9 it reports the modern Guard target inventories as unavailable; for schemas 1 through 10
@@ -81,6 +82,35 @@ GuardMemcpy pointer-slot anchor as unavailable. These
 diagnostics direct the user to reanalyze the exact original binary.
 Inspect the warnings before applying a script; the output file is still created when a deliberate
 lossy reduction is safe and diagnosed.
+
+### Loss reporting and strict policy
+
+Every export computes a typed, deterministic target-loss report before rendering. Each item uses a
+stable machine code, a total occurrence count, and a fixed explanation. Reports aggregate by code,
+contain no per-symbol detail list, and have a fixed maximum of 21 items. Neutral warnings remain a
+separate domain: they describe reductions made while building the common projection, while target
+loss describes fields that the selected writer cannot retain. The CLI always prints both occurrence
+totals after a successful export.
+
+JSON is the loss-aware reference target and therefore has zero target-loss items: it embeds the
+neutral warnings and every field of the validated projection. Markdown reports only its real
+presentation losses, including rows beyond a 1,024-row section cap, candidate details beyond the
+first three, byte truncation, and entity attributions reduced to one displayed source. MAP and PDB
+use the same named-symbol selection and same-RVA collision plan as their writers. IDA and Ghidra use
+the same function-size acceptance, function-record, and global-suppression plan as their generated
+scripts. This sharing keeps diagnostics aligned with emitted output without changing that output.
+
+Use `--fail-on-loss` when an automated workflow must accept only a lossless result:
+
+```console
+resymbol export application.resym --format json --fail-on-loss
+```
+
+The flag rejects the operation if either neutral-warning occurrences or target-loss occurrences are
+nonzero. Rejection happens before writer rendering, temporary staging, or destination publication;
+the error includes both totals and no output is created. Formats with an inherently narrower model
+normally fail this policy, so JSON is the expected archival/interchange choice and Markdown is
+suitable only when its bounded presentation happens to retain the complete projection.
 
 Both generated debugger scripts enforce the same application rules:
 

@@ -234,6 +234,11 @@ prereleases; breaking changes remain explicit.
   slice deliberately omits private symbols, compilands, source lines, locals, prototypes, function
   extents, and types; ordinary generation requires no Visual Studio, DIA, LLVM, or compiler
   installation.
+- Added typed, deterministic export-loss reporting for JSON, Markdown, MAP, PDB, IDAPython, and
+  Ghidra Java. Stable machine codes aggregate bounded occurrence counts without per-symbol detail;
+  MAP/PDB and debugger-script reports share their writers' exact selection, collision, and function
+  size rules. `resymbol export --fail-on-loss` rejects neutral-warning or target-loss occurrences
+  before rendering and publication, while every successful export prints both totals.
 - Added optional `resymbol inspect PACKAGE --binary EXACT_ORIGINAL_BINARY` verification for package
   schemas 1 through 10. Inspection validates the package first, then requires the supplied file's
   exact size and SHA-256 to match before any inspection output reaches stdout. Failures report on
