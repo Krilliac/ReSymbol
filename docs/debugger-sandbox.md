@@ -172,13 +172,19 @@ The current seam is intentionally narrow:
   must contain exactly one command result and only events correlated to that command;
 - session generations and stop/run identifiers must advance exactly through the command-specific
   reducer path; non-transition events carry the exact current state token, and memory/breakpoint
-  evidence must match the request. An ordinary rejected command may not claim any effect. The sole
-  retained-rejection exception is an exact cleanup-required failure: it may preserve `Failed` state
-  and a validated `CleanupAttemptFailed` event while its command identifier and any presented one-use
-  authority remain consumed without cloning the reducer or lease;
-- `RemoteCommandCheckpoint` is a public opaque transaction value so an external host worker can use
-  the same begin/reject semantics. It restores only ordinary visible state; command, run/stop, and
-  one-use authorization watermarks remain consumed;
+  evidence must match the request. `ProviderUnavailable` and policy/discovery rejection are
+  effect-free and rollback-safe. An exact provisioning, attestation, launch, runtime, or cleanup
+  failure instead retains `Failed` plus its cleanup ownership and resolves the transaction so a
+  later exact `Close` remains possible. A cleanup-stage retained rejection additionally requires one
+  validated `CleanupAttemptFailed` event carrying its incomplete receipt. Every rejected command
+  still consumes its command identifier and any presented one-use authority without cloning the
+  reducer or lease;
+- the audited host client owns a crate-private, move-only remote-command transaction ticket bound
+  to the exact reducer instance, command ID, and post-accept state. Exactly one transaction may be
+  active. An effect-free rejection restores only ordinary visible state, while validated success
+  and cleanup-required sandbox failure explicitly commit their retained effects. Stale, foreign,
+  mismatched, already-resolved, and post-effect rollback attempts fail closed; command, run/stop,
+  and one-use authorization watermarks remain consumed;
 - attestation and cleanup events are bound both to the outer event session and to the reducer's exact
   binary, policy, provider, build, provisioning epoch, and cleanup expectation before `Closed` can be
   accepted or released;
@@ -186,10 +192,12 @@ The current seam is intentionally narrow:
   capability as unavailable, supports only offline open/close, and rejects every other operation
   without producing security evidence;
 - host-risk and sandbox-ownership grant objects are host-local and non-serializable. Commands carry
-  only strict 64-character lowercase-hex lease IDs; the host reducer bounds registrations, consumes
-  a presented lease even on mismatch, and drops every unused lease after a target opens. The client
-  receives only a cloneable non-authority verifier record, while the sole move-only lease transfers
-  to the host worker;
+  only strict 64-character lowercase-hex lease IDs. Non-cloneable trusted issuers derive each ID from
+  an operating-system-entropy-backed secret and a monotonic sequence, and return the sole move-only
+  lease together with a cloneable non-authority verifier; caller-chosen IDs cannot construct a grant.
+  The host reducer bounds registrations, rejects duplicate registration, consumes a presented lease
+  even on mismatch, and drops every unused lease after a target opens. The verifier goes only to the
+  controller-side shadow reducer, while the lease transfers to the host worker;
 - authority-bearing lease values and each `SessionMachine` consumption registry are deliberately
   non-cloneable. Pure lease IDs, exact launch/attach comparison records, and retained sandbox
   evidence remain cloneable value data without granting host authority;

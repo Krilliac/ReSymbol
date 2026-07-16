@@ -1,13 +1,14 @@
 //! Pure debugger-session state reduction.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use resymbol_core::BinaryId;
 use thiserror::Error;
 
 use crate::authorization::{
-    HostLaunchIntent, HostRiskLease, HostRiskOperation, HostRiskVerifier, SandboxOwnershipBinding,
-    SandboxOwnershipLease, SandboxOwnershipVerifier,
+    HostLaunchIntent, HostLaunchIntentError, HostRiskLease, HostRiskOperation, HostRiskVerifier,
+    SandboxOwnershipBinding, SandboxOwnershipLease, SandboxOwnershipVerifier,
 };
 use crate::identity::{HostRiskLeaseId, ProvisioningEpoch, SandboxOwnershipLeaseId};
 use crate::protocol::{
@@ -42,6 +43,7 @@ pub const MAX_REGISTERED_AUTHORIZATION_LEASES: usize = 64;
 /// ```
 #[derive(Debug, PartialEq, Eq)]
 pub struct SessionMachine {
+    reducer_instance: Arc<ReducerInstanceBinding>,
     session_id: SessionId,
     provisioning_epoch: ProvisioningEpoch,
     helper_build: HelperBuildId,
@@ -55,7 +57,11 @@ pub struct SessionMachine {
     inherited_sandbox: Option<SandboxOwnershipBinding>,
     host_risk_leases: BTreeMap<HostRiskLeaseId, Option<HostRiskVerifier>>,
     sandbox_ownership_leases: BTreeMap<SandboxOwnershipLeaseId, Option<SandboxOwnershipVerifier>>,
+    pending_remote_command: Option<CommandId>,
 }
+
+#[derive(Debug, PartialEq, Eq)]
+struct ReducerInstanceBinding;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExecutionGate {
@@ -66,17 +72,35 @@ enum ExecutionGate {
     SandboxAccepted,
 }
 
-/// Ordinary-state checkpoint for one remote command, deliberately excluding
-/// command watermarks and one-use authority registries.
+/// Move-only, reducer-instance-bound transaction ticket for one remote command.
+///
+/// The ticket is crate-private so only the audited host client can resolve a
+/// remote command. Its rollback image deliberately excludes command, run/stop,
+/// and one-use authority watermarks.
 #[derive(Debug)]
-pub struct RemoteCommandCheckpoint {
-    session_id: SessionId,
-    provisioning_epoch: ProvisioningEpoch,
+pub(crate) struct RemoteCommandCheckpoint {
+    reducer_instance: Arc<ReducerInstanceBinding>,
+    command_id: CommandId,
     state: SessionState,
     target: Option<DebugTargetRequest>,
     execution_gate: ExecutionGate,
     sandbox: Option<SandboxMachine>,
     inherited_sandbox: Option<SandboxOwnershipBinding>,
+    post_accept: RemoteCommandPostAcceptState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemoteCommandPostAcceptState {
+    state: SessionState,
+    target: Option<DebugTargetRequest>,
+    last_command_id: Option<CommandId>,
+    last_stop_id: u64,
+    last_run_id: u64,
+    execution_gate: ExecutionGate,
+    sandbox: Option<SandboxMachine>,
+    inherited_sandbox: Option<SandboxOwnershipBinding>,
+    host_risk_leases: BTreeMap<HostRiskLeaseId, Option<HostRiskVerifier>>,
+    sandbox_ownership_leases: BTreeMap<SandboxOwnershipLeaseId, Option<SandboxOwnershipVerifier>>,
 }
 
 impl SessionMachine {
@@ -91,6 +115,7 @@ impl SessionMachine {
             generation: StateGeneration::new(1).expect("initial generation is nonzero"),
         };
         Self {
+            reducer_instance: Arc::new(ReducerInstanceBinding),
             session_id,
             provisioning_epoch,
             helper_build,
@@ -104,6 +129,7 @@ impl SessionMachine {
             inherited_sandbox: None,
             host_risk_leases: BTreeMap::new(),
             sandbox_ownership_leases: BTreeMap::new(),
+            pending_remote_command: None,
         }
     }
 
@@ -231,6 +257,14 @@ impl SessionMachine {
         &mut self,
         envelope: &CommandEnvelope,
     ) -> Result<&SessionState, SessionMachineError> {
+        self.require_no_remote_command_pending()?;
+        self.accept_command_inner(envelope)
+    }
+
+    fn accept_command_inner(
+        &mut self,
+        envelope: &CommandEnvelope,
+    ) -> Result<&SessionState, SessionMachineError> {
         envelope.validate()?;
         self.observe_command_id(envelope.command_id)?;
         if matches!(envelope.command, DebugCommand::ProbeCapabilities) {
@@ -283,44 +317,109 @@ impl SessionMachine {
 
     /// Begins a command whose outcome is reported by an untrusted remote host.
     ///
-    /// The returned checkpoint can restore only visible reducer state after an
-    /// explicit rejection. Command IDs and consumed/cleared authority remain
-    /// one-use even when the remote operation reports no effect.
-    pub fn begin_remote_command(
+    /// The returned move-only ticket can restore only visible reducer state
+    /// after an exact, effect-free rejection. It is bound to this reducer
+    /// allocation, the accepted command, and the exact post-accept state.
+    /// Command IDs and consumed/cleared authority remain one-use even when the
+    /// remote operation reports no effect.
+    pub(crate) fn begin_remote_command(
         &mut self,
         envelope: &CommandEnvelope,
     ) -> Result<RemoteCommandCheckpoint, SessionMachineError> {
-        let checkpoint = RemoteCommandCheckpoint {
-            session_id: self.session_id,
-            provisioning_epoch: self.provisioning_epoch.clone(),
-            state: self.state.clone(),
-            target: self.target.clone(),
-            execution_gate: self.execution_gate,
-            sandbox: self.sandbox.clone(),
-            inherited_sandbox: self.inherited_sandbox.clone(),
-        };
-        self.accept_command(envelope)?;
-        Ok(checkpoint)
+        self.require_no_remote_command_pending()?;
+        let state = self.state.clone();
+        let target = self.target.clone();
+        let execution_gate = self.execution_gate;
+        let sandbox = self.sandbox.clone();
+        let inherited_sandbox = self.inherited_sandbox.clone();
+        self.accept_command_inner(envelope)?;
+        self.pending_remote_command = Some(envelope.command_id);
+        Ok(RemoteCommandCheckpoint {
+            reducer_instance: Arc::clone(&self.reducer_instance),
+            command_id: envelope.command_id,
+            state,
+            target,
+            execution_gate,
+            sandbox,
+            inherited_sandbox,
+            post_accept: self.remote_command_post_accept_state(),
+        })
     }
 
-    /// Restores visible state after an exact remote rejection without
-    /// restoring command IDs, token allocation, or one-use authority.
-    pub fn reject_remote_command(
+    /// Resolves a remote command whose response has been fully validated and
+    /// whose effects must be retained, including a rejected sandbox operation
+    /// that entered a cleanup-required failure state.
+    pub(crate) fn commit_remote_command(
         &mut self,
         checkpoint: RemoteCommandCheckpoint,
+        command_id: CommandId,
     ) -> Result<&SessionState, SessionMachineError> {
-        if self.session_id != checkpoint.session_id {
-            return Err(SessionMachineError::SessionBindingMismatch);
+        self.validate_remote_checkpoint(&checkpoint, command_id)?;
+        self.pending_remote_command = None;
+        Ok(&self.state)
+    }
+
+    /// Restores visible state after an exact, effect-free remote rejection
+    /// without restoring command IDs, token allocation, or one-use authority.
+    pub(crate) fn reject_remote_command(
+        &mut self,
+        checkpoint: RemoteCommandCheckpoint,
+        command_id: CommandId,
+    ) -> Result<&SessionState, SessionMachineError> {
+        self.validate_remote_checkpoint(&checkpoint, command_id)?;
+        if self.remote_command_post_accept_state() != checkpoint.post_accept {
+            return Err(SessionMachineError::RemoteCommandStateChanged);
         }
-        if self.provisioning_epoch != checkpoint.provisioning_epoch {
-            return Err(SessionMachineError::ProvisioningEpochMismatch);
-        }
+        self.pending_remote_command = None;
         self.state = checkpoint.state;
         self.target = checkpoint.target;
         self.execution_gate = checkpoint.execution_gate;
         self.sandbox = checkpoint.sandbox;
         self.inherited_sandbox = checkpoint.inherited_sandbox;
         Ok(&self.state)
+    }
+
+    fn require_no_remote_command_pending(&self) -> Result<(), SessionMachineError> {
+        if let Some(command_id) = self.pending_remote_command {
+            Err(SessionMachineError::RemoteCommandPending { command_id })
+        } else {
+            Ok(())
+        }
+    }
+
+    fn validate_remote_checkpoint(
+        &self,
+        checkpoint: &RemoteCommandCheckpoint,
+        command_id: CommandId,
+    ) -> Result<(), SessionMachineError> {
+        if !Arc::ptr_eq(&self.reducer_instance, &checkpoint.reducer_instance) {
+            return Err(SessionMachineError::RemoteCommandReducerMismatch);
+        }
+        let Some(pending_command_id) = self.pending_remote_command else {
+            return Err(SessionMachineError::RemoteCommandNotPending);
+        };
+        if command_id != checkpoint.command_id || pending_command_id != checkpoint.command_id {
+            return Err(SessionMachineError::RemoteCommandCheckpointMismatch {
+                pending: pending_command_id,
+                presented: command_id,
+            });
+        }
+        Ok(())
+    }
+
+    fn remote_command_post_accept_state(&self) -> RemoteCommandPostAcceptState {
+        RemoteCommandPostAcceptState {
+            state: self.state.clone(),
+            target: self.target.clone(),
+            last_command_id: self.last_command_id,
+            last_stop_id: self.last_stop_id,
+            last_run_id: self.last_run_id,
+            execution_gate: self.execution_gate,
+            sandbox: self.sandbox.clone(),
+            inherited_sandbox: self.inherited_sandbox.clone(),
+            host_risk_leases: self.host_risk_leases.clone(),
+            sandbox_ownership_leases: self.sandbox_ownership_leases.clone(),
+        }
     }
 
     /// Records the creation-time suspended target before accepting any
@@ -613,7 +712,7 @@ impl SessionMachine {
                     self.consume_host_risk_lease(
                         risk_lease,
                         &HostRiskOperation::Launch {
-                            intent: HostLaunchIntent::from_target(target),
+                            intent: HostLaunchIntent::from_target(target)?,
                         },
                     )?;
                     (None, ExecutionGate::HostRiskAccepted, None)
@@ -839,6 +938,8 @@ pub enum SessionMachineError {
     Policy(#[from] PolicyValidationError),
     #[error(transparent)]
     Sandbox(#[from] SandboxMachineError),
+    #[error(transparent)]
+    HostLaunchIntent(#[from] HostLaunchIntentError),
     #[error("global capability commands are handled outside a session reducer")]
     GlobalCommand,
     #[error("command id {received:?} is not newer than {last:?}")]
@@ -846,6 +947,21 @@ pub enum SessionMachineError {
         last: CommandId,
         received: CommandId,
     },
+    #[error("remote command {command_id:?} still awaits explicit resolution")]
+    RemoteCommandPending { command_id: CommandId },
+    #[error("no remote command awaits resolution")]
+    RemoteCommandNotPending,
+    #[error("remote command checkpoint belongs to another reducer instance")]
+    RemoteCommandReducerMismatch,
+    #[error(
+        "remote command checkpoint does not match active command {pending:?} (presented {presented:?})"
+    )]
+    RemoteCommandCheckpointMismatch {
+        pending: CommandId,
+        presented: CommandId,
+    },
+    #[error("remote command state changed after acceptance and cannot be rolled back")]
+    RemoteCommandStateChanged,
     #[error("cannot {action} from session state {from:?}")]
     InvalidTransition {
         from: SessionStateKind,
@@ -899,6 +1015,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::authorization::{HostRiskLeaseIssuer, SandboxOwnershipLeaseIssuer};
     use crate::protocol::{
         AttachTarget, DebugTargetRequest, LaunchEnvironment, LaunchTarget, MemoryAddress,
         ProcessIdentity, ProcessStartKey, ProtocolVersion,
@@ -1016,7 +1133,7 @@ mod tests {
             unreachable!("host target is a launch")
         };
         HostRiskOperation::Launch {
-            intent: HostLaunchIntent::from_target(&target),
+            intent: HostLaunchIntent::from_target(&target).expect("host launch target"),
         }
     }
 
@@ -1034,6 +1151,21 @@ mod tests {
             session_id: Some(expected_state.session_id),
             expected_state: Some(expected_state),
             command,
+        }
+    }
+
+    fn duplicate_remote_checkpoint(
+        checkpoint: &RemoteCommandCheckpoint,
+    ) -> RemoteCommandCheckpoint {
+        RemoteCommandCheckpoint {
+            reducer_instance: Arc::clone(&checkpoint.reducer_instance),
+            command_id: checkpoint.command_id,
+            state: checkpoint.state.clone(),
+            target: checkpoint.target.clone(),
+            execution_gate: checkpoint.execution_gate,
+            sandbox: checkpoint.sandbox.clone(),
+            inherited_sandbox: checkpoint.inherited_sandbox.clone(),
+            post_accept: checkpoint.post_accept.clone(),
         }
     }
 
@@ -1306,6 +1438,207 @@ mod tests {
     }
 
     #[test]
+    fn remote_checkpoint_cannot_rewind_another_reducer_with_matching_session_metadata() {
+        let mut source = machine();
+        let source_initial = source.state().state_token();
+        let open = command(
+            1,
+            source_initial,
+            DebugCommand::Open(DebugTargetRequest::Offline(
+                crate::protocol::OfflineTarget {
+                    path: PathBuf::from("source.exe"),
+                },
+            )),
+        );
+        let foreign = source
+            .begin_remote_command(&open)
+            .expect("source remote command");
+
+        let mut destination = machine();
+        let destination_initial = destination.state().state_token();
+        destination
+            .accept_command(&command(
+                1,
+                destination_initial,
+                DebugCommand::Open(DebugTargetRequest::Offline(
+                    crate::protocol::OfflineTarget {
+                        path: PathBuf::from("destination.exe"),
+                    },
+                )),
+            ))
+            .expect("destination open");
+        destination
+            .complete_open_offline()
+            .expect("destination offline state");
+        let offline = destination.state().state_token();
+        destination
+            .accept_command(&command(2, offline, DebugCommand::Close { state: offline }))
+            .expect("destination close");
+        destination
+            .complete_close(None)
+            .expect("destination closed");
+
+        assert_eq!(
+            destination.reject_remote_command(foreign, CommandId::new(1).expect("command id")),
+            Err(SessionMachineError::RemoteCommandReducerMismatch)
+        );
+        assert_eq!(destination.state().kind(), SessionStateKind::Closed);
+    }
+
+    #[test]
+    fn remote_checkpoint_rejects_wrong_command_double_use_and_stale_post_success_replay() {
+        let mut wrong_command = machine();
+        let initial = wrong_command.state().state_token();
+        let checkpoint = wrong_command
+            .begin_remote_command(&command(
+                1,
+                initial,
+                DebugCommand::Open(DebugTargetRequest::Offline(
+                    crate::protocol::OfflineTarget {
+                        path: PathBuf::from("wrong-command.exe"),
+                    },
+                )),
+            ))
+            .expect("remote open");
+        assert!(matches!(
+            wrong_command
+                .reject_remote_command(checkpoint, CommandId::new(2).expect("wrong command id")),
+            Err(SessionMachineError::RemoteCommandCheckpointMismatch { .. })
+        ));
+
+        let mut double_use = machine();
+        let initial = double_use.state().state_token();
+        let checkpoint = double_use
+            .begin_remote_command(&command(
+                1,
+                initial,
+                DebugCommand::Open(DebugTargetRequest::Offline(
+                    crate::protocol::OfflineTarget {
+                        path: PathBuf::from("double-use.exe"),
+                    },
+                )),
+            ))
+            .expect("remote open");
+        let duplicate = duplicate_remote_checkpoint(&checkpoint);
+        let command_id = CommandId::new(1).expect("command id");
+        double_use
+            .reject_remote_command(checkpoint, command_id)
+            .expect("first rejection");
+        assert_eq!(
+            double_use.reject_remote_command(duplicate, command_id),
+            Err(SessionMachineError::RemoteCommandNotPending)
+        );
+
+        let mut after_success = machine();
+        let initial = after_success.state().state_token();
+        let checkpoint = after_success
+            .begin_remote_command(&command(
+                1,
+                initial,
+                DebugCommand::Open(DebugTargetRequest::Offline(
+                    crate::protocol::OfflineTarget {
+                        path: PathBuf::from("after-success.exe"),
+                    },
+                )),
+            ))
+            .expect("remote open");
+        let stale = duplicate_remote_checkpoint(&checkpoint);
+        after_success
+            .complete_open_offline()
+            .expect("successful remote effect");
+        after_success
+            .commit_remote_command(checkpoint, command_id)
+            .expect("commit success");
+        let offline = after_success.state().state_token();
+        let later = after_success
+            .begin_remote_command(&command(
+                2,
+                offline,
+                DebugCommand::ReadMemory {
+                    view: crate::protocol::ReadViewToken::Offline { state: offline },
+                    address: MemoryAddress::new(0),
+                    size: 1,
+                },
+            ))
+            .expect("later remote command");
+        after_success
+            .commit_remote_command(later, CommandId::new(2).expect("later command id"))
+            .expect("commit later success");
+        assert_eq!(
+            after_success.reject_remote_command(stale, command_id),
+            Err(SessionMachineError::RemoteCommandNotPending)
+        );
+        assert_eq!(after_success.state().kind(), SessionStateKind::Offline);
+    }
+
+    #[test]
+    fn remote_rejection_requires_unchanged_post_accept_state_and_one_pending_command() {
+        let mut machine = machine();
+        let initial = machine.state().state_token();
+        let checkpoint = machine
+            .begin_remote_command(&command(
+                1,
+                initial,
+                DebugCommand::Open(DebugTargetRequest::Offline(
+                    crate::protocol::OfflineTarget {
+                        path: PathBuf::from("changed.exe"),
+                    },
+                )),
+            ))
+            .expect("remote open");
+        let accepted = machine.state().state_token();
+        assert!(matches!(
+            machine.begin_remote_command(&command(
+                2,
+                accepted,
+                DebugCommand::Close { state: accepted },
+            )),
+            Err(SessionMachineError::RemoteCommandPending { command_id })
+                if command_id == CommandId::new(1).expect("command id")
+        ));
+        machine
+            .complete_open_offline()
+            .expect("remote success effect");
+        assert_eq!(
+            machine.reject_remote_command(checkpoint, CommandId::new(1).expect("command id")),
+            Err(SessionMachineError::RemoteCommandStateChanged)
+        );
+        assert_eq!(machine.state().kind(), SessionStateKind::Offline);
+    }
+
+    #[test]
+    fn retained_sandbox_failure_commit_allows_later_exact_close() {
+        let mut machine = machine();
+        let initial = machine.state().state_token();
+        let checkpoint = machine
+            .begin_remote_command(&command(
+                1,
+                initial,
+                DebugCommand::Open(sandbox_target(BinaryId::digest(b"retained failure"))),
+            ))
+            .expect("remote sandbox open");
+        let expected = machine
+            .expected_attestation()
+            .expect("expected sandbox evidence")
+            .clone();
+        machine
+            .mark_failed("provider failed after provisioning")
+            .expect("cleanup-required failure");
+        machine
+            .commit_remote_command(checkpoint, CommandId::new(1).expect("command id"))
+            .expect("retain failure transaction");
+
+        let failed = machine.state().state_token();
+        machine
+            .accept_command(&command(2, failed, DebugCommand::Close { state: failed }))
+            .expect("close after retained failure");
+        machine
+            .complete_close(Some(&cleanup_receipt(&expected)))
+            .expect("exact cleanup closes session");
+        assert_eq!(machine.state().kind(), SessionStateKind::Closed);
+    }
+
+    #[test]
     fn sandbox_terminal_state_requires_bound_complete_cleanup_receipt() {
         let mut machine = machine();
         let next_id = open_attested_and_stopped(&mut machine);
@@ -1360,7 +1693,7 @@ mod tests {
         let mut machine = machine();
         let risk_lease = host_risk_lease_id('b');
         machine
-            .register_host_risk_lease(HostRiskLease::new(
+            .register_host_risk_lease(HostRiskLease::new_for_test(
                 risk_lease.clone(),
                 session_id(),
                 provisioning_epoch(),
@@ -1383,13 +1716,71 @@ mod tests {
     }
 
     #[test]
+    fn host_launch_intent_rejects_sandboxed_targets() {
+        let DebugTargetRequest::Launch(sandboxed) =
+            sandbox_target(BinaryId::digest(b"sandboxed target"))
+        else {
+            unreachable!("sandbox target is a launch")
+        };
+        assert_eq!(
+            HostLaunchIntent::from_target(&sandboxed),
+            Err(HostLaunchIntentError::SandboxedTarget)
+        );
+
+        let DebugTargetRequest::Launch(host) =
+            host_target(sandboxed.binary_id.clone(), host_risk_lease_id('5'))
+        else {
+            unreachable!("host target is a launch")
+        };
+        assert!(HostLaunchIntent::from_target(&host).is_ok());
+    }
+
+    #[test]
+    fn issuer_pair_cannot_register_the_same_grant_twice() {
+        let binary = BinaryId::digest(b"unique host grant");
+        let placeholder = host_risk_lease_id('1');
+        let operation = host_launch_operation(binary, placeholder);
+        let mut issuer = HostRiskLeaseIssuer::new().expect("host-risk issuer");
+        let (lease, verifier) = issuer
+            .issue(session_id(), provisioning_epoch(), operation)
+            .expect("host-risk grant");
+        let mut machine = machine();
+        machine
+            .register_host_risk_lease(lease)
+            .expect("first registration");
+        assert_eq!(
+            machine.register_host_risk_verifier(verifier),
+            Err(SessionMachineError::DuplicateAuthorizationLease)
+        );
+
+        let binding = SandboxOwnershipBinding::new(
+            session_id(),
+            process_identity(4800, 17, b"unique ownership grant"),
+            AttachMode::Debug,
+            SandboxProviderSelection::LocalAppContainer,
+            PolicyDigest::new("4".repeat(64)).expect("policy digest"),
+            provisioning_epoch(),
+        );
+        let mut issuer = SandboxOwnershipLeaseIssuer::new().expect("sandbox ownership issuer");
+        let (lease, verifier) = issuer.issue(binding).expect("sandbox ownership grant");
+        let mut machine = machine();
+        machine
+            .register_sandbox_ownership_lease(lease)
+            .expect("first registration");
+        assert_eq!(
+            machine.register_sandbox_ownership_verifier(verifier),
+            Err(SessionMachineError::DuplicateAuthorizationLease)
+        );
+    }
+
+    #[test]
     fn cross_target_host_risk_attempt_consumes_the_one_use_lease() {
         let approved = BinaryId::digest(b"approved host target");
         let different = BinaryId::digest(b"different host target");
         let lease_id = host_risk_lease_id('c');
         let mut machine = machine();
         machine
-            .register_host_risk_lease(HostRiskLease::new(
+            .register_host_risk_lease(HostRiskLease::new_for_test(
                 lease_id.clone(),
                 session_id(),
                 provisioning_epoch(),
@@ -1416,7 +1807,7 @@ mod tests {
             Err(SessionMachineError::HostRiskLeaseUnavailable)
         );
         assert_eq!(
-            machine.register_host_risk_lease(HostRiskLease::new(
+            machine.register_host_risk_lease(HostRiskLease::new_for_test(
                 host_risk_lease_id('c'),
                 session_id(),
                 provisioning_epoch(),
@@ -1441,12 +1832,13 @@ mod tests {
 
         let mut machine = machine();
         machine
-            .register_host_risk_lease(HostRiskLease::new(
+            .register_host_risk_lease(HostRiskLease::new_for_test(
                 lease_id.clone(),
                 session_id(),
                 provisioning_epoch(),
                 HostRiskOperation::Launch {
-                    intent: HostLaunchIntent::from_target(&approved),
+                    intent: HostLaunchIntent::from_target(&approved)
+                        .expect("approved host launch target"),
                 },
             ))
             .expect("register exact launch intent");
@@ -1465,12 +1857,13 @@ mod tests {
 
         let stale_id = host_risk_lease_id('9');
         assert_eq!(
-            machine.register_host_risk_lease(HostRiskLease::new(
+            machine.register_host_risk_lease(HostRiskLease::new_for_test(
                 stale_id,
                 session_id(),
                 ProvisioningEpoch::new("f".repeat(64)).expect("stale epoch"),
                 HostRiskOperation::Launch {
-                    intent: HostLaunchIntent::from_target(&approved),
+                    intent: HostLaunchIntent::from_target(&approved)
+                        .expect("approved host launch target"),
                 },
             )),
             Err(SessionMachineError::ProvisioningEpochMismatch)
@@ -1484,7 +1877,7 @@ mod tests {
         let lease_id = host_risk_lease_id('d');
         let mut machine = machine();
         machine
-            .register_host_risk_lease(HostRiskLease::new(
+            .register_host_risk_lease(HostRiskLease::new_for_test(
                 lease_id.clone(),
                 session_id(),
                 provisioning_epoch(),
@@ -1522,7 +1915,7 @@ mod tests {
         let mut mode_machine =
             SessionMachine::new(session_id(), provisioning_epoch(), helper_build());
         mode_machine
-            .register_host_risk_lease(HostRiskLease::new(
+            .register_host_risk_lease(HostRiskLease::new_for_test(
                 mode_lease.clone(),
                 session_id(),
                 provisioning_epoch(),
@@ -1589,7 +1982,7 @@ mod tests {
         );
 
         machine
-            .register_sandbox_ownership_lease(SandboxOwnershipLease::new(
+            .register_sandbox_ownership_lease(SandboxOwnershipLease::new_for_test(
                 first_id.clone(),
                 binding.clone(),
             ))
@@ -1617,7 +2010,7 @@ mod tests {
             Err(SessionMachineError::SandboxOwnershipLeaseUnavailable)
         );
         assert_eq!(
-            machine.register_sandbox_ownership_lease(SandboxOwnershipLease::new(
+            machine.register_sandbox_ownership_lease(SandboxOwnershipLease::new_for_test(
                 ownership_lease_id('e'),
                 binding.clone(),
             )),
@@ -1626,7 +2019,7 @@ mod tests {
 
         let mode_id = ownership_lease_id('5');
         machine
-            .register_sandbox_ownership_lease(SandboxOwnershipLease::new(
+            .register_sandbox_ownership_lease(SandboxOwnershipLease::new_for_test(
                 mode_id.clone(),
                 binding.clone(),
             ))
@@ -1659,7 +2052,7 @@ mod tests {
 
         let exact_id = ownership_lease_id('1');
         machine
-            .register_sandbox_ownership_lease(SandboxOwnershipLease::new(
+            .register_sandbox_ownership_lease(SandboxOwnershipLease::new_for_test(
                 exact_id.clone(),
                 binding.clone(),
             ))
@@ -1690,7 +2083,7 @@ mod tests {
             provisioning_epoch(),
         );
         assert_eq!(
-            machine.register_sandbox_ownership_lease(SandboxOwnershipLease::new(
+            machine.register_sandbox_ownership_lease(SandboxOwnershipLease::new_for_test(
                 ownership_lease_id('2'),
                 wrong_session,
             )),
@@ -1706,7 +2099,7 @@ mod tests {
             ProvisioningEpoch::new("f".repeat(64)).expect("different epoch"),
         );
         assert_eq!(
-            machine.register_sandbox_ownership_lease(SandboxOwnershipLease::new(
+            machine.register_sandbox_ownership_lease(SandboxOwnershipLease::new_for_test(
                 ownership_lease_id('3'),
                 wrong_epoch,
             )),
@@ -1728,7 +2121,7 @@ mod tests {
         let lease_id = ownership_lease_id('7');
         let mut machine = machine();
         machine
-            .register_sandbox_ownership_lease(SandboxOwnershipLease::new(
+            .register_sandbox_ownership_lease(SandboxOwnershipLease::new_for_test(
                 lease_id.clone(),
                 binding.clone(),
             ))
