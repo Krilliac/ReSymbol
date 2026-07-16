@@ -168,6 +168,9 @@ The current seam is intentionally narrow:
 - host-risk and sandbox-ownership grant objects are host-local and non-serializable. Commands carry
   only strict 64-character lowercase-hex lease IDs; the reducer bounds registrations, consumes a
   presented lease even on mismatch, and drops every unused lease after a target opens;
+- authority-bearing lease values and the `SessionMachine` consumption registry are deliberately
+  non-cloneable. Ownership moves into one session worker, while pure lease IDs, operation bindings,
+  and retained sandbox evidence remain cloneable value data;
 - only `Closed` sessions can be released, and sandbox closure requires the exact cleanup receipt that
   the reducer validates; and
 - the client and transport expose value types only. Future process, pipe, token, Job, VM, and provider

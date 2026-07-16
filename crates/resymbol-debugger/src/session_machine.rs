@@ -27,7 +27,18 @@ pub const MAX_REGISTERED_AUTHORIZATION_LEASES: usize = 64;
 /// threads, but mutation must be serialized by its owner (later, one host
 /// `SessionWorker`). An active session is non-hot-reloadable and must reach
 /// `Closed` before provider code is replaced.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// The reducer intentionally does not implement [`Clone`] because it owns the
+/// consumption registry for one-use authorization leases. Move the reducer
+/// when transferring its single owner.
+///
+/// ```compile_fail
+/// use resymbol_debugger::SessionMachine;
+///
+/// fn require_clone<T: Clone>() {}
+/// require_clone::<SessionMachine>();
+/// ```
+#[derive(Debug, PartialEq, Eq)]
 pub struct SessionMachine {
     session_id: SessionId,
     provisioning_epoch: ProvisioningEpoch,
