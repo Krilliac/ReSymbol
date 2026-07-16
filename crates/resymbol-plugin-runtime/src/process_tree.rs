@@ -2,7 +2,9 @@
 //!
 //! Unix children become leaders of a fresh process group before `exec`, so a
 //! single signal can terminate the leader and all descendants that remain in
-//! that group. Windows children are assigned to a kill-on-close Job Object.
+//! that group. Linux uses `waitid(WNOWAIT)` and macOS uses `kqueue` `NOTE_EXIT`
+//! so the group is terminated while its leader is still unreaped. Windows
+//! children are assigned to a kill-on-close Job Object.
 //! Windows' ordinary [`Command::spawn`] API cannot create a process already
 //! suspended inside a job, so there is an unavoidable spawn-to-assignment race
 //! in which a very short-lived child could create an uncontained descendant.
@@ -10,6 +12,8 @@
 use std::io;
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus};
 
+#[cfg(target_os = "macos")]
+use kqueue::{EventData, EventFilter, FilterFlag, Ident, Proc, Watcher};
 #[cfg(target_os = "linux")]
 use rustix::process::{WaitId, WaitIdOptions, waitid};
 #[cfg(unix)]
@@ -24,6 +28,79 @@ use std::os::windows::io::AsRawHandle;
 #[cfg(windows)]
 use win32job::{ExtendedLimitInfo, Job};
 
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+struct MacExitObserver {
+    watcher: Watcher,
+    pid: i32,
+}
+
+#[cfg(target_os = "macos")]
+enum MacExitRegistration {
+    Watching(MacExitObserver),
+    AlreadyExited,
+}
+
+#[cfg(target_os = "macos")]
+impl MacExitObserver {
+    fn register(pid: u32) -> io::Result<MacExitRegistration> {
+        let pid = i32::try_from(pid)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "child PID exceeds pid_t"))?;
+        let mut watcher = Watcher::new()?;
+        watcher.add_pid(pid, EventFilter::EVFILT_PROC, FilterFlag::NOTE_EXIT)?;
+        match watcher.watch() {
+            Ok(()) => Ok(MacExitRegistration::Watching(Self { watcher, pid })),
+            Err(error) if error.raw_os_error() == Some(Errno::SRCH.raw_os_error()) => {
+                // XNU refuses a new process reference after exit draining has
+                // begun. The child is still unreaped here, so its PID and
+                // process-group identifier remain stable for termination.
+                Ok(MacExitRegistration::AlreadyExited)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn try_observe_exit(&self) -> io::Result<bool> {
+        loop {
+            let Some(event) = self.watcher.poll(None) else {
+                return Ok(false);
+            };
+            match self.decode(event) {
+                Ok(()) => return Ok(true),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn observe_exit(&self) -> io::Result<()> {
+        loop {
+            let event = self.watcher.poll_forever(None).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "macOS child-exit observer stopped unexpectedly",
+                )
+            })?;
+            match self.decode(event) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn decode(&self, event: kqueue::Event) -> io::Result<()> {
+        match (event.ident, event.data) {
+            (Ident::Pid(pid), EventData::Proc(Proc::Exit(_))) if pid == self.pid => Ok(()),
+            (_, EventData::Error(error)) => Err(error),
+            (ident, data) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unexpected macOS child-exit event for {ident:?}: {data:?}"),
+            )),
+        }
+    }
+}
+
 /// A direct child process whose descendants share an OS containment boundary.
 ///
 /// Waiting and polling report the exit status of the direct child (the process
@@ -34,6 +111,10 @@ pub(crate) struct ContainedChild {
     direct_child_status: Option<ExitStatus>,
     #[cfg(unix)]
     process_group: Option<Pid>,
+    #[cfg(target_os = "macos")]
+    exit_observer: Option<MacExitObserver>,
+    #[cfg(target_os = "macos")]
+    direct_child_exit_observed: bool,
     #[cfg(windows)]
     job: Option<Job>,
 }
@@ -46,12 +127,46 @@ impl ContainedChild {
             command.process_group(0);
             let child = command.spawn()?;
             let process_group = Pid::from_child(&child);
-
-            Ok(Self {
+            let mut contained = Self {
                 child,
                 direct_child_status: None,
                 process_group: Some(process_group),
-            })
+                #[cfg(target_os = "macos")]
+                exit_observer: None,
+                #[cfg(target_os = "macos")]
+                direct_child_exit_observed: false,
+            };
+
+            #[cfg(target_os = "macos")]
+            match MacExitObserver::register(contained.child.id()) {
+                Ok(MacExitRegistration::Watching(observer)) => {
+                    contained.exit_observer = Some(observer);
+                }
+                Ok(MacExitRegistration::AlreadyExited) => {
+                    contained.direct_child_exit_observed = true;
+                    contained.reap_observed_direct_child().map_err(|error| {
+                        io::Error::new(
+                            error.kind(),
+                            format!(
+                                "failed to clean up child that exited before macOS observer registration: {error}"
+                            ),
+                        )
+                    })?;
+                }
+                Err(error) => {
+                    let terminate_error = contained.terminate().err();
+                    let wait_error = match contained.child.wait() {
+                        Ok(status) => {
+                            contained.direct_child_status = Some(status);
+                            None
+                        }
+                        Err(wait_error) => Some(wait_error),
+                    };
+                    return Err(mac_exit_observer_error(error, terminate_error, wait_error));
+                }
+            }
+
+            Ok(contained)
         }
 
         #[cfg(windows)]
@@ -102,32 +217,19 @@ impl ContainedChild {
 
     /// Polls the direct child without waiting for descendants.
     ///
-    /// Linux observes exit without reaping, terminates the still-stable
-    /// containment boundary, and only then collects the direct child's status.
-    /// macOS reaps the direct child first because hosted systems reject
-    /// `waitid(WNOWAIT)`, then immediately terminates its process group. A group
-    /// with surviving descendants retains its identifier after the leader exits.
+    /// Linux and macOS observe exit without reaping, terminate the still-stable
+    /// containment boundary, and only then collect the direct child's status.
     pub(crate) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         if let Some(status) = self.direct_child_status {
             return Ok(Some(status));
         }
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             if !self.observe_direct_child_exit(true)? {
                 return Ok(None);
             }
             self.reap_observed_direct_child().map(Some)
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            let status = self.child.try_wait()?;
-            if let Some(status) = status {
-                self.direct_child_status = Some(status);
-                self.terminate()?;
-            }
-            Ok(status)
         }
 
         #[cfg(any(windows, all(unix, not(any(target_os = "linux", target_os = "macos")))))]
@@ -140,26 +242,17 @@ impl ContainedChild {
 
     /// Waits for and returns the direct child's exit status.
     ///
-    /// Linux retains the exited child until the containment boundary has been
-    /// terminated. macOS reaps the leader and immediately terminates the group;
-    /// surviving descendants keep that process-group identifier allocated.
+    /// Linux and macOS retain the exited child until the containment boundary
+    /// has been terminated.
     pub(crate) fn wait(&mut self) -> io::Result<ExitStatus> {
         if let Some(status) = self.direct_child_status {
             return Ok(status);
         }
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             self.observe_direct_child_exit(false)?;
             self.reap_observed_direct_child()
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            let status = self.child.wait()?;
-            self.direct_child_status = Some(status);
-            self.terminate()?;
-            Ok(status)
         }
 
         #[cfg(any(windows, all(unix, not(any(target_os = "linux", target_os = "macos")))))]
@@ -172,7 +265,7 @@ impl ContainedChild {
 
     /// Observes direct-child exit without releasing its PID or process-group ID.
     #[cfg(target_os = "linux")]
-    fn observe_direct_child_exit(&self, nohang: bool) -> io::Result<bool> {
+    fn observe_direct_child_exit(&mut self, nohang: bool) -> io::Result<bool> {
         let mut options = WaitIdOptions::EXITED | WaitIdOptions::NOWAIT;
         if nohang {
             options |= WaitIdOptions::NOHANG;
@@ -186,9 +279,36 @@ impl ContainedChild {
         }
     }
 
+    /// Observes direct-child exit through a process knote without reaping it.
+    #[cfg(target_os = "macos")]
+    fn observe_direct_child_exit(&mut self, nohang: bool) -> io::Result<bool> {
+        if self.direct_child_exit_observed {
+            return Ok(true);
+        }
+        let observer = self.exit_observer.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "macOS child-exit observer is unavailable",
+            )
+        })?;
+        let observed = if nohang {
+            observer.try_observe_exit()?
+        } else {
+            observer.observe_exit()?;
+            true
+        };
+        // NOTE_EXIT is one-shot. Persist observation before process-group
+        // termination so a fallible terminate-and-retry path cannot block on
+        // an event that has already been consumed.
+        self.direct_child_exit_observed = observed;
+        Ok(observed)
+    }
+
     /// Terminates the still-stable containment boundary, then reaps its leader.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn reap_observed_direct_child(&mut self) -> io::Result<ExitStatus> {
+        #[cfg(target_os = "macos")]
+        drop(self.exit_observer.take());
         self.terminate()?;
         let status = self.child.wait()?;
         self.direct_child_status = Some(status);
@@ -274,6 +394,24 @@ fn combine_termination_results(
     }
 }
 
+#[cfg(target_os = "macos")]
+fn mac_exit_observer_error(
+    error: io::Error,
+    terminate_error: Option<io::Error>,
+    wait_error: Option<io::Error>,
+) -> io::Error {
+    let mut message = format!("failed to register macOS child-exit observer: {error}");
+    if let Some(terminate_error) = terminate_error {
+        message.push_str(&format!(
+            "; process-tree termination also failed: {terminate_error}"
+        ));
+    }
+    if let Some(wait_error) = wait_error {
+        message.push_str(&format!("; direct-child reap also failed: {wait_error}"));
+    }
+    io::Error::new(error.kind(), message)
+}
+
 #[cfg(windows)]
 fn job_error(context: &str, error: win32job::JobError) -> io::Error {
     let error: io::Error = error.into();
@@ -344,6 +482,18 @@ mod tests {
         assert!(child.take_stderr().is_none());
         assert!(child.wait()?.success());
 
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn immediate_exit_registration_never_misses_the_child() -> io::Result<()> {
+        for _ in 0..256 {
+            let mut command = exit_command(23);
+            let mut child = ContainedChild::spawn(&mut command)?;
+            assert_eq!(child.wait()?.code(), Some(23));
+            assert_eq!(child.try_wait()?.and_then(|status| status.code()), Some(23));
+        }
         Ok(())
     }
 

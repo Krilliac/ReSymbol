@@ -374,6 +374,10 @@ schema versions independently.
 
 ### Safety and limits
 
+- macOS executable-plugin containment now observes direct-child exit with a `kqueue` process filter,
+  terminates the still-stable process group, and only then reaps the leader. XNU registration
+  races resolve through an already-exited path that also kills the group before collecting status,
+  preventing process-group identifier reuse from redirecting cleanup at an unrelated group.
 - Live host launch/attach contracts no longer accept caller-created acknowledgement values or a
   claimed sandbox owner session. A trusted session worker must pre-register a bounded, one-use
   256-bit lease for the exact launch binary or PID/start-key/image/mode attach identity; sandbox-owned

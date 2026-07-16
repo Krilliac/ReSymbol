@@ -217,8 +217,10 @@ completes, a deadline expires, a stdout/stderr capture worker fails, or the runt
 ordinary descendants cannot retain capture pipes after their parent exits. This is lifecycle
 containment, not a filesystem, network, credential, process-authority, or general OS sandbox.
 Windows uses a safe Rust wrapper to assign the child to its Job Object immediately after spawn,
-leaving a narrow pre-assignment escape race. On POSIX a hostile plugin/helper or descendant can
-deliberately leave its process group or session and escape later group termination.
+leaving a narrow pre-assignment escape race. Linux observes exit with `waitid(WNOWAIT)` and macOS
+uses a `kqueue` `NOTE_EXIT` process filter, so both terminate the still-stable process group before
+reaping its leader. On POSIX a hostile plugin/helper or descendant can deliberately leave its
+process group or session and escape later group termination.
 
 The fingerprint proves only which local bytes were approved; it does not authenticate a publisher.
 There is also an unavoidable check-to-launch window while plugin files remain mutable. Keep the

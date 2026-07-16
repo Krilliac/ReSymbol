@@ -377,7 +377,9 @@ sandboxing remains separate work. The current runner owns ordinary descendants t
 process groups or Windows Job Objects and terminates the tree on direct-child completion, deadline,
 stdout/stderr capture failure, or runtime drop. This lifecycle containment does not restrict ambient
 authority. Windows retains a narrow pre-Job-assignment escape race, and a hostile POSIX
-plugin/helper or descendant can deliberately leave its process group or session.
+plugin/helper or descendant can deliberately leave its process group or session. Linux and macOS
+otherwise observe direct-child exit without reaping and terminate the stable group before collecting
+the leader's status.
 
 ## Milestone 2: useful native-binary MVP
 

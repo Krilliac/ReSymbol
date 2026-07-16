@@ -529,8 +529,10 @@ operations; they are not restrictions enforced by the operating system. A finger
 reviewed local bytes, not a publisher, and mutable plugin files leave a check-to-launch window.
 Process-tree ownership is lifecycle containment, not authority sandboxing. On Windows ReSymbol uses
 a safe Rust wrapper for immediate post-spawn Job Object assignment, but a narrow pre-assignment
-escape race remains. On POSIX a hostile plugin/helper or descendant can deliberately leave its
-process group or session. Only trust artifacts whose code and publisher you would run directly.
+escape race remains. Linux `waitid(WNOWAIT)` and macOS `kqueue` exit notifications let ReSymbol
+terminate a still-stable process group before reaping its leader. On POSIX a hostile plugin/helper
+or descendant can deliberately leave its process group or session. Only trust artifacts whose code
+and publisher you would run directly.
 Official archives bundle both helpers beside `resymbol`; the Windows archive also places
 `resymbol-workbench.exe` beside `resymbol.exe`. Linux archives pair the static musl main executable
 with a GNU native helper built on Ubuntu 22.04 for glibc 2.35 or newer so it can load ordinary glibc
