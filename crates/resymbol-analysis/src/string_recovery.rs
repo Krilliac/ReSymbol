@@ -118,7 +118,7 @@ fn recover_strings_with_limits(
 }
 
 fn eligible_section_bytes<'a>(bytes: &'a [u8], section: &PeSection) -> Option<&'a [u8]> {
-    let file_backed_size = section.layout().file_backed_size;
+    let file_backed_size = section.file_backed_size();
     if file_backed_size == 0
         || section.characteristics & IMAGE_SCN_CNT_INITIALIZED_DATA == 0
         || section.characteristics & IMAGE_SCN_MEM_READ == 0
@@ -283,7 +283,7 @@ fn eligible_section_contains(sections: &[PeSection], rva: u32, size: u32) -> boo
     let range_end = range_start + u64::from(size);
     sections.iter().any(|section| {
         let section_start = u64::from(section.virtual_address);
-        let file_backed_size = section.layout().file_backed_size;
+        let file_backed_size = section.file_backed_size();
         let section_end = section_start + u64::from(file_backed_size);
         file_backed_size != 0
             && section.characteristics & IMAGE_SCN_CNT_INITIALIZED_DATA != 0

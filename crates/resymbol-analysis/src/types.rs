@@ -383,33 +383,31 @@ pub struct PeSection {
     pub characteristics: u32,
 }
 
-/// Canonical image-loader view of one PE section.
-///
-/// This stays crate-private so the serialized section-header model remains the
-/// public API while every analysis path agrees on which bytes are loaded and
-/// which loaded bytes are initialized from the file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct PeSectionLayout {
-    pub(crate) loaded_size: u32,
-    pub(crate) file_backed_size: u32,
-}
-
 impl PeSection {
-    /// Derive the section spans used by the PE loader and RVA-to-file mapping.
-    pub(crate) const fn layout(&self) -> PeSectionLayout {
-        let loaded_size = if self.virtual_size == 0 {
+    /// Number of bytes contributed to the loaded image before section-alignment padding.
+    ///
+    /// PE images use `SizeOfRawData` only when `VirtualSize` is zero. A nonzero
+    /// `VirtualSize` is authoritative even when the raw file record is larger.
+    #[must_use]
+    pub const fn loaded_size(&self) -> u32 {
+        if self.virtual_size == 0 {
             self.raw_data_size
         } else {
             self.virtual_size
-        };
-        let file_backed_size = if self.raw_data_size < loaded_size {
+        }
+    }
+
+    /// Loaded prefix initialized from the section's raw file data.
+    ///
+    /// Raw file-alignment padding beyond the loaded span is never exposed as
+    /// initialized memory, while a virtual tail beyond the raw span is zero-fill.
+    #[must_use]
+    pub const fn file_backed_size(&self) -> u32 {
+        let loaded_size = self.loaded_size();
+        if self.raw_data_size < loaded_size {
             self.raw_data_size
         } else {
             loaded_size
-        };
-        PeSectionLayout {
-            loaded_size,
-            file_backed_size,
         }
     }
 }
