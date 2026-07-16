@@ -19,32 +19,40 @@
                          "view":  "overview",
                          "width":  1440,
                          "height":  900,
-                         "bytes":  219664,
-                         "sha256":  "7de540749664e91f558d7a9173f236b6d583633a235f226f54fedbc71d4d0937"
+                         "bytes":  245092,
+                         "sha256":  "eade425514e2a1dd061e87afc502b6d537696c3349e4dc0fd33fb912857ae0a2"
                      },
                      {
                          "file":  "workbench-functions.png",
                          "view":  "functions",
                          "width":  1440,
                          "height":  900,
-                         "bytes":  227203,
-                         "sha256":  "a6c477e2b50d650b327f7e6fabd402b134c6eea6f8524d77c6a1f5f9258226d5"
+                         "bytes":  252544,
+                         "sha256":  "ba57a7faf9b850ef40d02f9652222eb0201b40030513fd2bb8774086cbc7f50d"
                      },
                      {
                          "file":  "workbench-graph.png",
                          "view":  "graph",
                          "width":  1440,
                          "height":  900,
-                         "bytes":  249790,
-                         "sha256":  "1f414b9b3843f324a2a0ba767df0be78e3417446a0771ac9ba7477c4a66af68e"
+                         "bytes":  260539,
+                         "sha256":  "8c2ea17b88172160013f64f5f426780c232f49451a4ce9c060dfab5153a48333"
                      },
                      {
                          "file":  "workbench-address-space.png",
                          "view":  "address-space",
                          "width":  1440,
                          "height":  900,
-                         "bytes":  233857,
-                         "sha256":  "723485ac0ac9805654f48c2b9da7273fe96edf88070ae192295b2c462641984f"
+                         "bytes":  260166,
+                         "sha256":  "628b3c63fbecf74c380e97cb92a083f66849e39d0c1017dc9b0d78d4d05fb497"
+                     },
+                     {
+                         "file":  "workbench-debugger-sandbox.png",
+                         "view":  "debugger-sandbox",
+                         "width":  1440,
+                         "height":  900,
+                         "bytes":  272343,
+                         "sha256":  "e99c95f1bda243272297233af6fe0d45eebf29f5ac6a597c56d06061d957371c"
                      }
                  ]
 }
