@@ -1245,7 +1245,7 @@ fn classify_rejected_response(
                 Err(invalid())
             }
         }
-        Some(SandboxRejectionDiagnostic::Failed { detail, .. }) => {
+        Some(SandboxRejectionDiagnostic::Failed { stage, detail }) => {
             let exact_failed_state = matches!(
                 reducer.state(),
                 SessionState::Failed { message, .. } if message.as_str() == detail.as_str()
