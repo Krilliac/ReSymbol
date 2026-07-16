@@ -81,11 +81,11 @@ pub use sandbox::{
     PolicyDigestError, PolicyValidationError, ProcessMitigationProfile, ProviderUnavailable,
     ProviderUnavailableReason, ResourceLimitError, SANDBOX_POLICY_DIGEST_VERSION,
     SandboxAttestation, SandboxCleanupAttemptFailure, SandboxCleanupReceipt, SandboxFailure,
-    SandboxFailureKind, SandboxFailureStage, SandboxGuarantee, SandboxLifecycleEvent,
-    SandboxLifecycleState, SandboxMachine, SandboxMachineError, SandboxNetworkMode, SandboxPolicy,
-    SandboxPolicyApprovalId, SandboxProviderDescriptor, SandboxProviderSelection,
-    SandboxResourceLimits, SealedImageDigest, SealedImageDigestError, SealedImageId,
-    VmIsolationIdentity, Win32kProfile,
+    SandboxFailureContext, SandboxFailureKind, SandboxFailureStage, SandboxFailureValidationError,
+    SandboxGuarantee, SandboxLifecycleEvent, SandboxLifecycleState, SandboxMachine,
+    SandboxMachineError, SandboxNetworkMode, SandboxPolicy, SandboxPolicyApprovalId,
+    SandboxProviderDescriptor, SandboxProviderSelection, SandboxResourceLimits, SealedImageDigest,
+    SealedImageDigestError, SealedImageId, VmIsolationIdentity, Win32kProfile,
 };
 pub use session_machine::{
     MAX_REGISTERED_AUTHORIZATION_LEASES, RemoteCommandCheckpoint, SessionMachine,

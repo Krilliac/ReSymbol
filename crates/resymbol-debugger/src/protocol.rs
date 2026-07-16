@@ -16,7 +16,8 @@ use thiserror::Error;
 
 pub use crate::identity::{HostRiskLeaseId, SandboxOwnershipLeaseId, SessionId};
 use crate::sandbox::{
-    CleanupAttemptFailureError, SandboxAttestation, SandboxLifecycleEvent, SandboxPolicy,
+    CleanupAttemptFailureError, SandboxAttestation, SandboxFailureValidationError,
+    SandboxLifecycleEvent, SandboxPolicy,
 };
 use resymbol_core::BinaryId;
 
@@ -1128,6 +1129,10 @@ impl DebugEvent {
         match self {
             Self::Capabilities(report) => report.validate(),
             Self::StateChanged(SessionState::Failed { message, .. }) => validate_reason(message),
+            Self::SandboxLifecycle(SandboxLifecycleEvent::Failed(failure)) => {
+                failure.validate_stage_kind()?;
+                Ok(())
+            }
             Self::SandboxLifecycle(SandboxLifecycleEvent::CleanupAttemptFailed(attempt)) => {
                 attempt.validate()?;
                 Ok(())
@@ -1268,6 +1273,8 @@ impl EventSequenceCursor {
 pub enum ProtocolValidationError {
     #[error(transparent)]
     CleanupAttemptFailure(#[from] CleanupAttemptFailureError),
+    #[error(transparent)]
+    SandboxFailure(#[from] SandboxFailureValidationError),
     #[error("{kind} identifier must be nonzero")]
     ZeroIdentifier { kind: &'static str },
     #[error("unsupported debugger protocol version {major}.{minor}")]
@@ -1351,8 +1358,9 @@ mod tests {
     use crate::identity::ProvisioningEpoch;
     use crate::sandbox::{
         CleanupOutcome, CleanupReceiptId, CleanupResidual, CleanupResidualKind, DiagnosticText,
-        PolicyDigest, SandboxCleanupAttemptFailure, SandboxCleanupReceipt, SandboxFailure,
-        SandboxFailureKind, SandboxFailureStage, SandboxProviderSelection,
+        HelperBuildId, PolicyDigest, SandboxCleanupAttemptFailure, SandboxCleanupReceipt,
+        SandboxFailure, SandboxFailureContext, SandboxFailureKind, SandboxFailureStage,
+        SandboxProviderSelection,
     };
 
     fn session(value: u64) -> SessionId {
@@ -1430,7 +1438,14 @@ mod tests {
                 SandboxCleanupAttemptFailure {
                     failure: SandboxFailure {
                         session_id,
+                        provisioning_epoch: receipt.provisioning_epoch.clone(),
+                        policy_digest: receipt.policy_digest.clone(),
                         provider: SandboxProviderSelection::LocalAppContainer,
+                        context: SandboxFailureContext::Launch {
+                            binary_id: BinaryId::digest(b"cleanup-attempt binary"),
+                            helper_build: HelperBuildId::new("cleanup-attempt-helper")
+                                .expect("helper build"),
+                        },
                         stage: SandboxFailureStage::Cleanup,
                         kind: SandboxFailureKind::CleanupIncomplete,
                         retryable: true,
@@ -1739,6 +1754,29 @@ mod tests {
             .expect("cleanup-attempt payload")
             .insert("unexpected".to_owned(), serde_json::Value::Bool(true));
         assert!(serde_json::from_value::<EventEnvelope>(unknown).is_err());
+    }
+
+    #[test]
+    fn generic_sandbox_failure_rejects_incoherent_stage_kind_at_protocol_boundary() {
+        let mut envelope = cleanup_attempt_event();
+        let DebugEvent::SandboxLifecycle(SandboxLifecycleEvent::CleanupAttemptFailed(attempt)) =
+            envelope.event
+        else {
+            unreachable!("cleanup-attempt fixture")
+        };
+        let mut failure = attempt.failure;
+        failure.kind = SandboxFailureKind::HelperFailure;
+        envelope.event = DebugEvent::SandboxLifecycle(SandboxLifecycleEvent::Failed(failure));
+
+        assert_eq!(
+            envelope.validate(),
+            Err(ProtocolValidationError::SandboxFailure(
+                SandboxFailureValidationError::StageKind {
+                    stage: SandboxFailureStage::Cleanup,
+                    kind: SandboxFailureKind::HelperFailure,
+                }
+            ))
+        );
     }
 
     #[test]
