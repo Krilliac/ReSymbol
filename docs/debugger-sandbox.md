@@ -15,7 +15,10 @@ ReSymbol currently implements the non-executing foundation for debugger and sand
   exact wire/typed protocol version binding, strict typed command/event codec, cumulative
   response-allocation budget, and single-owner host-client seam;
 - a feature-gated synthetic host that models only offline open/close reducer mechanics, rejects
-  every unsupported operation, and never fabricates target, attestation, or cleanup evidence; and
+  every unsupported operation, and never fabricates target, attestation, or cleanup evidence;
+- a production, in-process `OfflineImageDebugHost` that freezes an identity-checked image snapshot,
+  advertises only offline analysis, and serves bounded reads from exact canonical file-backed image
+  ranges without opening or executing a target; and
 - sandbox policy, attestation, failure, lifecycle, resource-limit, and cleanup-receipt data models.
 
 The debugger crate also exposes a bounded provider-readiness service. It is discovery only: it
@@ -24,7 +27,7 @@ provision any other resource. A readiness result means only that a caller may at
 the suspended target still needs the exact policy/provider/build attestation described below.
 
 The Windows debugger host process, pipe transport, AppContainer provider, Hyper-V provider, guest
-agent, live process attach, breakpoint engine, register access, memory access, and instruction
+agent, live process attach, breakpoint engine, register access, live memory access, and instruction
 editing are not implemented. `SyntheticDebugHost` is available only to crate tests or the explicit
 `test-support` feature. It is not a security boundary or platform provider. The current types and UI
 must not be described as a working malware sandbox or live debugger.
@@ -112,6 +115,34 @@ Target selection is explicit and capability-reported:
 Unavailable modes return a typed reason. ReSymbol must never silently replace a requested sandbox,
 target mode, mitigation, or read-only boundary with a weaker option.
 
+### Verified offline image host
+
+`VerifiedOfflineImage` is an immutable, non-executing input boundary. Construction canonicalizes a
+regular-file origin, rejects a direct symbolic-link target, enforces the 1 GiB application ingestion
+ceiling before allocating, reads no more than the metadata-declared length plus one byte, and checks
+the open file and path metadata again after the read. Caller-supplied snapshots use the same size
+ceiling. The snapshot's size and SHA-256 are recomputed, its bytes are parsed, every field of the
+resulting `BinaryIdentity` must equal the caller's expected identity, and the canonical static
+address space must validate. The host retains the resulting `Arc<[u8]>`; later disk replacement does
+not alter an established snapshot.
+
+The only accepted open target is the exact canonical `OfflineTarget.path` returned for that verified
+image. In this host, `MemoryAddress` unambiguously means an RVA. A read must be nonempty, no larger
+than the protocol's 1 MiB memory-read ceiling, remain within one canonical region, and remain wholly
+inside that region's initialized file-backed prefix. Header/section bytes are returned from the
+frozen snapshot. Image gaps, section zero-fill, loader-rounded padding, raw file-alignment bytes
+beyond a smaller `VirtualSize`, address overflow, image overrun, and cross-region or cross-backing
+spans are rejected without a memory-read event.
+
+`OfflineImageDebugHost` advertises only `OfflineAnalysis` and supports only capability probing, that
+exact offline open, bounded RVA reads, and close. Dump, snapshot, observe, attach, launch, execution,
+write, register, breakpoint, terminate, and sandbox operations are rejected through the same opaque
+remote-command checkpoint path. Rejections restore visible reducer state while retaining command and
+authority-consumption watermarks, and emit only a correlated rejected command result. This host
+never emits sandbox attestation, lifecycle, or cleanup evidence. Graceful shutdown and the mandatory
+non-panicking abort/drop paths close only the in-process control boundary; they do not claim target
+or sandbox cleanup.
+
 ## Session safety contract
 
 Before a live backend is allowed, one pure state reducer must prove these invariants with exhaustive
@@ -188,6 +219,9 @@ The current seam is intentionally narrow:
 - connection-level capability probing is explicit; the synthetic host reports every platform
   capability as unavailable, supports only offline open/close, and rejects every other operation
   without producing security evidence;
+- the production offline-image host reports only offline analysis as available, binds open to one
+  preverified canonical snapshot, treats memory addresses as RVAs, and returns only exact
+  file-backed header/section prefixes under the protocol and response budgets;
 - host-risk and sandbox-ownership grant objects are host-local and non-serializable. Commands carry
   only strict 64-character lowercase-hex lease IDs. Non-cloneable trusted issuers derive each ID from
   an operating-system-entropy-backed secret and a monotonic sequence, and return the sole move-only
