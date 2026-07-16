@@ -14,9 +14,11 @@ use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
+pub use crate::identity::SessionId;
 use crate::sandbox::{
     RiskAcknowledgementId, SandboxAttestation, SandboxLifecycleEvent, SandboxPolicy,
 };
+use resymbol_core::BinaryId;
 
 pub const PROTOCOL_MAJOR: u16 = 1;
 pub const PROTOCOL_MINOR: u16 = 0;
@@ -58,7 +60,6 @@ macro_rules! nonzero_id {
     };
 }
 
-nonzero_id!(SessionId, u64, "session");
 nonzero_id!(CommandId, u64, "command");
 nonzero_id!(EventSequence, u64, "event sequence");
 nonzero_id!(StateGeneration, u64, "state generation");
@@ -161,6 +162,9 @@ impl MemoryAddress {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LaunchTarget {
+    /// Exact SHA-256 identity that the backend must re-verify after staging and
+    /// before target-controlled code is allowed to run.
+    pub binary_id: BinaryId,
     pub executable: PathBuf,
     #[serde(default)]
     pub arguments: Vec<String>,
@@ -734,7 +738,7 @@ impl CommandEnvelope {
                 state.matches_live(*live)
             }
             (DebugCommand::Terminate { execution }, _) => state.matches_execution(*execution),
-            (DebugCommand::Close { .. }, _) => true,
+            (DebugCommand::Close { .. }, state) => !matches!(state, SessionState::Closed { .. }),
             _ => false,
         };
         if allowed {
@@ -773,6 +777,12 @@ pub enum SessionState {
         token: StateToken,
         target: DebugTargetRequest,
     },
+    AwaitingAttestation {
+        token: StateToken,
+    },
+    AttestationAccepted {
+        token: StateToken,
+    },
     Offline {
         token: StateToken,
     },
@@ -795,6 +805,9 @@ pub enum SessionState {
     Running {
         token: RunToken,
     },
+    Pausing {
+        token: StateToken,
+    },
     Closing {
         token: StateToken,
     },
@@ -809,6 +822,30 @@ pub enum SessionState {
         token: StateToken,
         message: String,
     },
+    Closed {
+        token: StateToken,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SessionStateKind {
+    Idle,
+    Opening,
+    AwaitingAttestation,
+    AttestationAccepted,
+    Offline,
+    Dump,
+    Snapshot,
+    Observing,
+    Stopped,
+    Running,
+    Pausing,
+    Closing,
+    Detached,
+    Exited,
+    Failed,
+    Closed,
 }
 
 impl SessionState {
@@ -817,16 +854,42 @@ impl SessionState {
         match self {
             Self::Idle { token }
             | Self::Opening { token, .. }
+            | Self::AwaitingAttestation { token }
+            | Self::AttestationAccepted { token }
             | Self::Offline { token }
             | Self::Dump { token }
             | Self::Snapshot { token, .. }
             | Self::Observing { token, .. }
+            | Self::Pausing { token }
             | Self::Closing { token }
             | Self::Detached { token }
             | Self::Exited { token, .. }
-            | Self::Failed { token, .. } => *token,
+            | Self::Failed { token, .. }
+            | Self::Closed { token } => *token,
             Self::Stopped { token, .. } => token.state,
             Self::Running { token } => token.state,
+        }
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> SessionStateKind {
+        match self {
+            Self::Idle { .. } => SessionStateKind::Idle,
+            Self::Opening { .. } => SessionStateKind::Opening,
+            Self::AwaitingAttestation { .. } => SessionStateKind::AwaitingAttestation,
+            Self::AttestationAccepted { .. } => SessionStateKind::AttestationAccepted,
+            Self::Offline { .. } => SessionStateKind::Offline,
+            Self::Dump { .. } => SessionStateKind::Dump,
+            Self::Snapshot { .. } => SessionStateKind::Snapshot,
+            Self::Observing { .. } => SessionStateKind::Observing,
+            Self::Stopped { .. } => SessionStateKind::Stopped,
+            Self::Running { .. } => SessionStateKind::Running,
+            Self::Pausing { .. } => SessionStateKind::Pausing,
+            Self::Closing { .. } => SessionStateKind::Closing,
+            Self::Detached { .. } => SessionStateKind::Detached,
+            Self::Exited { .. } => SessionStateKind::Exited,
+            Self::Failed { .. } => SessionStateKind::Failed,
+            Self::Closed { .. } => SessionStateKind::Closed,
         }
     }
 
@@ -1018,7 +1081,13 @@ pub struct EventSequenceCursor {
 
 impl EventSequenceCursor {
     pub fn observe(&mut self, sequence: EventSequence) -> Result<(), ProtocolValidationError> {
-        let expected = self.last.map_or(1, |last| last.get().saturating_add(1));
+        let expected = match self.last {
+            Some(last) => last
+                .get()
+                .checked_add(1)
+                .ok_or(ProtocolValidationError::EventSequenceOverflow)?,
+            None => 1,
+        };
         if sequence.get() != expected {
             return Err(ProtocolValidationError::UnexpectedEventSequence {
                 expected,
@@ -1098,6 +1167,8 @@ pub enum ProtocolValidationError {
     MismatchedCommandCorrelation,
     #[error("expected event sequence {expected}, received {actual}")]
     UnexpectedEventSequence { expected: u64, actual: u64 },
+    #[error("event sequence exhausted its u64 identifier space")]
+    EventSequenceOverflow,
 }
 
 #[cfg(test)]
@@ -1146,10 +1217,7 @@ mod tests {
 
     #[test]
     fn nonzero_ids_are_enforced_during_construction_and_deserialization() {
-        assert_eq!(
-            SessionId::new(0),
-            Err(ProtocolValidationError::ZeroIdentifier { kind: "session" })
-        );
+        assert!(SessionId::new(0).is_err());
         assert!(serde_json::from_str::<CommandId>("0").is_err());
         assert_eq!(serde_json::from_str::<CommandId>("7").unwrap().get(), 7);
     }
@@ -1356,6 +1424,14 @@ mod tests {
                 expected: 3,
                 actual: 4,
             })
+        );
+
+        let mut exhausted = EventSequenceCursor {
+            last: Some(EventSequence::new(u64::MAX).unwrap()),
+        };
+        assert_eq!(
+            exhausted.observe(EventSequence::new(u64::MAX).unwrap()),
+            Err(ProtocolValidationError::EventSequenceOverflow)
         );
     }
 
