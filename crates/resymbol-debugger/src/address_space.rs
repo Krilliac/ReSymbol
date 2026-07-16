@@ -167,6 +167,10 @@ pub struct StaticAddressSpace {
     pub binary_id: BinaryId,
     pub preferred_image_base: u64,
     pub image_size: u64,
+    /// Exact in-memory section granularity declared by the PE optional header.
+    pub section_alignment: u32,
+    /// Exact on-disk section-data granularity declared by the PE optional header.
+    pub file_alignment: u32,
     pub entry_point: Option<RelativeAddress>,
     regions: Vec<StaticRegion>,
 }
@@ -295,6 +299,8 @@ impl StaticAddressSpace {
             binary_id: analysis.identity.id.clone(),
             preferred_image_base: analysis.identity.image_base,
             image_size,
+            section_alignment: analysis.section_alignment,
+            file_alignment: analysis.file_alignment,
             entry_point,
             regions,
         })
@@ -356,19 +362,18 @@ fn validate_image_alignment(analysis: &PeAnalysis) -> Result<(), StaticAddressSp
             requirement: "must be greater than or equal to FileAlignment",
         });
     }
-    if section_alignment < X64_PAGE_SIZE {
-        if file_alignment != section_alignment {
-            return Err(StaticAddressSpaceError::InvalidAlignment {
-                field: "FileAlignment",
-                value: u64::from(file_alignment),
-                requirement: "must equal SectionAlignment for sub-page images",
-            });
-        }
-    } else if !(MIN_STANDARD_FILE_ALIGNMENT..=MAX_FILE_ALIGNMENT).contains(&file_alignment) {
+    if !(MIN_STANDARD_FILE_ALIGNMENT..=MAX_FILE_ALIGNMENT).contains(&file_alignment) {
         return Err(StaticAddressSpaceError::InvalidAlignment {
             field: "FileAlignment",
             value: u64::from(file_alignment),
-            requirement: "must be between 512 and 65536 for page-aligned images",
+            requirement: "must be between 512 and 65536",
+        });
+    }
+    if section_alignment < X64_PAGE_SIZE && file_alignment != section_alignment {
+        return Err(StaticAddressSpaceError::InvalidAlignment {
+            field: "FileAlignment",
+            value: u64::from(file_alignment),
+            requirement: "must equal SectionAlignment for sub-page images",
         });
     }
 
@@ -667,6 +672,8 @@ mod tests {
     fn distinguishes_loaded_content_zero_fill_and_loader_padding() {
         let layout =
             StaticAddressSpace::from_validated_pe(&synthetic_analysis()).expect("synthetic layout");
+        assert_eq!(layout.section_alignment, 0x1000);
+        assert_eq!(layout.file_alignment, 0x200);
 
         let headers = layout.regions().first().expect("headers");
         assert_eq!(headers.range.size(), 0x1000);
@@ -756,6 +763,16 @@ mod tests {
         analysis.file_alignment = 3;
         assert!(matches!(
             StaticAddressSpace::from_pe(&analysis),
+            Err(StaticAddressSpaceError::InvalidAlignment {
+                field: "FileAlignment",
+                ..
+            })
+        ));
+
+        let mut analysis = synthetic_analysis();
+        analysis.file_alignment = 0x100;
+        assert!(matches!(
+            StaticAddressSpace::from_validated_pe(&analysis),
             Err(StaticAddressSpaceError::InvalidAlignment {
                 field: "FileAlignment",
                 ..

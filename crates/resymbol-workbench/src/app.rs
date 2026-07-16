@@ -1997,7 +1997,7 @@ impl WorkbenchApp {
             .inner_margin(egui::Margin::same(10))
             .corner_radius(4)
             .show(ui, |ui| {
-                ui.columns(5, |columns| {
+                ui.columns(6, |columns| {
                     property_row(
                         &mut columns[0],
                         "Preferred base",
@@ -2012,6 +2012,15 @@ impl WorkbenchApp {
                     );
                     property_row(
                         &mut columns[2],
+                        "Section / file align",
+                        &format!(
+                            "0x{:X} / 0x{:X}",
+                            address_space.section_alignment, address_space.file_alignment
+                        ),
+                        true,
+                    );
+                    property_row(
+                        &mut columns[3],
                         "Entry RVA",
                         &address_space.entry_point.map_or_else(
                             || "none".to_owned(),
@@ -2020,12 +2029,12 @@ impl WorkbenchApp {
                         true,
                     );
                     property_row(
-                        &mut columns[3],
+                        &mut columns[4],
                         "Regions",
                         &address_space.regions().len().to_string(),
                         false,
                     );
-                    property_row(&mut columns[4], "Indicators", &indicator_text, false);
+                    property_row(&mut columns[5], "Indicators", &indicator_text, false);
                 });
             });
 
