@@ -98,9 +98,10 @@ using results from someone else. Running an import script changes the current ID
 Ghidra program, so use the host tool's normal backup/versioning workflow for important projects.
 
 PDB export has an additional pre-write gate: `--binary` must name the exact original PE used to
-create the package. ReSymbol hashes those bytes, matches their identity and PE metadata against the
-session, and reads the CodeView identity and raw section headers directly from that file. The PE is
-opened read-only for inspection and is never patched or rewritten.
+create the package. The shared bounded binary reader checks the regular file and exact package size
+before allocation, hashes the immutable retained snapshot, and passes those same verified bytes to
+the PDB renderer for PE metadata, CodeView identity, and raw section-header inspection. The PE is
+opened read-only and is never patched or rewritten.
 
 ## JSON projection
 

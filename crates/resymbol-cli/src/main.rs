@@ -13,6 +13,7 @@ use resymbol_analysis::{
     PeLoadConfigGuardMemcpyAnchor, PeLoadConfigSecurityAnchors, PeLoadConfigXfgAnchors,
     PluginRunRecord, PluginRunStatus, analyze_bytes,
 };
+use resymbol_app::AppServices;
 use resymbol_core::{
     BinaryId, ClaimProvenance, Confidence, DiscoveredPlugin, Evidence, PLUGIN_DISABLED_SENTINEL,
     PluginDiscoveryOptions, PluginSource, SymbolAssertion, SymbolClaim, SymbolSubject,
@@ -262,13 +263,10 @@ struct AnalysisPluginHosts<'a> {
 }
 
 fn analyze(args: AnalyzeArgs, safe_mode: bool, plugin_dir: PathBuf) -> Result<()> {
-    let binary = args
-        .binary
-        .canonicalize()
-        .with_context(|| format!("cannot open binary {}", args.binary.display()))?;
-    let bytes = Arc::<[u8]>::from(
-        fs::read(&binary).with_context(|| format!("cannot read binary {}", binary.display()))?,
-    );
+    let (binary, bytes) = AppServices::default()
+        .read_binary_exact(&args.binary, None)
+        .with_context(|| format!("cannot read binary {}", args.binary.display()))?
+        .into_parts();
     let base_analysis = analyze_bytes(&bytes)
         .with_context(|| format!("cannot analyze binary {}", binary.display()))?;
     let output = args.output.unwrap_or_else(|| default_package_path(&binary));
@@ -1554,12 +1552,12 @@ fn export(args: ExportArgs) -> Result<()> {
         .context("cannot build debugger export projection")?;
     let source_binary = if format == ExportFormat::Pdb {
         let binary = binary.context("--format pdb requires --binary <EXACT_ORIGINAL_PE>")?;
-        let canonical = binary
-            .canonicalize()
-            .with_context(|| format!("cannot open source binary {}", binary.display()))?;
-        let bytes = fs::read(&canonical)
-            .with_context(|| format!("cannot read source binary {}", canonical.display()))?;
-        Some((canonical, bytes))
+        let identity = package_data.package.payload().base_analysis().identity();
+        Some(
+            AppServices::default()
+                .read_binary_exact(&binary, Some(identity))
+                .with_context(|| format!("cannot read source binary {}", binary.display()))?,
+        )
     } else {
         None
     };
@@ -1591,8 +1589,7 @@ fn export(args: ExportArgs) -> Result<()> {
             source_binary
                 .as_ref()
                 .expect("PDB source binary was required above")
-                .1
-                .as_slice(),
+                .bytes(),
         )
         .context("cannot render exact-RSDS public-symbol PDB")?,
         ExportFormat::IdaPython => render_ida_python(&projection)
@@ -1613,8 +1610,8 @@ fn export(args: ExportArgs) -> Result<()> {
         .map(|warning| warning.occurrences)
         .sum::<u64>();
     println!("package: {}", package_path.display());
-    if let Some((path, _)) = &source_binary {
-        println!("source binary: {}", path.display());
+    if let Some(source) = &source_binary {
+        println!("source binary: {}", source.path().display());
     }
     println!("format: {}", format.label());
     println!("output: {}", output.display());
@@ -5289,8 +5286,21 @@ entrypoint = "Plugin.dll"
             binary: Some(wrong_binary),
         })
         .expect_err("PDB export binds the exact PE digest");
-        assert!(format!("{error:#}").contains("binary.id"));
+        assert!(format!("{error:#}").contains("SHA-256"));
         assert!(!mismatched_output.exists());
+
+        let short_binary = temp.path().join("short.exe");
+        fs::write(&short_binary, &bytes[..bytes.len() - 1]).expect("write wrong-size PE fixture");
+        let short_output = temp.path().join("short.pdb");
+        let error = export(ExportArgs {
+            package: package.clone(),
+            format: ExportFormat::Pdb,
+            output: Some(short_output.clone()),
+            binary: Some(short_binary),
+        })
+        .expect_err("PDB export binds the exact PE size before rendering");
+        assert!(format!("{error:#}").contains("project describes exactly"));
+        assert!(!short_output.exists());
 
         export(ExportArgs {
             package: package.clone(),

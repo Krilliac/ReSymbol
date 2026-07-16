@@ -241,6 +241,11 @@ resymbol analyze path/to/application.exe --output results/application.resym
 ReSymbol uses create-new writes and refuses to overwrite an existing package. Move or remove an old
 result, or choose a new output path, before repeating an analysis.
 
+`analyze` accepts only a regular input file and reads it through the same bounded exact-snapshot
+service used by the workbench and PDB source export. The default limit is 1 GiB; a declared-length
+change during the read is rejected before analysis instead of accepting a prefix or an appended
+tail.
+
 `inspect` validates the envelope schema, analysis payload, and agreement between the outer and
 embedded binary identities before printing a summary. The package is canonical JSON and can also be
 printed in a readable form:
