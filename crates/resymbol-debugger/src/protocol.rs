@@ -929,20 +929,13 @@ impl SessionState {
     /// consumer-side contract for state events; it rejects impossible state
     /// jumps even when a forged event carries the next numeric generation.
     pub fn validate_successor(&self, next: &Self) -> Result<(), ProtocolValidationError> {
-        self.validate_successor_from_generation(next, self.state_token().generation)
-    }
-
-    pub(crate) fn validate_successor_from_generation(
-        &self,
-        next: &Self,
-        current_generation: StateGeneration,
-    ) -> Result<(), ProtocolValidationError> {
         let current_token = self.state_token();
         let next_token = next.state_token();
         if next_token.session_id != current_token.session_id {
             return Err(ProtocolValidationError::StaleSession);
         }
-        let expected_generation = current_generation
+        let expected_generation = current_token
+            .generation
             .get()
             .checked_add(1)
             .ok_or(ProtocolValidationError::StateGenerationOverflow)?;

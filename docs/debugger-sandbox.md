@@ -219,8 +219,7 @@ The current seam is intentionally narrow:
   rollback. An effect-free rejection restores only ordinary visible state, while a host must
   validate the complete remote evidence before explicitly committing successful or
   cleanup-required effects. Stale, foreign, mismatched, already-resolved, and post-effect rollback
-  attempts fail closed; command, state-generation, run/stop, and one-use authorization watermarks
-  remain consumed;
+  attempts fail closed; command, run/stop, and one-use authorization watermarks remain consumed;
 - failure, attestation, and cleanup events are bound both to the outer event session and to the
   reducer's exact binary or inherited process, policy, provider, helper build, provisioning epoch,
   and cleanup expectation before failure can be retained or `Closed` can be accepted and released;
