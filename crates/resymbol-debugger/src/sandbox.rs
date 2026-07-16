@@ -685,7 +685,7 @@ fn require_guarantee(
     }
 }
 
-fn provider_boundary(provider: &SandboxProviderSelection) -> IsolationBoundary {
+pub(crate) fn provider_boundary(provider: &SandboxProviderSelection) -> IsolationBoundary {
     match provider {
         SandboxProviderSelection::LocalAppContainer => IsolationBoundary::UserMode,
         SandboxProviderSelection::WindowsSandbox | SandboxProviderSelection::HyperV => {
@@ -695,7 +695,10 @@ fn provider_boundary(provider: &SandboxProviderSelection) -> IsolationBoundary {
     }
 }
 
-fn provider_supports(provider: &SandboxProviderSelection, guarantee: SandboxGuarantee) -> bool {
+pub(crate) fn provider_supports(
+    provider: &SandboxProviderSelection,
+    guarantee: SandboxGuarantee,
+) -> bool {
     match provider {
         SandboxProviderSelection::LocalAppContainer => matches!(
             guarantee,
@@ -886,6 +889,11 @@ impl DiagnosticText {
             });
         }
         Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 

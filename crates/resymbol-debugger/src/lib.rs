@@ -11,6 +11,7 @@ pub mod host_wire;
 mod identity;
 mod protection;
 pub mod protocol;
+mod provider_probe;
 pub mod sandbox;
 mod session_machine;
 
@@ -43,6 +44,13 @@ pub use protocol::{
     ProcessId, ProtocolValidationError, ProtocolVersion, ReadViewToken, RunId, RunToken, SessionId,
     SessionState, SessionStateKind, SnapshotId, StateGeneration, StateToken, StepKind, StopId,
     StopReason, StopToken, ThreadId,
+};
+pub use provider_probe::{
+    MAX_PROBE_GUARANTEES, MAX_PROBE_REQUIREMENTS, ProviderProbeObservation,
+    ProviderProbeValidationError, SandboxProviderProbeBackend, SandboxProviderProbeRequest,
+    SandboxProviderReadiness, SandboxProviderReadinessReason, SandboxProviderReadinessReport,
+    SandboxProviderReadinessService, SandboxProviderRequirement, SystemSandboxProviderProbe,
+    WindowsOptionalFeature,
 };
 pub use sandbox::{
     AttestationMismatch, AuthenticatedChannelNonce, AuthenticatedChannelNonceError,
