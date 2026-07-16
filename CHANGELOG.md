@@ -243,9 +243,11 @@ prereleases; breaking changes remain explicit.
 
 ### Changed
 
-- Bumped the debugger wire and typed-command protocol to 1.2. Cleanup providers can now report a
-  retryable `CleanupAttemptFailed` lifecycle event containing an exact, bounded incomplete cleanup
-  receipt. The controller retains failed-session ownership and residual evidence for retry; only a
+- Bumped the debugger wire and typed-command protocol to 1.2. Sandbox failures now bind the exact
+  session, provisioning epoch, policy digest, provider, and launch binary/helper or inherited
+  process/mode context. The controller validates an exact command-stage-kind-phase matrix before
+  rollback or retaining failed ownership. Cleanup providers can additionally report a bounded
+  `CleanupAttemptFailed` event with an exact incomplete receipt and advisory retryability; only a
   later exact complete `Closed` receipt verifies cleanup and permits release.
 - Expanded exact public parser-boundary regressions for oversized PE header offsets, directory and
   table declarations, runtime-function counts, bounded PE strings, and CodeView payload and
