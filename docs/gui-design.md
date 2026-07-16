@@ -31,6 +31,19 @@ The title/identity area shows the active binary and the exact SHA-256 identity b
 package. A short status label accompanies the hash so identity is never communicated by color
 alone.
 
+Opening is a persistent workbench action rather than a first-run-only step. **File -> Open Binary or
+Package...**, the always-visible **Open Another...** button, the **Open Binary** workflow stage,
+Ctrl/Cmd+O, and a single-file drag/drop all enter the same guarded replacement flow. The File menu
+also retains up to eight successfully opened inputs as a newest-first **Open Recent** list; failed
+attempts are not added, missing entries are visibly disabled, and the list can be cleared.
+
+If the active binary has unsaved review decisions, replacement pauses for **Save Review New...**,
+**Discard Review and Open**, or **Cancel**. Save-and-open proceeds only after the exact queued ledger
+snapshot is durable. Discard authorizes only the selected replacement attempt: the current project
+and dirty ledger remain active until that binary opens successfully, so a bad or missing path cannot
+destroy review work. While replacement analysis runs, the header keeps the old exact identity visible
+and separately labels the selected path as opening.
+
 ## Approved workbench layout
 
 The implemented shell has the approved four persistent regions:

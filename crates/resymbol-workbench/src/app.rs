@@ -56,6 +56,7 @@ use crate::{
 const STORAGE_KEY: &str = "resymbol-workbench-preferences-v1";
 const MAX_ACTIVITY_ENTRIES: usize = 512;
 const MAX_ACTIVITY_MESSAGE_BYTES: usize = 512;
+const MAX_RECENT_BINARIES: usize = 8;
 const OFFLINE_READ_SIZES: [u32; 5] = [16, 32, 64, 128, MAX_OFFLINE_IMAGE_UI_READ_BYTES];
 const OFFLINE_HEX_ROW_BYTES: usize = 16;
 
@@ -206,6 +207,7 @@ struct Preferences {
     left_panel_open: bool,
     right_panel_open: bool,
     bottom_panel_open: bool,
+    recent_binaries: Vec<PathBuf>,
 }
 
 impl Default for Preferences {
@@ -215,6 +217,7 @@ impl Default for Preferences {
             left_panel_open: true,
             right_panel_open: true,
             bottom_panel_open: true,
+            recent_binaries: Vec::new(),
         }
     }
 }
@@ -242,6 +245,13 @@ enum ReviewUiAction {
 enum CloseDialogAction {
     SaveNew,
     DiscardAndClose,
+    Cancel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BinarySwitchDialogAction {
+    SaveNew,
+    DiscardAndOpen,
     Cancel,
 }
 
@@ -478,6 +488,8 @@ pub struct WorkbenchApp {
     close_confirmation_open: bool,
     close_after_review_save: bool,
     allow_dirty_close: bool,
+    pending_binary_open: Option<PathBuf>,
+    open_after_review_save: bool,
     readiness_choice: SandboxProviderChoice,
     readiness_outcome: Option<DebuggerReadinessOutcome>,
     readiness_error: Option<String>,
@@ -579,6 +591,8 @@ impl WorkbenchApp {
             close_confirmation_open: false,
             close_after_review_save: false,
             allow_dirty_close: false,
+            pending_binary_open: None,
+            open_after_review_save: false,
             readiness_choice: SandboxProviderChoice::default(),
             readiness_outcome: None,
             readiness_error: None,
@@ -677,6 +691,11 @@ impl WorkbenchApp {
         }
     }
 
+    fn remember_recent_binary(&mut self, path: PathBuf) {
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
+        push_recent_binary(&mut self.preferences.recent_binaries, path);
+    }
+
     #[cfg(feature = "screenshot")]
     fn advance_screenshot_capture(&mut self, context: &egui::Context) {
         const SETTLE_FRAMES: u8 = 12;
@@ -724,6 +743,10 @@ impl WorkbenchApp {
     }
 
     fn request_close(&mut self, context: &egui::Context) -> bool {
+        // A close request supersedes an in-progress project-switch prompt. Keeping both
+        // continuations alive could otherwise let one review save trigger two actions.
+        self.pending_binary_open = None;
+        self.open_after_review_save = false;
         let review_is_dirty = self
             .review
             .as_ref()
@@ -862,6 +885,131 @@ impl WorkbenchApp {
                 self.close_confirmation_open = false;
                 self.close_after_review_save = false;
                 self.allow_dirty_close = false;
+            }
+            None => {}
+        }
+    }
+
+    fn show_binary_switch_confirmation(&mut self, context: &egui::Context) {
+        let Some(target_path) = self.pending_binary_open.clone() else {
+            return;
+        };
+        let review_is_dirty = self
+            .review
+            .as_ref()
+            .is_some_and(BoundReviewLedger::is_dirty);
+        if !review_is_dirty {
+            if self.review_operation.is_pending() {
+                return;
+            }
+            self.pending_binary_open = None;
+            self.open_after_review_save = false;
+            if let Err(error) = self.start_analysis(target_path) {
+                self.log(ActivityLevel::Error, error);
+            }
+            return;
+        }
+
+        let replacement_busy = self.project_operation.is_pending()
+            || self.review_operation.is_pending()
+            || self.export_operation.is_pending()
+            || self.readiness_operation.is_pending()
+            || self.offline_read.is_pending();
+        let response = egui::Modal::new(egui::Id::new("dirty_review_binary_switch_confirmation"))
+            .show(context, |ui| {
+                ui.set_min_width(470.0);
+                ui.heading("Open a different binary?");
+                ui.label(
+                    "The current binary has unsaved review decisions. Replacing it requires an explicit save or discard.",
+                );
+                ui.add_space(6.0);
+                ui.label(RichText::new("Next binary").strong());
+                ui.label(
+                    RichText::new(target_path.display().to_string())
+                        .monospace()
+                        .small()
+                        .color(self.preferences.theme.semantic_colors().secondary_text),
+                );
+                ui.small(
+                    "If the new binary fails to open, the current project and its review decisions remain active.",
+                );
+                if self.open_after_review_save && self.review_operation.is_pending() {
+                    ui.separator();
+                    ui.label("Saving the exact current ledger snapshot before switching...");
+                }
+                if let Some(Err(error)) = &self.review_result {
+                    ui.separator();
+                    ui.colored_label(
+                        self.preferences
+                            .theme
+                            .semantic_colors()
+                            .destructive_quarantined,
+                        format!("[ERROR] {error}"),
+                    );
+                }
+                ui.separator();
+                let mut action = None;
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(!replacement_busy, egui::Button::new("Save Review New..."))
+                        .on_hover_text(
+                            "Create a new binary-bound review sidecar, then open the selected binary only after that exact snapshot is durable",
+                        )
+                        .clicked()
+                    {
+                        action = Some(BinarySwitchDialogAction::SaveNew);
+                    }
+                    if ui
+                        .add_enabled(
+                            !replacement_busy,
+                            egui::Button::new("Discard Review and Open"),
+                        )
+                        .clicked()
+                    {
+                        action = Some(BinarySwitchDialogAction::DiscardAndOpen);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        action = Some(BinarySwitchDialogAction::Cancel);
+                    }
+                });
+                action
+            });
+        let should_cancel = response.should_close();
+        let action = response
+            .inner
+            .or_else(|| should_cancel.then_some(BinarySwitchDialogAction::Cancel));
+
+        match action {
+            Some(BinarySwitchDialogAction::SaveNew) => {
+                if let Some(path) = self.choose_new_review_sidecar(
+                    "Save review decisions to a new sidecar before switching binaries",
+                ) {
+                    match self.queue_review_save(path) {
+                        Ok(_) => {
+                            self.close_after_review_save = false;
+                            self.open_after_review_save = true;
+                        }
+                        Err(error) => {
+                            self.open_after_review_save = false;
+                            self.review_result = Some(Err(error.clone()));
+                            self.log(
+                                ActivityLevel::Error,
+                                format!("Review save before binary switch failed: {error}"),
+                            );
+                        }
+                    }
+                }
+            }
+            Some(BinarySwitchDialogAction::DiscardAndOpen) => {
+                self.pending_binary_open = None;
+                self.open_after_review_save = false;
+                if let Err(error) = self.start_analysis_with_policy(target_path, true) {
+                    self.log(ActivityLevel::Error, error);
+                }
+            }
+            Some(BinarySwitchDialogAction::Cancel) => {
+                self.pending_binary_open = None;
+                self.open_after_review_save = false;
             }
             None => {}
         }
@@ -1124,7 +1272,66 @@ impl WorkbenchApp {
             .try_send_line(format_command_result(success, message.as_ref()));
     }
 
+    fn request_binary_open(&mut self, path: PathBuf) {
+        if self.project_operation.is_pending() {
+            self.log(
+                ActivityLevel::Warning,
+                "Wait for the current project operation before opening another binary",
+            );
+            return;
+        }
+        if self.export_operation.is_pending() || self.review_operation.is_pending() {
+            self.log(
+                ActivityLevel::Warning,
+                "Wait for the current export or review operation before opening another binary",
+            );
+            return;
+        }
+        if self.offline_read.is_pending() {
+            self.log(
+                ActivityLevel::Warning,
+                "Wait for the exact offline byte read before opening another binary",
+            );
+            return;
+        }
+        if self.readiness_operation.is_pending() {
+            self.log(
+                ActivityLevel::Warning,
+                "Wait for the debugger sandbox readiness probe before opening another binary",
+            );
+            return;
+        }
+        if self
+            .review
+            .as_ref()
+            .is_some_and(BoundReviewLedger::is_dirty)
+        {
+            self.close_after_review_save = false;
+            self.open_after_review_save = false;
+            self.pending_binary_open = Some(path.clone());
+            self.log(
+                ActivityLevel::Warning,
+                format!(
+                    "Binary switch paused for unsaved review decisions: {}",
+                    path.display()
+                ),
+            );
+            return;
+        }
+        if let Err(error) = self.start_analysis(path) {
+            self.log(ActivityLevel::Error, error);
+        }
+    }
+
     fn start_analysis(&mut self, path: PathBuf) -> Result<String, String> {
+        self.start_analysis_with_policy(path, false)
+    }
+
+    fn start_analysis_with_policy(
+        &mut self,
+        path: PathBuf,
+        allow_dirty_review_replacement: bool,
+    ) -> Result<String, String> {
         if self.project_operation.is_pending() {
             return Err("a project operation is already running".to_owned());
         }
@@ -1136,10 +1343,17 @@ impl WorkbenchApp {
                 "wait for the exact offline byte read before replacing the project".to_owned(),
             );
         }
+        if self.readiness_operation.is_pending() {
+            return Err(
+                "wait for the debugger sandbox readiness probe before replacing the project"
+                    .to_owned(),
+            );
+        }
         if self
             .review
             .as_ref()
             .is_some_and(BoundReviewLedger::is_dirty)
+            && !allow_dirty_review_replacement
         {
             return Err(
                 "the current project has unsaved review decisions; save them to a new sidecar before replacing the project"
@@ -1159,6 +1373,8 @@ impl WorkbenchApp {
             }
         };
         self.service_worker.submit(command)?;
+        self.pending_binary_open = None;
+        self.open_after_review_save = false;
         self.project_operation.begin(operation);
         self.analysis_path = Some(path.clone());
         self.stage = WorkflowStage::Analyze;
@@ -1586,7 +1802,12 @@ impl WorkbenchApp {
                         continue;
                     }
                     match result {
-                        Ok(project) => self.accept_project(project, ProjectAcceptance::NewProject),
+                        Ok(project) => {
+                            if let Some(path) = self.analysis_path.clone() {
+                                self.remember_recent_binary(path);
+                            }
+                            self.accept_project(project, ProjectAcceptance::NewProject);
+                        }
                         Err(error) => {
                             self.stage = if self.project.is_some() {
                                 WorkflowStage::Review
@@ -1689,10 +1910,21 @@ impl WorkbenchApp {
                                     self.close_confirmation_open = true;
                                 }
                             }
+                            if self.open_after_review_save {
+                                self.open_after_review_save = false;
+                                if current {
+                                    if let Some(path) = self.pending_binary_open.take() {
+                                        if let Err(error) = self.start_analysis(path) {
+                                            self.log(ActivityLevel::Error, error);
+                                        }
+                                    }
+                                }
+                            }
                         }
                         Err(error) => {
                             let was_closing_after_save = self.close_after_review_save;
                             self.close_after_review_save = false;
+                            self.open_after_review_save = false;
                             if was_closing_after_save {
                                 self.close_confirmation_open = true;
                             }
@@ -2064,21 +2296,32 @@ impl WorkbenchApp {
     }
 
     fn choose_binary(&mut self, _context: &egui::Context) {
-        let Some(path) = rfd::FileDialog::new()
+        let mut dialog = rfd::FileDialog::new()
             .set_title("Open a PE32+ x86-64 binary or current ReSymbol package")
             .add_filter("Windows binaries", &["exe", "dll", "sys"])
-            .add_filter("ReSymbol packages", &["resym"])
-            .pick_file()
-        else {
+            .add_filter("ReSymbol packages", &["resym"]);
+        if let Some(directory) = self
+            .project
+            .as_ref()
+            .and_then(|project| project.identity.active_binary_path().parent())
+        {
+            dialog = dialog.set_directory(directory);
+        } else if let Some(directory) = self
+            .preferences
+            .recent_binaries
+            .first()
+            .and_then(|path| path.parent())
+        {
+            dialog = dialog.set_directory(directory);
+        }
+        let Some(path) = dialog.pick_file() else {
             return;
         };
-        if let Err(error) = self.start_analysis(path) {
-            self.log(ActivityLevel::Error, error);
-        }
+        self.request_binary_open(path);
     }
 
     fn handle_inputs(&mut self, context: &egui::Context) {
-        if self.close_confirmation_open {
+        if self.close_confirmation_open || self.pending_binary_open.is_some() {
             return;
         }
         let (open_shortcut, load_review_shortcut, save_review_shortcut, save_review_as_shortcut) =
@@ -2150,17 +2393,70 @@ impl WorkbenchApp {
                 .raw
                 .dropped_files
                 .iter()
-                .find_map(|file| file.path.clone())
+                .filter_map(|file| file.path.clone())
+                .collect::<Vec<_>>()
         });
-        if let Some(path) = dropped {
-            if let Err(error) = self.start_analysis(path) {
-                self.log(ActivityLevel::Error, error);
-            }
+        match dropped.as_slice() {
+            [] => {}
+            [path] => self.request_binary_open(path.clone()),
+            paths => self.log(
+                ActivityLevel::Warning,
+                format!(
+                    "Ignored {} dropped paths; drop exactly one binary or package at a time",
+                    paths.len()
+                ),
+            ),
         }
+    }
+
+    fn show_binary_drop_target(&self, context: &egui::Context) {
+        let hovered_count = context.input(|input| input.raw.hovered_files.len());
+        if hovered_count == 0 {
+            return;
+        }
+        let colors = self.preferences.theme.semantic_colors();
+        let rect = context.screen_rect();
+        let size = egui::vec2(430.0, 118.0);
+        egui::Area::new(egui::Id::new("binary_drop_target"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(rect.center() - size / 2.0)
+            .show(context, |ui| {
+                ui.set_min_size(size);
+                egui::Frame::new()
+                    .fill(colors.raised)
+                    .stroke(egui::Stroke::new(2.0, colors.exact_extracted))
+                    .corner_radius(8)
+                    .inner_margin(egui::Margin::same(18))
+                    .show(ui, |ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.heading(if hovered_count == 1 {
+                                "Drop to open this binary"
+                            } else {
+                                "Drop exactly one binary"
+                            });
+                            ui.label(
+                                "PE32+ .exe/.dll/.sys and current .resym packages are supported.",
+                            );
+                            ui.small(
+                                "The active project remains intact unless the replacement opens successfully.",
+                            );
+                        });
+                    });
+            });
     }
 
     fn show_header(&mut self, context: &egui::Context) {
         let colors = self.preferences.theme.semantic_colors();
+        let can_open_binary = !self.project_operation.is_pending()
+            && !self.export_operation.is_pending()
+            && !self.review_operation.is_pending()
+            && !self.readiness_operation.is_pending()
+            && !self.offline_read.is_pending()
+            && self.pending_binary_open.is_none();
+        let recent_binaries = self.preferences.recent_binaries.clone();
+        let mut choose_binary_requested = false;
+        let mut recent_binary_requested = None;
+        let mut clear_recent_requested = false;
         egui::TopBottomPanel::top("workbench_header")
             .exact_height(112.0)
             .frame(
@@ -2221,6 +2517,21 @@ impl WorkbenchApp {
                                         project.identity.sha256.as_str()
                                     ));
                                 });
+                                if self.project_operation.is_pending() {
+                                    if let Some(path) = &self.analysis_path {
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "[OPENING] {}",
+                                                path.file_name()
+                                                    .and_then(|name| name.to_str())
+                                                    .unwrap_or("selected binary")
+                                            ))
+                                            .small()
+                                            .color(colors.inferred),
+                                        )
+                                        .on_hover_text(path.display().to_string());
+                                    }
+                                }
                             });
                     } else if let Some(path) = &self.analysis_path {
                         ui.label(path.display().to_string());
@@ -2253,8 +2564,20 @@ impl WorkbenchApp {
                                 self.stage = WorkflowStage::Export;
                                 self.main_tab = MainTab::Exports;
                             } else {
-                                self.choose_binary(context);
+                                choose_binary_requested = true;
                             }
+                        }
+
+                        if self.project.is_some()
+                            && ui
+                                .add_enabled(
+                                    can_open_binary,
+                                    egui::Button::new("Open Another..."),
+                                )
+                                .on_hover_text("Open another binary or package (Ctrl+O)")
+                                .clicked()
+                        {
+                            choose_binary_requested = true;
                         }
 
                         egui::ComboBox::from_id_salt("header_theme_selector")
@@ -2304,13 +2627,68 @@ impl WorkbenchApp {
                                 ui.close();
                             }
                         });
+
+                        ui.menu_button("File", |ui| {
+                            if ui
+                                .add_enabled(
+                                    can_open_binary,
+                                    egui::Button::new("Open Binary or Package...    Ctrl+O"),
+                                )
+                                .clicked()
+                            {
+                                choose_binary_requested = true;
+                                ui.close();
+                            }
+                            ui.menu_button("Open Recent", |ui| {
+                                if recent_binaries.is_empty() {
+                                    ui.add_enabled(false, egui::Label::new("No recent binaries"));
+                                } else {
+                                    for path in &recent_binaries {
+                                        let label = path
+                                            .file_name()
+                                            .and_then(|name| name.to_str())
+                                            .map_or_else(
+                                                || path.display().to_string(),
+                                                ToOwned::to_owned,
+                                            );
+                                        let exists = path.is_file();
+                                        let response = ui.add_enabled(
+                                            can_open_binary && exists,
+                                            egui::Button::new(if exists {
+                                                label
+                                            } else {
+                                                format!("{label}  [missing]")
+                                            }),
+                                        );
+                                        if response
+                                            .on_hover_text(path.display().to_string())
+                                            .clicked()
+                                        {
+                                            recent_binary_requested = Some(path.clone());
+                                            ui.close();
+                                        }
+                                    }
+                                }
+                            });
+                            ui.separator();
+                            if ui
+                                .add_enabled(
+                                    !recent_binaries.is_empty(),
+                                    egui::Button::new("Clear Recent"),
+                                )
+                                .clicked()
+                            {
+                                clear_recent_requested = true;
+                                ui.close();
+                            }
+                        });
                     });
                 });
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     for (index, stage) in WorkflowStage::ALL.into_iter().enumerate() {
                         let enabled = match stage {
-                            WorkflowStage::Open => true,
+                            WorkflowStage::Open => can_open_binary,
                             WorkflowStage::Analyze => self.project_operation.is_pending(),
                             WorkflowStage::Review | WorkflowStage::Export => self.project.is_some(),
                         };
@@ -2327,12 +2705,16 @@ impl WorkbenchApp {
                                 .stroke(egui::Stroke::new(1.0, colors.exact_extracted));
                         }
                         if ui.add_enabled(enabled, button).clicked() {
-                            self.stage = stage;
-                            self.main_tab = match stage {
-                                WorkflowStage::Export => MainTab::Exports,
-                                WorkflowStage::Review => MainTab::Functions,
-                                _ => MainTab::Overview,
-                            };
+                            if stage == WorkflowStage::Open {
+                                choose_binary_requested = true;
+                            } else {
+                                self.stage = stage;
+                                self.main_tab = match stage {
+                                    WorkflowStage::Export => MainTab::Exports,
+                                    WorkflowStage::Review => MainTab::Functions,
+                                    _ => MainTab::Overview,
+                                };
+                            }
                         }
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -2347,6 +2729,14 @@ impl WorkbenchApp {
                     });
                 });
             });
+        if clear_recent_requested {
+            self.preferences.recent_binaries.clear();
+        }
+        if let Some(path) = recent_binary_requested {
+            self.request_binary_open(path);
+        } else if choose_binary_requested {
+            self.choose_binary(context);
+        }
     }
 
     fn show_project_panel(&mut self, context: &egui::Context) {
@@ -4847,6 +5237,8 @@ impl eframe::App for WorkbenchApp {
         self.show_inspector(context);
         self.show_activity_panel(context);
         self.show_central(context);
+        self.show_binary_drop_target(context);
+        self.show_binary_switch_confirmation(context);
         self.show_close_confirmation(context);
 
         #[cfg(feature = "screenshot")]
@@ -5989,6 +6381,12 @@ fn bounded_message(mut message: String) -> String {
     message
 }
 
+fn push_recent_binary(recent_binaries: &mut Vec<PathBuf>, path: PathBuf) {
+    recent_binaries.retain(|existing| existing != &path);
+    recent_binaries.insert(0, path);
+    recent_binaries.truncate(MAX_RECENT_BINARIES);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6031,6 +6429,36 @@ mod tests {
         assert!(review_save_requires_dialog(existing.path(), None));
         let new_path = directory.path().join("new-project.review.json");
         assert!(!review_save_requires_dialog(&new_path, None,));
+    }
+
+    #[test]
+    fn recent_binaries_are_newest_first_deduplicated_and_bounded() {
+        let mut recent = Vec::new();
+        for index in 0..(MAX_RECENT_BINARIES + 2) {
+            push_recent_binary(&mut recent, PathBuf::from(format!("binary-{index}.exe")));
+        }
+        assert_eq!(recent.len(), MAX_RECENT_BINARIES);
+        assert_eq!(recent[0], PathBuf::from("binary-9.exe"));
+        assert_eq!(
+            recent[MAX_RECENT_BINARIES - 1],
+            PathBuf::from("binary-2.exe")
+        );
+
+        push_recent_binary(&mut recent, PathBuf::from("binary-5.exe"));
+        assert_eq!(recent[0], PathBuf::from("binary-5.exe"));
+        assert_eq!(
+            recent
+                .iter()
+                .filter(|path| path.as_path() == Path::new("binary-5.exe"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn legacy_preferences_default_to_an_empty_recent_binary_list() {
+        let preferences: Preferences = serde_json::from_str("{}").expect("legacy preferences");
+        assert!(preferences.recent_binaries.is_empty());
     }
 
     #[test]

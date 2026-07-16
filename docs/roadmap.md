@@ -29,7 +29,10 @@ bounded Markdown, MAP, public-symbol PDB, IDA Python, and Ghidra Java files with
 existing destination. **Keep as Alias** remains an alternate rather than an implicit primary;
 disposition and rationale are one undo/redo unit. A dirty native close or companion-console `quit`
 requires an explicit create-new save, discard, or cancel decision, and save-and-close waits for the
-exact queued ledger snapshot to become durable.
+exact queued ledger snapshot to become durable. Binary replacement is equally explicit through the
+permanent File/Open Another controls, Ctrl+O, Open Recent, the workflow stage, and guarded
+single-file drag/drop; dirty review state is retained until an exact save or a successful explicitly
+discarding replacement.
 
 An off-by-default companion console can be spawned from the running workbench. It mirrors bounded
 timestamped activity and routes status, navigation, layout, export, and lifecycle commands back to

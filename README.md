@@ -350,6 +350,11 @@ On Windows, open the same supported PE in the desktop workbench:
 .\resymbol-workbench.exe application.exe
 ```
 
+To select a different input without restarting, use **Open Another...**, **File -> Open Binary or
+Package...**, the **Open Binary** workflow stage, Ctrl+O, **File -> Open Recent**, or drop exactly one
+supported file onto the window. A dirty review ledger triggers an explicit save/discard/cancel
+handoff, and the old project remains active if the replacement cannot be opened.
+
 The desktop slice runs core analysis only. It exposes evidence, provenance, durable exact-claim
 review, plugin health, a static Address Space/protection assessment, and read-only debugger/sandbox
 provider readiness. Its Reconstruction Graph roots at the PE entry point when available, otherwise
