@@ -7,7 +7,7 @@ use std::{marker::PhantomData, rc::Rc};
 
 use thiserror::Error;
 
-use crate::authorization::{HostRiskLease, SandboxOwnershipLease};
+use crate::authorization::{HostRiskLease, SandboxOwnershipBinding, SandboxOwnershipLease};
 use crate::host_codec::{
     HostCodecError, HostFrame, decode_command_frame, decode_event_frame, encode_command_frame,
     encode_event_frame,
@@ -31,7 +31,7 @@ use crate::protocol::{
 use crate::sandbox::{
     CleanupOutcome, CleanupReceiptId, DiagnosticText, ExpectedSandboxAttestation, HelperBuildId,
     IsolationBoundary, SandboxAttestation, SandboxCleanupReceipt, SandboxLifecycleEvent,
-    SandboxLifecycleState,
+    SandboxLifecycleState, provider_boundary,
 };
 use crate::{SessionMachine, SessionMachineError};
 
@@ -1227,10 +1227,17 @@ impl InMemoryDebugHost {
         command_id: CommandId,
         events: &mut Vec<HostFrame>,
     ) -> Result<(), HostTransportError> {
-        let receipt = self
-            .machine_ref()?
-            .expected_attestation()
-            .map(complete_cleanup_receipt);
+        let receipt = {
+            let machine = self.machine_ref()?;
+            machine
+                .expected_attestation()
+                .map(complete_cleanup_receipt)
+                .or_else(|| {
+                    machine
+                        .inherited_sandbox()
+                        .map(complete_inherited_cleanup_receipt)
+                })
+        };
         if receipt.is_some() {
             self.push_sandbox_state(events, command_id, SandboxLifecycleState::Cleanup)?;
         }
@@ -1446,6 +1453,40 @@ fn complete_cleanup_receipt(expected: &ExpectedSandboxAttestation) -> SandboxCle
         provisioning_epoch: expected.provisioning_epoch.clone(),
         provider: expected.provider.clone(),
         policy_digest: expected.policy_digest.clone(),
+        process: None,
+        outcome: CleanupOutcome::Complete,
+        process_tree_terminated_and_reaped: true,
+        handles_closed: true,
+        file_system_rolled_back: true,
+        registry_rolled_back: true,
+        network_torn_down: true,
+        owned_paths_deleted: true,
+        appcontainer_profile_deleted,
+        differencing_disk_discarded,
+        control_channel_closed,
+        terminated_processes: 1,
+        residuals: Vec::new(),
+    }
+}
+
+fn complete_inherited_cleanup_receipt(binding: &SandboxOwnershipBinding) -> SandboxCleanupReceipt {
+    let (appcontainer_profile_deleted, differencing_disk_discarded, control_channel_closed) =
+        match provider_boundary(binding.provider()) {
+            IsolationBoundary::UserMode => (Some(true), None, None),
+            IsolationBoundary::Hypervisor => (None, Some(true), Some(true)),
+        };
+    SandboxCleanupReceipt {
+        receipt_id: CleanupReceiptId::new(format!(
+            "fake-inherited-cleanup-{}-{}",
+            binding.session_id().get(),
+            binding.process().process_id.get()
+        ))
+        .expect("bounded fake inherited cleanup receipt id"),
+        session_id: binding.session_id(),
+        provisioning_epoch: binding.provisioning_epoch().clone(),
+        provider: binding.provider().clone(),
+        policy_digest: binding.policy_digest().clone(),
+        process: Some(binding.process().clone()),
         outcome: CleanupOutcome::Complete,
         process_tree_terminated_and_reaped: true,
         handles_closed: true,
@@ -1961,7 +2002,7 @@ mod tests {
             .submit(DebugCommand::Open(DebugTargetRequest::Attach(
                 AttachTarget {
                     scope: AttachScope::OwnedSandbox {
-                        process,
+                        process: process.clone(),
                         ownership_lease,
                     },
                     mode: AttachMode::ObserveReadOnly,
@@ -1972,6 +2013,27 @@ mod tests {
         assert_eq!(
             client.session_state().map(SessionState::kind),
             Some(SessionStateKind::Observing)
+        );
+
+        let state = client
+            .session_state()
+            .expect("observing state")
+            .state_token();
+        let closed = client
+            .submit(DebugCommand::Close { state })
+            .expect("fake host proves inherited cleanup");
+        assert_eq!(closed.outcome, CommandOutcome::Succeeded);
+        let receipt = closed.events.iter().find_map(|event| match &event.event {
+            DebugEvent::SandboxLifecycle(SandboxLifecycleEvent::Closed(receipt)) => Some(receipt),
+            _ => None,
+        });
+        assert_eq!(
+            receipt.and_then(|receipt| receipt.process.as_ref()),
+            Some(&process)
+        );
+        assert_eq!(
+            client.session_state().map(SessionState::kind),
+            Some(SessionStateKind::Closed)
         );
     }
 

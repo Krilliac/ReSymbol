@@ -132,7 +132,9 @@ tests:
    exact process identity, attach mode, provider, policy digest, session, and provisioning epoch. A PID or claimed
    owner session in a command is never proof of ownership.
 8. Cleanup receipts carry the same provisioning epoch as attestation, so evidence from an otherwise
-   identical earlier provisioning instance is rejected. Helper loss never implies cleanup succeeded.
+   identical earlier provisioning instance is rejected. An inherited-sandbox attach also binds its
+   receipt to the exact process identity, provider, policy digest, and session retained from the
+   provider-issued ownership lease. Helper loss never implies cleanup succeeded.
 
 The pure reducers, typed client, and in-memory host now exercise these ordering and binding rules. They
 remain requirements for a future process-executing provider, not evidence that such a provider exists.
@@ -168,8 +170,10 @@ The current seam is intentionally narrow:
 - host-risk and sandbox-ownership grant objects are host-local and non-serializable. Commands carry
   only strict 64-character lowercase-hex lease IDs; the reducer bounds registrations, consumes a
   presented lease even on mismatch, and drops every unused lease after a target opens;
-- only `Closed` sessions can be released, and sandbox closure requires the exact cleanup receipt that
-  the reducer validates; and
+- only `Closed` sessions can be released, and both newly provisioned and inherited sandbox closure
+  require a complete receipt. Inherited cleanup is validated against the retained session,
+  provisioning epoch, provider, policy digest, and PID/start-key/image process identity before the
+  reducer can enter `Closed`; and
 - the client and transport expose value types only. Future process, pipe, token, Job, VM, and provider
   handles stay opaque inside the owning host implementation.
 
