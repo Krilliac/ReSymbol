@@ -148,7 +148,8 @@ provider, not evidence that such a provider exists.
 
 The current seam is intentionally narrow:
 
-- debugger wire and typed-command protocol 1.1 carries the lease identifiers and provisioning epoch;
+- debugger wire and typed-command protocol 1.2 carries the lease identifiers, provisioning epoch,
+  and explicit incomplete cleanup-attempt evidence;
 - a four-byte length prefix is validated before allocating a bounded control buffer;
 - controller and host roles, directions, nonzero challenge nonce, expected plaintext build claims,
   offered protocol version, response kind, and independent frame sequences are correlated before
@@ -170,9 +171,11 @@ The current seam is intentionally narrow:
 - command IDs and event IDs are independent monotonic domains, while each synchronous response batch
   must contain exactly one command result and only events correlated to that command;
 - session generations and stop/run identifiers must advance exactly through the command-specific
-  reducer path; non-transition events carry the exact current state token, memory/breakpoint evidence
-  must match the request, and a rejected command may not claim any effect. Its command identifier and
-  any presented one-use authority remain consumed without cloning the reducer or lease;
+  reducer path; non-transition events carry the exact current state token, and memory/breakpoint
+  evidence must match the request. An ordinary rejected command may not claim any effect. The sole
+  retained-rejection exception is an exact cleanup-required failure: it may preserve `Failed` state
+  and a validated `CleanupAttemptFailed` event while its command identifier and any presented one-use
+  authority remain consumed without cloning the reducer or lease;
 - `RemoteCommandCheckpoint` is a public opaque transaction value so an external host worker can use
   the same begin/reject semantics. It restores only ordinary visible state; command, run/stop, and
   one-use authorization watermarks remain consumed;
@@ -193,9 +196,13 @@ The current seam is intentionally narrow:
 - only `Closed` sessions can be released, and both newly provisioned and inherited sandbox closure
   require a complete receipt. Inherited cleanup is validated against the retained session,
   provisioning epoch, provider, policy digest, and PID/start-key/image process identity before the
-  reducer can enter `Closed`. Active abandon, transport loss, and client drop invoke the transport's
-  mandatory non-panicking abort contract, including kill-on-close ownership where applicable, but
-  never imply cleanup or synthesize `Closed`; and
+  reducer can enter `Closed`. `CleanupAttemptFailed` is a separate, retryable cleanup-stage failure
+  carrying an exact `Incomplete` receipt with at least one bounded residual. It retains `Failed`
+  state and sandbox ownership for another cleanup attempt, leaves cleanup unverified, and can never
+  imply `Closed` or permit release. Complete, forged, mismatched, duplicate, wrong-stage, or
+  success-associated incomplete receipts fail the connection. Active abandon, transport loss, and
+  client drop invoke the transport's mandatory non-panicking abort contract, including kill-on-close
+  ownership where applicable, but never imply cleanup or synthesize `Closed`; and
 - the client and transport expose value types only. Future process, pipe, token, Job, VM, and provider
   handles stay opaque inside the owning host implementation.
 
