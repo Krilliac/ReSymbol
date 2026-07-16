@@ -19,32 +19,32 @@
                          "view":  "overview",
                          "width":  1440,
                          "height":  900,
-                         "bytes":  220893,
-                         "sha256":  "17d0b038f6268fe6f1cb4284c0a9f149b54a6262b26c602795a8cd0fb6c86484"
+                         "bytes":  219664,
+                         "sha256":  "7de540749664e91f558d7a9173f236b6d583633a235f226f54fedbc71d4d0937"
                      },
                      {
                          "file":  "workbench-functions.png",
                          "view":  "functions",
                          "width":  1440,
                          "height":  900,
-                         "bytes":  226971,
-                         "sha256":  "665dd0de6857d09d6e387febb962b00b07f92bee1284ac0b43a0b5d138eb6e4f"
+                         "bytes":  227203,
+                         "sha256":  "a6c477e2b50d650b327f7e6fabd402b134c6eea6f8524d77c6a1f5f9258226d5"
                      },
                      {
                          "file":  "workbench-graph.png",
                          "view":  "graph",
                          "width":  1440,
                          "height":  900,
-                         "bytes":  253155,
-                         "sha256":  "44985228507439b36bf7e245c2d09cc180b7610a7f072240be2a90855a26efc4"
+                         "bytes":  249790,
+                         "sha256":  "1f414b9b3843f324a2a0ba767df0be78e3417446a0771ac9ba7477c4a66af68e"
                      },
                      {
                          "file":  "workbench-address-space.png",
                          "view":  "address-space",
                          "width":  1440,
                          "height":  900,
-                         "bytes":  236967,
-                         "sha256":  "31bd1e93dcec620da0cbc7584acdff7fb91f56f60a845d1b403a2b447951aeae"
+                         "bytes":  233857,
+                         "sha256":  "723485ac0ac9805654f48c2b9da7273fe96edf88070ae192295b2c462641984f"
                      }
                  ]
 }

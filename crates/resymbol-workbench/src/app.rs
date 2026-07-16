@@ -273,7 +273,12 @@ impl WorkbenchApp {
         #[cfg(feature = "screenshot")]
         creation_context
             .egui_ctx
-            .style_mut(|style| style.animation_time = 0.0);
+            .style_mut(|style| {
+                style.animation_time = 0.0;
+                // Floating scrollbars expand when the pointer happens to overlap them. Captures
+                // must not depend on the host cursor position, so keep their width fixed.
+                style.spacing.scroll = egui::style::ScrollStyle::solid();
+            });
         #[cfg(feature = "screenshot")]
         for panel_id in [
             "project_navigation",
