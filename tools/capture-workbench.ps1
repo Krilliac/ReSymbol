@@ -12,7 +12,7 @@ Set-StrictMode -Version Latest
 
 $captureWidth = 1440
 $captureHeight = 900
-$captureTabs = @('overview', 'functions', 'graph', 'address-space')
+$captureTabs = @('overview', 'functions', 'graph', 'address-space', 'debugger-sandbox')
 
 if (-not ('ReSymbol.WorkbenchCaptureDpi' -as [type])) {
     Add-Type -TypeDefinition @'

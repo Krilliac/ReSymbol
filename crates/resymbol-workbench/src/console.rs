@@ -37,7 +37,7 @@ Commands:
   help
   status
   open <path>
-  tab <overview|functions|types|relationships|graph|address-space|exports>
+  tab <overview|functions|types|relationships|graph|address-space|debugger-sandbox|exports>
   focus <0xRVA|decimal>
   theme <graphite|light|ida|classic>
   panel <left|right|bottom> <show|hide|toggle>
@@ -92,17 +92,19 @@ pub enum ConsoleTab {
     Relationships,
     Graph,
     AddressSpace,
+    DebuggerSandbox,
     Exports,
 }
 
 impl ConsoleTab {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Overview,
         Self::Functions,
         Self::Types,
         Self::Relationships,
         Self::Graph,
         Self::AddressSpace,
+        Self::DebuggerSandbox,
         Self::Exports,
     ];
 
@@ -115,6 +117,7 @@ impl ConsoleTab {
             Self::Relationships => "relationships",
             Self::Graph => "graph",
             Self::AddressSpace => "address-space",
+            Self::DebuggerSandbox => "debugger-sandbox",
             Self::Exports => "exports",
         }
     }
@@ -289,7 +292,7 @@ pub fn parse_command(input: &str) -> Result<ConsoleCommand, String> {
             expect_arity(
                 &tokens,
                 1,
-                "tab <overview|functions|types|relationships|graph|address-space|exports>",
+                "tab <overview|functions|types|relationships|graph|address-space|debugger-sandbox|exports>",
             )?;
             Ok(ConsoleCommand::Tab(parse_tab(&tokens[1])?))
         }
@@ -546,9 +549,10 @@ fn parse_tab(value: &str) -> Result<ConsoleTab, String> {
         "relationships" => Ok(ConsoleTab::Relationships),
         "graph" => Ok(ConsoleTab::Graph),
         "address-space" | "memory-map" => Ok(ConsoleTab::AddressSpace),
+        "debugger-sandbox" | "sandbox" | "readiness" => Ok(ConsoleTab::DebuggerSandbox),
         "exports" => Ok(ConsoleTab::Exports),
         _ => Err(format!(
-            "invalid tab `{value}`; expected overview, functions, types, relationships, graph, address-space, or exports"
+            "invalid tab `{value}`; expected overview, functions, types, relationships, graph, address-space, debugger-sandbox, or exports"
         )),
     }
 }
@@ -667,6 +671,10 @@ mod tests {
             (
                 "tab memory-map",
                 ConsoleCommand::Tab(ConsoleTab::AddressSpace),
+            ),
+            (
+                "tab debugger-sandbox",
+                ConsoleCommand::Tab(ConsoleTab::DebuggerSandbox),
             ),
             ("focus 0x401000", ConsoleCommand::Focus(0x401000)),
             (
@@ -855,6 +863,12 @@ mod tests {
         let decoded: ConsoleCommand =
             serde_json::from_str(&encoded).expect("deserialize address-space tab");
         assert_eq!(decoded, address_space);
+
+        let readiness = ConsoleCommand::Tab(ConsoleTab::DebuggerSandbox);
+        let encoded = serde_json::to_string(&readiness).expect("serialize readiness tab");
+        let decoded: ConsoleCommand =
+            serde_json::from_str(&encoded).expect("deserialize readiness tab");
+        assert_eq!(decoded, readiness);
 
         let frame = ConsoleToHostFrame::Fatal("startup failed".to_owned());
         let encoded = serde_json::to_string(&frame).expect("serialize frame");

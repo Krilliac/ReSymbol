@@ -17,7 +17,11 @@ use resymbol_core::{
     DiscoveredPlugin, PluginDiscoveryOptions, PluginDiscoveryReport, discover_plugins,
     plugin_api::PluginHealthState,
 };
-use resymbol_debugger::{MemoryAccess, ProtectionSeverity, StaticRegionKind};
+use resymbol_debugger::{
+    IsolationBoundary, MemoryAccess, ProtectionSeverity, SandboxGuarantee,
+    SandboxProviderReadiness, SandboxProviderReadinessReason, SandboxProviderRequirement,
+    SandboxProviderSelection, StaticRegionKind,
+};
 use resymbol_export::{ExportControlFlowTarget, ExportProducer};
 use serde::{Deserialize, Serialize};
 
@@ -35,6 +39,10 @@ use crate::{
     model::{
         FunctionFilter, FunctionSort, FunctionSortKey, FunctionStatus, LoadedProject,
         ProtectionAssessment, SortDirection,
+    },
+    readiness::{
+        DebuggerReadinessEvidence, DebuggerReadinessOutcome, ReadinessProtectionStatus,
+        SandboxProviderChoice,
     },
     review_state::BoundReviewLedger,
     theme::{SemanticColors, ThemePreset},
@@ -77,17 +85,19 @@ enum MainTab {
     Relationships,
     Graph,
     AddressSpace,
+    DebuggerSandbox,
     Exports,
 }
 
 impl MainTab {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::Overview,
         Self::Functions,
         Self::Types,
         Self::Relationships,
         Self::Graph,
         Self::AddressSpace,
+        Self::DebuggerSandbox,
         Self::Exports,
     ];
 
@@ -99,6 +109,7 @@ impl MainTab {
             Self::Relationships => "Relationships",
             Self::Graph => "Graph",
             Self::AddressSpace => "Address Space",
+            Self::DebuggerSandbox => "Debugger / Sandbox",
             Self::Exports => "Exports",
         }
     }
@@ -242,6 +253,7 @@ pub struct WorkbenchApp {
     project_operation: OperationGate,
     export_operation: OperationGate,
     review_operation: OperationGate,
+    readiness_operation: OperationGate,
     worker_disconnected: bool,
     analysis_path: Option<PathBuf>,
     function_filter: FunctionFilter,
@@ -269,6 +281,9 @@ pub struct WorkbenchApp {
     review_result: Option<Result<String, String>>,
     pending_review_rollback: Option<BoundReviewLedger>,
     review_orphaned_decisions: usize,
+    readiness_choice: SandboxProviderChoice,
+    readiness_outcome: Option<DebuggerReadinessOutcome>,
+    readiness_error: Option<String>,
 }
 
 impl WorkbenchApp {
@@ -332,6 +347,7 @@ impl WorkbenchApp {
             project_operation: OperationGate::default(),
             export_operation: OperationGate::default(),
             review_operation: OperationGate::default(),
+            readiness_operation: OperationGate::default(),
             worker_disconnected: false,
             analysis_path: None,
             function_filter: FunctionFilter::default(),
@@ -360,6 +376,9 @@ impl WorkbenchApp {
             review_result: None,
             pending_review_rollback: None,
             review_orphaned_decisions: 0,
+            readiness_choice: SandboxProviderChoice::default(),
+            readiness_outcome: None,
+            readiness_error: None,
         };
         app.log(
             ActivityLevel::Info,
@@ -407,6 +426,7 @@ impl WorkbenchApp {
                 "functions" => MainTab::Functions,
                 "graph" => MainTab::Graph,
                 "address-space" | "memory-map" => MainTab::AddressSpace,
+                "debugger-sandbox" | "readiness" => MainTab::DebuggerSandbox,
                 "exports" => {
                     app.stage = WorkflowStage::Export;
                     MainTab::Exports
@@ -414,6 +434,10 @@ impl WorkbenchApp {
                 _ => panic!("unsupported screenshot tab {tab:?}"),
             };
             app.project = Some(project);
+            if app.main_tab == MainTab::DebuggerSandbox {
+                app.queue_sandbox_readiness_probe()
+                    .unwrap_or_else(|error| panic!("cannot queue readiness capture: {error}"));
+            }
             app.log(
                 ActivityLevel::Success,
                 format!("Loaded {} for visual regression capture", path.display()),
@@ -472,6 +496,12 @@ impl WorkbenchApp {
                 )
             });
             context.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+
+        if self.main_tab == MainTab::DebuggerSandbox && self.readiness_operation.is_pending() {
+            self.screenshot_frame_count = 0;
+            context.request_repaint();
             return;
         }
 
@@ -647,6 +677,7 @@ impl WorkbenchApp {
                     ConsoleTab::Relationships => MainTab::Relationships,
                     ConsoleTab::Graph => MainTab::Graph,
                     ConsoleTab::AddressSpace => MainTab::AddressSpace,
+                    ConsoleTab::DebuggerSandbox => MainTab::DebuggerSandbox,
                     ConsoleTab::Exports => MainTab::Exports,
                 };
                 if tab == ConsoleTab::Exports {
@@ -776,6 +807,57 @@ impl WorkbenchApp {
             "bounded core analysis"
         };
         let message = format!("Queued {action} for {}", path.display());
+        self.log(ActivityLevel::Info, &message);
+        Ok(message)
+    }
+
+    fn select_sandbox_provider(&mut self, choice: SandboxProviderChoice) {
+        if self.readiness_choice == choice {
+            return;
+        }
+        self.readiness_choice = choice;
+        self.readiness_operation.invalidate();
+        self.readiness_outcome = None;
+        self.readiness_error = None;
+        self.log(
+            ActivityLevel::Info,
+            format!(
+                "Selected {} for read-only capability discovery; no provider was activated",
+                choice.label()
+            ),
+        );
+    }
+
+    fn queue_sandbox_readiness_probe(&mut self) -> Result<String, String> {
+        if self.readiness_operation.is_pending() {
+            return Err("a provider readiness check is already running".to_owned());
+        }
+        if self.project_operation.is_pending() {
+            return Err(
+                "wait for the current project operation before checking readiness".to_owned(),
+            );
+        }
+        let project = self
+            .project
+            .as_ref()
+            .ok_or_else(|| "open a project before checking provider readiness".to_owned())?;
+        let evidence = DebuggerReadinessEvidence::from_project(project);
+        let project_name = project.identity.display_name.clone();
+        let operation = self.operation_sequence.issue();
+        self.service_worker
+            .submit(WorkerCommand::ProbeSandboxProvider {
+                operation,
+                evidence,
+                choice: self.readiness_choice,
+            })?;
+        self.readiness_operation.begin(operation);
+        self.readiness_outcome = None;
+        self.readiness_error = None;
+        let message = format!(
+            "Queued read-only {} readiness check for {}; no target will be opened or executed",
+            self.readiness_choice.label(),
+            project_name
+        );
         self.log(ActivityLevel::Info, &message);
         Ok(message)
     }
@@ -1067,6 +1149,7 @@ impl WorkbenchApp {
                         self.project_operation.invalidate();
                         self.export_operation.invalidate();
                         self.review_operation.invalidate();
+                        self.readiness_operation.invalidate();
                         if let Some(previous) = self.pending_review_rollback.take() {
                             self.review = Some(previous);
                         }
@@ -1290,6 +1373,55 @@ impl WorkbenchApp {
                         }
                     }
                 }
+                WorkerEvent::SandboxProviderProbed { operation, result } => {
+                    if !self.readiness_operation.finish(operation) {
+                        self.log(
+                            ActivityLevel::Warning,
+                            format!(
+                                "Ignored stale sandbox readiness result for operation {}",
+                                operation.get()
+                            ),
+                        );
+                        continue;
+                    }
+                    match result {
+                        Ok(outcome) => {
+                            let current = self.project.as_ref().is_some_and(|project| {
+                                outcome.matches(project, self.readiness_choice)
+                            });
+                            if !current {
+                                self.readiness_outcome = None;
+                                self.readiness_error = Some(
+                                    "Readiness result did not match the current binary evidence or selected provider"
+                                        .to_owned(),
+                                );
+                                self.log(
+                                    ActivityLevel::Warning,
+                                    "Ignored sandbox readiness result for stale binary evidence or provider selection",
+                                );
+                                continue;
+                            }
+                            let message = format!(
+                                "Read-only {} readiness check completed for {}; no target was opened or executed",
+                                outcome.choice().label(),
+                                short_hash(outcome.evidence().binary_id().as_str())
+                            );
+                            self.readiness_error = None;
+                            self.readiness_outcome = Some(outcome);
+                            self.console_reply(true, &message);
+                            self.log(ActivityLevel::Success, message);
+                        }
+                        Err(error) => {
+                            self.readiness_outcome = None;
+                            self.readiness_error = Some(error.clone());
+                            self.console_reply(false, &error);
+                            self.log(
+                                ActivityLevel::Error,
+                                format!("Sandbox readiness check failed closed: {error}"),
+                            );
+                        }
+                    }
+                }
             }
         }
     }
@@ -1345,7 +1477,10 @@ impl WorkbenchApp {
             .map(ToOwned::to_owned);
         self.export_operation.invalidate();
         self.review_operation.invalidate();
+        self.readiness_operation.invalidate();
         self.pending_review_rollback = None;
+        self.readiness_outcome = None;
+        self.readiness_error = None;
         self.export_destination = default_export_path(&project, self.export_kind)
             .to_string_lossy()
             .into_owned();
@@ -1806,6 +1941,16 @@ impl WorkbenchApp {
                         .clicked()
                     {
                         self.main_tab = MainTab::AddressSpace;
+                        self.stage = WorkflowStage::Review;
+                    }
+                    if ui
+                        .selectable_label(
+                            self.main_tab == MainTab::DebuggerSandbox,
+                            "Debugger / Sandbox readiness",
+                        )
+                        .clicked()
+                    {
+                        self.main_tab = MainTab::DebuggerSandbox;
                         self.stage = WorkflowStage::Review;
                     }
                 } else {
@@ -2624,6 +2769,7 @@ impl WorkbenchApp {
                     MainTab::Relationships => self.show_relationships(ui),
                     MainTab::Graph => self.show_graph(ui),
                     MainTab::AddressSpace => self.show_address_space(ui),
+                    MainTab::DebuggerSandbox => self.show_debugger_sandbox_readiness(ui),
                     MainTab::Exports => self.show_exports(ui),
                 }
             });
@@ -3604,6 +3750,166 @@ impl WorkbenchApp {
         }
     }
 
+    fn show_debugger_sandbox_readiness(&mut self, ui: &mut egui::Ui) {
+        let Some(project) = self.project.as_ref() else {
+            return;
+        };
+        let colors = self.preferences.theme.semantic_colors();
+        let evidence = DebuggerReadinessEvidence::from_project(project);
+        let binary_name = project.identity.display_name.clone();
+        let binary_path = project.identity.path.display().to_string();
+
+        ScrollArea::vertical().show(ui, |ui| {
+            ui.heading("Debugger / Sandbox readiness");
+            ui.label(
+                RichText::new(
+                    "Read-only provider discovery bound to the exact active binary and static protection evidence",
+                )
+                .color(colors.secondary_text),
+            );
+            ui.add_space(10.0);
+
+            egui::Frame::new()
+                .fill(colors.raised)
+                .stroke(egui::Stroke::new(1.0, colors.warning_conflict))
+                .inner_margin(egui::Margin::same(12))
+                .corner_radius(4)
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new("[NON-EXECUTING] Discovery only")
+                            .strong()
+                            .color(colors.healthy),
+                    );
+                    ui.label(
+                        "This tab cannot open, attach, launch, resume, or modify a target. It cannot create an AppContainer profile or VM, activate a provider, or produce an attestation.",
+                    );
+                    ui.label(
+                        RichText::new(
+                            "A ready result permits only a future provisioning attempt. It is not a containment guarantee.",
+                        )
+                        .strong()
+                        .color(colors.warning_conflict),
+                    );
+                });
+
+            ui.add_space(10.0);
+            ui.columns(2, |columns| {
+                workbench_card(colors).show(&mut columns[0], |ui| {
+                    ui.heading("Current binary binding");
+                    property_row(ui, "File", &binary_name, false);
+                    property_row(ui, "SHA-256", evidence.binary_id().as_str(), true);
+                    property_row(ui, "Size", &format_bytes(evidence.file_size()), false);
+                    ui.label(
+                        RichText::new(evidence.source_status().label())
+                            .color(colors.exact_extracted),
+                    );
+                    ui.label(
+                        RichText::new(binary_path)
+                            .small()
+                            .monospace()
+                            .color(colors.secondary_text),
+                    );
+                });
+                workbench_card(colors).show(&mut columns[1], |ui| {
+                    ui.heading("Static protection evidence");
+                    let (cue, color) = match evidence.protection_status() {
+                        ReadinessProtectionStatus::Available {
+                            findings: 0,
+                            requires_acknowledgement: false,
+                        } => ("[AVAILABLE]", colors.healthy),
+                        ReadinessProtectionStatus::Available { .. } => {
+                            ("[REVIEW]", colors.warning_conflict)
+                        }
+                        ReadinessProtectionStatus::ExactSourceRequired
+                        | ReadinessProtectionStatus::UnsupportedFormat => {
+                            ("[UNAVAILABLE]", colors.warning_conflict)
+                        }
+                    };
+                    ui.label(RichText::new(cue).strong().color(color));
+                    ui.label(evidence.protection_status().label());
+                    ui.label(
+                        RichText::new(
+                            "Protection findings are offline evidence, not permission to execute.",
+                        )
+                        .color(colors.secondary_text),
+                    );
+                });
+            });
+
+            ui.add_space(12.0);
+            ui.heading("Requested provider");
+            ui.label(
+                RichText::new(
+                    "Selecting a provider changes only this request. ReSymbol never substitutes another provider.",
+                )
+                .color(colors.secondary_text),
+            );
+            let mut requested_choice = self.readiness_choice;
+            ui.horizontal_wrapped(|ui| {
+                for choice in SandboxProviderChoice::ALL {
+                    ui.selectable_value(
+                        &mut requested_choice,
+                        choice,
+                        format!("{} - {}", choice.label(), choice.boundary_label()),
+                    );
+                }
+            });
+            if requested_choice != self.readiness_choice {
+                self.select_sandbox_provider(requested_choice);
+            }
+
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                let pending = self.readiness_operation.is_pending();
+                if ui
+                    .add_enabled(
+                        !pending,
+                        egui::Button::new(if pending {
+                            "Read-only check running..."
+                        } else {
+                            "Run read-only readiness check"
+                        }),
+                    )
+                    .clicked()
+                {
+                    if let Err(error) = self.queue_sandbox_readiness_probe() {
+                        self.readiness_error = Some(error.clone());
+                        self.log(ActivityLevel::Error, error);
+                    }
+                }
+                ui.label(
+                    RichText::new(format!(
+                        "Exact request: {} / {}",
+                        self.readiness_choice.label(),
+                        self.readiness_choice.boundary_label()
+                    ))
+                    .monospace()
+                    .color(colors.secondary_text),
+                );
+            });
+
+            if let Some(error) = &self.readiness_error {
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(format!("[FAIL CLOSED] {error}"))
+                        .color(colors.destructive_quarantined),
+                );
+            }
+
+            ui.add_space(12.0);
+            if let Some(outcome) = &self.readiness_outcome {
+                show_sandbox_readiness_outcome(ui, outcome, colors);
+            } else if !self.readiness_operation.is_pending() && self.readiness_error.is_none() {
+                ui.label(
+                    RichText::new(
+                        "No readiness observation for this provider and binary evidence snapshot.",
+                    )
+                    .color(colors.secondary_text),
+                );
+            }
+        });
+    }
+
     fn show_exports(&mut self, ui: &mut egui::Ui) {
         let Some(project) = &self.project else {
             return;
@@ -3844,6 +4150,7 @@ impl eframe::App for WorkbenchApp {
             && (self.project_operation.is_pending()
                 || self.export_operation.is_pending()
                 || self.review_operation.is_pending()
+                || self.readiness_operation.is_pending()
                 || self.console_host.is_enabled())
         {
             context.request_repaint_after(std::time::Duration::from_millis(100));
@@ -3860,6 +4167,188 @@ impl eframe::App for WorkbenchApp {
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, STORAGE_KEY, &self.preferences);
+    }
+}
+
+fn show_sandbox_readiness_outcome(
+    ui: &mut egui::Ui,
+    outcome: &DebuggerReadinessOutcome,
+    colors: SemanticColors,
+) {
+    let report = outcome.report();
+    let (status, status_color) = match report.readiness() {
+        SandboxProviderReadiness::ReadyForProvisioningAttempt => {
+            ("READY FOR PROVISIONING ATTEMPT", colors.healthy)
+        }
+        SandboxProviderReadiness::Unavailable => ("UNAVAILABLE", colors.warning_conflict),
+        SandboxProviderReadiness::Indeterminate => ("INDETERMINATE", colors.warning_conflict),
+    };
+
+    egui::Frame::new()
+        .fill(colors.raised)
+        .stroke(egui::Stroke::new(1.0, status_color))
+        .inner_margin(egui::Margin::same(12))
+        .corner_radius(4)
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(format!("[{status}]"))
+                        .strong()
+                        .color(status_color),
+                );
+                ui.label(
+                    RichText::new(provider_selection_label(report.provider()))
+                        .strong()
+                        .monospace(),
+                );
+                ui.label(
+                    RichText::new(isolation_boundary_label(report.required_boundary()))
+                        .color(colors.secondary_text),
+                );
+            });
+            ui.label(
+                RichText::new(format!(
+                    "Reason: {}",
+                    readiness_reason_label(report.reason())
+                ))
+                .color(status_color),
+            );
+            ui.label(report.detail().as_str());
+            ui.label(
+                RichText::new(format!(
+                    "Bound binary: {} / {}",
+                    outcome.evidence().binary_id(),
+                    format_bytes(outcome.evidence().file_size())
+                ))
+                .small()
+                .monospace()
+                .color(colors.secondary_text),
+            );
+
+            ui.add_space(8.0);
+            ui.columns(2, |columns| {
+                columns[0].label(RichText::new("Required policy properties").strong());
+                for guarantee in report.required_guarantees() {
+                    columns[0].label(format!("- {}", sandbox_guarantee_label(*guarantee)));
+                }
+
+                columns[1].label(RichText::new("Unresolved requirements").strong());
+                if report.requirements().is_empty() {
+                    columns[1].label(
+                        RichText::new("None observed by this read-only probe")
+                            .color(colors.healthy),
+                    );
+                } else {
+                    for requirement in report.requirements() {
+                        columns[1].label(format!(
+                            "- {}",
+                            sandbox_requirement_label(requirement)
+                        ));
+                    }
+                }
+            });
+
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(
+                    "No target or sandbox instance exists. Suspended creation, exact runtime attestation, and cleanup proof remain mandatory future gates.",
+                )
+                .strong()
+                .color(colors.warning_conflict),
+            );
+        });
+}
+
+fn provider_selection_label(provider: &SandboxProviderSelection) -> String {
+    match provider {
+        SandboxProviderSelection::LocalAppContainer => "Local AppContainer".to_owned(),
+        SandboxProviderSelection::WindowsSandbox => "Windows Sandbox".to_owned(),
+        SandboxProviderSelection::HyperV => "Hyper-V".to_owned(),
+        SandboxProviderSelection::Registered { descriptor } => format!(
+            "Registered {} ({})",
+            descriptor.id, descriptor.build_identity
+        ),
+    }
+}
+
+const fn isolation_boundary_label(boundary: IsolationBoundary) -> &'static str {
+    match boundary {
+        IsolationBoundary::UserMode => "User mode / shared kernel",
+        IsolationBoundary::Hypervisor => "Hypervisor",
+    }
+}
+
+const fn readiness_reason_label(reason: SandboxProviderReadinessReason) -> &'static str {
+    match reason {
+        SandboxProviderReadinessReason::ConfirmedByReadOnlyProbe => {
+            "confirmed by a read-only capability probe"
+        }
+        SandboxProviderReadinessReason::UnsupportedPlatform => "unsupported platform",
+        SandboxProviderReadinessReason::FeatureDisabled => "required feature disabled",
+        SandboxProviderReadinessReason::AdministrativePolicy => "administrative policy",
+        SandboxProviderReadinessReason::ResourceUnavailable => "resource unavailable",
+        SandboxProviderReadinessReason::ProbeBackendUnavailable => "probe backend unavailable",
+        SandboxProviderReadinessReason::CapabilitiesUnverified => "capabilities unverified",
+        SandboxProviderReadinessReason::ProviderIdentityMismatch => "provider identity mismatch",
+        SandboxProviderReadinessReason::BoundaryMismatch => "isolation boundary mismatch",
+        SandboxProviderReadinessReason::MissingRequiredGuarantees => {
+            "required provider properties missing"
+        }
+        SandboxProviderReadinessReason::InvalidProbeObservation => "invalid probe observation",
+    }
+}
+
+fn sandbox_requirement_label(requirement: &SandboxProviderRequirement) -> String {
+    match requirement {
+        SandboxProviderRequirement::WindowsOperatingSystem => "Windows operating system".to_owned(),
+        SandboxProviderRequirement::StableReadOnlyCapabilityProbe => {
+            "Stable read-only Windows capability probe".to_owned()
+        }
+        SandboxProviderRequirement::AppContainerApiAvailability => {
+            "AppContainer API availability".to_owned()
+        }
+        SandboxProviderRequirement::WindowsOptionalFeature { feature } => {
+            format!("Windows optional feature `{}`", feature.feature_name())
+        }
+        SandboxProviderRequirement::HardwareVirtualization => "Hardware virtualization".to_owned(),
+        SandboxProviderRequirement::HypervisorActive => "Active Windows hypervisor".to_owned(),
+        SandboxProviderRequirement::AdministrativePolicyApproval => {
+            "Administrative policy permits the provider".to_owned()
+        }
+        SandboxProviderRequirement::ProviderHelperAvailable => {
+            "Exact provider helper build available".to_owned()
+        }
+        SandboxProviderRequirement::SealedVmImageAvailable => {
+            "Registered sealed VM image available".to_owned()
+        }
+        SandboxProviderRequirement::RegisteredProviderProbe { id, build_identity } => {
+            format!("Registered provider {id} build {build_identity}")
+        }
+        SandboxProviderRequirement::ExactProviderIdentity => "Exact provider identity".to_owned(),
+        SandboxProviderRequirement::ProviderMatchingBoundary { boundary } => format!(
+            "Provider matching {} boundary",
+            isolation_boundary_label(*boundary)
+        ),
+        SandboxProviderRequirement::ProviderSupportingRequiredGuarantees => {
+            "Provider supporting every requested policy property".to_owned()
+        }
+    }
+}
+
+const fn sandbox_guarantee_label(guarantee: SandboxGuarantee) -> &'static str {
+    match guarantee {
+        SandboxGuarantee::FileSystemRedirection => "File-system redirection",
+        SandboxGuarantee::RegistryRedirection => "Registry redirection",
+        SandboxGuarantee::DisposableFileSystem => "Disposable file system",
+        SandboxGuarantee::DisposableRegistry => "Disposable registry",
+        SandboxGuarantee::RollbackOnClose => "Rollback on close",
+        SandboxGuarantee::NetworkDisabled => "Network disabled",
+        SandboxGuarantee::IsolatedNetworkSimulation => "Isolated network simulation",
+        SandboxGuarantee::ResourceLimits => "Resource limits",
+        SandboxGuarantee::ChildProcessControl => "Child-process control",
+        SandboxGuarantee::ProcessMitigations => "Process mitigations",
+        SandboxGuarantee::JobAssignmentAtCreation => "Job assignment at creation",
+        SandboxGuarantee::HypervisorBoundary => "Hypervisor boundary",
     }
 }
 

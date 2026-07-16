@@ -9,8 +9,14 @@ use std::{
 };
 
 use resymbol_app::{AppServices, ExportFormat, ProjectSnapshot, ReviewLedger};
+use resymbol_debugger::{
+    SandboxProviderProbeBackend, SandboxProviderReadinessService, SystemSandboxProviderProbe,
+};
 
-use crate::model::LoadedProject;
+use crate::{
+    model::LoadedProject,
+    readiness::{DebuggerReadinessEvidence, DebuggerReadinessOutcome, SandboxProviderChoice},
+};
 
 const COMMAND_QUEUE_CAPACITY: usize = 4;
 const EVENT_QUEUE_CAPACITY: usize = COMMAND_QUEUE_CAPACITY + 1;
@@ -237,6 +243,11 @@ pub enum WorkerCommand {
         project: Arc<ProjectSnapshot>,
         path: PathBuf,
     },
+    ProbeSandboxProvider {
+        operation: OperationId,
+        evidence: DebuggerReadinessEvidence,
+        choice: SandboxProviderChoice,
+    },
     Shutdown,
 }
 
@@ -265,6 +276,10 @@ pub enum WorkerEvent {
     ReviewLoaded {
         operation: OperationId,
         result: Result<ReviewLoadOutcome, String>,
+    },
+    SandboxProviderProbed {
+        operation: OperationId,
+        result: Result<DebuggerReadinessOutcome, String>,
     },
 }
 
@@ -395,9 +410,36 @@ fn process_command(services: &AppServices, command: WorkerCommand) -> Option<Wor
                     })
                 }),
         },
+        WorkerCommand::ProbeSandboxProvider {
+            operation,
+            evidence,
+            choice,
+        } => {
+            process_sandbox_provider_probe(operation, evidence, choice, SystemSandboxProviderProbe)
+        }
         WorkerCommand::Shutdown => return None,
     };
     Some(event)
+}
+
+fn process_sandbox_provider_probe<B>(
+    operation: OperationId,
+    evidence: DebuggerReadinessEvidence,
+    choice: SandboxProviderChoice,
+    backend: B,
+) -> WorkerEvent
+where
+    B: SandboxProviderProbeBackend,
+{
+    let result = choice
+        .probe_request()
+        .map_err(|error| error.to_string())
+        .and_then(|request| {
+            let report = SandboxProviderReadinessService::new(backend).probe(&request);
+            DebuggerReadinessOutcome::new(evidence, choice, report)
+                .map_err(|error| error.to_string())
+        });
+    WorkerEvent::SandboxProviderProbed { operation, result }
 }
 
 fn apply_reviews(
@@ -423,6 +465,9 @@ mod tests {
     use std::io::Write as _;
 
     use resymbol_core::{BinaryFormat, BinaryId, BinaryIdentity};
+    use resymbol_debugger::{
+        DiagnosticText, ProviderProbeObservation, SandboxProviderProbeRequest,
+    };
     use tempfile::{NamedTempFile, tempdir};
 
     use super::*;
@@ -438,6 +483,22 @@ mod tests {
         AppServices::default()
             .analyze_binary(source.path())
             .expect("analyze worker fixture")
+    }
+
+    #[derive(Debug, Clone)]
+    struct ExactFakeProbe;
+
+    impl SandboxProviderProbeBackend for ExactFakeProbe {
+        fn probe(&self, request: &SandboxProviderProbeRequest) -> ProviderProbeObservation {
+            ProviderProbeObservation::ready(
+                request.provider().clone(),
+                request.required_boundary(),
+                request.required_guarantees().clone(),
+                DiagnosticText::new("Deterministic read-only test observation.")
+                    .expect("bounded diagnostic"),
+            )
+            .expect("valid fake observation")
+        }
     }
 
     #[test]
@@ -550,6 +611,31 @@ mod tests {
                 assert_eq!(outcome.orphaned_decisions, 0);
                 assert_eq!(outcome.project.snapshot.session(), project.session());
                 assert_eq!(outcome.project.projection, project.projection_arc());
+            }
+            _ => panic!("unexpected worker event"),
+        }
+    }
+
+    #[test]
+    fn worker_probe_preserves_operation_provider_and_static_binary_binding() {
+        let snapshot = project_snapshot();
+        let project = LoadedProject::from_snapshot(snapshot).expect("loaded project");
+        let evidence = DebuggerReadinessEvidence::from_project(&project);
+        let expected_evidence = evidence.clone();
+        let choice = SandboxProviderChoice::WindowsSandbox;
+        let operation = OperationSequence::default().issue();
+
+        let event = process_sandbox_provider_probe(operation, evidence, choice, ExactFakeProbe);
+        match event {
+            WorkerEvent::SandboxProviderProbed {
+                operation: actual,
+                result: Ok(outcome),
+            } => {
+                assert_eq!(actual, operation);
+                assert_eq!(outcome.choice(), choice);
+                assert_eq!(outcome.evidence(), &expected_evidence);
+                assert_eq!(outcome.report().provider(), &choice.selection());
+                assert!(outcome.matches(&project, choice));
             }
             _ => panic!("unexpected worker event"),
         }

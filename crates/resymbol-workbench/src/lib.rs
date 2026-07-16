@@ -5,6 +5,7 @@ pub mod console;
 mod console_host;
 mod graph;
 mod model;
+mod readiness;
 mod review_state;
 mod theme;
 mod worker;
