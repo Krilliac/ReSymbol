@@ -8,6 +8,12 @@ prereleases; breaking changes remain explicit.
 
 ### Added
 
+- Added checked PE32+ `GuardMemcpyFunctionPointer` storage-anchor recovery from the versioned load
+  configuration. Package schema 13 records the optional checked slot RVA behind an always-present
+  marker, while schemas 1 through 12 remain explicitly readable and report the field as unavailable.
+  The loader-managed slot is inventory only: it does not create a function, thunk, graph edge,
+  claim, or control-flow seed. Malformed, overlapping, cross-section, header, and unbacked layouts
+  fail before publication, and schema relabeling is rejected.
 - Added the backend-neutral `resymbol-debugger` foundation without enabling target execution. The
   crate provides an exact-identity static PE address-space partition, bounded protection indicators,
   capability- and token-carrying debugger commands/events, compare-before-write contracts, a
