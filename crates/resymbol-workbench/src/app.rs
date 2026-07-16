@@ -14,8 +14,8 @@ use resymbol_app::{
     DecisionAction, ExportFormat, MAX_REVIEW_ANNOTATION_BYTES, MAX_REVIEWER_BYTES, ReviewSubject,
 };
 use resymbol_core::{
-    DiscoveredPlugin, PluginDiscoveryOptions, PluginDiscoveryReport, discover_plugins,
-    plugin_api::PluginHealthState,
+    BinaryIdentity, DiscoveredPlugin, PluginDiscoveryOptions, PluginDiscoveryReport,
+    discover_plugins, plugin_api::PluginHealthState,
 };
 use resymbol_debugger::{
     IsolationBoundary, MemoryAccess, ProtectionSeverity, SandboxGuarantee,
@@ -47,14 +47,17 @@ use crate::{
     review_state::BoundReviewLedger,
     theme::{SemanticColors, ThemePreset},
     worker::{
-        OperationGate, OperationSequence, ServiceWorker, WorkerCommand, WorkerEvent,
-        WorkerExportKind,
+        MAX_OFFLINE_IMAGE_UI_READ_BYTES, OfflineImageReadAvailability, OfflineImageReadOutcome,
+        OfflineImageReadSpan, OperationGate, OperationId, OperationSequence, ServiceWorker,
+        WorkerCommand, WorkerEvent, WorkerExportKind,
     },
 };
 
 const STORAGE_KEY: &str = "resymbol-workbench-preferences-v1";
 const MAX_ACTIVITY_ENTRIES: usize = 512;
 const MAX_ACTIVITY_MESSAGE_BYTES: usize = 512;
+const OFFLINE_READ_SIZES: [u32; 5] = [16, 32, 64, 128, MAX_OFFLINE_IMAGE_UI_READ_BYTES];
+const OFFLINE_HEX_ROW_BYTES: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkflowStage {
@@ -254,6 +257,176 @@ struct ActivityEntry {
     message: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OfflineSourceBinding {
+    identity: BinaryIdentity,
+    canonical_source_path: PathBuf,
+}
+
+impl OfflineSourceBinding {
+    fn from_project(project: &LoadedProject) -> Option<Self> {
+        if !project.snapshot.has_verified_source()
+            || project.snapshot.verified_source_bytes().is_none()
+        {
+            return None;
+        }
+        Some(Self {
+            identity: project.session().base_analysis().identity().clone(),
+            canonical_source_path: project.snapshot.verified_source_path()?.to_path_buf(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OfflineReadRequestBinding {
+    source: OfflineSourceBinding,
+    span: OfflineImageReadSpan,
+}
+
+impl OfflineReadRequestBinding {
+    fn matches_outcome(&self, outcome: &OfflineImageReadOutcome) -> bool {
+        outcome.binding().identity() == &self.source.identity
+            && outcome.binding().source_path() == self.source.canonical_source_path.as_path()
+            && outcome.span() == self.span
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingOfflineRead {
+    operation: OperationId,
+    binding: OfflineReadRequestBinding,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OfflineReadPresentation {
+    Outcome(OfflineImageReadOutcome),
+    Error(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OfflineReadEventDisposition {
+    Stale,
+    Available { byte_count: usize },
+    Unavailable { detail: String },
+    Failed { detail: String },
+    Mismatched { detail: String },
+}
+
+#[derive(Debug, Default)]
+struct OfflineReadUiState {
+    operation: OperationGate,
+    pending: Option<PendingOfflineRead>,
+    presentation: Option<OfflineReadPresentation>,
+}
+
+impl OfflineReadUiState {
+    fn begin(&mut self, operation: OperationId, binding: OfflineReadRequestBinding) {
+        self.operation.begin(operation);
+        self.pending = Some(PendingOfflineRead { operation, binding });
+        self.presentation = None;
+    }
+
+    fn clear(&mut self) {
+        self.operation.invalidate();
+        self.pending = None;
+        self.presentation = None;
+    }
+
+    fn present_error(&mut self, detail: impl Into<String>) {
+        self.presentation = Some(OfflineReadPresentation::Error(bounded_message(
+            detail.into(),
+        )));
+    }
+
+    fn is_pending(&self) -> bool {
+        self.operation.is_pending()
+    }
+
+    fn accept(
+        &mut self,
+        operation: OperationId,
+        result: Result<OfflineImageReadOutcome, crate::worker::OfflineImageReadFailure>,
+        current_source: Option<OfflineSourceBinding>,
+    ) -> OfflineReadEventDisposition {
+        if !self.operation.finish(operation) {
+            return OfflineReadEventDisposition::Stale;
+        }
+        let Some(pending) = self.pending.take() else {
+            return self.fail_mismatch("offline read completed without an exact pending binding");
+        };
+        if pending.operation != operation {
+            return self.fail_mismatch("offline read operation did not match its pending binding");
+        }
+        if current_source.as_ref() != Some(&pending.binding.source) {
+            return self.fail_mismatch(
+                "offline read no longer matches the active full identity and canonical source path",
+            );
+        }
+
+        match result {
+            Err(error) => {
+                let detail = bounded_message(error.to_string());
+                self.presentation = Some(OfflineReadPresentation::Error(detail.clone()));
+                OfflineReadEventDisposition::Failed { detail }
+            }
+            Ok(outcome) => {
+                if !pending.binding.matches_outcome(&outcome) {
+                    return self.fail_mismatch(
+                        "offline read response did not match the exact identity, source, RVA, and size request",
+                    );
+                }
+                if !outcome.lifecycle().is_complete() {
+                    return self.fail_mismatch(
+                        "offline read response omitted complete close, release, or disconnect evidence",
+                    );
+                }
+                if outcome
+                    .availability()
+                    .bytes()
+                    .is_some_and(|bytes| bytes.len() != pending.binding.span.size() as usize)
+                {
+                    return self.fail_mismatch(
+                        "offline read response byte count did not match the exact requested size",
+                    );
+                }
+                let disposition = match outcome.availability() {
+                    OfflineImageReadAvailability::Available { bytes } => {
+                        OfflineReadEventDisposition::Available {
+                            byte_count: bytes.len(),
+                        }
+                    }
+                    OfflineImageReadAvailability::Unavailable(unavailable) => {
+                        OfflineReadEventDisposition::Unavailable {
+                            detail: unavailable.detail().to_owned(),
+                        }
+                    }
+                };
+                self.presentation = Some(OfflineReadPresentation::Outcome(outcome));
+                disposition
+            }
+        }
+    }
+
+    fn fail_mismatch(&mut self, detail: impl Into<String>) -> OfflineReadEventDisposition {
+        let detail = bounded_message(detail.into());
+        self.presentation = Some(OfflineReadPresentation::Error(detail.clone()));
+        OfflineReadEventDisposition::Mismatched { detail }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OfflineHexRow {
+    rva: u64,
+    hex: String,
+    ascii: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OfflineReadDisplay<'a> {
+    Available { byte_count: usize },
+    Unavailable { code: &'static str, detail: &'a str },
+}
+
 /// Native ReSymbol evidence-review workbench.
 pub struct WorkbenchApp {
     preferences: Preferences,
@@ -301,6 +474,9 @@ pub struct WorkbenchApp {
     readiness_choice: SandboxProviderChoice,
     readiness_outcome: Option<DebuggerReadinessOutcome>,
     readiness_error: Option<String>,
+    offline_read: OfflineReadUiState,
+    offline_read_rva_input: String,
+    offline_read_size: u32,
 }
 
 impl WorkbenchApp {
@@ -399,6 +575,9 @@ impl WorkbenchApp {
             readiness_choice: SandboxProviderChoice::default(),
             readiness_outcome: None,
             readiness_error: None,
+            offline_read: OfflineReadUiState::default(),
+            offline_read_rva_input: "0x00000000".to_owned(),
+            offline_read_size: 64,
         };
         app.log(
             ActivityLevel::Info,
@@ -945,6 +1124,11 @@ impl WorkbenchApp {
         if self.export_operation.is_pending() || self.review_operation.is_pending() {
             return Err("wait for the current export or review operation first".to_owned());
         }
+        if self.offline_read.is_pending() {
+            return Err(
+                "wait for the exact offline byte read before replacing the project".to_owned(),
+            );
+        }
         if self
             .review
             .as_ref()
@@ -1027,6 +1211,57 @@ impl WorkbenchApp {
             "Queued read-only {} readiness check for {}; no target will be opened or executed",
             self.readiness_choice.label(),
             project_name
+        );
+        self.log(ActivityLevel::Info, &message);
+        Ok(message)
+    }
+
+    fn queue_offline_image_read(&mut self) -> Result<String, String> {
+        if self.offline_read.is_pending() {
+            return Err("an exact offline image read is already running".to_owned());
+        }
+        if self.worker_disconnected {
+            return Err("the application-service worker is unavailable".to_owned());
+        }
+        if self.project_operation.is_pending() {
+            return Err(
+                "wait for the current project or source operation before reading bytes".to_owned(),
+            );
+        }
+        if !OFFLINE_READ_SIZES.contains(&self.offline_read_size) {
+            return Err("choose a supported offline read size".to_owned());
+        }
+        let rva = parse_hex_rva(&self.offline_read_rva_input)?;
+        let span = OfflineImageReadSpan::new(rva, self.offline_read_size)
+            .map_err(|error| bounded_message(error.to_string()))?;
+        let (snapshot, source, project_name) = {
+            let project = self
+                .project
+                .as_ref()
+                .ok_or_else(|| "open a project before reading offline bytes".to_owned())?;
+            let source = OfflineSourceBinding::from_project(project).ok_or_else(|| {
+                "the exact source binary must be verified before reading offline bytes".to_owned()
+            })?;
+            (
+                Arc::clone(&project.snapshot),
+                source,
+                project.identity.display_name.clone(),
+            )
+        };
+        let operation = self.operation_sequence.issue();
+        self.service_worker
+            .submit(WorkerCommand::ReadOfflineImage {
+                operation,
+                project: snapshot,
+                rva: span.rva(),
+                size: span.size(),
+            })?;
+        self.offline_read
+            .begin(operation, OfflineReadRequestBinding { source, span });
+        let message = format!(
+            "Queued exact offline read of {} byte(s) at RVA 0x{:X} for {project_name}",
+            span.size(),
+            span.rva()
         );
         self.log(ActivityLevel::Info, &message);
         Ok(message)
@@ -1320,6 +1555,7 @@ impl WorkbenchApp {
                         self.export_operation.invalidate();
                         self.review_operation.invalidate();
                         self.readiness_operation.invalidate();
+                        self.offline_read.clear();
                         if let Some(previous) = self.pending_review_rollback.take() {
                             self.review = Some(previous);
                         }
@@ -1608,29 +1844,37 @@ impl WorkbenchApp {
                     }
                 }
                 WorkerEvent::OfflineImageRead { operation, result } => {
-                    let (level, message) = match result {
-                        Ok(outcome) => {
-                            let summary = outcome.availability().bytes().map_or_else(
-                                || "exact RVA span was unavailable".to_owned(),
-                                |bytes| format!("read {} exact byte(s)", bytes.len()),
-                            );
-                            (
-                                ActivityLevel::Info,
-                                format!(
-                                    "Offline image operation {} completed before a UI consumer was registered: {summary}",
-                                    operation.get()
-                                ),
-                            )
-                        }
-                        Err(error) => (
-                            ActivityLevel::Error,
+                    let current_source = self
+                        .project
+                        .as_ref()
+                        .and_then(OfflineSourceBinding::from_project);
+                    match self.offline_read.accept(operation, result, current_source) {
+                        OfflineReadEventDisposition::Stale => self.log(
+                            ActivityLevel::Warning,
                             format!(
-                                "Offline image operation {} failed before a UI consumer was registered: {error}",
+                                "Ignored stale offline image result for operation {}",
                                 operation.get()
                             ),
                         ),
-                    };
-                    self.log(level, message);
+                        OfflineReadEventDisposition::Available { byte_count } => self.log(
+                            ActivityLevel::Success,
+                            format!(
+                                "Read {byte_count} exact frozen source byte(s) through the offline host"
+                            ),
+                        ),
+                        OfflineReadEventDisposition::Unavailable { detail } => self.log(
+                            ActivityLevel::Warning,
+                            format!("Exact offline byte span is unavailable: {detail}"),
+                        ),
+                        OfflineReadEventDisposition::Failed { detail } => self.log(
+                            ActivityLevel::Error,
+                            format!("Offline image read failed: {detail}"),
+                        ),
+                        OfflineReadEventDisposition::Mismatched { detail } => self.log(
+                            ActivityLevel::Error,
+                            format!("Offline image response failed closed: {detail}"),
+                        ),
+                    }
                 }
             }
         }
@@ -1701,6 +1945,7 @@ impl WorkbenchApp {
         self.export_operation.invalidate();
         self.review_operation.invalidate();
         self.readiness_operation.invalidate();
+        self.offline_read.clear();
         self.pending_review_rollback = None;
         self.readiness_outcome = None;
         self.readiness_error = None;
@@ -1779,6 +2024,8 @@ impl WorkbenchApp {
             );
             return;
         }
+        let offline_source_changed = OfflineSourceBinding::from_project(current)
+            != OfflineSourceBinding::from_project(&project);
 
         let selected_rva = self
             .selected_projection_index
@@ -1800,6 +2047,9 @@ impl WorkbenchApp {
             .or_else(|| reconstruction_graph.default_root().map(|root| root.rva));
         self.reconstruction_graph = Some(reconstruction_graph);
         self.export_result = None;
+        if offline_source_changed {
+            self.offline_read.clear();
+        }
         self.project = Some(project);
     }
 
@@ -3334,17 +3584,8 @@ impl WorkbenchApp {
         });
     }
 
-    fn show_address_space(&self, ui: &mut egui::Ui) {
-        let project = self.project.as_ref().expect("checked by caller");
-        let address_space = &project.static_address_space;
+    fn show_address_space(&mut self, ui: &mut egui::Ui) {
         let colors = self.preferences.theme.semantic_colors();
-        let indicator_text = project
-            .protection_assessment
-            .unavailable_reason()
-            .map_or_else(
-                || project.protection_assessment.findings().len().to_string(),
-                |_| "source required".to_owned(),
-            );
 
         ui.heading("Static address space");
         ui.horizontal_wrapped(|ui| {
@@ -3359,6 +3600,19 @@ impl WorkbenchApp {
             );
         });
         ui.add_space(8.0);
+
+        self.show_offline_byte_reader(ui, colors);
+        ui.add_space(8.0);
+
+        let project = self.project.as_ref().expect("checked by caller");
+        let address_space = &project.static_address_space;
+        let indicator_text = project
+            .protection_assessment
+            .unavailable_reason()
+            .map_or_else(
+                || project.protection_assessment.findings().len().to_string(),
+                |_| "source required".to_owned(),
+            );
 
         egui::Frame::new()
             .fill(colors.raised)
@@ -3541,6 +3795,164 @@ impl WorkbenchApp {
                         }
                     });
             });
+    }
+
+    fn show_offline_byte_reader(&mut self, ui: &mut egui::Ui, colors: SemanticColors) {
+        let source_ready = self
+            .project
+            .as_ref()
+            .and_then(OfflineSourceBinding::from_project)
+            .is_some();
+        let pending = self.offline_read.is_pending();
+        let presentation = self.offline_read.presentation.clone();
+        let can_queue = source_ready
+            && !pending
+            && !self.worker_disconnected
+            && !self.project_operation.is_pending();
+        let mut queue_requested = false;
+
+        egui::Frame::new()
+            .fill(colors.raised)
+            .stroke(egui::Stroke::new(1.0, colors.border))
+            .inner_margin(egui::Margin::same(10))
+            .corner_radius(4)
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new("Exact offline bytes")
+                            .strong()
+                            .color(colors.exact_extracted),
+                    );
+                    ui.label(
+                        RichText::new(
+                            "Frozen verified source bytes through the in-process offline host; no process, live mapping, or sandbox is created.",
+                        )
+                        .color(colors.secondary_text),
+                    );
+                });
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("RVA (hex)").strong());
+                    ui.add_enabled(
+                        !pending,
+                        TextEdit::singleline(&mut self.offline_read_rva_input)
+                            .id_salt("offline_read_rva")
+                            .desired_width(150.0)
+                            .char_limit(18)
+                            .hint_text("0x00000000"),
+                    );
+                    ui.add_enabled_ui(!pending, |ui| {
+                        egui::ComboBox::from_id_salt("offline_read_size")
+                            .selected_text(format!("{} bytes", self.offline_read_size))
+                            .show_ui(ui, |ui| {
+                                for size in OFFLINE_READ_SIZES {
+                                    ui.selectable_value(
+                                        &mut self.offline_read_size,
+                                        size,
+                                        format!("{size} bytes"),
+                                    );
+                                }
+                            });
+                    });
+                    let button_label = if !source_ready {
+                        "[SOURCE REQUIRED]"
+                    } else if self.worker_disconnected {
+                        "[WORKER UNAVAILABLE]"
+                    } else if pending {
+                        "[READING...]"
+                    } else {
+                        "Read frozen bytes"
+                    };
+                    queue_requested = ui
+                        .add_enabled(can_queue, egui::Button::new(button_label))
+                        .clicked();
+                    if pending {
+                        ui.spinner();
+                    }
+                });
+
+                if let Some(presentation) = presentation {
+                    ui.add_space(7.0);
+                    match presentation {
+                        OfflineReadPresentation::Error(error) => {
+                            ui.colored_label(
+                                colors.destructive_quarantined,
+                                format!("[FAILED CLOSED] {error}"),
+                            );
+                        }
+                        OfflineReadPresentation::Outcome(outcome) => {
+                            match outcome.availability() {
+                                OfflineImageReadAvailability::Available { bytes } => {
+                                    ui.colored_label(
+                                        colors.healthy,
+                                        offline_read_banner(
+                                            OfflineReadDisplay::Available {
+                                                byte_count: bytes.len(),
+                                            },
+                                            outcome.span().rva(),
+                                        ),
+                                    );
+                                    ui.label(
+                                        RichText::new(offline_lifecycle_text(&outcome))
+                                            .color(colors.secondary_text),
+                                    );
+                                    ScrollArea::both()
+                                        .id_salt("offline_hex_rows_scroll")
+                                        .auto_shrink([false, true])
+                                        .max_height(124.0)
+                                        .show(ui, |ui| {
+                                            egui::Grid::new("offline_hex_rows")
+                                                .num_columns(3)
+                                                .spacing([12.0, 2.0])
+                                                .striped(true)
+                                                .show(ui, |ui| {
+                                                    for row in format_offline_hex_rows(
+                                                        outcome.span().rva(),
+                                                        bytes,
+                                                    ) {
+                                                        ui.monospace(format!(
+                                                            "0x{:016X}",
+                                                            row.rva
+                                                        ));
+                                                        ui.monospace(row.hex);
+                                                        ui.monospace(format!("|{}|", row.ascii));
+                                                        ui.end_row();
+                                                    }
+                                                });
+                                        });
+                                }
+                                OfflineImageReadAvailability::Unavailable(unavailable) => {
+                                    ui.colored_label(
+                                        colors.warning_conflict,
+                                        offline_read_banner(
+                                            OfflineReadDisplay::Unavailable {
+                                                code: unavailable.code(),
+                                                detail: unavailable.detail(),
+                                            },
+                                            outcome.span().rva(),
+                                        ),
+                                    );
+                                    ui.label(
+                                        RichText::new(offline_lifecycle_text(&outcome))
+                                            .color(colors.secondary_text),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+
+        if queue_requested {
+            if let Err(error) = self.queue_offline_image_read() {
+                let error = bounded_message(error);
+                self.offline_read.present_error(error.clone());
+                self.log(
+                    ActivityLevel::Error,
+                    format!("Cannot queue offline image read: {error}"),
+                );
+            }
+        }
     }
 
     fn show_functions(&mut self, ui: &mut egui::Ui) {
@@ -4410,6 +4822,7 @@ impl eframe::App for WorkbenchApp {
                 || self.export_operation.is_pending()
                 || self.review_operation.is_pending()
                 || self.readiness_operation.is_pending()
+                || self.offline_read.is_pending()
                 || self.console_host.is_enabled())
         {
             context.request_repaint_after(std::time::Duration::from_millis(100));
@@ -4800,6 +5213,77 @@ fn memory_access_text(access: MemoryAccess) -> String {
     ]
     .into_iter()
     .collect()
+}
+
+fn parse_hex_rva(input: &str) -> Result<u64, String> {
+    let input = input.trim();
+    let digits = input
+        .strip_prefix("0x")
+        .or_else(|| input.strip_prefix("0X"))
+        .unwrap_or(input);
+    if digits.is_empty() {
+        return Err("enter a hexadecimal RVA".to_owned());
+    }
+    if digits.len() > 16 || !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("RVA must contain at most 16 hexadecimal digits".to_owned());
+    }
+    u64::from_str_radix(digits, 16).map_err(|_| "RVA is outside the u64 range".to_owned())
+}
+
+fn format_offline_hex_rows(start_rva: u64, bytes: &[u8]) -> Vec<OfflineHexRow> {
+    let bounded = &bytes[..bytes.len().min(MAX_OFFLINE_IMAGE_UI_READ_BYTES as usize)];
+    bounded
+        .chunks(OFFLINE_HEX_ROW_BYTES)
+        .enumerate()
+        .map(|(index, chunk)| OfflineHexRow {
+            rva: start_rva.saturating_add((index * OFFLINE_HEX_ROW_BYTES) as u64),
+            hex: chunk
+                .iter()
+                .map(|byte| format!("{byte:02X}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+            ascii: chunk
+                .iter()
+                .map(|byte| {
+                    if matches!(*byte, 0x20..=0x7e) {
+                        char::from(*byte)
+                    } else {
+                        '.'
+                    }
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+fn offline_read_banner(display: OfflineReadDisplay<'_>, rva: u64) -> String {
+    match display {
+        OfflineReadDisplay::Available { byte_count } => {
+            format!("[EXACT BYTES] {byte_count} byte(s) at RVA 0x{rva:X}")
+        }
+        OfflineReadDisplay::Unavailable { code, detail } => {
+            format!("[RANGE UNAVAILABLE:{code}] RVA 0x{rva:X}: {detail}")
+        }
+    }
+}
+
+fn offline_lifecycle_status(complete: bool, capability_count: usize) -> String {
+    if complete {
+        format!(
+            "Lifecycle complete: {capability_count} capabilities probed; session closed, released, and control disconnected"
+        )
+    } else {
+        "Lifecycle incomplete: result is not safe to present".to_owned()
+    }
+}
+
+fn offline_lifecycle_text(outcome: &OfflineImageReadOutcome) -> String {
+    let lifecycle = outcome.lifecycle();
+    format!(
+        "Session {} | {}",
+        lifecycle.session_id().get(),
+        offline_lifecycle_status(lifecycle.is_complete(), lifecycle.capability_count())
+    )
 }
 
 fn protection_severity_visual(
@@ -5414,9 +5898,25 @@ fn bounded_message(mut message: String) -> String {
 }
 
 #[cfg(test)]
-mod close_safety_tests {
-    use super::{MainTab, WorkflowStage, close_requires_confirmation, review_save_requires_dialog};
-    use std::path::Path;
+mod tests {
+    use super::*;
+    use std::{io::Write as _, path::Path};
+
+    use resymbol_app::AppServices;
+    use tempfile::NamedTempFile;
+
+    const STRIPPED_FIXTURE: &[u8] =
+        include_bytes!("../../../fixtures/pe-x64-msvc/artifacts/milestone2-stripped.exe");
+
+    fn loaded_project_with_source() -> (NamedTempFile, LoadedProject) {
+        let mut source = NamedTempFile::new().expect("temporary PE");
+        source.write_all(STRIPPED_FIXTURE).expect("write PE");
+        let snapshot = AppServices::default()
+            .analyze_binary(source.path())
+            .expect("analyze PE");
+        let project = LoadedProject::from_snapshot(snapshot).expect("loaded project");
+        (source, project)
+    }
 
     #[test]
     fn dirty_close_requires_an_explicit_discard() {
@@ -5451,5 +5951,189 @@ mod close_safety_tests {
             };
             assert_eq!(tab.workflow_stage(), expected);
         }
+    }
+
+    #[test]
+    fn offline_source_guard_requires_the_exact_verified_snapshot() {
+        let (_source, project) = loaded_project_with_source();
+        let binding = OfflineSourceBinding::from_project(&project).expect("exact source binding");
+        assert_eq!(
+            &binding.identity,
+            project.session().base_analysis().identity()
+        );
+        assert_eq!(
+            binding.canonical_source_path.as_path(),
+            project
+                .snapshot
+                .verified_source_path()
+                .expect("verified source")
+        );
+
+        let directory = tempfile::tempdir().expect("package directory");
+        let package_path = directory.path().join("package-only.resym");
+        let services = AppServices::default();
+        services
+            .save_package_new(&project.snapshot, &package_path)
+            .expect("save package");
+        let package = services.open_package(&package_path).expect("open package");
+        let package = LoadedProject::from_snapshot(package).expect("package project");
+        assert!(OfflineSourceBinding::from_project(&package).is_none());
+    }
+
+    #[test]
+    fn offline_state_rejects_old_operations_full_identity_drift_and_same_hash_other_paths() {
+        let (_source, project) = loaded_project_with_source();
+        let source = OfflineSourceBinding::from_project(&project).expect("source binding");
+        let span = OfflineImageReadSpan::new(0, 64).expect("read span");
+        let binding = OfflineReadRequestBinding {
+            source: source.clone(),
+            span,
+        };
+        let mut sequence = OperationSequence::default();
+        let older = sequence.issue();
+        let current = sequence.issue();
+        let mut state = OfflineReadUiState::default();
+        state.begin(older, binding.clone());
+        state.begin(current, binding.clone());
+
+        let disposition = state.accept(
+            older,
+            Err(crate::worker::OfflineImageReadFailure::VerifiedSourceRequired),
+            Some(source.clone()),
+        );
+        assert_eq!(disposition, OfflineReadEventDisposition::Stale);
+        assert!(state.is_pending());
+        assert_eq!(
+            state.pending.as_ref().map(|pending| pending.operation),
+            Some(current)
+        );
+        assert!(state.presentation.is_none());
+
+        let mut other_path = source.clone();
+        other_path.canonical_source_path = PathBuf::from("same-hash-other-path.exe");
+        let disposition = state.accept(
+            current,
+            Err(crate::worker::OfflineImageReadFailure::VerifiedSourceRequired),
+            Some(other_path),
+        );
+        assert!(matches!(
+            disposition,
+            OfflineReadEventDisposition::Mismatched { .. }
+        ));
+        assert!(!state.is_pending());
+        assert!(matches!(
+            state.presentation.as_ref(),
+            Some(OfflineReadPresentation::Error(_))
+        ));
+
+        let next = sequence.issue();
+        state.begin(next, binding);
+        let mut changed_identity = source;
+        changed_identity
+            .identity
+            .architecture
+            .push_str("-different");
+        let disposition = state.accept(
+            next,
+            Err(crate::worker::OfflineImageReadFailure::VerifiedSourceRequired),
+            Some(changed_identity),
+        );
+        assert!(matches!(
+            disposition,
+            OfflineReadEventDisposition::Mismatched { .. }
+        ));
+    }
+
+    #[test]
+    fn offline_state_clear_invalidates_pending_and_presented_project_evidence() {
+        let (_source, project) = loaded_project_with_source();
+        let source = OfflineSourceBinding::from_project(&project).expect("source binding");
+        let binding = OfflineReadRequestBinding {
+            source,
+            span: OfflineImageReadSpan::new(0, 64).expect("span"),
+        };
+        let operation = OperationSequence::default().issue();
+        let mut state = OfflineReadUiState::default();
+        state.begin(operation, binding);
+        state.present_error("old project presentation");
+
+        state.clear();
+
+        assert!(!state.is_pending());
+        assert!(state.pending.is_none());
+        assert!(state.presentation.is_none());
+    }
+
+    #[test]
+    fn offline_state_bounds_ui_failures_before_presentation() {
+        let mut state = OfflineReadUiState::default();
+        state.present_error("x".repeat(MAX_ACTIVITY_MESSAGE_BYTES * 4));
+
+        let Some(OfflineReadPresentation::Error(error)) = state.presentation.as_ref() else {
+            panic!("bounded offline failure presentation");
+        };
+        assert_eq!(error.len(), MAX_ACTIVITY_MESSAGE_BYTES + 3);
+        assert!(error.ends_with("..."));
+    }
+
+    #[test]
+    fn offline_success_and_unavailable_present_complete_lifecycle_evidence() {
+        assert_eq!(
+            offline_read_banner(OfflineReadDisplay::Available { byte_count: 64 }, 0x1234),
+            "[EXACT BYTES] 64 byte(s) at RVA 0x1234"
+        );
+        assert_eq!(
+            offline_read_banner(
+                OfflineReadDisplay::Unavailable {
+                    code: "offline-range-unavailable",
+                    detail: "span crosses exact file backing",
+                },
+                0x2000,
+            ),
+            "[RANGE UNAVAILABLE:offline-range-unavailable] RVA 0x2000: span crosses exact file backing"
+        );
+        let lifecycle = offline_lifecycle_status(true, 14);
+        assert_eq!(
+            lifecycle,
+            "Lifecycle complete: 14 capabilities probed; session closed, released, and control disconnected"
+        );
+        assert_eq!(
+            offline_lifecycle_status(false, 14),
+            "Lifecycle incomplete: result is not safe to present"
+        );
+    }
+
+    #[test]
+    fn offline_hex_formatter_is_deterministic_and_bounded_to_sixteen_byte_rows() {
+        let bytes = (0..400)
+            .map(|value| (value % 256) as u8)
+            .collect::<Vec<_>>();
+        let first = format_offline_hex_rows(0x1000, &bytes);
+        let second = format_offline_hex_rows(0x1000, &bytes);
+
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 16);
+        assert_eq!(first[0].rva, 0x1000);
+        assert_eq!(first[1].rva, 0x1010);
+        assert_eq!(
+            first[0].hex,
+            "00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F"
+        );
+        assert_eq!(first[0].ascii, "................");
+        assert!(first.iter().all(|row| row.ascii.len() <= 16));
+        assert!(first.iter().all(|row| row.hex.split(' ').count() <= 16));
+        assert!(format_offline_hex_rows(0, &[]).is_empty());
+    }
+
+    #[test]
+    fn offline_rva_parser_accepts_only_bounded_hexadecimal_input() {
+        assert_eq!(parse_hex_rva("0x10"), Ok(0x10));
+        assert_eq!(parse_hex_rva("10"), Ok(0x10));
+        assert_eq!(parse_hex_rva("  0Xabcdef  "), Ok(0xabcdef));
+        assert!(parse_hex_rva("").is_err());
+        assert!(parse_hex_rva("0x").is_err());
+        assert!(parse_hex_rva("-1").is_err());
+        assert!(parse_hex_rva("0x10000000000000000").is_err());
+        assert!(parse_hex_rva("0x12_G4").is_err());
     }
 }
