@@ -450,8 +450,9 @@ Semantic inference remains optional and never converts a hypothesis into an extr
 
 - Desktop workbench GUI for project navigation, evidence review, claim comparison, plugin health,
   bounded retained-relationship graphing, and export preview (initial Windows-first core-only shell,
-  synchronized Reconstruction Graph, and evidence inspector implemented; durable review, plugin
-  execution, docking/disassembly, editable or exhaustive graphing, debugger bridges, and the
+  synchronized Reconstruction Graph, evidence inspector, current-package opening, six create-new
+  exports, and durable exact-claim review with sidecars and undo/redo implemented; bulk review,
+  plugin execution, docking/disassembly, editable or exhaustive graphing, debugger bridges, and the
   remaining [approved design](gui-design.md) are planned)
 - Signed or verifiable plugin packages and registry metadata
 - Hash-addressed community symbol packs without bundled application binaries

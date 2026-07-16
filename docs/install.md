@@ -201,14 +201,16 @@ the file picker:
 .\resymbol-workbench.exe .\path\to\application.exe
 ```
 
-The workbench performs background core-only analysis and provides read-only evidence, provenance,
-plugin-health, and bounded Reconstruction Graph views. The graph's root and synchronized selection
-controls let you move between the entry point or deterministic lowest-RVA fallback and individual
-functions; only retained direct-call, thunk, and import edges are drawn. A **BOUNDED** cue identifies
-large views that exceed the rendering budget. The export page creates new `.resym`, neutral JSON,
-Markdown, or MAP files; plugin execution, existing-package opening, and overwriting destinations are
-not implemented in this first slice. Use the CLI for plugin execution, PDB/IDA/Ghidra exports, and
-package inspection.
+The workbench performs background core-only analysis and provides evidence, provenance, durable
+exact-claim review, plugin-health, and bounded Reconstruction Graph views. The graph's root and
+synchronized selection controls let you move between the entry point or deterministic lowest-RVA
+fallback and individual functions; only retained direct-call, thunk, and import edges are drawn. A
+**BOUNDED** cue identifies large views that exceed the rendering budget. The workbench opens current
+`.resym` packages, can verify them against an exact source binary, saves review history to a separate
+create-new sidecar, and publishes create-new `.resym`, neutral JSON, Markdown, MAP, public-symbol PDB,
+IDA Python, or Ghidra Java artifacts. It never overwrites an existing destination. Plugin execution
+and legacy package migration remain CLI workflows; live launch, attach, and memory mutation are not
+implemented.
 
 The **View -> Companion console** checkbox spawns the packaged console helper when you want live
 timestamped activity or command control. Enter `help` there for the bounded command set. The helper
