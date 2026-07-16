@@ -110,10 +110,11 @@ fn emits_documented_sections_rebased_addresses_and_exact_identity() {
     )));
     assert!(output.contains("; ReSymbol exact binary file size: 1536 bytes\n"));
     assert!(output.contains(" Start         Length     Name                   Class\n"));
-    assert!(output.contains(" 0001:00000000 00000200H .text"));
+    assert!(output.contains(" 0001:00000000 00000180H .text"));
     assert!(output.contains(".text                   CODE\n"));
-    assert!(output.contains(" 0002:00000000 00000200H .r_x20_data"));
+    assert!(output.contains(" 0002:00000000 00000180H .r_x20_data"));
     assert!(output.contains(".r_x20_data             DATA\n"));
+    assert!(!output.contains("00000200H"));
     assert!(output.contains(&format!(
         " 0001:00000010       {:<26} 0000000180001010     <resymbol>\n",
         "evil_x20_name_x3b__x3f_"
