@@ -14,6 +14,46 @@ $captureWidth = 1440
 $captureHeight = 900
 $captureTabs = @('overview', 'functions', 'graph', 'address-space')
 
+if (-not ('ReSymbol.WorkbenchCaptureDpi' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace ReSymbol {
+    public static class WorkbenchCaptureDpi {
+        [DllImport("user32.dll")]
+        public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr value);
+
+        [DllImport("user32.dll")]
+        public static extern uint GetDpiForSystem();
+    }
+}
+'@
+}
+
+# PowerShell is normally DPI-virtualized to 96 DPI. Query under the same per-monitor-aware-v2
+# context used by the native workbench, then keep both framebuffer pixels and egui layout fixed.
+$priorDpiContext = [ReSymbol.WorkbenchCaptureDpi]::SetThreadDpiAwarenessContext([IntPtr](-4))
+try {
+    $desktopDpi = [ReSymbol.WorkbenchCaptureDpi]::GetDpiForSystem()
+}
+finally {
+    [void][ReSymbol.WorkbenchCaptureDpi]::SetThreadDpiAwarenessContext($priorDpiContext)
+}
+if ($desktopDpi -lt 96 -or $desktopDpi -gt 768) {
+    throw "Capture desktop reported unsupported DPI $desktopDpi"
+}
+$dpiScale = [double]$desktopDpi / 96.0
+$viewportWidthPoints = [double]$captureWidth / $dpiScale
+$viewportHeightPoints = [double]$captureHeight / $dpiScale
+$uiZoom = 1.0 / $dpiScale
+$invariant = [Globalization.CultureInfo]::InvariantCulture
+$viewportPoints = '{0},{1}' -f @(
+    $viewportWidthPoints.ToString('R', $invariant),
+    $viewportHeightPoints.ToString('R', $invariant)
+)
+$uiZoomText = $uiZoom.ToString('R', $invariant)
+
 $repoRoot = Split-Path -Parent $PSScriptRoot
 if (-not $Binary) {
     $Binary = Join-Path $repoRoot 'fixtures\pe-x64-msvc\artifacts\milestone2-symbolized.exe'
@@ -43,22 +83,30 @@ try {
         throw "Screenshot executable does not exist: $executable"
     }
 
-    # Eframe/winit is DPI-aware. A non-100% desktop scale changes the physical framebuffer, so the
-    # exact dimension check below is the authoritative DPI gate instead of silently resampling.
+    # The application owns a fixed native capture viewport. Exact output validation below is the
+    # authoritative framebuffer gate; captured pixels are never resized or resampled.
     Add-Type -AssemblyName System.Drawing
     $captures = [Collections.Generic.List[object]]::new()
     $manifestPath = Join-Path $OutputDirectory 'capture-manifest.json'
     Remove-Item -LiteralPath $manifestPath -Force -ErrorAction SilentlyContinue
 
-    $priorScreenshot = $env:EFRAME_SCREENSHOT_TO
+    $priorEframeScreenshot = $env:EFRAME_SCREENSHOT_TO
+    $priorScreenshot = $env:RESYMBOL_WORKBENCH_SCREENSHOT_TO
     $priorTab = $env:RESYMBOL_WORKBENCH_SCREENSHOT_TAB
     $priorZoom = $env:RESYMBOL_WORKBENCH_SCREENSHOT_ZOOM
+    $priorViewport = $env:RESYMBOL_WORKBENCH_SCREENSHOT_VIEWPORT_POINTS
     try {
-        $env:RESYMBOL_WORKBENCH_SCREENSHOT_ZOOM = '1'
+        # ReSymbol owns the delayed in-app capture. Keep eframe's private second-pass hook disabled;
+        # it fires before this application's panels have settled on some Windows GL drivers.
+        $env:EFRAME_SCREENSHOT_TO = $null
+        $env:RESYMBOL_WORKBENCH_SCREENSHOT_ZOOM = $uiZoomText
+        $env:RESYMBOL_WORKBENCH_SCREENSHOT_VIEWPORT_POINTS = $viewportPoints
         foreach ($tab in $captureTabs) {
             $destination = Join-Path $OutputDirectory "workbench-$tab.png"
+            $statePath = "$destination.state.ron"
             Remove-Item -LiteralPath $destination -Force -ErrorAction SilentlyContinue
-            $env:EFRAME_SCREENSHOT_TO = $destination
+            Remove-Item -LiteralPath $statePath -Force -ErrorAction SilentlyContinue
+            $env:RESYMBOL_WORKBENCH_SCREENSHOT_TO = $destination
             $env:RESYMBOL_WORKBENCH_SCREENSHOT_TAB = $tab
 
             $quotedBinary = '"{0}"' -f $Binary
@@ -92,7 +140,7 @@ try {
                     throw "Screenshot '$tab' is not a PNG image"
                 }
                 if ($image.Width -ne $captureWidth -or $image.Height -ne $captureHeight) {
-                    throw "Screenshot '$tab' is $($image.Width)x$($image.Height), expected ${captureWidth}x${captureHeight}. Ensure the capture desktop uses 100% DPI scaling."
+                    throw "Screenshot '$tab' is $($image.Width)x$($image.Height), expected ${captureWidth}x${captureHeight}."
                 }
 
                 $file = Get-Item -LiteralPath $destination
@@ -112,9 +160,15 @@ try {
         }
     }
     finally {
-        $env:EFRAME_SCREENSHOT_TO = $priorScreenshot
+        foreach ($tab in $captureTabs) {
+            $statePath = Join-Path $OutputDirectory "workbench-$tab.png.state.ron"
+            Remove-Item -LiteralPath $statePath -Force -ErrorAction SilentlyContinue
+        }
+        $env:EFRAME_SCREENSHOT_TO = $priorEframeScreenshot
+        $env:RESYMBOL_WORKBENCH_SCREENSHOT_TO = $priorScreenshot
         $env:RESYMBOL_WORKBENCH_SCREENSHOT_TAB = $priorTab
         $env:RESYMBOL_WORKBENCH_SCREENSHOT_ZOOM = $priorZoom
+        $env:RESYMBOL_WORKBENCH_SCREENSHOT_VIEWPORT_POINTS = $priorViewport
     }
 
     if ($captures.Count -ne $captureTabs.Count) {
@@ -130,7 +184,11 @@ try {
         viewport = [ordered]@{
             width = $captureWidth
             height = $captureHeight
-            ui_zoom = 1
+            desktop_dpi = $desktopDpi
+            width_points = $viewportWidthPoints
+            height_points = $viewportHeightPoints
+            ui_zoom = $uiZoom
+            effective_pixels_per_point = 1
         }
         captures = $captures
     }

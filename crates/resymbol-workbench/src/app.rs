@@ -4,6 +4,8 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+#[cfg(feature = "screenshot")]
+use std::{fs::OpenOptions, io::BufWriter, path::Path};
 
 use eframe::egui::{self, Align, Key, Layout, RichText, ScrollArea, Sense, TextEdit};
 use egui_extras::{Column, TableBuilder};
@@ -238,6 +240,12 @@ pub struct WorkbenchApp {
     export_kind: ExportKind,
     export_destination: String,
     export_result: Option<Result<String, String>>,
+    #[cfg(feature = "screenshot")]
+    screenshot_destination: Option<PathBuf>,
+    #[cfg(feature = "screenshot")]
+    screenshot_frame_count: u8,
+    #[cfg(feature = "screenshot")]
+    screenshot_requested: bool,
 }
 
 impl WorkbenchApp {
@@ -253,7 +261,6 @@ impl WorkbenchApp {
             );
             creation_context.egui_ctx.set_zoom_factor(zoom);
         }
-
         let preferences: Preferences = if cfg!(feature = "screenshot") {
             Preferences::default()
         } else {
@@ -311,6 +318,13 @@ impl WorkbenchApp {
             export_kind: ExportKind::Package,
             export_destination: String::new(),
             export_result: None,
+            #[cfg(feature = "screenshot")]
+            screenshot_destination: std::env::var_os("RESYMBOL_WORKBENCH_SCREENSHOT_TO")
+                .map(PathBuf::from),
+            #[cfg(feature = "screenshot")]
+            screenshot_frame_count: 0,
+            #[cfg(feature = "screenshot")]
+            screenshot_requested: false,
         };
         app.log(
             ActivityLevel::Info,
@@ -391,6 +405,46 @@ impl WorkbenchApp {
                 self.console_host
                     .try_send_line(format_activity(elapsed, level.label(), &message));
         }
+    }
+
+    #[cfg(feature = "screenshot")]
+    fn advance_screenshot_capture(&mut self, context: &egui::Context) {
+        const SETTLE_FRAMES: u8 = 12;
+        if self.screenshot_destination.is_none() {
+            return;
+        }
+
+        let captured = context.input(|input| {
+            input.events.iter().find_map(|event| match event {
+                egui::Event::Screenshot { image, .. } => Some(Arc::clone(image)),
+                _ => None,
+            })
+        });
+        if let Some(image) = captured {
+            let destination = self
+                .screenshot_destination
+                .take()
+                .expect("capture destination remains present");
+            write_screenshot_new(&destination, &image).unwrap_or_else(|error| {
+                panic!(
+                    "cannot write workbench screenshot {}: {error}",
+                    destination.display()
+                )
+            });
+            context.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+
+        if !self.screenshot_requested {
+            self.screenshot_frame_count = self.screenshot_frame_count.saturating_add(1);
+            if self.screenshot_frame_count >= SETTLE_FRAMES {
+                context.send_viewport_cmd(egui::ViewportCommand::Screenshot(
+                    egui::UserData::default(),
+                ));
+                self.screenshot_requested = true;
+            }
+        }
+        context.request_repaint();
     }
 
     fn set_console_enabled(&mut self, enabled: bool) {
@@ -2842,11 +2896,12 @@ impl eframe::App for WorkbenchApp {
         self.show_activity_panel(context);
         self.show_central(context);
 
-        if cfg!(feature = "screenshot") {
-            context.request_repaint();
-        } else if self.project_operation.is_pending()
-            || self.export_operation.is_pending()
-            || self.console_host.is_enabled()
+        #[cfg(feature = "screenshot")]
+        self.advance_screenshot_capture(context);
+        if !cfg!(feature = "screenshot")
+            && (self.project_operation.is_pending()
+                || self.export_operation.is_pending()
+                || self.console_host.is_enabled())
         {
             context.request_repaint_after(std::time::Duration::from_millis(100));
         }
@@ -2863,6 +2918,49 @@ impl eframe::App for WorkbenchApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, STORAGE_KEY, &self.preferences);
     }
+}
+
+#[cfg(feature = "screenshot")]
+fn write_screenshot_new(path: &Path, image: &egui::ColorImage) -> Result<(), String> {
+    const MAX_CAPTURE_DIMENSION: usize = 8_192;
+    let [width, height] = image.size;
+    if width == 0 || height == 0 || width > MAX_CAPTURE_DIMENSION || height > MAX_CAPTURE_DIMENSION
+    {
+        return Err(format!("invalid capture dimensions {width}x{height}"));
+    }
+    let pixel_count = width
+        .checked_mul(height)
+        .ok_or_else(|| "capture dimensions overflow".to_owned())?;
+    if image.pixels.len() != pixel_count {
+        return Err("capture pixel count does not match its dimensions".to_owned());
+    }
+    let byte_count = pixel_count
+        .checked_mul(4)
+        .ok_or_else(|| "capture byte count overflows".to_owned())?;
+    let mut rgba = Vec::with_capacity(byte_count);
+    for pixel in &image.pixels {
+        rgba.extend_from_slice(&pixel.to_array());
+    }
+
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| format!("create-new failed: {error}"))?;
+    let width = u32::try_from(width).map_err(|_| "capture width exceeds u32".to_owned())?;
+    let height = u32::try_from(height).map_err(|_| "capture height exceeds u32".to_owned())?;
+    let mut encoder = png::Encoder::new(BufWriter::new(file), width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder
+        .write_header()
+        .map_err(|error| format!("PNG header failed: {error}"))?;
+    writer
+        .write_image_data(&rgba)
+        .map_err(|error| format!("PNG data failed: {error}"))?;
+    writer
+        .finish()
+        .map_err(|error| format!("PNG finish failed: {error}"))
 }
 
 fn show_plugin(ui: &mut egui::Ui, plugin: &DiscoveredPlugin, colors: SemanticColors) {

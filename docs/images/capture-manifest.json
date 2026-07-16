@@ -1,0 +1,50 @@
+{
+    "schema_version":  1,
+    "fixture":  {
+                    "file":  "milestone2-symbolized.exe",
+                    "sha256":  "f7f221b4de7c6e4f6f2e4e227840ffa8ecc3d92a3553d8763755a3fafadc1a5e"
+                },
+    "viewport":  {
+                     "width":  1440,
+                     "height":  900,
+                     "desktop_dpi":  120,
+                     "width_points":  1152,
+                     "height_points":  720,
+                     "ui_zoom":  0.8,
+                     "effective_pixels_per_point":  1
+                 },
+    "captures":  [
+                     {
+                         "file":  "workbench-overview.png",
+                         "view":  "overview",
+                         "width":  1440,
+                         "height":  900,
+                         "bytes":  220956,
+                         "sha256":  "328fc62aece173d253438445c9386cae587afae20ef25263c75836b874536f73"
+                     },
+                     {
+                         "file":  "workbench-functions.png",
+                         "view":  "functions",
+                         "width":  1440,
+                         "height":  900,
+                         "bytes":  227051,
+                         "sha256":  "bb8fca69c9e51facf38d6305d0b9f63a0f1b9cafddc62deeaf768ded56c78c0e"
+                     },
+                     {
+                         "file":  "workbench-graph.png",
+                         "view":  "graph",
+                         "width":  1440,
+                         "height":  900,
+                         "bytes":  253220,
+                         "sha256":  "0ec35b82297578edfbce5c7e08db4213c051125dd28c9b5dddd66a4d140c56ed"
+                     },
+                     {
+                         "file":  "workbench-address-space.png",
+                         "view":  "address-space",
+                         "width":  1440,
+                         "height":  900,
+                         "bytes":  243756,
+                         "sha256":  "c796fc0e0717a57cb52b25ea192dc818a6220716bd4981bb2961d0a177652111"
+                     }
+                 ]
+}

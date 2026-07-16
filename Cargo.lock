@@ -3074,6 +3074,7 @@ version = "0.1.0-alpha.1"
 dependencies = [
  "eframe",
  "egui_extras",
+ "png",
  "resymbol-analysis",
  "resymbol-app",
  "resymbol-core",
