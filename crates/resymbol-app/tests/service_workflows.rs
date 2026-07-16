@@ -29,6 +29,14 @@ fn analyze_save_open_and_exact_identity_verification_are_immutable() {
     assert_eq!(analyzed.binary_path(), Some(canonical_binary.as_path()));
     assert!(analyzed.package_path().is_none());
     assert_eq!(Arc::strong_count(&analyzed), 1);
+    let first_source = analyzed
+        .verified_source_bytes_arc()
+        .expect("analyzed source snapshot");
+    let second_source = analyzed
+        .verified_source_bytes_arc()
+        .expect("shared source snapshot");
+    assert!(Arc::ptr_eq(&first_source, &second_source));
+    assert_eq!(first_source.as_ref(), EXACT_RSDS_PE);
 
     let package_path = temp.path().join("fixture.resym");
     services
@@ -44,6 +52,7 @@ fn analyze_save_open_and_exact_identity_verification_are_immutable() {
         .expect("open current-schema package");
     let canonical_package = fs::canonicalize(&package_path).expect("canonicalize saved package");
     assert!(!opened.has_verified_source());
+    assert!(opened.verified_source_bytes_arc().is_none());
     assert!(opened.binary_path().is_none());
     assert_eq!(opened.package_path(), Some(canonical_package.as_path()));
     assert_eq!(

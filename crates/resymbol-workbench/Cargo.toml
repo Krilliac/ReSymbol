@@ -15,6 +15,7 @@ screenshot = ["dep:png"]
 [dependencies]
 eframe = { version = "=0.32.3", default-features = false, features = ["accesskit", "default_fonts", "glow", "persistence"] }
 egui_extras = { version = "=0.32.3", default-features = false }
+getrandom = "0.3.4"
 resymbol-analysis = { path = "../resymbol-analysis" }
 resymbol-app = { path = "../resymbol-app" }
 resymbol-core = { path = "../resymbol-core" }
