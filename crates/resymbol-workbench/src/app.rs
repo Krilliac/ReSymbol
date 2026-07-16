@@ -2051,7 +2051,7 @@ impl WorkbenchApp {
             .inner_margin(egui::Margin::same(10))
             .corner_radius(4)
             .show(ui, |ui| {
-                ui.columns(5, |columns| {
+                ui.columns(6, |columns| {
                     property_row(
                         &mut columns[0],
                         "Preferred base",
@@ -2066,6 +2066,15 @@ impl WorkbenchApp {
                     );
                     property_row(
                         &mut columns[2],
+                        "Section / file align",
+                        &format!(
+                            "0x{:X} / 0x{:X}",
+                            address_space.section_alignment, address_space.file_alignment
+                        ),
+                        true,
+                    );
+                    property_row(
+                        &mut columns[3],
                         "Entry RVA",
                         &address_space.entry_point.map_or_else(
                             || "none".to_owned(),
@@ -2074,12 +2083,12 @@ impl WorkbenchApp {
                         true,
                     );
                     property_row(
-                        &mut columns[3],
+                        &mut columns[4],
                         "Regions",
                         &address_space.regions().len().to_string(),
                         false,
                     );
-                    property_row(&mut columns[4], "Indicators", &indicator_text, false);
+                    property_row(&mut columns[5], "Indicators", &indicator_text, false);
                 });
             });
 
@@ -2191,11 +2200,21 @@ impl WorkbenchApp {
                                                 .color(colors.secondary_text),
                                         );
                                     }
-                                    _ if region.zero_fill_size() != 0 => {
-                                        ui.monospace(format!(
-                                            "0x{:X} zero-fill",
-                                            region.zero_fill_size()
-                                        ));
+                                    _ if region.zero_fill_size() != 0
+                                        || region.mapped_padding_size() != 0 =>
+                                    {
+                                        let zero_fill = region.zero_fill_size();
+                                        let mapped_padding = region.mapped_padding_size();
+                                        let detail = match (zero_fill, mapped_padding) {
+                                            (0, padding) => {
+                                                format!("0x{padding:X} mapped padding")
+                                            }
+                                            (zeroes, 0) => format!("0x{zeroes:X} zero-fill"),
+                                            (zeroes, padding) => format!(
+                                                "0x{zeroes:X} zero-fill + 0x{padding:X} padding"
+                                            ),
+                                        };
+                                        ui.monospace(detail);
                                     }
                                     _ => {
                                         ui.label(
