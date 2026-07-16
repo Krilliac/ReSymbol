@@ -57,7 +57,7 @@ impl BoundReviewLedger {
     }
 
     #[must_use]
-    pub const fn persisted_path(&self) -> Option<&Path> {
+    pub fn persisted_path(&self) -> Option<&Path> {
         self.persisted_path.as_deref()
     }
 
@@ -91,7 +91,8 @@ impl BoundReviewLedger {
         self.ledger.can_redo()
     }
 
-    pub fn orphaned_count(&self, session: &AnalysisSession) -> Result<usize, ReviewStateError> {
+    #[cfg(test)]
+    fn orphaned_count(&self, session: &AnalysisSession) -> Result<usize, ReviewStateError> {
         self.ledger
             .orphaned_decision_count(session)
             .map_err(|error| ReviewStateError::Binding(error.to_string()))

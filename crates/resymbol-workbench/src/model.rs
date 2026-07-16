@@ -15,7 +15,9 @@ use std::{
 };
 
 use resymbol_analysis::{AnalysisSession, BinaryAnalysis, SessionValidationError};
-use resymbol_app::{AppError, AppServices, ProjectSnapshot, ReviewSubject, ReviewValidationError};
+#[cfg(any(feature = "screenshot", test))]
+use resymbol_app::AppServices;
+use resymbol_app::{AppError, ProjectSnapshot, ReviewSubject, ReviewValidationError};
 use resymbol_core::{
     BinaryId, ClaimProducer, ControlFlowTarget, SymbolAssertion, SymbolClaim, SymbolSubject,
 };
