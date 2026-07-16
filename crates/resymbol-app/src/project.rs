@@ -251,6 +251,12 @@ impl ProjectSnapshot {
         self.projection.as_ref()
     }
 
+    /// Clone the shared immutable projection without rebuilding or copying it.
+    #[must_use]
+    pub fn projection_arc(&self) -> Arc<ExportProjection> {
+        Arc::clone(&self.projection)
+    }
+
     #[must_use]
     pub const fn has_verified_source(&self) -> bool {
         self.exact_source.is_some()
@@ -261,6 +267,18 @@ impl ProjectSnapshot {
         self.exact_source
             .as_ref()
             .map(|source| source.path.as_path())
+    }
+
+    /// Exact source bytes retained by the same identity gate used for analysis.
+    ///
+    /// Frontends may derive byte-dependent, read-only views from this slice. It
+    /// is absent for package-only projects until the original binary has been
+    /// verified by [`AppServices::verify_source_binary`].
+    #[must_use]
+    pub fn verified_source_bytes(&self) -> Option<&[u8]> {
+        self.exact_source
+            .as_ref()
+            .map(|source| source.bytes.as_ref())
     }
 
     /// Apply the current review ledger to a fresh export projection.
@@ -277,9 +295,7 @@ impl ProjectSnapshot {
     }
 
     pub(crate) fn exact_source_bytes(&self) -> Option<&[u8]> {
-        self.exact_source
-            .as_ref()
-            .map(|source| source.bytes.as_ref())
+        self.verified_source_bytes()
     }
 
     pub(crate) fn suggested_stem(&self) -> String {

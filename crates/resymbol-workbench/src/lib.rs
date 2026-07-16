@@ -6,5 +6,6 @@ mod console_host;
 mod graph;
 mod model;
 mod theme;
+mod worker;
 
 pub use app::WorkbenchApp;

@@ -1,16 +1,14 @@
 use std::{
     collections::BTreeMap,
-    fs::OpenOptions,
-    io::Write,
-    path::{Path, PathBuf},
-    sync::mpsc::{self, Receiver, TryRecvError},
-    thread,
+    path::PathBuf,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use eframe::egui::{self, Align, Key, Layout, RichText, ScrollArea, Sense, TextEdit};
 use egui_extras::{Column, TableBuilder};
 use resymbol_analysis::BinaryAnalysis;
+use resymbol_app::ExportFormat;
 use resymbol_core::{
     DiscoveredPlugin, PluginDiscoveryOptions, PluginDiscoveryReport, discover_plugins,
     plugin_api::PluginHealthState,
@@ -18,8 +16,7 @@ use resymbol_core::{
 use resymbol_debugger::{
     EvidenceStrength, MemoryAccess, ProtectionEvidence, ProtectionSeverity, StaticRegionKind,
 };
-use resymbol_export::{ExportControlFlowTarget, ExportProducer, render_map, render_markdown};
-use resymbol_package::write_file_new_bound;
+use resymbol_export::{ExportControlFlowTarget, ExportProducer};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -34,9 +31,14 @@ use crate::{
         ReconstructionGraph, ReconstructionGraphView, ReconstructionGraphViewNode,
     },
     model::{
-        FunctionFilter, FunctionSort, FunctionSortKey, FunctionStatus, LoadedProject, SortDirection,
+        FunctionFilter, FunctionSort, FunctionSortKey, FunctionStatus, LoadedProject,
+        ProtectionAssessment, SortDirection,
     },
     theme::{SemanticColors, ThemePreset},
+    worker::{
+        OperationGate, OperationSequence, ServiceWorker, WorkerCommand, WorkerEvent,
+        WorkerExportKind,
+    },
 };
 
 const STORAGE_KEY: &str = "resymbol-workbench-preferences-v1";
@@ -126,10 +128,21 @@ enum ExportKind {
     NeutralJson,
     Markdown,
     Map,
+    Pdb,
+    IdaPython,
+    GhidraJava,
 }
 
 impl ExportKind {
-    const ALL: [Self; 4] = [Self::Package, Self::NeutralJson, Self::Markdown, Self::Map];
+    const ALL: [Self; 7] = [
+        Self::Package,
+        Self::NeutralJson,
+        Self::Markdown,
+        Self::Map,
+        Self::Pdb,
+        Self::IdaPython,
+        Self::GhidraJava,
+    ];
 
     const fn label(self) -> &'static str {
         match self {
@@ -137,15 +150,21 @@ impl ExportKind {
             Self::NeutralJson => "Neutral JSON",
             Self::Markdown => "Markdown report",
             Self::Map => "Microsoft-style MAP",
+            Self::Pdb => "Public-symbol PDB",
+            Self::IdaPython => "IDA Python",
+            Self::GhidraJava => "Ghidra Java",
         }
     }
 
-    const fn extension(self) -> &'static str {
+    const fn worker_kind(self) -> WorkerExportKind {
         match self {
-            Self::Package => "resym",
-            Self::NeutralJson => "symbols.json",
-            Self::Markdown => "symbols.md",
-            Self::Map => "map",
+            Self::Package => WorkerExportKind::Package,
+            Self::NeutralJson => WorkerExportKind::Service(ExportFormat::Json),
+            Self::Markdown => WorkerExportKind::Service(ExportFormat::Markdown),
+            Self::Map => WorkerExportKind::Service(ExportFormat::Map),
+            Self::Pdb => WorkerExportKind::Service(ExportFormat::Pdb),
+            Self::IdaPython => WorkerExportKind::Service(ExportFormat::IdaPython),
+            Self::GhidraJava => WorkerExportKind::Service(ExportFormat::GhidraJava),
         }
     }
 }
@@ -204,7 +223,11 @@ pub struct WorkbenchApp {
     activity_tab: ActivityTab,
     started_at: Instant,
     project: Option<LoadedProject>,
-    analysis_receiver: Option<Receiver<Result<LoadedProject, String>>>,
+    service_worker: ServiceWorker,
+    operation_sequence: OperationSequence,
+    project_operation: OperationGate,
+    export_operation: OperationGate,
+    worker_disconnected: bool,
     analysis_path: Option<PathBuf>,
     function_filter: FunctionFilter,
     function_sort: FunctionSort,
@@ -217,7 +240,6 @@ pub struct WorkbenchApp {
     export_kind: ExportKind,
     export_destination: String,
     export_result: Option<Result<String, String>>,
-    protection_dialog_open: bool,
 }
 
 impl WorkbenchApp {
@@ -274,7 +296,11 @@ impl WorkbenchApp {
             activity_tab: ActivityTab::Progress,
             started_at: Instant::now(),
             project: None,
-            analysis_receiver: None,
+            service_worker: ServiceWorker::start(creation_context.egui_ctx.clone()),
+            operation_sequence: OperationSequence::default(),
+            project_operation: OperationGate::default(),
+            export_operation: OperationGate::default(),
+            worker_disconnected: false,
             analysis_path: None,
             function_filter: FunctionFilter::default(),
             function_sort: FunctionSort::default(),
@@ -287,7 +313,6 @@ impl WorkbenchApp {
             export_kind: ExportKind::Package,
             export_destination: String::new(),
             export_result: None,
-            protection_dialog_open: false,
         };
         app.log(
             ActivityLevel::Info,
@@ -345,7 +370,9 @@ impl WorkbenchApp {
         }
 
         if let Some(path) = startup_path {
-            app.start_analysis(path, creation_context.egui_ctx.clone());
+            if let Err(error) = app.start_analysis(path) {
+                app.log(ActivityLevel::Error, error);
+            }
         }
         app
     }
@@ -469,22 +496,12 @@ impl WorkbenchApp {
     }
 
     fn apply_console_command(&mut self, command: ConsoleCommand, context: &egui::Context) {
-        if self.protection_dialog_open
-            && !matches!(&command, ConsoleCommand::Help | ConsoleCommand::Status)
-        {
-            self.console_reply(
-                false,
-                "acknowledge the protection warning before changing workbench state",
-            );
-            return;
-        }
-
         match command {
             ConsoleCommand::Help => {
                 let _ = self.console_host.try_send_line(format_help());
             }
             ConsoleCommand::Status => {
-                let analysis = if self.analysis_receiver.is_some() {
+                let analysis = if self.project_operation.is_pending() {
                     "running"
                 } else if self.project.is_some() {
                     "ready"
@@ -522,14 +539,10 @@ impl WorkbenchApp {
                     ),
                 );
             }
-            ConsoleCommand::Open(path) => {
-                if self.analysis_receiver.is_some() {
-                    self.console_reply(false, "an analysis is already running");
-                } else {
-                    self.console_reply(true, format!("queued {}", path.display()));
-                    self.start_analysis(path, context.clone());
-                }
-            }
+            ConsoleCommand::Open(path) => match self.start_analysis(path) {
+                Ok(message) => self.console_reply(true, message),
+                Err(error) => self.console_reply(false, error),
+            },
             ConsoleCommand::Tab(tab) => {
                 if self.project.is_none() && tab != ConsoleTab::Overview {
                     self.console_reply(false, "open a binary before selecting that tab");
@@ -606,27 +619,18 @@ impl WorkbenchApp {
                     ConsoleExportKind::Json => ExportKind::NeutralJson,
                     ConsoleExportKind::Markdown => ExportKind::Markdown,
                     ConsoleExportKind::Map => ExportKind::Map,
-                };
-                let Some(project) = self.project.as_ref() else {
-                    self.console_reply(false, "open a binary before exporting");
-                    return;
+                    ConsoleExportKind::Pdb => ExportKind::Pdb,
+                    ConsoleExportKind::IdaPython => ExportKind::IdaPython,
+                    ConsoleExportKind::GhidraJava => ExportKind::GhidraJava,
                 };
                 self.export_kind = kind;
                 self.export_destination = path.to_string_lossy().into_owned();
                 self.stage = WorkflowStage::Export;
                 self.main_tab = MainTab::Exports;
-                let result = write_export(project, kind, &path);
-                match &result {
-                    Ok(message) => {
-                        self.console_reply(true, message);
-                        self.log(ActivityLevel::Success, message.clone());
-                    }
-                    Err(error) => {
-                        self.console_reply(false, error);
-                        self.log(ActivityLevel::Error, format!("Export failed: {error}"));
-                    }
+                match self.queue_export(kind, path) {
+                    Ok(message) => self.console_reply(true, message),
+                    Err(error) => self.console_reply(false, error),
                 }
-                self.export_result = Some(result);
             }
             ConsoleCommand::Quit => {
                 self.console_reply(true, "closing workbench");
@@ -641,108 +645,230 @@ impl WorkbenchApp {
             .try_send_line(format_command_result(success, message.as_ref()));
     }
 
-    fn start_analysis(&mut self, path: PathBuf, context: egui::Context) {
-        if self.analysis_receiver.is_some() {
-            self.log(ActivityLevel::Warning, "An analysis is already running");
-            return;
-        }
-
-        self.project = None;
-        self.selected_projection_index = None;
-        self.graph_root_rva = None;
-        self.reconstruction_graph = None;
-        self.protection_dialog_open = false;
-        self.function_filter = FunctionFilter::default();
-        self.stage = WorkflowStage::Analyze;
-        self.main_tab = MainTab::Overview;
-        self.export_result = None;
-        self.export_destination.clear();
+    fn start_analysis(&mut self, path: PathBuf) -> Result<String, String> {
+        let operation = self.operation_sequence.issue();
+        let command = if is_package_path(&path) {
+            WorkerCommand::OpenPackage {
+                operation,
+                path: path.clone(),
+            }
+        } else {
+            WorkerCommand::Analyze {
+                operation,
+                path: path.clone(),
+            }
+        };
+        self.service_worker.submit(command)?;
+        self.project_operation.begin(operation);
         self.analysis_path = Some(path.clone());
-        self.log(
-            ActivityLevel::Info,
-            format!("Queued core analysis for {}", path.display()),
-        );
-
-        let (sender, receiver) = mpsc::channel();
-        thread::spawn(move || {
-            let result = LoadedProject::from_path(&path).map_err(|error| error.to_string());
-            let _ = sender.send(result);
-            context.request_repaint();
-        });
-        self.analysis_receiver = Some(receiver);
+        self.stage = WorkflowStage::Analyze;
+        let action = if is_package_path(&path) {
+            "package open"
+        } else {
+            "bounded core analysis"
+        };
+        let message = format!("Queued {action} for {}", path.display());
+        self.log(ActivityLevel::Info, &message);
+        Ok(message)
     }
 
-    fn poll_analysis(&mut self) {
-        let result = match self.analysis_receiver.as_ref().map(Receiver::try_recv) {
-            Some(Ok(result)) => Some(result),
-            Some(Err(TryRecvError::Disconnected)) => Some(Err(
-                "analysis worker stopped without returning a result".to_owned(),
-            )),
-            Some(Err(TryRecvError::Empty)) | None => None,
-        };
-        let Some(result) = result else {
-            return;
-        };
-        self.analysis_receiver = None;
+    fn queue_export(&mut self, kind: ExportKind, path: PathBuf) -> Result<String, String> {
+        if path.as_os_str().is_empty() {
+            return Err("choose a destination path".to_owned());
+        }
+        if self.export_operation.is_pending() {
+            return Err("an export is already running".to_owned());
+        }
+        if self.project_operation.is_pending() {
+            return Err("wait for the current project operation before exporting".to_owned());
+        }
+        let project = self
+            .project
+            .as_ref()
+            .ok_or_else(|| "open a binary or package before exporting".to_owned())?;
+        if kind == ExportKind::Pdb && !project.snapshot.has_verified_source() {
+            return Err(
+                "PDB export requires the exact source binary; package-only projects must verify it first"
+                    .to_owned(),
+            );
+        }
 
-        match result {
-            Ok(project) => {
-                let function_count = project.functions.len();
-                let warning_count = project.projection.warnings.len();
-                let protection_count = project.protection_report.findings().len();
-                let protection_dialog_open = project.protection_report.requires_acknowledgement();
-                self.export_destination = default_export_path(&project, self.export_kind)
-                    .to_string_lossy()
-                    .into_owned();
-                self.analysis_path = Some(project.identity.path.clone());
-                self.selected_projection_index =
-                    project.functions.first().map(|row| row.projection_index);
-                let reconstruction_graph = ReconstructionGraph::from_project(&project);
-                self.graph_root_rva = reconstruction_graph.default_root().map(|root| root.rva);
-                self.reconstruction_graph = Some(reconstruction_graph);
-                self.project = Some(project);
-                self.protection_dialog_open = protection_dialog_open;
-                self.stage = WorkflowStage::Review;
-                self.main_tab = MainTab::Overview;
-                if protection_dialog_open {
-                    self.activity_tab = ActivityTab::Warnings;
-                    self.log(
-                        ActivityLevel::Warning,
-                        format!(
-                            "Static protection assessment requires review: {protection_count} finding(s)"
-                        ),
-                    );
+        let operation = self.operation_sequence.issue();
+        self.service_worker.submit(WorkerCommand::Export {
+            operation,
+            project: Arc::clone(&project.snapshot),
+            kind: kind.worker_kind(),
+            path: path.clone(),
+        })?;
+        self.export_operation.begin(operation);
+        self.export_result = None;
+        let message = format!("Queued {} export to {}", kind.label(), path.display());
+        self.log(ActivityLevel::Info, &message);
+        Ok(message)
+    }
+
+    fn queue_source_verification(&mut self, path: PathBuf) -> Result<String, String> {
+        if self.project_operation.is_pending() {
+            return Err("a project operation is already running".to_owned());
+        }
+        let project = self
+            .project
+            .as_ref()
+            .ok_or_else(|| "open a package before verifying its source binary".to_owned())?;
+        if project.snapshot.has_verified_source() {
+            return Err("the exact source binary is already verified".to_owned());
+        }
+
+        let operation = self.operation_sequence.issue();
+        self.service_worker.submit(WorkerCommand::VerifySource {
+            operation,
+            project: Arc::clone(&project.snapshot),
+            path: path.clone(),
+        })?;
+        self.project_operation.begin(operation);
+        let message = format!(
+            "Queued exact-source identity verification for {}",
+            path.display()
+        );
+        self.log(ActivityLevel::Info, &message);
+        Ok(message)
+    }
+
+    fn poll_service_worker(&mut self) {
+        loop {
+            let event = match self.service_worker.try_recv() {
+                Ok(Some(event)) => event,
+                Ok(None) => break,
+                Err(error) => {
+                    if !self.worker_disconnected {
+                        self.worker_disconnected = true;
+                        self.project_operation.invalidate();
+                        self.export_operation.invalidate();
+                        self.log(ActivityLevel::Error, error);
+                    }
+                    break;
                 }
-                self.log(
-                    ActivityLevel::Success,
-                    format!(
-                        "Analysis complete: {function_count} functions, {protection_count} protection findings, {warning_count} projection warnings"
-                    ),
-                );
-            }
-            Err(error) => {
-                self.stage = WorkflowStage::Open;
-                self.log(ActivityLevel::Error, format!("Analysis failed: {error}"));
+            };
+
+            match event {
+                WorkerEvent::ProjectOpened { operation, result }
+                | WorkerEvent::SourceVerified { operation, result } => {
+                    if !self.project_operation.finish(operation) {
+                        self.log(
+                            ActivityLevel::Warning,
+                            format!(
+                                "Ignored stale project result for operation {}",
+                                operation.get()
+                            ),
+                        );
+                        continue;
+                    }
+                    match result {
+                        Ok(project) => self.accept_project(project),
+                        Err(error) => {
+                            self.stage = if self.project.is_some() {
+                                WorkflowStage::Review
+                            } else {
+                                WorkflowStage::Open
+                            };
+                            self.log(
+                                ActivityLevel::Error,
+                                format!("Project open failed: {error}"),
+                            );
+                        }
+                    }
+                }
+                WorkerEvent::ExportCompleted { operation, result } => {
+                    if !self.export_operation.finish(operation) {
+                        self.log(
+                            ActivityLevel::Warning,
+                            format!(
+                                "Ignored stale export result for operation {}",
+                                operation.get()
+                            ),
+                        );
+                        continue;
+                    }
+                    match result {
+                        Ok(outcome) => {
+                            let message = format!(
+                                "Wrote {} to {}",
+                                outcome.kind.label(),
+                                outcome.path.display()
+                            );
+                            self.export_result = Some(Ok(message.clone()));
+                            self.console_reply(true, &message);
+                            self.log(ActivityLevel::Success, message);
+                        }
+                        Err(error) => {
+                            self.export_result = Some(Err(error.clone()));
+                            self.console_reply(false, &error);
+                            self.log(ActivityLevel::Error, format!("Export failed: {error}"));
+                        }
+                    }
+                }
             }
         }
     }
 
-    fn choose_binary(&mut self, context: &egui::Context) {
+    fn accept_project(&mut self, project: LoadedProject) {
+        let function_count = project.functions.len();
+        let warning_count = project.projection.warnings.len();
+        let protection_count = project.protection_assessment.findings().len();
+        let protection_requires_review = project.protection_assessment.requires_acknowledgement();
+        let protection_unavailable = project
+            .protection_assessment
+            .unavailable_reason()
+            .map(ToOwned::to_owned);
+        self.export_operation.invalidate();
+        self.export_destination = default_export_path(&project, self.export_kind)
+            .to_string_lossy()
+            .into_owned();
+        self.export_result = None;
+        self.analysis_path = Some(project.identity.path.clone());
+        self.selected_projection_index = project.functions.first().map(|row| row.projection_index);
+        let reconstruction_graph = ReconstructionGraph::from_project(&project);
+        self.graph_root_rva = reconstruction_graph.default_root().map(|root| root.rva);
+        self.reconstruction_graph = Some(reconstruction_graph);
+        self.function_filter = FunctionFilter::default();
+        self.project = Some(project);
+        self.stage = WorkflowStage::Review;
+        self.main_tab = MainTab::Overview;
+        if protection_requires_review {
+            self.activity_tab = ActivityTab::Warnings;
+            self.log(
+                ActivityLevel::Warning,
+                format!(
+                    "Static protection assessment requires offline review: {protection_count} finding(s); no target code executed"
+                ),
+            );
+        } else if let Some(reason) = protection_unavailable {
+            self.activity_tab = ActivityTab::Warnings;
+            self.log(ActivityLevel::Warning, reason);
+        }
+        self.log(
+            ActivityLevel::Success,
+            format!(
+                "Project ready: {function_count} functions, {protection_count} protection findings, {warning_count} projection warnings"
+            ),
+        );
+    }
+
+    fn choose_binary(&mut self, _context: &egui::Context) {
         let Some(path) = rfd::FileDialog::new()
-            .set_title("Open a PE32+ x86-64 binary")
+            .set_title("Open a PE32+ x86-64 binary or current ReSymbol package")
             .add_filter("Windows binaries", &["exe", "dll", "sys"])
+            .add_filter("ReSymbol packages", &["resym"])
             .pick_file()
         else {
             return;
         };
-        self.start_analysis(path, context.clone());
+        if let Err(error) = self.start_analysis(path) {
+            self.log(ActivityLevel::Error, error);
+        }
     }
 
     fn handle_inputs(&mut self, context: &egui::Context) {
-        if self.protection_dialog_open {
-            return;
-        }
-
         let open_shortcut =
             context.input(|input| input.modifiers.command && input.key_pressed(Key::O));
         if open_shortcut {
@@ -757,7 +883,9 @@ impl WorkbenchApp {
                 .find_map(|file| file.path.clone())
         });
         if let Some(path) = dropped {
-            self.start_analysis(path, context.clone());
+            if let Err(error) = self.start_analysis(path) {
+                self.log(ActivityLevel::Error, error);
+            }
         }
     }
 
@@ -834,7 +962,7 @@ impl WorkbenchApp {
                     }
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let primary_label = if self.analysis_receiver.is_some() {
+                        let primary_label = if self.project_operation.is_pending() {
                             "Analyzing..."
                         } else if self.project.is_some() {
                             "Export Symbols"
@@ -843,7 +971,7 @@ impl WorkbenchApp {
                         };
                         if ui
                             .add_enabled(
-                                self.analysis_receiver.is_none(),
+                                !self.project_operation.is_pending(),
                                 egui::Button::new(RichText::new(primary_label).strong())
                                     .fill(colors.selection)
                                     .stroke(egui::Stroke::new(1.0, colors.exact_extracted))
@@ -913,7 +1041,7 @@ impl WorkbenchApp {
                     for (index, stage) in WorkflowStage::ALL.into_iter().enumerate() {
                         let enabled = match stage {
                             WorkflowStage::Open => true,
-                            WorkflowStage::Analyze => self.analysis_receiver.is_some(),
+                            WorkflowStage::Analyze => self.project_operation.is_pending(),
                             WorkflowStage::Review | WorkflowStage::Export => self.project.is_some(),
                         };
                         let selected = self.stage == stage;
@@ -938,7 +1066,7 @@ impl WorkbenchApp {
                         }
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let (cue, text, color) = if self.analysis_receiver.is_some() {
+                        let (cue, text, color) = if self.project_operation.is_pending() {
                             ("[RUN]", "Core analyzer working", colors.inferred)
                         } else if self.project.is_some() {
                             ("[READY]", "Validated projection", colors.healthy)
@@ -999,7 +1127,10 @@ impl WorkbenchApp {
                         });
                     ui.add_space(8.0);
                     ui.collapsing("Analysis session", |ui| {
-                        ui.label(format!("Schema {}", project.package.schema_version()));
+                        ui.label(format!(
+                            "Schema {}",
+                            project.snapshot.package().schema_version()
+                        ));
                         ui.label("Core-only safe review mode");
                     });
                     if ui
@@ -1325,8 +1456,8 @@ impl WorkbenchApp {
 
     fn show_progress(&self, ui: &mut egui::Ui) {
         let colors = self.preferences.theme.semantic_colors();
-        let (fraction, label, color) = if self.analysis_receiver.is_some() {
-            (0.55, "Core analyzer running", colors.inferred)
+        let (fraction, label, color) = if self.project_operation.is_pending() {
+            (0.55, "Application service running", colors.inferred)
         } else if self.project.is_some() {
             (1.0, "Analysis completed", colors.exact_extracted)
         } else {
@@ -1340,11 +1471,15 @@ impl WorkbenchApp {
                 .fill(color),
         );
         ui.horizontal_wrapped(|ui| {
+            let protection_complete = self
+                .project
+                .as_ref()
+                .is_some_and(|project| project.protection_assessment.is_available());
             for (label, complete) in [
                 ("Identity", self.project.is_some()),
                 ("Base analysis", self.project.is_some()),
                 ("Static address map", self.project.is_some()),
-                ("Protection scan", self.project.is_some()),
+                ("Protection scan", protection_complete),
                 ("Evidence projection", self.project.is_some()),
                 ("Export preview", self.main_tab == MainTab::Exports),
             ] {
@@ -1364,12 +1499,24 @@ impl WorkbenchApp {
             ui.label("No static findings or projection warnings until analysis completes");
             return;
         };
-        let protection_findings = project.protection_report.findings();
-        if protection_findings.is_empty() && project.projection.warnings.is_empty() {
+        let protection_findings = project.protection_assessment.findings();
+        let protection_unavailable = project.protection_assessment.unavailable_reason();
+        if protection_findings.is_empty()
+            && protection_unavailable.is_none()
+            && project.projection.warnings.is_empty()
+        {
             ui.label("[OK] No static protection indicators or neutral-projection losses");
             return;
         }
         ScrollArea::vertical().show(ui, |ui| {
+            if let Some(reason) = protection_unavailable {
+                ui.label(
+                    RichText::new(format!("[UNAVAILABLE] {reason}"))
+                        .strong()
+                        .color(self.preferences.theme.semantic_colors().warning_conflict),
+                );
+                ui.small("The package still provides a validated static address map; no executable bytes are embedded or inferred.");
+            }
             if !protection_findings.is_empty() {
                 ui.label(
                     RichText::new(format!(
@@ -1395,7 +1542,9 @@ impl WorkbenchApp {
                     });
                 }
             }
-            if !protection_findings.is_empty() && !project.projection.warnings.is_empty() {
+            if (!protection_findings.is_empty() || protection_unavailable.is_some())
+                && !project.projection.warnings.is_empty()
+            {
                 ui.separator();
             }
             if !project.projection.warnings.is_empty() {
@@ -1491,6 +1640,9 @@ impl WorkbenchApp {
                     return;
                 }
 
+                self.show_protection_banner(ui);
+                ui.add_space(8.0);
+
                 match self.main_tab {
                     MainTab::Overview => self.show_overview(ui),
                     MainTab::Functions => self.show_functions(ui),
@@ -1503,165 +1655,106 @@ impl WorkbenchApp {
             });
     }
 
-    fn show_protection_dialog(&mut self, context: &egui::Context) {
-        if !self.protection_dialog_open {
-            return;
-        }
+    fn show_protection_banner(&mut self, ui: &mut egui::Ui) {
         let Some(project) = self.project.as_ref() else {
-            self.protection_dialog_open = false;
             return;
         };
-
-        let display_name = project.identity.display_name.clone();
-        let binary_hash = project.identity.sha256.as_str().to_owned();
-        let findings = project.protection_report.findings().to_vec();
         let colors = self.preferences.theme.semantic_colors();
-        let mut review_address_space = false;
-        let mut continue_offline = false;
-        let mut close_project = false;
+        let finding_count = project.protection_assessment.findings().len();
+        let unavailable = project
+            .protection_assessment
+            .unavailable_reason()
+            .map(ToOwned::to_owned);
+        let needs_source = matches!(
+            &project.protection_assessment,
+            ProtectionAssessment::ExactSourceRequired
+        );
+        let mut verify_source = false;
 
-        egui::Modal::new(egui::Id::new("protection_assessment_dialog"))
-            .frame(
-                egui::Frame::popup(context.style().as_ref())
-                    .fill(colors.panel)
-                    .stroke(egui::Stroke::new(1.0, colors.warning_conflict))
-                    .inner_margin(egui::Margin::same(18)),
-            )
-            .show(context, |ui| {
-                ui.set_max_width(760.0);
-                ui.heading(
-                    RichText::new("[!] Protection and anti-analysis indicators")
-                        .color(colors.warning_conflict),
-                );
-                ui.label(
-                    "ReSymbol found static artifacts that deserve review before any live execution workflow. No target code has run.",
-                );
-                ui.add_space(6.0);
+        egui::Frame::new()
+            .fill(colors.raised)
+            .stroke(egui::Stroke::new(1.0, colors.warning_conflict))
+            .inner_margin(egui::Margin::symmetric(10, 7))
+            .corner_radius(4)
+            .show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new(display_name).strong());
                     ui.label(
-                        RichText::new(short_hash(&binary_hash))
-                            .monospace()
+                        RichText::new("[OFFLINE] No target code has executed")
+                            .strong()
+                            .color(colors.healthy),
+                    );
+                    if let Some(reason) = unavailable.as_deref() {
+                        ui.label(RichText::new(reason).color(colors.warning_conflict));
+                    } else if finding_count == 0 {
+                        ui.label(
+                            RichText::new(
+                                "The bounded static scan found no supported protection indicators.",
+                            )
                             .color(colors.secondary_text),
-                    )
-                    .on_hover_text(format!("SHA-256 {binary_hash}"));
-                });
-                ui.separator();
-                ScrollArea::vertical().max_height(430.0).show(ui, |ui| {
-                    for finding in &findings {
-                        let (cue, color) = protection_severity_visual(finding.severity, colors);
-                        egui::Frame::new()
-                            .fill(colors.raised)
-                            .stroke(egui::Stroke::new(1.0, colors.border))
-                            .inner_margin(egui::Margin::same(10))
-                            .corner_radius(4)
-                            .show(ui, |ui| {
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.colored_label(
-                                        color,
-                                        RichText::new(format!("[{cue}] {}", finding.title))
-                                            .strong(),
-                                    );
-                                    ui.label(
-                                        RichText::new(protection_strength_label(finding.strength))
-                                            .small()
-                                            .color(colors.secondary_text),
-                                    );
-                                });
-                                ui.label(&finding.summary);
-                                for evidence in &finding.evidence {
-                                    ui.label(
-                                        RichText::new(format!(
-                                            "Evidence: {}",
-                                            protection_evidence_text(evidence)
-                                        ))
-                                        .monospace()
-                                        .small()
-                                        .color(colors.secondary_text),
-                                    );
-                                }
-                            });
-                        ui.add_space(6.0);
+                        );
+                    } else {
+                        ui.label(
+                            RichText::new(format!(
+                                "{} static protection or anti-analysis indicator(s) require review",
+                                finding_count
+                            ))
+                            .strong()
+                            .color(colors.warning_conflict),
+                        );
+                        ui.label(
+                            RichText::new(
+                                "These bounded findings are evidence, not proof of intent or runtime behavior.",
+                            )
+                            .color(colors.secondary_text),
+                        );
+                    }
+                    if needs_source
+                        && ui
+                            .add_enabled(
+                                !self.project_operation.is_pending(),
+                                egui::Button::new("Verify exact source..."),
+                            )
+                            .clicked()
+                    {
+                        verify_source = true;
                     }
                 });
-                ui.label(
-                    RichText::new(
-                        "Findings identify exact metadata or bounded heuristics. They do not prove malicious intent or that a code path executes.",
-                    )
-                    .small()
-                    .color(colors.secondary_text),
+                ui.small(
+                    "Live launch/attach is not performed here. Any future live action must use a separate acknowledgement bound to the exact target identity and execution policy.",
                 );
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui
-                        .button(RichText::new("Review address space").strong())
-                        .clicked()
-                    {
-                        review_address_space = true;
-                    }
-                    if ui.button("Continue offline review").clicked() {
-                        continue_offline = true;
-                    }
-                    if ui
-                        .button(
-                            RichText::new("Close project")
-                                .color(colors.destructive_quarantined),
-                        )
-                        .clicked()
-                    {
-                        close_project = true;
-                    }
-                });
             });
 
-        if review_address_space {
-            self.protection_dialog_open = false;
-            self.main_tab = MainTab::AddressSpace;
-            self.activity_tab = ActivityTab::Warnings;
-            self.stage = WorkflowStage::Review;
-            self.log(
-                ActivityLevel::Info,
-                "Protection dialog acknowledged; opened static address space",
-            );
-        } else if continue_offline {
-            self.protection_dialog_open = false;
-            self.log(
-                ActivityLevel::Info,
-                "Protection dialog acknowledged; continuing offline review",
-            );
-        } else if close_project {
-            self.protection_dialog_open = false;
-            self.project = None;
-            self.analysis_path = None;
-            self.selected_projection_index = None;
-            self.graph_root_rva = None;
-            self.reconstruction_graph = None;
-            self.export_destination.clear();
-            self.export_result = None;
-            self.stage = WorkflowStage::Open;
-            self.main_tab = MainTab::Overview;
-            self.log(
-                ActivityLevel::Info,
-                "Closed project without executing target code",
-            );
+        if verify_source {
+            let Some(path) = rfd::FileDialog::new()
+                .set_title("Verify the exact original PE for this package")
+                .add_filter("Windows binaries", &["exe", "dll", "sys"])
+                .pick_file()
+            else {
+                return;
+            };
+            if let Err(error) = self.queue_source_verification(path) {
+                self.log(ActivityLevel::Error, error);
+            }
         }
     }
 
     fn show_empty_state(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
         ui.with_layout(Layout::top_down_justified(Align::Center), |ui| {
             ui.add_space(70.0);
-            ui.heading(if self.analysis_receiver.is_some() {
+            ui.heading(if self.project_operation.is_pending() {
                 "Analyzing exact binary bytes"
             } else {
                 "Open a binary to begin"
             });
-            ui.label("ReSymbol currently accepts native Windows PE32+ x86-64 binaries.");
+            ui.label(
+                "Open a native Windows PE32+ x86-64 binary or a current ReSymbol package.",
+            );
             ui.label("The workbench keeps identity, status, confidence, and provenance visible independently.");
             ui.add_space(18.0);
             if ui
                 .add_enabled(
-                    self.analysis_receiver.is_none(),
-                    egui::Button::new(if self.analysis_receiver.is_some() {
+                    !self.project_operation.is_pending(),
+                    egui::Button::new(if self.project_operation.is_pending() {
                         "Core analysis running..."
                     } else {
                         "Open Binary (Ctrl+O)"
@@ -1672,7 +1765,7 @@ impl WorkbenchApp {
                 self.choose_binary(context);
             }
             ui.add_space(10.0);
-            ui.small("You can also drag an .exe, .dll, or .sys file onto this window.");
+            ui.small("You can also drag an .exe, .dll, .sys, or .resym file onto this window.");
         });
     }
 
@@ -1730,8 +1823,10 @@ impl WorkbenchApp {
                 summary_card(
                     &mut columns[1],
                     "Protection indicators",
-                    project.protection_report.findings().len(),
-                    if project.protection_report.is_empty() {
+                    project.protection_assessment.findings().len(),
+                    if project.protection_assessment.is_available()
+                        && project.protection_assessment.findings().is_empty()
+                    {
                         colors.healthy
                     } else {
                         colors.warning_conflict
@@ -1770,10 +1865,19 @@ impl WorkbenchApp {
                         &format_bytes(project.identity.image_size),
                         false,
                     );
-                    ui.label(
-                        RichText::new("[EXACT] Source bytes verified and analyzed")
-                            .color(colors.exact_extracted),
-                    );
+                    if project.snapshot.has_verified_source() {
+                        ui.label(
+                            RichText::new("[EXACT] Source bytes verified and analyzed")
+                                .color(colors.exact_extracted),
+                        );
+                    } else {
+                        ui.label(
+                            RichText::new(
+                                "[BOUND] Package identity validated; executable bytes are not loaded",
+                            )
+                            .color(colors.warning_conflict),
+                        );
+                    }
                 });
 
                 workbench_card(colors).show(&mut columns[1], |ui| {
@@ -1867,6 +1971,13 @@ impl WorkbenchApp {
         let project = self.project.as_ref().expect("checked by caller");
         let address_space = &project.static_address_space;
         let colors = self.preferences.theme.semantic_colors();
+        let indicator_text = project
+            .protection_assessment
+            .unavailable_reason()
+            .map_or_else(
+                || project.protection_assessment.findings().len().to_string(),
+                |_| "source required".to_owned(),
+            );
 
         ui.heading("Static address space");
         ui.horizontal_wrapped(|ui| {
@@ -1916,16 +2027,11 @@ impl WorkbenchApp {
                         &address_space.regions().len().to_string(),
                         false,
                     );
-                    property_row(
-                        &mut columns[4],
-                        "Indicators",
-                        &project.protection_report.findings().len().to_string(),
-                        false,
-                    );
+                    property_row(&mut columns[4], "Indicators", &indicator_text, false);
                 });
             });
 
-        let findings = project.protection_report.findings();
+        let findings = project.protection_assessment.findings();
         if !findings.is_empty() {
             ui.add_space(8.0);
             egui::Frame::new()
@@ -2510,7 +2616,7 @@ impl WorkbenchApp {
             return;
         };
         let colors = self.preferences.theme.semantic_colors();
-        let mut export_activity = None;
+        let mut queued_export = None;
         ScrollArea::vertical().show(ui, |ui| {
             ui.heading("Validated export");
             ui.label(
@@ -2673,34 +2779,38 @@ impl WorkbenchApp {
             });
 
             ui.add_space(12.0);
-            let write = ui.add_sized(
-                [ui.available_width(), 38.0],
-                egui::Button::new(
-                    RichText::new(format!("Create {} artifact", self.export_kind.label()))
-                        .strong(),
-                )
-                .fill(colors.selection)
-                .stroke(egui::Stroke::new(1.0, colors.exact_extracted))
-                .corner_radius(4),
+            let exact_source_ready = project.snapshot.has_verified_source();
+            let can_export = !self.export_operation.is_pending()
+                && !self.project_operation.is_pending()
+                && (self.export_kind != ExportKind::Pdb || exact_source_ready);
+            let action_label = if self.export_operation.is_pending() {
+                "Exporting...".to_owned()
+            } else if self.project_operation.is_pending() {
+                "Project operation running...".to_owned()
+            } else {
+                format!("Create {} artifact", self.export_kind.label())
+            };
+            let write = ui.add_enabled(
+                can_export,
+                egui::Button::new(RichText::new(action_label).strong())
+                    .min_size(egui::vec2(ui.available_width(), 38.0))
+                    .fill(colors.selection)
+                    .stroke(egui::Stroke::new(1.0, colors.exact_extracted))
+                    .corner_radius(4),
             );
-            if write.clicked() {
-                let result = write_export(
-                    project,
-                    self.export_kind,
-                    Path::new(&self.export_destination),
+            if self.export_kind == ExportKind::Pdb && !exact_source_ready {
+                ui.label(
+                    RichText::new(
+                        "[SOURCE REQUIRED] Verify the exact original PE before creating a PDB.",
+                    )
+                    .color(colors.warning_conflict),
                 );
-                self.export_result = Some(result.clone());
-                match &result {
-                    Ok(message) => {
-                        export_activity = Some((ActivityLevel::Success, message.clone()));
-                    }
-                    Err(error) => {
-                        export_activity = Some((
-                            ActivityLevel::Error,
-                            format!("Export failed: {error}"),
-                        ));
-                    }
-                }
+            }
+            if write.clicked() {
+                queued_export = Some((
+                    self.export_kind,
+                    PathBuf::from(&self.export_destination),
+                ));
             }
             if let Some(result) = &self.export_result {
                 match result {
@@ -2711,10 +2821,13 @@ impl WorkbenchApp {
                     ),
                 };
             }
-            ui.small("PDB, IDAPython, and Ghidra Java remain available from the CLI while their workbench identity and capability panels are completed.");
+            ui.small("Rendering and create-new staged publication run on the bounded application-service worker, never the egui event loop.");
         });
-        if let Some((level, message)) = export_activity {
-            self.log(level, message);
+        if let Some((kind, path)) = queued_export {
+            if let Err(error) = self.queue_export(kind, path) {
+                self.export_result = Some(Err(error.clone()));
+                self.log(ActivityLevel::Error, format!("Export failed: {error}"));
+            }
         }
     }
 }
@@ -2723,18 +2836,20 @@ impl eframe::App for WorkbenchApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.preferences.theme.apply(context);
         self.poll_console(context);
-        self.poll_analysis();
+        self.poll_service_worker();
         self.handle_inputs(context);
         self.show_header(context);
         self.show_project_panel(context);
         self.show_inspector(context);
         self.show_activity_panel(context);
         self.show_central(context);
-        self.show_protection_dialog(context);
 
         if cfg!(feature = "screenshot") {
             context.request_repaint();
-        } else if self.analysis_receiver.is_some() || self.console_host.is_enabled() {
+        } else if self.project_operation.is_pending()
+            || self.export_operation.is_pending()
+            || self.console_host.is_enabled()
+        {
             context.request_repaint_after(std::time::Duration::from_millis(100));
         }
     }
@@ -3009,6 +3124,9 @@ fn export_kind_description(kind: ExportKind) -> &'static str {
         ExportKind::NeutralJson => "Debugger-neutral structured symbol projection",
         ExportKind::Markdown => "Bounded human-review report",
         ExportKind::Map => "Microsoft-linker-style public symbol map",
+        ExportKind::Pdb => "Public-symbol PDB bound to the verified original PE",
+        ExportKind::IdaPython => "Identity-gated IDA importer script",
+        ExportKind::GhidraJava => "Identity-gated Ghidra importer script",
     }
 }
 
@@ -3481,57 +3599,33 @@ const fn panel_state(open: bool) -> &'static str {
     if open { "shown" } else { "hidden" }
 }
 
+fn is_package_path(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("resym"))
+}
+
 fn default_export_path(project: &LoadedProject, kind: ExportKind) -> PathBuf {
-    let mut path = project.identity.path.clone();
-    path.set_extension(kind.extension());
+    let digest = project.identity.sha256.as_str();
+    let stem = project
+        .snapshot
+        .origin_path()
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .map_or_else(|| format!("resymbol_{}", &digest[..12]), ToOwned::to_owned);
+    let file_name = match kind {
+        ExportKind::Package => format!("{stem}.resym"),
+        ExportKind::NeutralJson => format!("{stem}.symbols.json"),
+        ExportKind::Markdown => format!("{stem}.symbols.md"),
+        ExportKind::Map => format!("{stem}.map"),
+        ExportKind::Pdb => format!("{stem}.pdb"),
+        ExportKind::IdaPython => format!("{stem}.ida.py"),
+        ExportKind::GhidraJava => format!("ReSymbolImport_{}.java", &digest[..12]),
+    };
+    let mut path = project.snapshot.origin_path().to_path_buf();
+    path.set_file_name(file_name);
     path
-}
-
-fn write_export(project: &LoadedProject, kind: ExportKind, path: &Path) -> Result<String, String> {
-    if path.as_os_str().is_empty() {
-        return Err("choose a destination path".to_owned());
-    }
-
-    match kind {
-        ExportKind::Package => {
-            write_file_new_bound(path, &project.package).map_err(|error| error.to_string())?
-        }
-        ExportKind::NeutralJson => {
-            let bytes = serde_json::to_vec_pretty(&project.projection)
-                .map_err(|error| format!("cannot render neutral JSON: {error}"))?;
-            write_new_bytes(path, &bytes)?;
-        }
-        ExportKind::Markdown => {
-            let text = render_markdown(&project.projection).map_err(|error| error.to_string())?;
-            write_new_bytes(path, text.as_bytes())?;
-        }
-        ExportKind::Map => {
-            let module_name = project
-                .identity
-                .path
-                .file_stem()
-                .and_then(|name| name.to_str())
-                .filter(|name| !name.is_empty())
-                .unwrap_or("resymbol");
-            let text = render_map(project.session(), &project.projection, module_name)
-                .map_err(|error| error.to_string())?;
-            write_new_bytes(path, text.as_bytes())?;
-        }
-    }
-
-    Ok(format!("Wrote {} to {}", kind.label(), path.display()))
-}
-
-fn write_new_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|error| format!("cannot create {}: {error}", path.display()))?;
-    file.write_all(bytes)
-        .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
-    file.sync_all()
-        .map_err(|error| format!("cannot flush {}: {error}", path.display()))
 }
 
 fn bounded_message(mut message: String) -> String {

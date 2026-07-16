@@ -8,25 +8,23 @@
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
-    fs, io,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
-use resymbol_analysis::{
-    AnalysisError, AnalysisSession, BinaryAnalysis, SessionValidationError, analyze_bytes,
-};
+use resymbol_analysis::{AnalysisSession, BinaryAnalysis, SessionValidationError};
+use resymbol_app::{AppError, AppServices, ProjectSnapshot};
 use resymbol_core::{
     BinaryId, ClaimProducer, ControlFlowTarget, SymbolAssertion, SymbolClaim, SymbolSubject,
 };
 use resymbol_debugger::{
-    ProtectionReport, ProtectionScanError, StaticAddressSpace, StaticAddressSpaceError,
-    scan_pe_protections,
+    ProtectionFinding, ProtectionReport, ProtectionScanError, StaticAddressSpace,
+    StaticAddressSpaceError, scan_pe_protections,
 };
 use resymbol_export::{
-    AttributedText, ExportAttribution, ExportBinaryFormat, ExportError, ExportFunction,
-    ExportProducer, ExportProjection,
+    AttributedText, ExportAttribution, ExportBinaryFormat, ExportFunction, ExportProducer,
+    ExportProjection,
 };
-use resymbol_package::{PackageError, ResymPackage};
 use thiserror::Error;
 
 /// Exact identity and address-space metadata for the active binary.
@@ -206,60 +204,91 @@ pub struct FunctionFilter {
     pub statuses: BTreeSet<FunctionStatus>,
 }
 
-/// Validated state for one open binary and its read-only workbench indexes.
+/// Result of the byte-dependent static protection scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProtectionAssessment {
+    /// The exact source bytes were retained and scanned.
+    Available(ProtectionReport),
+    /// A package can provide a static image layout without carrying executable
+    /// bytes. The scan must remain unavailable until those bytes are verified.
+    ExactSourceRequired,
+    /// The open analysis format has no implemented protection scanner.
+    UnsupportedFormat,
+}
+
+impl ProtectionAssessment {
+    #[must_use]
+    pub const fn is_available(&self) -> bool {
+        matches!(self, Self::Available(_))
+    }
+
+    #[must_use]
+    pub fn findings(&self) -> &[ProtectionFinding] {
+        match self {
+            Self::Available(report) => report.findings(),
+            Self::ExactSourceRequired | Self::UnsupportedFormat => &[],
+        }
+    }
+
+    #[must_use]
+    pub fn requires_acknowledgement(&self) -> bool {
+        match self {
+            Self::Available(report) => report.requires_acknowledgement(),
+            Self::ExactSourceRequired | Self::UnsupportedFormat => false,
+        }
+    }
+
+    #[must_use]
+    pub const fn unavailable_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::Available(_) => None,
+            Self::ExactSourceRequired => {
+                Some("Protection assessment unavailable until the exact source binary is verified")
+            }
+            Self::UnsupportedFormat => {
+                Some("Protection assessment is not implemented for this binary format")
+            }
+        }
+    }
+}
+
+/// Validated state for one open binary/package and its read-only workbench indexes.
 #[derive(Debug)]
 pub struct LoadedProject {
+    pub snapshot: Arc<ProjectSnapshot>,
     pub identity: ProjectIdentity,
-    pub package: ResymPackage<AnalysisSession>,
-    pub projection: ExportProjection,
+    pub projection: Arc<ExportProjection>,
     pub static_address_space: StaticAddressSpace,
-    pub protection_report: ProtectionReport,
+    pub protection_assessment: ProtectionAssessment,
     pub functions: Vec<FunctionRow>,
     function_details: Vec<FunctionDetail>,
 }
 
 impl LoadedProject {
-    /// Read and analyze an exact binary from disk.
+    /// Read and analyze an exact binary through the bounded application service.
     pub fn from_path(path: impl AsRef<Path>) -> Result<Self, ModelError> {
-        let path = path.as_ref().to_path_buf();
-        let bytes = fs::read(&path).map_err(|source| ModelError::ReadBinary {
-            path: path.clone(),
-            source,
-        })?;
-        Self::load(path, &bytes)
+        let snapshot = AppServices::default().analyze_binary(path)?;
+        Self::from_snapshot(snapshot)
     }
 
-    /// Analyze caller-supplied bytes and retain `path` as display identity.
-    pub fn load(path: impl Into<PathBuf>, bytes: &[u8]) -> Result<Self, ModelError> {
-        Self::load_with_generator_version(path, bytes, env!("CARGO_PKG_VERSION"))
-    }
-
-    /// Analyze in-memory bytes with an explicit display path.
-    #[cfg(test)]
-    pub fn from_bytes(bytes: &[u8], path: impl Into<PathBuf>) -> Result<Self, ModelError> {
-        Self::load(path, bytes)
-    }
-
-    /// Variant used by package-producing frontends that supply their own
-    /// canonical SemVer generator version.
-    pub fn load_with_generator_version(
-        path: impl Into<PathBuf>,
-        bytes: &[u8],
-        generator_version: &str,
-    ) -> Result<Self, ModelError> {
-        let path = path.into();
-        let base_analysis = analyze_bytes(bytes)?;
-        let static_address_space = StaticAddressSpace::from_analysis(&base_analysis)?;
-        let protection_report = match &base_analysis {
-            BinaryAnalysis::Pe(analysis) => scan_pe_protections(analysis, bytes)?,
-            _ => return Err(ModelError::UnsupportedStaticAssessment),
+    /// Build presentation indexes around one immutable application snapshot.
+    pub fn from_snapshot(snapshot: Arc<ProjectSnapshot>) -> Result<Self, ModelError> {
+        snapshot.session().validate()?;
+        let base_analysis = snapshot.session().base_analysis();
+        let static_address_space = StaticAddressSpace::from_analysis(base_analysis)?;
+        let protection_assessment = match (base_analysis, snapshot.verified_source_bytes()) {
+            (BinaryAnalysis::Pe(analysis), Some(bytes)) => {
+                ProtectionAssessment::Available(scan_pe_protections(analysis, bytes)?)
+            }
+            (BinaryAnalysis::Pe(_), None) => ProtectionAssessment::ExactSourceRequired,
+            (_, _) => ProtectionAssessment::UnsupportedFormat,
         };
-        let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())?;
-        let combined_graph = session.combined_symbol_graph()?;
-        let projection = ExportProjection::from_session(&session)?;
+        let combined_graph = snapshot.session().combined_symbol_graph()?;
+        let projection = snapshot.projection_arc();
         let (functions, function_details) =
             build_function_inventory(&projection.functions, combined_graph.claims());
         let binary = &projection.binary;
+        let path = snapshot.origin_path().to_path_buf();
         let display_name = path
             .file_name()
             .and_then(|name| name.to_str())
@@ -276,15 +305,13 @@ impl LoadedProject {
             image_base: binary.image_base,
             image_size: binary.image_size,
         };
-        let package = ResymPackage::from_bound_payload(generator_version, session)?;
-        package.ensure_payload_binding()?;
 
         Ok(Self {
+            snapshot,
             identity,
-            package,
             projection,
             static_address_space,
-            protection_report,
+            protection_assessment,
             functions,
             function_details,
         })
@@ -292,8 +319,8 @@ impl LoadedProject {
 
     /// Empty-plugin analysis session bound inside the current package.
     #[must_use]
-    pub const fn session(&self) -> &AnalysisSession {
-        self.package.payload()
+    pub fn session(&self) -> &AnalysisSession {
+        self.snapshot.session()
     }
 
     /// Inspector details for a canonical row index.
@@ -635,35 +662,34 @@ fn producer_from_export(producer: &ExportProducer) -> ProducerSource {
 /// Workbench model construction failure.
 #[derive(Debug, Error)]
 pub enum ModelError {
-    #[error("cannot read binary {path}: {source}", path = .path.display())]
-    ReadBinary {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-    #[error("binary analysis failed: {0}")]
-    Analysis(#[from] AnalysisError),
+    #[error("application service failed: {0}")]
+    App(#[from] AppError),
     #[error("analysis session is invalid: {0}")]
     Session(#[from] SessionValidationError),
-    #[error("analysis package is invalid: {0}")]
-    Package(#[from] PackageError),
-    #[error("export projection failed: {0}")]
-    Export(#[from] ExportError),
     #[error("static address-space analysis failed: {0}")]
     StaticAddressSpace(#[from] StaticAddressSpaceError),
     #[error("protection assessment failed: {0}")]
     Protection(#[from] ProtectionScanError),
-    #[error("this binary format has no workbench protection assessment")]
-    UnsupportedStaticAssessment,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use resymbol_export::ExportProvenance;
+    use std::io::Write as _;
+    use tempfile::{NamedTempFile, tempdir};
 
     const STRIPPED_FIXTURE: &[u8] =
         include_bytes!("../../../fixtures/pe-x64-msvc/artifacts/milestone2-stripped.exe");
+
+    fn loaded_fixture(bytes: &[u8]) -> LoadedProject {
+        let mut source = NamedTempFile::new().expect("temporary PE");
+        source.write_all(bytes).expect("write temporary PE");
+        let snapshot = AppServices::default()
+            .analyze_binary(source.path())
+            .expect("service-backed fixture analysis");
+        LoadedProject::from_snapshot(snapshot).expect("fixture model")
+    }
 
     fn producer() -> ProducerSource {
         ProducerSource::Core {
@@ -759,17 +785,23 @@ mod tests {
 
     #[test]
     fn checked_in_fixture_builds_one_bound_shared_model() {
-        let project = LoadedProject::from_bytes(STRIPPED_FIXTURE, "milestone2-stripped.exe")
-            .expect("fixture model");
+        let project = loaded_fixture(STRIPPED_FIXTURE);
 
-        assert_eq!(&project.identity.sha256, project.package.binary_sha256());
+        assert_eq!(
+            &project.identity.sha256,
+            project.snapshot.package().binary_sha256()
+        );
         assert_eq!(
             project.static_address_space.binary_id,
             project.identity.sha256
         );
-        assert_eq!(project.protection_report.binary_id, project.identity.sha256);
+        let ProtectionAssessment::Available(report) = &project.protection_assessment else {
+            panic!("an exact source must receive a protection assessment");
+        };
+        assert_eq!(report.binary_id, project.identity.sha256);
         project
-            .package
+            .snapshot
+            .package()
             .ensure_payload_binding()
             .expect("package binding");
         assert!(project.session().plugin_runs().is_empty());
@@ -784,6 +816,42 @@ mod tests {
                 Some(row.rva)
             );
         }
+    }
+
+    #[test]
+    fn package_without_verified_source_reports_protection_unavailability() {
+        let directory = tempdir().expect("temporary project directory");
+        let source_path = directory.path().join("fixture.exe");
+        std::fs::write(&source_path, STRIPPED_FIXTURE).expect("write fixture PE");
+        let services = AppServices::default();
+        let analyzed = services
+            .analyze_binary(&source_path)
+            .expect("analyze exact source");
+        let package_path = directory.path().join("fixture.resym");
+        services
+            .save_package_new(&analyzed, &package_path)
+            .expect("save package");
+        let package_only = services
+            .open_package(&package_path)
+            .expect("open package without source");
+
+        let project = LoadedProject::from_snapshot(package_only).expect("package model");
+
+        assert!(matches!(
+            &project.protection_assessment,
+            ProtectionAssessment::ExactSourceRequired
+        ));
+        assert!(project.protection_assessment.findings().is_empty());
+        assert!(
+            !project.protection_assessment.requires_acknowledgement(),
+            "an unavailable offline scan must not block ordinary package inspection"
+        );
+        assert!(project.protection_assessment.unavailable_reason().is_some());
+        assert!(!project.snapshot.has_verified_source());
+        assert_eq!(
+            project.static_address_space.binary_id,
+            project.identity.sha256
+        );
     }
 
     #[test]
