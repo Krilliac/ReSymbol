@@ -137,7 +137,7 @@ spans are rejected without a memory-read event.
 `OfflineImageDebugHost` advertises only `OfflineAnalysis` and supports only capability probing, that
 exact offline open, bounded RVA reads, and close. Dump, snapshot, observe, attach, launch, execution,
 write, register, breakpoint, terminate, and sandbox operations are rejected through the same
-crate-private, host-owned remote-command transaction path. Rejections restore visible reducer
+public-but-opaque, host-owned remote-command transaction path. Rejections restore visible reducer
 state while retaining command and authority-consumption watermarks, and emit only a correlated
 rejected command result. This host
 never emits sandbox attestation, lifecycle, or cleanup evidence. Graceful shutdown and the mandatory
@@ -211,13 +211,14 @@ The current seam is intentionally narrow:
   validated `CleanupAttemptFailed` event carrying its incomplete receipt. Every rejected command
   still consumes its command identifier and any presented one-use authority without cloning the
   reducer or lease;
-- the audited crate-internal client and host implementations own crate-private, move-only
-  remote-command transaction tickets bound to the exact reducer instance, command ID, and
-  post-accept state. Exactly one transaction may be
-  active. An effect-free rejection restores only ordinary visible state, while validated success
-  and cleanup-required sandbox failure explicitly commit their retained effects. Stale, foreign,
-  mismatched, already-resolved, and post-effect rollback attempts fail closed; command, run/stop,
-  and one-use authorization watermarks remain consumed;
+- audited controller and host implementations, including external helper/provider crates, use a
+  public-but-opaque, move-only remote-command transaction ticket bound to the exact reducer
+  instance, command ID, and post-accept state. Exactly one transaction may be active. Dropping or
+  forgetting its ticket leaves that reducer permanently pending and fail-closed; it never implies
+  rollback. An effect-free rejection restores only ordinary visible state, while a host must
+  validate the complete remote evidence before explicitly committing successful or
+  cleanup-required effects. Stale, foreign, mismatched, already-resolved, and post-effect rollback
+  attempts fail closed; command, run/stop, and one-use authorization watermarks remain consumed;
 - attestation and cleanup events are bound both to the outer event session and to the reducer's exact
   binary, policy, provider, build, provisioning epoch, and cleanup expectation before `Closed` can be
   accepted or released;
@@ -231,6 +232,10 @@ The current seam is intentionally narrow:
   only strict 64-character lowercase-hex lease IDs. Non-cloneable trusted issuers derive each ID from
   an operating-system-entropy-backed secret and a monotonic sequence, and return the sole move-only
   lease together with a cloneable non-authority verifier; caller-chosen IDs cannot construct a grant.
+  Host launch issuance atomically binds the fresh ID to the exact pre-approved launch intent, so no
+  placeholder authority value is needed. Issuer ownership must remain inside the trusted approval or
+  provider boundary: entropy prevents payload forgery, but does not authenticate code already allowed
+  to invoke a trusted issuer.
   The host reducer bounds registrations, rejects duplicate registration, consumes a presented lease
   even on mismatch, and drops every unused lease after a target opens. The verifier goes only to the
   controller-side shadow reducer, while the lease transfers to the host worker;

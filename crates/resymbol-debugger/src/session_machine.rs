@@ -78,6 +78,16 @@ enum ExecutionGate {
 /// only through [`SessionMachine::commit_remote_command`] or
 /// [`SessionMachine::reject_remote_command`]. Its rollback image deliberately
 /// excludes command, run/stop, and one-use authority watermarks.
+/// Dropping or forgetting an unresolved ticket deliberately leaves the reducer
+/// in [`SessionMachineError::RemoteCommandPending`]; this is a fail-closed
+/// terminal condition for that reducer instance, not an implicit rollback.
+///
+/// ```compile_fail
+/// use resymbol_debugger::RemoteCommandCheckpoint;
+///
+/// fn require_clone<T: Clone>() {}
+/// require_clone::<RemoteCommandCheckpoint>();
+/// ```
 ///
 /// ```no_run
 /// use resymbol_debugger::{
@@ -113,6 +123,7 @@ enum ExecutionGate {
 /// }
 /// ```
 #[derive(Debug)]
+#[must_use = "remote command tickets must be committed or rejected"]
 pub struct RemoteCommandCheckpoint {
     reducer_instance: Arc<ReducerInstanceBinding>,
     command_id: CommandId,
