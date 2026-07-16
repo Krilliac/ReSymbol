@@ -15,6 +15,9 @@ use resymbol_core::{
     DiscoveredPlugin, PluginDiscoveryOptions, PluginDiscoveryReport, discover_plugins,
     plugin_api::PluginHealthState,
 };
+use resymbol_debugger::{
+    EvidenceStrength, MemoryAccess, ProtectionEvidence, ProtectionSeverity, StaticRegionKind,
+};
 use resymbol_export::{ExportControlFlowTarget, ExportProducer, render_map, render_markdown};
 use resymbol_package::write_file_new_bound;
 use serde::{Deserialize, Serialize};
@@ -68,16 +71,18 @@ enum MainTab {
     Types,
     Relationships,
     Graph,
+    AddressSpace,
     Exports,
 }
 
 impl MainTab {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::Overview,
         Self::Functions,
         Self::Types,
         Self::Relationships,
         Self::Graph,
+        Self::AddressSpace,
         Self::Exports,
     ];
 
@@ -88,6 +93,7 @@ impl MainTab {
             Self::Types => "Types",
             Self::Relationships => "Relationships",
             Self::Graph => "Graph",
+            Self::AddressSpace => "Address Space",
             Self::Exports => "Exports",
         }
     }
@@ -211,6 +217,7 @@ pub struct WorkbenchApp {
     export_kind: ExportKind,
     export_destination: String,
     export_result: Option<Result<String, String>>,
+    protection_dialog_open: bool,
 }
 
 impl WorkbenchApp {
@@ -280,6 +287,7 @@ impl WorkbenchApp {
             export_kind: ExportKind::Package,
             export_destination: String::new(),
             export_result: None,
+            protection_dialog_open: false,
         };
         app.log(
             ActivityLevel::Info,
@@ -321,6 +329,7 @@ impl WorkbenchApp {
                 "overview" => MainTab::Overview,
                 "functions" => MainTab::Functions,
                 "graph" => MainTab::Graph,
+                "address-space" | "memory-map" => MainTab::AddressSpace,
                 "exports" => {
                     app.stage = WorkflowStage::Export;
                     MainTab::Exports
@@ -460,6 +469,16 @@ impl WorkbenchApp {
     }
 
     fn apply_console_command(&mut self, command: ConsoleCommand, context: &egui::Context) {
+        if self.protection_dialog_open
+            && !matches!(&command, ConsoleCommand::Help | ConsoleCommand::Status)
+        {
+            self.console_reply(
+                false,
+                "acknowledge the protection warning before changing workbench state",
+            );
+            return;
+        }
+
         match command {
             ConsoleCommand::Help => {
                 let _ = self.console_host.try_send_line(format_help());
@@ -522,6 +541,7 @@ impl WorkbenchApp {
                     ConsoleTab::Types => MainTab::Types,
                     ConsoleTab::Relationships => MainTab::Relationships,
                     ConsoleTab::Graph => MainTab::Graph,
+                    ConsoleTab::AddressSpace => MainTab::AddressSpace,
                     ConsoleTab::Exports => MainTab::Exports,
                 };
                 if tab == ConsoleTab::Exports {
@@ -631,6 +651,7 @@ impl WorkbenchApp {
         self.selected_projection_index = None;
         self.graph_root_rva = None;
         self.reconstruction_graph = None;
+        self.protection_dialog_open = false;
         self.function_filter = FunctionFilter::default();
         self.stage = WorkflowStage::Analyze;
         self.main_tab = MainTab::Overview;
@@ -668,6 +689,8 @@ impl WorkbenchApp {
             Ok(project) => {
                 let function_count = project.functions.len();
                 let warning_count = project.projection.warnings.len();
+                let protection_count = project.protection_report.findings().len();
+                let protection_dialog_open = project.protection_report.requires_acknowledgement();
                 self.export_destination = default_export_path(&project, self.export_kind)
                     .to_string_lossy()
                     .into_owned();
@@ -678,12 +701,22 @@ impl WorkbenchApp {
                 self.graph_root_rva = reconstruction_graph.default_root().map(|root| root.rva);
                 self.reconstruction_graph = Some(reconstruction_graph);
                 self.project = Some(project);
+                self.protection_dialog_open = protection_dialog_open;
                 self.stage = WorkflowStage::Review;
                 self.main_tab = MainTab::Overview;
+                if protection_dialog_open {
+                    self.activity_tab = ActivityTab::Warnings;
+                    self.log(
+                        ActivityLevel::Warning,
+                        format!(
+                            "Static protection assessment requires review: {protection_count} finding(s)"
+                        ),
+                    );
+                }
                 self.log(
                     ActivityLevel::Success,
                     format!(
-                        "Analysis complete: {function_count} functions, {warning_count} projection warnings"
+                        "Analysis complete: {function_count} functions, {protection_count} protection findings, {warning_count} projection warnings"
                     ),
                 );
             }
@@ -706,6 +739,10 @@ impl WorkbenchApp {
     }
 
     fn handle_inputs(&mut self, context: &egui::Context) {
+        if self.protection_dialog_open {
+            return;
+        }
+
         let open_shortcut =
             context.input(|input| input.modifiers.command && input.key_pressed(Key::O));
         if open_shortcut {
@@ -995,6 +1032,19 @@ impl WorkbenchApp {
                         .clicked()
                     {
                         self.main_tab = MainTab::Graph;
+                        self.stage = WorkflowStage::Review;
+                    }
+                    if ui
+                        .selectable_label(
+                            self.main_tab == MainTab::AddressSpace,
+                            format!(
+                                "Address space ({})",
+                                project.static_address_space.regions().len()
+                            ),
+                        )
+                        .clicked()
+                    {
+                        self.main_tab = MainTab::AddressSpace;
                         self.stage = WorkflowStage::Review;
                     }
                 } else {
@@ -1293,6 +1343,8 @@ impl WorkbenchApp {
             for (label, complete) in [
                 ("Identity", self.project.is_some()),
                 ("Base analysis", self.project.is_some()),
+                ("Static address map", self.project.is_some()),
+                ("Protection scan", self.project.is_some()),
                 ("Evidence projection", self.project.is_some()),
                 ("Export preview", self.main_tab == MainTab::Exports),
             ] {
@@ -1309,17 +1361,55 @@ impl WorkbenchApp {
 
     fn show_warnings(&self, ui: &mut egui::Ui) {
         let Some(project) = &self.project else {
-            ui.label("No projection warnings until analysis completes");
+            ui.label("No static findings or projection warnings until analysis completes");
             return;
         };
-        if project.projection.warnings.is_empty() {
-            ui.label("[OK] No neutral-projection losses");
+        let protection_findings = project.protection_report.findings();
+        if protection_findings.is_empty() && project.projection.warnings.is_empty() {
+            ui.label("[OK] No static protection indicators or neutral-projection losses");
             return;
         }
         ScrollArea::vertical().show(ui, |ui| {
+            if !protection_findings.is_empty() {
+                ui.label(
+                    RichText::new(format!(
+                        "Static protection indicators ({})",
+                        protection_findings.len()
+                    ))
+                    .strong(),
+                );
+                ui.small(
+                    "These are bounded artifact findings, not proof of intent or runtime behavior.",
+                );
+                for (finding_index, finding) in protection_findings.iter().enumerate() {
+                    let (cue, color) = protection_severity_visual(
+                        finding.severity,
+                        self.preferences.theme.semantic_colors(),
+                    );
+                    ui.colored_label(
+                        color,
+                        RichText::new(format!("[{cue}] {}", finding.title)).strong(),
+                    );
+                    ui.indent(("protection-finding", finding_index), |ui| {
+                        ui.label(&finding.summary);
+                    });
+                }
+            }
+            if !protection_findings.is_empty() && !project.projection.warnings.is_empty() {
+                ui.separator();
+            }
+            if !project.projection.warnings.is_empty() {
+                ui.label(
+                    RichText::new(format!(
+                        "Neutral projection losses ({})",
+                        project.projection.warnings.len()
+                    ))
+                    .strong(),
+                );
+            }
             for warning in &project.projection.warnings {
                 ui.label(format!(
-                    "[WARN] {:?} x{} - {}",
+                    "[LOSS] {:?} x{} - {}",
                     warning.code, warning.occurrences, warning.message
                 ));
             }
@@ -1357,7 +1447,7 @@ impl WorkbenchApp {
                     .inner_margin(egui::Margin::same(12)),
             )
             .show(context, |ui| {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     for tab in MainTab::ALL {
                         if ui
                             .add_sized(
@@ -1407,9 +1497,154 @@ impl WorkbenchApp {
                     MainTab::Types => self.show_types(ui),
                     MainTab::Relationships => self.show_relationships(ui),
                     MainTab::Graph => self.show_graph(ui),
+                    MainTab::AddressSpace => self.show_address_space(ui),
                     MainTab::Exports => self.show_exports(ui),
                 }
             });
+    }
+
+    fn show_protection_dialog(&mut self, context: &egui::Context) {
+        if !self.protection_dialog_open {
+            return;
+        }
+        let Some(project) = self.project.as_ref() else {
+            self.protection_dialog_open = false;
+            return;
+        };
+
+        let display_name = project.identity.display_name.clone();
+        let binary_hash = project.identity.sha256.as_str().to_owned();
+        let findings = project.protection_report.findings().to_vec();
+        let colors = self.preferences.theme.semantic_colors();
+        let mut review_address_space = false;
+        let mut continue_offline = false;
+        let mut close_project = false;
+
+        egui::Modal::new(egui::Id::new("protection_assessment_dialog"))
+            .frame(
+                egui::Frame::popup(context.style().as_ref())
+                    .fill(colors.panel)
+                    .stroke(egui::Stroke::new(1.0, colors.warning_conflict))
+                    .inner_margin(egui::Margin::same(18)),
+            )
+            .show(context, |ui| {
+                ui.set_max_width(760.0);
+                ui.heading(
+                    RichText::new("[!] Protection and anti-analysis indicators")
+                        .color(colors.warning_conflict),
+                );
+                ui.label(
+                    "ReSymbol found static artifacts that deserve review before any live execution workflow. No target code has run.",
+                );
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(display_name).strong());
+                    ui.label(
+                        RichText::new(short_hash(&binary_hash))
+                            .monospace()
+                            .color(colors.secondary_text),
+                    )
+                    .on_hover_text(format!("SHA-256 {binary_hash}"));
+                });
+                ui.separator();
+                ScrollArea::vertical().max_height(430.0).show(ui, |ui| {
+                    for finding in &findings {
+                        let (cue, color) = protection_severity_visual(finding.severity, colors);
+                        egui::Frame::new()
+                            .fill(colors.raised)
+                            .stroke(egui::Stroke::new(1.0, colors.border))
+                            .inner_margin(egui::Margin::same(10))
+                            .corner_radius(4)
+                            .show(ui, |ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.colored_label(
+                                        color,
+                                        RichText::new(format!("[{cue}] {}", finding.title))
+                                            .strong(),
+                                    );
+                                    ui.label(
+                                        RichText::new(protection_strength_label(finding.strength))
+                                            .small()
+                                            .color(colors.secondary_text),
+                                    );
+                                });
+                                ui.label(&finding.summary);
+                                for evidence in &finding.evidence {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "Evidence: {}",
+                                            protection_evidence_text(evidence)
+                                        ))
+                                        .monospace()
+                                        .small()
+                                        .color(colors.secondary_text),
+                                    );
+                                }
+                            });
+                        ui.add_space(6.0);
+                    }
+                });
+                ui.label(
+                    RichText::new(
+                        "Findings identify exact metadata or bounded heuristics. They do not prove malicious intent or that a code path executes.",
+                    )
+                    .small()
+                    .color(colors.secondary_text),
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(RichText::new("Review address space").strong())
+                        .clicked()
+                    {
+                        review_address_space = true;
+                    }
+                    if ui.button("Continue offline review").clicked() {
+                        continue_offline = true;
+                    }
+                    if ui
+                        .button(
+                            RichText::new("Close project")
+                                .color(colors.destructive_quarantined),
+                        )
+                        .clicked()
+                    {
+                        close_project = true;
+                    }
+                });
+            });
+
+        if review_address_space {
+            self.protection_dialog_open = false;
+            self.main_tab = MainTab::AddressSpace;
+            self.activity_tab = ActivityTab::Warnings;
+            self.stage = WorkflowStage::Review;
+            self.log(
+                ActivityLevel::Info,
+                "Protection dialog acknowledged; opened static address space",
+            );
+        } else if continue_offline {
+            self.protection_dialog_open = false;
+            self.log(
+                ActivityLevel::Info,
+                "Protection dialog acknowledged; continuing offline review",
+            );
+        } else if close_project {
+            self.protection_dialog_open = false;
+            self.project = None;
+            self.analysis_path = None;
+            self.selected_projection_index = None;
+            self.graph_root_rva = None;
+            self.reconstruction_graph = None;
+            self.export_destination.clear();
+            self.export_result = None;
+            self.stage = WorkflowStage::Open;
+            self.main_tab = MainTab::Overview;
+            self.log(
+                ActivityLevel::Info,
+                "Closed project without executing target code",
+            );
+        }
     }
 
     fn show_empty_state(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
@@ -1458,7 +1693,7 @@ impl WorkbenchApp {
             );
             ui.add_space(12.0);
 
-            ui.columns(5, |columns| {
+            ui.columns(3, |columns| {
                 summary_card(
                     &mut columns[0],
                     "Functions",
@@ -1480,8 +1715,11 @@ impl WorkbenchApp {
                     colors.plugin_provenance,
                     colors,
                 );
+            });
+            ui.add_space(8.0);
+            ui.columns(3, |columns| {
                 summary_card(
-                    &mut columns[3],
+                    &mut columns[0],
                     "Relationships",
                     project.projection.direct_calls.len()
                         + project.projection.thunks.len()
@@ -1490,10 +1728,25 @@ impl WorkbenchApp {
                     colors,
                 );
                 summary_card(
-                    &mut columns[4],
-                    "Warnings",
+                    &mut columns[1],
+                    "Protection indicators",
+                    project.protection_report.findings().len(),
+                    if project.protection_report.is_empty() {
+                        colors.healthy
+                    } else {
+                        colors.warning_conflict
+                    },
+                    colors,
+                );
+                summary_card(
+                    &mut columns[2],
+                    "Projection losses",
                     project.projection.warnings.len(),
-                    colors.warning_conflict,
+                    if project.projection.warnings.is_empty() {
+                        colors.healthy
+                    } else {
+                        colors.warning_conflict
+                    },
                     colors,
                 );
             });
@@ -1608,6 +1861,194 @@ impl WorkbenchApp {
                 }
             }
         });
+    }
+
+    fn show_address_space(&self, ui: &mut egui::Ui) {
+        let project = self.project.as_ref().expect("checked by caller");
+        let address_space = &project.static_address_space;
+        let colors = self.preferences.theme.semantic_colors();
+
+        ui.heading("Static address space");
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new("[OFFLINE] No target code has executed")
+                    .strong()
+                    .color(colors.healthy),
+            );
+            ui.label(
+                RichText::new("Preferred PE layout; live mappings may differ after load")
+                    .color(colors.secondary_text),
+            );
+        });
+        ui.add_space(8.0);
+
+        egui::Frame::new()
+            .fill(colors.raised)
+            .stroke(egui::Stroke::new(1.0, colors.border))
+            .inner_margin(egui::Margin::same(10))
+            .corner_radius(4)
+            .show(ui, |ui| {
+                ui.columns(5, |columns| {
+                    property_row(
+                        &mut columns[0],
+                        "Preferred base",
+                        &format!("0x{:016X}", address_space.preferred_image_base),
+                        true,
+                    );
+                    property_row(
+                        &mut columns[1],
+                        "Image size",
+                        &format!("0x{:X}", address_space.image_size),
+                        true,
+                    );
+                    property_row(
+                        &mut columns[2],
+                        "Entry RVA",
+                        &address_space.entry_point.map_or_else(
+                            || "none".to_owned(),
+                            |entry| format!("0x{:08X}", entry.get()),
+                        ),
+                        true,
+                    );
+                    property_row(
+                        &mut columns[3],
+                        "Regions",
+                        &address_space.regions().len().to_string(),
+                        false,
+                    );
+                    property_row(
+                        &mut columns[4],
+                        "Indicators",
+                        &project.protection_report.findings().len().to_string(),
+                        false,
+                    );
+                });
+            });
+
+        let findings = project.protection_report.findings();
+        if !findings.is_empty() {
+            ui.add_space(8.0);
+            egui::Frame::new()
+                .fill(colors.raised)
+                .stroke(egui::Stroke::new(1.0, colors.warning_conflict))
+                .inner_margin(egui::Margin::symmetric(10, 7))
+                .corner_radius(4)
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "{} static protection indicator(s)",
+                                findings.len()
+                            ))
+                            .strong()
+                            .color(colors.warning_conflict),
+                        );
+                        for finding in findings.iter().take(3) {
+                            let (cue, color) = protection_severity_visual(finding.severity, colors);
+                            ui.colored_label(color, format!("[{cue}] {}", finding.title));
+                        }
+                        if findings.len() > 3 {
+                            ui.label(format!("+{} more in Warnings", findings.len() - 3));
+                        }
+                    });
+                });
+        }
+
+        ui.add_space(8.0);
+        let available_height = ui.available_height().max(180.0);
+        ScrollArea::horizontal()
+            .id_salt("static-address-space-horizontal")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.set_min_width(870.0);
+                TableBuilder::new(ui)
+                    .striped(true)
+                    .resizable(true)
+                    .min_scrolled_height(available_height)
+                    .column(Column::initial(170.0).at_least(120.0))
+                    .column(Column::initial(195.0).at_least(160.0))
+                    .column(Column::initial(165.0).at_least(145.0))
+                    .column(Column::initial(165.0).at_least(130.0))
+                    .column(Column::initial(75.0).at_least(65.0))
+                    .column(Column::remainder().at_least(110.0))
+                    .header(30.0, |mut header| {
+                        header.col(|ui| {
+                            ui.strong("Region");
+                        });
+                        header.col(|ui| {
+                            ui.strong("RVA range");
+                        });
+                        header.col(|ui| {
+                            ui.strong("Preferred VA");
+                        });
+                        header.col(|ui| {
+                            ui.strong("File backing");
+                        });
+                        header.col(|ui| {
+                            ui.strong("Access");
+                        });
+                        header.col(|ui| {
+                            ui.strong("Tail");
+                        });
+                    })
+                    .body(|mut body| {
+                        for region in address_space.regions() {
+                            body.row(30.0, |mut row| {
+                                row.col(|ui| {
+                                    ui.monospace(static_region_name(&region.kind));
+                                });
+                                row.col(|ui| {
+                                    ui.monospace(format!(
+                                        "0x{:08X}..0x{:08X}",
+                                        region.range.start().get(),
+                                        region.range.end()
+                                    ));
+                                });
+                                row.col(|ui| {
+                                    let preferred = address_space
+                                        .preferred_virtual_address(region.range.start())
+                                        .expect("validated preferred range");
+                                    ui.monospace(format!("0x{preferred:016X}"));
+                                });
+                                row.col(|ui| {
+                                    if let Some(backing) = region.file_backing {
+                                        ui.monospace(format!(
+                                            "0x{:X}..0x{:X}",
+                                            backing.offset,
+                                            backing.offset + backing.size
+                                        ));
+                                    } else {
+                                        ui.label(
+                                            RichText::new("unbacked").color(colors.secondary_text),
+                                        );
+                                    }
+                                });
+                                row.col(|ui| {
+                                    ui.monospace(memory_access_text(region.access));
+                                });
+                                row.col(|ui| match &region.kind {
+                                    StaticRegionKind::ImageGap => {
+                                        ui.label(
+                                            RichText::new("unowned gap")
+                                                .color(colors.secondary_text),
+                                        );
+                                    }
+                                    _ if region.zero_fill_size() != 0 => {
+                                        ui.monospace(format!(
+                                            "0x{:X} zero-fill",
+                                            region.zero_fill_size()
+                                        ));
+                                    }
+                                    _ => {
+                                        ui.label(
+                                            RichText::new("fully backed").color(colors.healthy),
+                                        );
+                                    }
+                                });
+                            });
+                        }
+                    });
+            });
     }
 
     fn show_functions(&mut self, ui: &mut egui::Ui) {
@@ -2289,6 +2730,7 @@ impl eframe::App for WorkbenchApp {
         self.show_inspector(context);
         self.show_activity_panel(context);
         self.show_central(context);
+        self.show_protection_dialog(context);
 
         if cfg!(feature = "screenshot") {
             context.request_repaint();
@@ -2435,6 +2877,116 @@ fn short_hash(value: &str) -> String {
         value.to_owned()
     } else {
         format!("{}...{}", &value[..12], &value[value.len() - 8..])
+    }
+}
+
+fn static_region_name(kind: &StaticRegionKind) -> String {
+    match kind {
+        StaticRegionKind::Headers => "PE headers".to_owned(),
+        StaticRegionKind::Section {
+            table_index, name, ..
+        } => format!("#{table_index} {name}"),
+        StaticRegionKind::ImageGap => "Image gap".to_owned(),
+    }
+}
+
+fn memory_access_text(access: MemoryAccess) -> String {
+    [
+        if access.readable { 'R' } else { '-' },
+        if access.writable { 'W' } else { '-' },
+        if access.executable { 'X' } else { '-' },
+    ]
+    .into_iter()
+    .collect()
+}
+
+fn protection_severity_visual(
+    severity: ProtectionSeverity,
+    colors: SemanticColors,
+) -> (&'static str, egui::Color32) {
+    match severity {
+        ProtectionSeverity::Notice => ("NOTICE", colors.inferred),
+        ProtectionSeverity::Warning => ("WARNING", colors.warning_conflict),
+        ProtectionSeverity::High => ("HIGH", colors.destructive_quarantined),
+    }
+}
+
+fn protection_strength_label(strength: EvidenceStrength) -> &'static str {
+    match strength {
+        EvidenceStrength::ExactArtifact => "exact artifact",
+        EvidenceStrength::StrongHeuristic => "strong heuristic",
+        EvidenceStrength::Heuristic => "heuristic",
+    }
+}
+
+fn protection_evidence_text(evidence: &ProtectionEvidence) -> String {
+    match evidence {
+        ProtectionEvidence::Import {
+            library,
+            function,
+            iat_rva,
+            delayed,
+        } => format!(
+            "{}!{} at IAT RVA 0x{iat_rva:08X}{}",
+            library,
+            function,
+            if *delayed { " (delay import)" } else { "" }
+        ),
+        ProtectionEvidence::Section {
+            table_index,
+            name,
+            rva,
+            size,
+            characteristics,
+        } => format!(
+            "section #{table_index} {name} RVA 0x{rva:08X}+0x{size:X}, characteristics 0x{characteristics:08X}"
+        ),
+        ProtectionEvidence::EntropySample {
+            table_index,
+            name,
+            sample_bytes,
+            entropy_millibits_per_byte,
+        } => format!(
+            "section #{table_index} {name}, {sample_bytes} sampled bytes, entropy {:.3} bits/byte",
+            f32::from(*entropy_millibits_per_byte) / 1000.0
+        ),
+        ProtectionEvidence::EntryPoint {
+            rva,
+            section_index,
+            section_name,
+        } => format!("entry RVA 0x{rva:08X} in section #{section_index} {section_name}"),
+        ProtectionEvidence::EntryPointLocation {
+            rva,
+            section_index,
+            section_name,
+            file_backed,
+            executable,
+        } => {
+            let section = match (section_index, section_name) {
+                (Some(index), Some(name)) => format!("section #{index} {name}"),
+                _ => "no mapped section".to_owned(),
+            };
+            format!(
+                "entry RVA 0x{rva:08X} in {section}; {} file backing; {}",
+                if *file_backed { "has" } else { "no" },
+                if *executable {
+                    "executable"
+                } else {
+                    "not executable"
+                }
+            )
+        }
+        ProtectionEvidence::TlsCallback {
+            table_index,
+            callback_rva,
+        } => format!("TLS callback #{table_index} at RVA 0x{callback_rva:08X}"),
+        ProtectionEvidence::TlsCallbackCoverage {
+            retained_callbacks,
+            truncated,
+        } => format!(
+            "{retained_callbacks} TLS callbacks retained{}",
+            if *truncated { "; scan truncated" } else { "" }
+        ),
     }
 }
 

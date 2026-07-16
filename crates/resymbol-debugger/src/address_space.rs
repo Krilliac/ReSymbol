@@ -161,14 +161,12 @@ impl StaticAddressSpace {
         analysis.validate()?;
 
         let image_size = u64::from(analysis.size_of_image);
-        analysis
-            .identity
-            .image_base
-            .checked_add(image_size)
-            .ok_or(StaticAddressSpaceError::PreferredImageOverflow {
+        analysis.identity.image_base.checked_add(image_size).ok_or(
+            StaticAddressSpaceError::PreferredImageOverflow {
                 base: analysis.identity.image_base,
                 image_size,
-            })?;
+            },
+        )?;
         let header_size = u64::from(analysis.size_of_headers);
         let mut regions = Vec::with_capacity(analysis.sections.len().saturating_mul(2) + 2);
         regions.push(StaticRegion {

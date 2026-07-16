@@ -17,6 +17,7 @@ eframe = { version = "=0.32.3", default-features = false, features = ["accesskit
 egui_extras = { version = "=0.32.3", default-features = false }
 resymbol-analysis = { path = "../resymbol-analysis" }
 resymbol-core = { path = "../resymbol-core" }
+resymbol-debugger = { path = "../resymbol-debugger" }
 resymbol-export = { path = "../resymbol-export" }
 resymbol-package = { path = "../resymbol-package" }
 rfd = "=0.15.4"

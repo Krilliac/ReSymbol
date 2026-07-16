@@ -235,8 +235,8 @@ pub fn encode_control(header: &FrameHeader) -> Result<Vec<u8>, WireError> {
     match &header.body {
         ControlBody::Hello(hello) => {
             out.extend_from_slice(&hello.nonce);
-            let length = u16::try_from(hello.build_identity.len())
-                .map_err(|_| WireError::LengthOverflow)?;
+            let length =
+                u16::try_from(hello.build_identity.len()).map_err(|_| WireError::LengthOverflow)?;
             out.extend_from_slice(&length.to_le_bytes());
             out.extend_from_slice(hello.build_identity.as_bytes());
         }
@@ -308,12 +308,10 @@ pub fn decode_control(control: &[u8]) -> Result<FrameHeader, WireError> {
 
 fn array<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N], WireError> {
     let end = offset.checked_add(N).ok_or(WireError::LengthOverflow)?;
-    let source = bytes
-        .get(offset..end)
-        .ok_or(WireError::ControlTooSmall {
-            declared: bytes.len(),
-            minimum: end,
-        })?;
+    let source = bytes.get(offset..end).ok_or(WireError::ControlTooSmall {
+        declared: bytes.len(),
+        minimum: end,
+    })?;
     let mut value = [0_u8; N];
     value.copy_from_slice(source);
     Ok(value)
@@ -417,8 +415,7 @@ impl HeaderDecoder {
         let mut consumed = 0;
         if self.prefix_used < PREFIX_BYTES {
             let take = (PREFIX_BYTES - self.prefix_used).min(input.len());
-            self.prefix[self.prefix_used..self.prefix_used + take]
-                .copy_from_slice(&input[..take]);
+            self.prefix[self.prefix_used..self.prefix_used + take].copy_from_slice(&input[..take]);
             self.prefix_used += take;
             consumed += take;
             if self.prefix_used < PREFIX_BYTES {
@@ -534,10 +531,16 @@ mod tests {
     fn oversized_and_zero_lengths_fail_before_allocation() {
         let mut oversized = HeaderDecoder::default();
         let prefix = u32::try_from(MAX_CONTROL_BYTES + 1).unwrap().to_le_bytes();
-        assert!(matches!(oversized.push(&prefix), Err(WireError::ControlTooLarge { .. })));
+        assert!(matches!(
+            oversized.push(&prefix),
+            Err(WireError::ControlTooLarge { .. })
+        ));
         assert_eq!(oversized.buffered_control_bytes(), 0);
         let mut zero = HeaderDecoder::default();
-        assert_eq!(zero.push(&0_u32.to_le_bytes()).unwrap_err(), WireError::ZeroControlLength);
+        assert_eq!(
+            zero.push(&0_u32.to_le_bytes()).unwrap_err(),
+            WireError::ZeroControlLength
+        );
         assert_eq!(zero.buffered_control_bytes(), 0);
     }
 
@@ -559,7 +562,10 @@ mod tests {
         let mut encoded = encode_control(&hello(1)).unwrap();
         encoded[12..20].fill(0);
         let mut sequences = SequenceTracker::default();
-        assert_eq!(decode_frame(&encoded, &mut sequences).unwrap_err(), WireError::ZeroSequence);
+        assert_eq!(
+            decode_frame(&encoded, &mut sequences).unwrap_err(),
+            WireError::ZeroSequence
+        );
         sequences.observe(FrameSequence::new(9).unwrap()).unwrap();
         assert!(matches!(
             sequences.observe(FrameSequence::new(8).unwrap()),
@@ -571,12 +577,28 @@ mod tests {
     fn raw_bounds_and_address_overflow_fail() {
         let sequence = FrameSequence::new(1).unwrap();
         assert!(matches!(
-            FrameHeader::new(sequence, MessageKind::Event, MAX_RAW_BYTES + 1, None, ControlBody::Bytes(vec![])),
+            FrameHeader::new(
+                sequence,
+                MessageKind::Event,
+                MAX_RAW_BYTES + 1,
+                None,
+                ControlBody::Bytes(vec![])
+            ),
             Err(WireError::RawTooLarge { .. })
         ));
         assert_eq!(
-            FrameHeader::new(sequence, MessageKind::Event, 4, Some(u64::MAX - 1), ControlBody::Bytes(vec![])).unwrap_err(),
-            WireError::AddressOverflow { address: u64::MAX - 1, length: 4 }
+            FrameHeader::new(
+                sequence,
+                MessageKind::Event,
+                4,
+                Some(u64::MAX - 1),
+                ControlBody::Bytes(vec![])
+            )
+            .unwrap_err(),
+            WireError::AddressOverflow {
+                address: u64::MAX - 1,
+                length: 4
+            }
         );
     }
 

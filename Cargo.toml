@@ -3,6 +3,7 @@ members = [
     "crates/resymbol-analysis",
     "crates/resymbol-cli",
     "crates/resymbol-core",
+    "crates/resymbol-debugger",
     "crates/resymbol-export",
     "crates/resymbol-native-host",
     "crates/resymbol-package",

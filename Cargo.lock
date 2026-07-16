@@ -2965,6 +2965,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "resymbol-debugger"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "resymbol-analysis",
+ "resymbol-core",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "resymbol-export"
 version = "0.1.0-alpha.1"
 dependencies = [
@@ -3050,6 +3061,7 @@ dependencies = [
  "egui_extras",
  "resymbol-analysis",
  "resymbol-core",
+ "resymbol-debugger",
  "resymbol-export",
  "resymbol-package",
  "rfd",

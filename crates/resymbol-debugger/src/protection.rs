@@ -410,8 +410,8 @@ fn scan_entry_point(
         return Ok(());
     };
 
-    let section_index = u32::try_from(index)
-        .map_err(|_| ProtectionScanError::SectionIndexConversion { index })?;
+    let section_index =
+        u32::try_from(index).map_err(|_| ProtectionScanError::SectionIndexConversion { index })?;
     let executable = section.characteristics & IMAGE_SCN_MEM_EXECUTE != 0;
     let delta = rva - section.virtual_address;
     let file_backed = delta < section.raw_data_size;
@@ -631,9 +631,8 @@ mod tests {
     use resymbol_analysis::{BinaryAnalysis, PeSection, analyze_bytes};
 
     use super::{
-        EvidenceStrength, HIGH_ENTROPY_MILLIBITS, ProtectionSeverity,
-        anti_debug_import_assessment, entropy_millibits, packer_section_assessment,
-        scan_pe_protections,
+        EvidenceStrength, HIGH_ENTROPY_MILLIBITS, ProtectionSeverity, anti_debug_import_assessment,
+        entropy_millibits, packer_section_assessment, scan_pe_protections,
     };
 
     const FIXTURE: &[u8] =
@@ -663,9 +662,7 @@ mod tests {
 
     #[test]
     fn anti_debug_and_packer_names_are_case_insensitive_but_narrow() {
-        assert!(
-            anti_debug_import_assessment("KERNEL32.dll", "isdebuggerpresent").is_some()
-        );
+        assert!(anti_debug_import_assessment("KERNEL32.dll", "isdebuggerpresent").is_some());
         assert!(anti_debug_import_assessment("user32.dll", "IsDebuggerPresent").is_none());
         assert!(anti_debug_import_assessment("kernel32.dll", "CreateFileW").is_none());
         let (_, severity, strength) =
