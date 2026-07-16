@@ -895,6 +895,106 @@ impl SessionState {
         }
     }
 
+    /// Validates one externally observed reducer transition. This is the
+    /// consumer-side contract for state events; it rejects impossible state
+    /// jumps even when a forged event carries the next numeric generation.
+    pub fn validate_successor(&self, next: &Self) -> Result<(), ProtocolValidationError> {
+        let current_token = self.state_token();
+        let next_token = next.state_token();
+        if next_token.session_id != current_token.session_id {
+            return Err(ProtocolValidationError::StaleSession);
+        }
+        let expected_generation = current_token
+            .generation
+            .get()
+            .checked_add(1)
+            .ok_or(ProtocolValidationError::StateGenerationOverflow)?;
+        if next_token.generation.get() != expected_generation {
+            return Err(ProtocolValidationError::UnexpectedStateGeneration {
+                expected: expected_generation,
+                actual: next_token.generation.get(),
+            });
+        }
+        let from = self.kind();
+        let to = next.kind();
+        let allowed = match from {
+            SessionStateKind::Idle => matches!(
+                to,
+                SessionStateKind::Opening | SessionStateKind::Closing | SessionStateKind::Failed
+            ),
+            SessionStateKind::Opening => matches!(
+                to,
+                SessionStateKind::AwaitingAttestation
+                    | SessionStateKind::Offline
+                    | SessionStateKind::Dump
+                    | SessionStateKind::Observing
+                    | SessionStateKind::Stopped
+                    | SessionStateKind::Closing
+                    | SessionStateKind::Failed
+            ),
+            SessionStateKind::AwaitingAttestation => matches!(
+                to,
+                SessionStateKind::AttestationAccepted
+                    | SessionStateKind::Closing
+                    | SessionStateKind::Failed
+            ),
+            SessionStateKind::AttestationAccepted => matches!(
+                to,
+                SessionStateKind::Stopped
+                    | SessionStateKind::Exited
+                    | SessionStateKind::Closing
+                    | SessionStateKind::Failed
+            ),
+            SessionStateKind::Offline | SessionStateKind::Dump | SessionStateKind::Snapshot => {
+                matches!(to, SessionStateKind::Closing | SessionStateKind::Failed)
+            }
+            SessionStateKind::Observing => matches!(
+                to,
+                SessionStateKind::Detached | SessionStateKind::Closing | SessionStateKind::Failed
+            ),
+            SessionStateKind::Stopped => matches!(
+                to,
+                SessionStateKind::Stopped
+                    | SessionStateKind::Running
+                    | SessionStateKind::Detached
+                    | SessionStateKind::Exited
+                    | SessionStateKind::Closing
+                    | SessionStateKind::Failed
+            ),
+            SessionStateKind::Running => matches!(
+                to,
+                SessionStateKind::Stopped
+                    | SessionStateKind::Pausing
+                    | SessionStateKind::Detached
+                    | SessionStateKind::Exited
+                    | SessionStateKind::Closing
+                    | SessionStateKind::Failed
+            ),
+            SessionStateKind::Pausing => matches!(
+                to,
+                SessionStateKind::Stopped
+                    | SessionStateKind::Exited
+                    | SessionStateKind::Closing
+                    | SessionStateKind::Failed
+            ),
+            SessionStateKind::Detached | SessionStateKind::Exited => {
+                matches!(to, SessionStateKind::Closing | SessionStateKind::Failed)
+            }
+            SessionStateKind::Failed => {
+                matches!(to, SessionStateKind::Failed | SessionStateKind::Closing)
+            }
+            SessionStateKind::Closing => {
+                matches!(to, SessionStateKind::Closed | SessionStateKind::Failed)
+            }
+            SessionStateKind::Closed => false,
+        };
+        if allowed {
+            Ok(())
+        } else {
+            Err(ProtocolValidationError::InvalidSessionStateTransition { from, to })
+        }
+    }
+
     fn matches_read_view(&self, view: ReadViewToken) -> bool {
         match (view, self) {
             (ReadViewToken::Offline { state }, Self::Offline { token })
@@ -1109,6 +1209,13 @@ pub enum ProtocolValidationError {
     UnsupportedProtocolVersion { major: u16, minor: u16 },
     #[error("state generation overflow")]
     StateGenerationOverflow,
+    #[error("expected state generation {expected}, received {actual}")]
+    UnexpectedStateGeneration { expected: u64, actual: u64 },
+    #[error("invalid session state transition from {from:?} to {to:?}")]
+    InvalidSessionStateTransition {
+        from: SessionStateKind,
+        to: SessionStateKind,
+    },
     #[error("path cannot be empty")]
     EmptyPath,
     #[error("launch has {actual} arguments; maximum is {maximum}")]
@@ -1215,6 +1322,31 @@ mod tests {
             expected_state: Some(expected),
             command,
         }
+    }
+
+    #[test]
+    fn observed_state_successors_require_exact_generation_and_legal_edges() {
+        let idle = SessionState::Idle { token: state(1, 1) };
+        idle.validate_successor(&SessionState::Closing { token: state(1, 2) })
+            .unwrap();
+        assert_eq!(
+            idle.validate_successor(&SessionState::Closed { token: state(1, 2) }),
+            Err(ProtocolValidationError::InvalidSessionStateTransition {
+                from: SessionStateKind::Idle,
+                to: SessionStateKind::Closed,
+            })
+        );
+        assert_eq!(
+            idle.validate_successor(&SessionState::Closing { token: state(1, 3) }),
+            Err(ProtocolValidationError::UnexpectedStateGeneration {
+                expected: 2,
+                actual: 3,
+            })
+        );
+        assert_eq!(
+            idle.validate_successor(&SessionState::Closing { token: state(2, 2) }),
+            Err(ProtocolValidationError::StaleSession)
+        );
     }
 
     #[test]

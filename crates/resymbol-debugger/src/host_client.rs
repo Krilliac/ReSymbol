@@ -13,12 +13,14 @@ use crate::host_codec::{
 };
 use crate::host_wire::{
     EndpointRole, FrameSequence, HandshakeError, HandshakeMachine, HandshakeState,
-    ProtocolVersion as WireProtocolVersion, SequenceTracker, WireError,
+    ProtocolVersion as WireProtocolVersion, WireError,
 };
 use crate::protocol::{
-    CommandEnvelope, CommandId, CommandOutcome, DebugCommand, DebugEvent, DebugTargetRequest,
-    EventEnvelope, EventSequence, EventSequenceCursor, ProtocolValidationError, ProtocolVersion,
-    SessionId, SessionState, SessionStateKind, StateGeneration, StateToken, StopReason, ThreadId,
+    CapabilityAvailability, CapabilityReport, CapabilityStatus, CapabilityUnavailableCode,
+    CommandEnvelope, CommandId, CommandOutcome, DebugCapability, DebugCommand, DebugEvent,
+    DebugTargetRequest, EventEnvelope, EventSequence, EventSequenceCursor, ProtocolValidationError,
+    ProtocolVersion, SessionId, SessionState, SessionStateKind, StateGeneration, StateToken,
+    StopReason, ThreadId,
 };
 use crate::sandbox::{
     CleanupOutcome, CleanupReceiptId, DiagnosticText, ExpectedSandboxAttestation, HelperBuildId,
@@ -78,10 +80,14 @@ pub struct DebugHostClient<T: HostFrameExchange> {
 struct ClientSession {
     session_id: SessionId,
     state: SessionState,
+    last_stop_id: u64,
+    last_run_id: u64,
 }
 
 impl<T: HostFrameExchange> DebugHostClient<T> {
-    /// Establishes the identity-pinned controller/host handshake.
+    /// Establishes the direction- and identity-checked controller/host handshake.
+    /// The injected transport remains responsible for cryptographic peer
+    /// authentication; the wire handshake itself is not an authenticator.
     ///
     /// `[connection owner thread; potentially blocking]`
     pub fn connect(
@@ -160,6 +166,57 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
         self.session.as_ref().map(|session| &session.state)
     }
 
+    /// Queries connection-level capabilities without opening a target session.
+    /// The in-memory host returns every platform capability as unavailable;
+    /// real transports must report their provider's exact bounded status set.
+    ///
+    /// `[connection owner thread; potentially blocking]`
+    pub fn probe_capabilities(&mut self) -> Result<CapabilityReport, DebugHostClientError> {
+        self.require_connected()?;
+        if self.session.is_some() {
+            return Err(DebugHostClientError::CapabilityProbeRequiresNoSession);
+        }
+        let command_id =
+            CommandId::new(self.next_command_id).map_err(DebugHostClientError::Protocol)?;
+        let envelope = CommandEnvelope {
+            version: ProtocolVersion::current(),
+            command_id,
+            session_id: None,
+            expected_state: None,
+            command: DebugCommand::ProbeCapabilities,
+        };
+        envelope.validate()?;
+        let frame_sequence = FrameSequence::new(self.next_outbound_frame_sequence)?;
+        let request = encode_command_frame(frame_sequence, &envelope)?;
+        self.require_negotiated_frame_version(&request)?;
+        self.next_outbound_frame_sequence = self
+            .next_outbound_frame_sequence
+            .checked_add(1)
+            .ok_or(DebugHostClientError::FrameSequenceOverflow)?;
+        self.next_command_id = self
+            .next_command_id
+            .checked_add(1)
+            .ok_or(DebugHostClientError::CommandIdOverflow)?;
+        let responses = match self.transport.exchange(request) {
+            Ok(responses) => responses,
+            Err(error) => {
+                self.connection_state = if error.is_disconnected() {
+                    ClientConnectionState::Disconnected
+                } else {
+                    ClientConnectionState::Failed
+                };
+                let _ = self.transport.disconnect();
+                return Err(error.into());
+            }
+        };
+        let result = self.accept_capability_batch(command_id, responses);
+        if result.is_err() {
+            self.connection_state = ClientConnectionState::Failed;
+            let _ = self.transport.disconnect();
+        }
+        result
+    }
+
     /// Claims one logical session on this connection. The host independently
     /// creates its reducer when it receives the first `Open` command, so merely
     /// calling this method never claims a target has been opened.
@@ -179,6 +236,8 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
                         .expect("initial state generation is nonzero"),
                 },
             },
+            last_stop_id: 0,
+            last_run_id: 0,
         });
         self.connection_state = ClientConnectionState::SessionOpen;
         Ok(())
@@ -214,6 +273,7 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
 
         let frame_sequence = FrameSequence::new(self.next_outbound_frame_sequence)?;
         let request = encode_command_frame(frame_sequence, &envelope)?;
+        self.require_negotiated_frame_version(&request)?;
         self.next_outbound_frame_sequence = self
             .next_outbound_frame_sequence
             .checked_add(1)
@@ -257,6 +317,24 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
         Ok(())
     }
 
+    /// Drops client-side ownership after an unrecoverable connection failure.
+    ///
+    /// This is an evidence-preserving abandon operation, not cleanup: it
+    /// returns the last observed state and leaves the connection terminal. It
+    /// never converts an unclean sandbox or target session into `Closed`.
+    pub fn abandon_failed_session(&mut self) -> Result<SessionState, DebugHostClientError> {
+        if !matches!(
+            self.connection_state,
+            ClientConnectionState::Failed | ClientConnectionState::Disconnected
+        ) {
+            return Err(DebugHostClientError::SessionAbandonRequiresFailedConnection);
+        }
+        self.session
+            .take()
+            .map(|session| session.state)
+            .ok_or(DebugHostClientError::SessionNotOwned)
+    }
+
     /// Closes the control connection. An active target session must first
     /// reach `Closed`, including exact sandbox cleanup when applicable.
     ///
@@ -267,6 +345,9 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
         }
         if self.session.is_some() {
             return Err(DebugHostClientError::SessionStillOwned);
+        }
+        if self.connection_state == ClientConnectionState::Failed {
+            return Err(DebugHostClientError::ConnectionFailed);
         }
         self.transport.disconnect()?;
         self.connection_state = ClientConnectionState::Disconnected;
@@ -284,6 +365,76 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
             let _ = self.transport.disconnect();
         }
         result
+    }
+
+    fn accept_capability_batch(
+        &mut self,
+        command_id: CommandId,
+        responses: Vec<HostFrame>,
+    ) -> Result<CapabilityReport, DebugHostClientError> {
+        if responses.is_empty() {
+            return Err(DebugHostClientError::MissingCommandResult { command_id });
+        }
+        if responses.len() > MAX_RESPONSE_FRAMES {
+            return Err(DebugHostClientError::TooManyResponseFrames {
+                actual: responses.len(),
+                maximum: MAX_RESPONSE_FRAMES,
+            });
+        }
+        let mut report = None;
+        let mut outcome = None;
+        for frame in responses {
+            self.require_negotiated_frame_version(&frame)?;
+            if frame.header().sequence.get() != self.next_inbound_frame_sequence {
+                return Err(DebugHostClientError::UnexpectedFrameSequence {
+                    expected: self.next_inbound_frame_sequence,
+                    actual: frame.header().sequence.get(),
+                });
+            }
+            self.next_inbound_frame_sequence = self
+                .next_inbound_frame_sequence
+                .checked_add(1)
+                .ok_or(DebugHostClientError::FrameSequenceOverflow)?;
+            let event = decode_event_frame(&frame)?;
+            self.event_cursor.observe(event.sequence)?;
+            if event.caused_by != Some(command_id) {
+                return Err(DebugHostClientError::UnexpectedCommandCorrelation {
+                    expected: command_id,
+                    actual: event.caused_by,
+                });
+            }
+            if event.session_id.is_some() || event.state.is_some() {
+                return Err(DebugHostClientError::UnexpectedGlobalSessionContext);
+            }
+            match event.event {
+                DebugEvent::Capabilities(value) => {
+                    if report.replace(value).is_some() {
+                        return Err(DebugHostClientError::DuplicateCapabilityReport);
+                    }
+                }
+                DebugEvent::CommandResult {
+                    command_id: result_id,
+                    outcome: result,
+                } => {
+                    if result_id != command_id {
+                        return Err(DebugHostClientError::UnexpectedCommandCorrelation {
+                            expected: command_id,
+                            actual: Some(result_id),
+                        });
+                    }
+                    if outcome.replace(result).is_some() {
+                        return Err(DebugHostClientError::DuplicateCommandResult { command_id });
+                    }
+                }
+                DebugEvent::Warning { .. } => {}
+                _ => return Err(DebugHostClientError::UnexpectedGlobalEvent),
+            }
+        }
+        let outcome = outcome.ok_or(DebugHostClientError::MissingCommandResult { command_id })?;
+        if let CommandOutcome::Rejected { code, message } = outcome {
+            return Err(DebugHostClientError::CapabilityProbeRejected { code, message });
+        }
+        report.ok_or(DebugHostClientError::MissingCapabilityReport)
     }
 
     fn accept_response_batch_inner(
@@ -312,6 +463,7 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
         let mut outcome = None;
 
         for frame in responses {
+            self.require_negotiated_frame_version(&frame)?;
             if frame.header().sequence.get() != self.next_inbound_frame_sequence {
                 return self.fail(DebugHostClientError::UnexpectedFrameSequence {
                     expected: self.next_inbound_frame_sequence,
@@ -340,6 +492,20 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
                     expected: session_id,
                     actual: event.session_id,
                 });
+            }
+            if !matches!(&event.event, DebugEvent::StateChanged(_)) {
+                let expected = self
+                    .session
+                    .as_ref()
+                    .ok_or(DebugHostClientError::SessionNotOwned)?
+                    .state
+                    .state_token();
+                if event.state != Some(expected) {
+                    return self.fail(DebugHostClientError::UnexpectedEventState {
+                        expected,
+                        actual: event.state,
+                    });
+                }
             }
             match &event.event {
                 DebugEvent::StateChanged(state) => self.accept_state_change(state.clone())?,
@@ -383,29 +549,64 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
             .session
             .as_ref()
             .ok_or(DebugHostClientError::SessionNotOwned)?;
-        let session_id = session.session_id;
-        let current_generation = session.state.state_token().generation.get();
-        let token = next.state_token();
-        if token.session_id != session_id {
-            return self.fail(DebugHostClientError::UnexpectedEventSession {
-                expected: session_id,
-                actual: Some(token.session_id),
-            });
-        }
-        let expected = current_generation
-            .checked_add(1)
-            .ok_or(DebugHostClientError::StateGenerationOverflow)?;
-        if token.generation.get() != expected {
-            return self.fail(DebugHostClientError::UnexpectedStateGeneration {
-                expected,
-                actual: token.generation.get(),
-            });
-        }
-        self.session
+        session.state.validate_successor(&next)?;
+        let (next_stop_id, next_run_id) = match &next {
+            SessionState::Stopped { token, .. } => {
+                let expected = session
+                    .last_stop_id
+                    .checked_add(1)
+                    .ok_or(DebugHostClientError::ExecutionTokenOverflow)?;
+                if token.stop_id.get() != expected {
+                    return Err(DebugHostClientError::UnexpectedStopId {
+                        expected,
+                        actual: token.stop_id.get(),
+                    });
+                }
+                (Some(expected), None)
+            }
+            SessionState::Running { token } => {
+                let expected = session
+                    .last_run_id
+                    .checked_add(1)
+                    .ok_or(DebugHostClientError::ExecutionTokenOverflow)?;
+                if token.run_id.get() != expected {
+                    return Err(DebugHostClientError::UnexpectedRunId {
+                        expected,
+                        actual: token.run_id.get(),
+                    });
+                }
+                (None, Some(expected))
+            }
+            _ => (None, None),
+        };
+        let session = self
+            .session
             .as_mut()
-            .ok_or(DebugHostClientError::SessionNotOwned)?
-            .state = next;
+            .ok_or(DebugHostClientError::SessionNotOwned)?;
+        if let Some(stop_id) = next_stop_id {
+            session.last_stop_id = stop_id;
+        }
+        if let Some(run_id) = next_run_id {
+            session.last_run_id = run_id;
+        }
+        session.state = next;
         Ok(())
+    }
+
+    fn require_negotiated_frame_version(
+        &self,
+        frame: &HostFrame,
+    ) -> Result<(), DebugHostClientError> {
+        if frame.header().version == self.negotiated_version {
+            Ok(())
+        } else {
+            Err(DebugHostClientError::UnexpectedWireProtocolVersion {
+                expected_major: self.negotiated_version.major,
+                expected_minor: self.negotiated_version.minor,
+                actual_major: frame.header().version.major,
+                actual_minor: frame.header().version.minor,
+            })
+        }
     }
 
     fn require_connected(&self) -> Result<(), DebugHostClientError> {
@@ -499,8 +700,22 @@ pub enum DebugHostClientError {
     SessionNotClosed { state: SessionStateKind },
     #[error("session must be released before disconnect")]
     SessionStillOwned,
+    #[error("session abandonment is allowed only after connection failure")]
+    SessionAbandonRequiresFailedConnection,
     #[error("global capability probing is not a session command")]
     GlobalCommandRequiresConnectionApi,
+    #[error("capability probing requires a connection with no owned session")]
+    CapabilityProbeRequiresNoSession,
+    #[error("connection-level capability event unexpectedly carried session state")]
+    UnexpectedGlobalSessionContext,
+    #[error("connection-level capability response contained a session-only event")]
+    UnexpectedGlobalEvent,
+    #[error("capability response did not contain a capability report")]
+    MissingCapabilityReport,
+    #[error("capability response contained more than one capability report")]
+    DuplicateCapabilityReport,
+    #[error("capability probe was rejected with {code}: {message}")]
+    CapabilityProbeRejected { code: String, message: String },
     #[error("command identifier exhausted its u64 space")]
     CommandIdOverflow,
     #[error("host returned no correlated result for command {command_id:?}")]
@@ -511,6 +726,15 @@ pub enum DebugHostClientError {
     UnexpectedFrameSequence { expected: u64, actual: u64 },
     #[error("frame sequence exhausted its u64 space")]
     FrameSequenceOverflow,
+    #[error(
+        "expected wire protocol {expected_major}.{expected_minor}, received {actual_major}.{actual_minor}"
+    )]
+    UnexpectedWireProtocolVersion {
+        expected_major: u16,
+        expected_minor: u16,
+        actual_major: u16,
+        actual_minor: u16,
+    },
     #[error("expected correlation {expected:?}, received {actual:?}")]
     UnexpectedCommandCorrelation {
         expected: CommandId,
@@ -521,14 +745,21 @@ pub enum DebugHostClientError {
         expected: SessionId,
         actual: Option<SessionId>,
     },
+    #[error("expected event state {expected:?}, received {actual:?}")]
+    UnexpectedEventState {
+        expected: StateToken,
+        actual: Option<StateToken>,
+    },
+    #[error("expected stop identifier {expected}, received {actual}")]
+    UnexpectedStopId { expected: u64, actual: u64 },
+    #[error("expected run identifier {expected}, received {actual}")]
+    UnexpectedRunId { expected: u64, actual: u64 },
+    #[error("execution token identifier space is exhausted")]
+    ExecutionTokenOverflow,
     #[error("host returned more than one result for command {command_id:?}")]
     DuplicateCommandResult { command_id: CommandId },
     #[error("rejected command {command_id:?} changed session state")]
     RejectedCommandChangedState { command_id: CommandId },
-    #[error("expected state generation {expected}, received {actual}")]
-    UnexpectedStateGeneration { expected: u64, actual: u64 },
-    #[error("state generation exhausted its u64 space")]
-    StateGenerationOverflow,
 }
 
 /// A deterministic, non-executing host used for integration and UI tests.
@@ -539,7 +770,8 @@ pub struct InMemoryDebugHost {
     handshake: HandshakeMachine,
     helper_build: HelperBuildId,
     machine: Option<SessionMachine>,
-    command_frames: SequenceTracker,
+    last_command_id: Option<CommandId>,
+    next_command_frame_sequence: u64,
     next_frame_sequence: u64,
     next_event_sequence: u64,
     successful_exchanges: usize,
@@ -562,7 +794,8 @@ impl InMemoryDebugHost {
             )?,
             helper_build,
             machine: None,
-            command_frames: SequenceTracker::default(),
+            last_command_id: None,
+            next_command_frame_sequence: 1,
             next_frame_sequence: 2,
             next_event_sequence: 1,
             successful_exchanges: 0,
@@ -599,6 +832,17 @@ impl InMemoryDebugHost {
                 "injected in-memory backend failure",
             ));
         }
+        if request.header().sequence.get() != self.next_command_frame_sequence {
+            return Err(HostTransportError::protocol(format!(
+                "expected frame sequence {}, received {}",
+                self.next_command_frame_sequence,
+                request.header().sequence.get()
+            )));
+        }
+        self.next_command_frame_sequence = self
+            .next_command_frame_sequence
+            .checked_add(1)
+            .ok_or_else(|| HostTransportError::protocol("frame sequence overflow"))?;
 
         let responses = if self.handshake.state() != HandshakeState::Established {
             if !request.raw().is_empty() {
@@ -606,9 +850,6 @@ impl InMemoryDebugHost {
                     "handshake request carried raw payload",
                 ));
             }
-            self.command_frames
-                .observe(request.header().sequence)
-                .map_err(|error| HostTransportError::protocol(error.to_string()))?;
             let acknowledgement = self
                 .handshake
                 .accept(request.header())
@@ -619,9 +860,11 @@ impl InMemoryDebugHost {
                     .map_err(|error| HostTransportError::protocol(error.to_string()))?,
             ]
         } else {
-            self.command_frames
-                .observe(request.header().sequence)
-                .map_err(|error| HostTransportError::protocol(error.to_string()))?;
+            if self.handshake.negotiated_version() != Some(request.header().version) {
+                return Err(HostTransportError::protocol(
+                    "command frame version differs from negotiated handshake version",
+                ));
+            }
             let command = decode_command_frame(&request)
                 .map_err(|error| HostTransportError::protocol(error.to_string()))?;
             self.handle_command(command)?
@@ -637,9 +880,23 @@ impl InMemoryDebugHost {
         &mut self,
         envelope: CommandEnvelope,
     ) -> Result<Vec<HostFrame>, HostTransportError> {
+        self.observe_command_id(envelope.command_id)?;
         if matches!(&envelope.command, DebugCommand::ProbeCapabilities) {
+            envelope
+                .validate()
+                .map_err(|error| HostTransportError::protocol(error.to_string()))?;
+            return self.handle_capability_probe(envelope.command_id);
+        }
+        if matches!(
+            &envelope.command,
+            DebugCommand::ReadMemory { .. }
+                | DebugCommand::WriteMemory { .. }
+                | DebugCommand::SetBreakpoint { .. }
+                | DebugCommand::RemoveBreakpoint { .. }
+                | DebugCommand::CaptureSnapshot { .. }
+        ) {
             return Err(HostTransportError::protocol(
-                "the in-memory session seam does not claim global capabilities",
+                "the execution-neutral in-memory host does not implement target data operations",
             ));
         }
         let session_id = envelope
@@ -705,6 +962,61 @@ impl InMemoryDebugHost {
         Ok(events)
     }
 
+    fn observe_command_id(&mut self, command_id: CommandId) -> Result<(), HostTransportError> {
+        if self.last_command_id.is_some_and(|last| command_id <= last) {
+            return Err(HostTransportError::protocol(
+                "command identifier is not newer than the previous command",
+            ));
+        }
+        self.last_command_id = Some(command_id);
+        Ok(())
+    }
+
+    fn handle_capability_probe(
+        &mut self,
+        command_id: CommandId,
+    ) -> Result<Vec<HostFrame>, HostTransportError> {
+        let unavailable = |capability| CapabilityStatus {
+            capability,
+            availability: CapabilityAvailability::Unavailable {
+                code: CapabilityUnavailableCode::BackendUnavailable,
+                reason: "execution-neutral in-memory host has no platform provider".to_owned(),
+            },
+        };
+        let report = CapabilityReport {
+            statuses: [
+                DebugCapability::OfflineAnalysis,
+                DebugCapability::DumpRead,
+                DebugCapability::SnapshotRead,
+                DebugCapability::ObserveProcess,
+                DebugCapability::LiveMemoryRead,
+                DebugCapability::LiveMemoryWrite,
+                DebugCapability::ExecutionControl,
+                DebugCapability::RegisterRead,
+                DebugCapability::RegisterWrite,
+                DebugCapability::SoftwareBreakpoints,
+                DebugCapability::HardwareBreakpoints,
+                DebugCapability::SandboxedLaunch,
+                DebugCapability::HostLaunch,
+                DebugCapability::HostAttach,
+            ]
+            .into_iter()
+            .map(unavailable)
+            .collect(),
+        };
+        let mut events = Vec::with_capacity(2);
+        self.push_global_event(&mut events, command_id, DebugEvent::Capabilities(report))?;
+        self.push_global_event(
+            &mut events,
+            command_id,
+            DebugEvent::CommandResult {
+                command_id,
+                outcome: CommandOutcome::Succeeded,
+            },
+        )?;
+        Ok(events)
+    }
+
     fn drive_accepted_command(
         &mut self,
         command_id: CommandId,
@@ -738,13 +1050,14 @@ impl InMemoryDebugHost {
             DebugCommand::Close { .. } | DebugCommand::Terminate { .. } => {
                 self.drive_close(command_id, events)?;
             }
-            DebugCommand::Continue { .. }
-            | DebugCommand::ReadMemory { .. }
+            DebugCommand::Continue { .. } | DebugCommand::Detach { .. } => {}
+            DebugCommand::ReadMemory { .. }
             | DebugCommand::WriteMemory { .. }
             | DebugCommand::SetBreakpoint { .. }
             | DebugCommand::RemoveBreakpoint { .. }
-            | DebugCommand::CaptureSnapshot { .. }
-            | DebugCommand::Detach { .. } => {}
+            | DebugCommand::CaptureSnapshot { .. } => {
+                unreachable!("unsupported target data operations are rejected before reduction")
+            }
             DebugCommand::ProbeCapabilities => unreachable!("handled before session dispatch"),
         }
         Ok(())
@@ -890,6 +1203,45 @@ impl InMemoryDebugHost {
         )
     }
 
+    fn push_global_event(
+        &mut self,
+        frames: &mut Vec<HostFrame>,
+        command_id: CommandId,
+        event: DebugEvent,
+    ) -> Result<(), HostTransportError> {
+        if frames.len() >= MAX_RESPONSE_FRAMES {
+            return Err(HostTransportError::backend(
+                "fake response frame limit exceeded",
+            ));
+        }
+        let sequence = EventSequence::new(self.next_event_sequence)
+            .map_err(|error| HostTransportError::protocol(error.to_string()))?;
+        let envelope = EventEnvelope {
+            version: ProtocolVersion::current(),
+            sequence,
+            session_id: None,
+            state: None,
+            caused_by: Some(command_id),
+            event,
+        };
+        let frame = encode_event_frame(
+            FrameSequence::new(self.next_frame_sequence)
+                .map_err(|error| HostTransportError::protocol(error.to_string()))?,
+            &envelope,
+        )
+        .map_err(|error| HostTransportError::protocol(error.to_string()))?;
+        self.next_event_sequence = self
+            .next_event_sequence
+            .checked_add(1)
+            .ok_or_else(|| HostTransportError::protocol("event sequence overflow"))?;
+        self.next_frame_sequence = self
+            .next_frame_sequence
+            .checked_add(1)
+            .ok_or_else(|| HostTransportError::protocol("frame sequence overflow"))?;
+        frames.push(frame);
+        Ok(())
+    }
+
     fn push_event(
         &mut self,
         frames: &mut Vec<HostFrame>,
@@ -1019,7 +1371,9 @@ mod tests {
     use resymbol_core::BinaryId;
 
     use super::*;
-    use crate::protocol::{LaunchEnvironment, LaunchTarget, OfflineTarget};
+    use crate::protocol::{
+        LaunchEnvironment, LaunchTarget, MemoryAddress, OfflineTarget, ReadViewToken,
+    };
     use crate::sandbox::{
         ChildProcessProfile, DynamicCodeProfile, ProcessMitigationProfile, RiskAcknowledgementId,
         SandboxGuarantee, SandboxNetworkMode, SandboxPolicy, SandboxProviderSelection,
@@ -1048,6 +1402,8 @@ mod tests {
         WrongCorrelation,
         MissingResult,
         DuplicateResult,
+        ImpossibleTransition,
+        StaleEventState,
     }
 
     struct MutatingHost {
@@ -1116,6 +1472,33 @@ mod tests {
                         )
                         .unwrap(),
                     );
+                }
+                ResponseMutation::ImpossibleTransition => {
+                    for frame in &mut responses {
+                        let mut event = decode_event_frame(frame).unwrap();
+                        let DebugEvent::StateChanged(state) = &event.event else {
+                            continue;
+                        };
+                        let token = state.state_token();
+                        event.event = DebugEvent::StateChanged(SessionState::Closed { token });
+                        event.state = Some(token);
+                        *frame = encode_event_frame(frame.header().sequence, &event).unwrap();
+                        break;
+                    }
+                }
+                ResponseMutation::StaleEventState => {
+                    for frame in &mut responses {
+                        let mut event = decode_event_frame(frame).unwrap();
+                        if !matches!(event.event, DebugEvent::CommandResult { .. }) {
+                            continue;
+                        }
+                        event.state = Some(StateToken {
+                            session_id: session_id(),
+                            generation: StateGeneration::new(1).unwrap(),
+                        });
+                        *frame = encode_event_frame(frame.header().sequence, &event).unwrap();
+                        break;
+                    }
                 }
             }
             responses
@@ -1252,6 +1635,62 @@ mod tests {
         );
         client.release_closed_session().unwrap();
         client.disconnect().unwrap();
+    }
+
+    #[test]
+    fn connection_probe_reports_every_fake_capability_as_unavailable() {
+        let mut client = client(host());
+        let report = client.probe_capabilities().unwrap();
+        assert_eq!(report.statuses.len(), 14);
+        assert!(report.statuses.iter().all(|status| matches!(
+            &status.availability,
+            CapabilityAvailability::Unavailable {
+                code: CapabilityUnavailableCode::BackendUnavailable,
+                ..
+            }
+        )));
+
+        client.begin_session(session_id()).unwrap();
+        let opened = client
+            .submit(DebugCommand::Open(DebugTargetRequest::Offline(
+                OfflineTarget {
+                    path: PathBuf::from("sample.exe"),
+                },
+            )))
+            .unwrap();
+        assert_eq!(opened.command_id.get(), 2);
+    }
+
+    #[test]
+    fn fake_host_rejects_unimplemented_data_operations_and_client_can_abandon_failure() {
+        let mut client = client(host());
+        client.begin_session(session_id()).unwrap();
+        client
+            .submit(DebugCommand::Open(DebugTargetRequest::Offline(
+                OfflineTarget {
+                    path: PathBuf::from("sample.exe"),
+                },
+            )))
+            .unwrap();
+        let state = client.session_state().unwrap().state_token();
+        assert!(matches!(
+            client.submit(DebugCommand::ReadMemory {
+                view: ReadViewToken::Offline { state },
+                address: MemoryAddress::new(0),
+                size: 16,
+            }),
+            Err(DebugHostClientError::Transport(
+                HostTransportError::Protocol { .. }
+            ))
+        ));
+        assert_eq!(client.connection_state(), ClientConnectionState::Failed);
+        let abandoned = client.abandon_failed_session().unwrap();
+        assert_eq!(abandoned.kind(), SessionStateKind::Offline);
+        assert_eq!(client.connection_state(), ClientConnectionState::Failed);
+        assert_eq!(
+            client.disconnect(),
+            Err(DebugHostClientError::ConnectionFailed)
+        );
     }
 
     #[test]
@@ -1446,5 +1885,37 @@ mod tests {
             Err(DebugHostClientError::DuplicateCommandResult { command_id })
                 if command_id.get() == 1
         ));
+    }
+
+    #[test]
+    fn client_rejects_impossible_transitions_and_stale_event_state() {
+        let mut impossible = mutating_client(ResponseMutation::ImpossibleTransition);
+        impossible.begin_session(session_id()).unwrap();
+        assert!(matches!(
+            impossible.submit(DebugCommand::Open(DebugTargetRequest::Offline(
+                OfflineTarget {
+                    path: PathBuf::from("sample.exe")
+                }
+            ))),
+            Err(DebugHostClientError::Protocol(
+                ProtocolValidationError::InvalidSessionStateTransition {
+                    from: SessionStateKind::Idle,
+                    to: SessionStateKind::Closed,
+                }
+            ))
+        ));
+        assert_eq!(impossible.connection_state(), ClientConnectionState::Failed);
+
+        let mut stale = mutating_client(ResponseMutation::StaleEventState);
+        stale.begin_session(session_id()).unwrap();
+        assert!(matches!(
+            stale.submit(DebugCommand::Open(DebugTargetRequest::Offline(
+                OfflineTarget {
+                    path: PathBuf::from("sample.exe")
+                }
+            ))),
+            Err(DebugHostClientError::UnexpectedEventState { .. })
+        ));
+        assert_eq!(stale.connection_state(), ClientConnectionState::Failed);
     }
 }

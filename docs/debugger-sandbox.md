@@ -11,7 +11,7 @@ ReSymbol currently implements the non-executing foundation for debugger and sand
   sections;
 - backend-neutral target, capability, command, event, state-token, breakpoint, memory-read, and
   compare-before-write memory-mutation contracts;
-- a bounded control/raw-byte frame format, identity-pinned directional handshake, exact protocol
+- a bounded control/raw-byte frame format, direction- and identity-checked handshake, exact protocol
   version binding, strict typed command/event codec, and single-owner host-client seam;
 - a deterministic in-memory host that drives the real session and sandbox reducers for integration
   tests without reading an artifact, opening a process, or executing target code; and
@@ -90,13 +90,19 @@ remain requirements for a future process-executing provider, not evidence that s
 The current seam is intentionally narrow:
 
 - a four-byte length prefix is validated before allocating a bounded control buffer;
-- controller and host roles, directions, nonzero challenge nonce, pinned build identities, offered
+- controller and host roles, directions, nonzero challenge nonce, expected build identities, offered
   protocol version, response kind, and independent frame sequences are verified before commands;
+- the wire handshake detects reflection, replay, downgrade, and accidental peer mismatch but is not
+  cryptographic authentication; a future platform transport must authenticate the helper channel;
 - malformed, reflected, duplicate, replayed, stale, cross-session, overlong, and unknown-field inputs
   fail closed;
 - command IDs and event IDs are independent monotonic domains, while each synchronous response batch
   must contain exactly one command result and only events correlated to that command;
-- session generations must advance one at a time, and a rejected command may not change client state;
+- session generations and stop/run identifiers must advance exactly through a legal reducer
+  transition, non-transition events must carry the exact current state token, and a rejected command
+  may not change client state;
+- connection-level capability probing is explicit; the in-memory host reports every platform
+  capability as unavailable and rejects target-data operations it cannot honestly model;
 - only `Closed` sessions can be released, and sandbox closure requires the exact cleanup receipt that
   the reducer validates; and
 - the client and transport expose value types only. Future process, pipe, token, Job, VM, and provider
@@ -107,6 +113,10 @@ memory-written event buffers are carried exactly once through the separately bou
 an exact address and split descriptor in the control document. Inline/raw duplicates, mismatched
 lengths, and raw payloads on other message kinds are rejected. A future pipe transport must preserve
 that separation rather than increasing the control allocation.
+
+After a transport or validation failure, the client disconnects and remains terminal. Callers may
+abandon the poisoned client-side session to recover its last observed state for diagnostics, but this
+does not produce a cleanup receipt, mark the session `Closed`, or permit channel reuse.
 
 ## Local AppContainer boundary
 

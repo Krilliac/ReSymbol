@@ -8,11 +8,12 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
 use crate::host_wire::{
-    ControlBody, FrameHeader, FrameSequence, MessageKind, WireError, decode_frame, encode_control,
+    ControlBody, FrameHeader, FrameSequence, MessageKind, ProtocolVersion as WireProtocolVersion,
+    WireError, decode_frame, encode_control,
 };
 use crate::protocol::{
     CommandEnvelope, DebugCommand, DebugEvent, EventEnvelope, MAX_MEMORY_READ_BYTES,
-    MAX_MEMORY_WRITE_BYTES, ProtocolValidationError,
+    MAX_MEMORY_WRITE_BYTES, ProtocolValidationError, ProtocolVersion,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,6 +106,7 @@ pub fn encode_command_frame(
     sequence: FrameSequence,
     envelope: &CommandEnvelope,
 ) -> Result<HostFrame, HostCodecError> {
+    require_protocol_version(envelope.version, WireProtocolVersion::CURRENT)?;
     envelope.validate()?;
     let mut control_envelope = envelope.clone();
     let (raw_layout, raw_address, raw) = match &mut control_envelope.command {
@@ -142,6 +144,7 @@ pub fn encode_command_frame(
 
 pub fn decode_command_frame(frame: &HostFrame) -> Result<CommandEnvelope, HostCodecError> {
     let mut control: CommandControl = decode_json_frame(frame, MessageKind::Command)?;
+    require_protocol_version(control.envelope.version, frame.header.version)?;
     match (&mut control.envelope.command, control.raw_layout) {
         (
             DebugCommand::WriteMemory {
@@ -179,6 +182,7 @@ pub fn encode_event_frame(
     sequence: FrameSequence,
     event: &EventEnvelope,
 ) -> Result<HostFrame, HostCodecError> {
+    require_protocol_version(event.version, WireProtocolVersion::CURRENT)?;
     event.validate()?;
     let mut control_envelope = event.clone();
     let (raw_layout, raw_address, raw) = match &mut control_envelope.event {
@@ -216,6 +220,7 @@ pub fn encode_event_frame(
 
 pub fn decode_event_frame(frame: &HostFrame) -> Result<EventEnvelope, HostCodecError> {
     let mut control: EventControl = decode_json_frame(frame, MessageKind::Event)?;
+    require_protocol_version(control.envelope.version, frame.header.version)?;
     match (&mut control.envelope.event, control.raw_layout) {
         (DebugEvent::MemoryRead { address, bytes, .. }, EventRawLayout::MemoryRead) => {
             if !bytes.is_empty()
@@ -330,6 +335,22 @@ fn require_empty_placeholders(first: &[u8], second: &[u8]) -> Result<(), HostCod
     }
 }
 
+fn require_protocol_version(
+    protocol: ProtocolVersion,
+    wire: WireProtocolVersion,
+) -> Result<(), HostCodecError> {
+    if protocol.major == wire.major && protocol.minor == wire.minor {
+        Ok(())
+    } else {
+        Err(HostCodecError::ProtocolVersionMismatch {
+            wire_major: wire.major,
+            wire_minor: wire.minor,
+            envelope_major: protocol.major,
+            envelope_minor: protocol.minor,
+        })
+    }
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum HostCodecError {
     #[error(transparent)]
@@ -359,6 +380,15 @@ pub enum HostCodecError {
     UnexpectedRawAddress { actual: u64 },
     #[error("frame length does not fit the wire representation")]
     LengthOverflow,
+    #[error(
+        "wire protocol {wire_major}.{wire_minor} does not match envelope protocol {envelope_major}.{envelope_minor}"
+    )]
+    ProtocolVersionMismatch {
+        wire_major: u16,
+        wire_minor: u16,
+        envelope_major: u16,
+        envelope_minor: u16,
+    },
     #[error("frame contains trailing bytes: consumed {consumed}, available {available}")]
     TrailingBytes { consumed: usize, available: usize },
 }
@@ -448,6 +478,35 @@ mod tests {
         assert!(matches!(
             decode_event_frame(&frame),
             Err(HostCodecError::UnexpectedMessageKind { .. })
+        ));
+    }
+
+    #[test]
+    fn typed_codec_binds_envelope_version_to_wire_version() {
+        let mut control = CommandControl {
+            envelope: close_command(),
+            raw_layout: CommandRawLayout::None,
+        };
+        control.envelope.version.major += 1;
+        let frame = HostFrame::new(
+            FrameHeader::new(
+                FrameSequence::new(1).unwrap(),
+                MessageKind::Command,
+                0,
+                None,
+                ControlBody::Bytes(serde_json::to_vec(&control).unwrap()),
+            )
+            .unwrap(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(matches!(
+            decode_command_frame(&frame),
+            Err(HostCodecError::ProtocolVersionMismatch {
+                wire_major: crate::host_wire::PROTOCOL_MAJOR,
+                envelope_major,
+                ..
+            }) if envelope_major == crate::protocol::PROTOCOL_MAJOR + 1
         ));
     }
 
