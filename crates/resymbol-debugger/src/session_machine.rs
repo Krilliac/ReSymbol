@@ -225,7 +225,7 @@ impl SessionMachine {
         self.require_open_target("complete observing attach", |target| {
             matches!(
                 target,
-                DebugTargetRequest::Attach(target) if target.mode == AttachMode::Observe
+                DebugTargetRequest::Attach(target) if target.mode == AttachMode::ObserveReadOnly
             )
         })?;
         self.state = SessionState::Observing {

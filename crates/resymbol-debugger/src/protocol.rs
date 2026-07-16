@@ -743,6 +743,8 @@ impl CommandEnvelope {
         };
         if allowed {
             Ok(())
+        } else if matches!(&self.command, DebugCommand::Close { .. }) {
+            Err(ProtocolValidationError::CommandNotAllowedInState)
         } else if self.command.state_context().is_some() {
             Err(ProtocolValidationError::StaleExecutionToken)
         } else {
