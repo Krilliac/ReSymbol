@@ -204,11 +204,14 @@ tests:
    `AwaitingAttestation` leaves creation unknown and fails closed. An inherited-sandbox attach
    likewise binds its receipt to the exact process identity, provider, policy digest, and session
    retained from the provider-issued ownership lease. Helper loss never implies cleanup succeeded.
-9. A debug attach cannot complete without one correlated `LiveTargetBinding` for the exact retained
-   PID, trusted start key, and main-module `BinaryId`. The provider supplies the actual ASLR image
-   base and PE `SizeOfImage`; checked RVA translation rejects zero, overflowing, empty, and
-   out-of-image ranges. Duplicate or replacement evidence poisons the connection, and terminal or
-   failed lifecycle state invalidates the binding.
+9. A host launch, sandbox launch, or debug attach cannot complete without one correlated
+   `LiveTargetBinding`. A host launch mapping must match the exact requested main-module `BinaryId`.
+   A sandbox launch mapping is accepted only after attestation and must match its exact attested PID,
+   trusted start key, and `BinaryId`; a prior process mapping cannot be replayed. A debug attach maps
+   the exact process identity retained by the open command. The provider supplies the actual ASLR
+   image base and PE `SizeOfImage`; checked RVA translation rejects zero, overflowing, empty, and
+   out-of-image ranges. Missing, duplicate, or replacement evidence poisons the connection, and
+   terminal or failed lifecycle state invalidates the binding.
 
 The pure reducers and typed client now exercise these ordering and binding rules. The client
 independently replays each command through its reducer and accepts only command-specific state and
