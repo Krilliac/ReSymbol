@@ -1173,10 +1173,14 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
                         DebugCommand::SetBreakpoint {
                             stop: expected_stop,
                             breakpoint: expected_breakpoint,
+                            persistence: expected_persistence,
                         } => {
                             stop == expected_stop
                                 && breakpoint == expected_breakpoint
-                                && *change == BreakpointChange::Set
+                                && *change
+                                    == (BreakpointChange::Set {
+                                        persistence: *expected_persistence,
+                                    })
                         }
                         DebugCommand::RemoveBreakpoint {
                             stop: expected_stop,
@@ -2810,7 +2814,8 @@ mod tests {
     use crate::host_wire::{ControlBody, FrameHeader, MessageKind};
     use crate::identity::{HostRiskLeaseId, SandboxOwnershipLeaseId};
     use crate::protocol::{
-        AttachMode, AttachScope, AttachTarget, ExecutionToken, LaunchEnvironment, LaunchTarget,
+        AttachMode, AttachScope, AttachTarget, BreakpointId, BreakpointKind, BreakpointPersistence,
+        BreakpointScope, BreakpointSpec, ExecutionToken, LaunchEnvironment, LaunchTarget,
         MAX_MEMORY_READ_BYTES, MemoryAddress, OfflineTarget, ProcessId, ProcessIdentity,
         ProcessStartKey, ReadViewToken, RunId, RunToken, StateGeneration, StepKind, StopId,
         StopReason, StopToken, ThreadId,
@@ -4563,6 +4568,381 @@ mod tests {
             .expect("test session exists")
             .verified_state = verified_state;
         client.next_command_id = 2;
+    }
+
+    fn prime_stopped_scripted_exchange_client() -> (DebugHostClient<ScriptedExchangeHost>, StopToken)
+    {
+        let mut client = DebugHostClient::connect(
+            ScriptedExchangeHost::new(Vec::new()),
+            [0x6d; 16],
+            "controller/build-7",
+            "host/build-4",
+        )
+        .expect("connect scripted exchange host");
+        client
+            .begin_session(session_id(), provisioning_epoch(), helper_build())
+            .expect("begin breakpoint test session");
+
+        let process = async_process();
+        let risk_id = HostRiskLeaseId::new("b".repeat(64)).expect("host-risk id");
+        client
+            .register_host_risk_verifier(HostRiskVerifier::new(
+                risk_id.clone(),
+                session_id(),
+                provisioning_epoch(),
+                HostRiskOperation::Attach {
+                    process: process.clone(),
+                    mode: AttachMode::Debug,
+                },
+            ))
+            .expect("register breakpoint test verifier");
+
+        let verified_state = {
+            let reducer = &mut client.session.as_mut().expect("test session").reducer;
+            let idle = reducer.state().state_token();
+            reducer
+                .accept_command(&CommandEnvelope {
+                    version: ProtocolVersion::current(),
+                    command_id: CommandId::new(1).expect("open command id"),
+                    session_id: Some(session_id()),
+                    expected_state: Some(idle),
+                    command: DebugCommand::Open(DebugTargetRequest::Attach(AttachTarget {
+                        scope: AttachScope::Host {
+                            process,
+                            risk_lease: risk_id,
+                        },
+                        mode: AttachMode::Debug,
+                    })),
+                })
+                .expect("accept synthetic attach");
+            reducer
+                .mark_stopped(
+                    StopReason::Initial,
+                    ThreadId::new(9).expect("initial thread"),
+                )
+                .expect("mark synthetic stop")
+                .clone()
+        };
+        let token = match &verified_state {
+            SessionState::Stopped { token, .. } => *token,
+            _ => panic!("synthetic attach must be stopped"),
+        };
+        client
+            .session
+            .as_mut()
+            .expect("test session")
+            .verified_state = verified_state;
+        client.next_command_id = 2;
+        (client, token)
+    }
+
+    #[test]
+    fn breakpoint_policy_substitution_is_rejected_and_poisons_connection() {
+        let (mut client, stop) = prime_stopped_scripted_exchange_client();
+        let command_id = CommandId::new(2).expect("set command id");
+        let breakpoint = BreakpointSpec {
+            id: BreakpointId::new(7).expect("breakpoint id"),
+            address: MemoryAddress::new(0x0000_7ff6_8000_1234),
+            kind: BreakpointKind::Software,
+            scope: BreakpointScope::Process,
+        };
+        let refreshed_stop = StopToken {
+            state: StateToken {
+                session_id: session_id(),
+                generation: stop
+                    .state
+                    .generation
+                    .checked_next()
+                    .expect("refreshed state generation"),
+            },
+            stop_id: StopId::new(stop.stop_id.get() + 1).expect("refreshed stop id"),
+        };
+        let refreshed_state = SessionState::Stopped {
+            token: refreshed_stop,
+            reason: StopReason::Initial,
+            thread_id: ThreadId::new(9).expect("initial thread"),
+        };
+        client.transport.scripted.push_back(vec![
+            correlated_event_frame(
+                2,
+                1,
+                command_id,
+                refreshed_stop.state,
+                DebugEvent::StateChanged(refreshed_state),
+            ),
+            correlated_event_frame(
+                3,
+                2,
+                command_id,
+                refreshed_stop.state,
+                DebugEvent::BreakpointChanged {
+                    stop,
+                    breakpoint: breakpoint.clone(),
+                    change: BreakpointChange::Set {
+                        persistence: BreakpointPersistence::Persistent,
+                    },
+                },
+            ),
+            correlated_event_frame(
+                4,
+                3,
+                command_id,
+                refreshed_stop.state,
+                DebugEvent::CommandResult {
+                    command_id,
+                    outcome: CommandOutcome::Succeeded,
+                },
+            ),
+        ]);
+
+        assert_eq!(
+            client.submit(DebugCommand::SetBreakpoint {
+                stop,
+                breakpoint: breakpoint.clone(),
+                persistence: BreakpointPersistence::Temporary,
+            }),
+            Err(DebugHostClientError::UnexpectedCommandEvidence {
+                command_id,
+                evidence: "breakpoint-change",
+            })
+        );
+        assert_eq!(client.connection_state(), ClientConnectionState::Failed);
+        assert_eq!(
+            client.submit(DebugCommand::RemoveBreakpoint {
+                stop,
+                breakpoint_id: breakpoint.id,
+            }),
+            Err(DebugHostClientError::ConnectionFailed)
+        );
+    }
+
+    #[test]
+    fn exact_breakpoint_policy_succeeds_and_consumes_the_old_stop_token() {
+        for persistence in [
+            BreakpointPersistence::Persistent,
+            BreakpointPersistence::Temporary,
+        ] {
+            let (mut client, stop) = prime_stopped_scripted_exchange_client();
+            let command_id = CommandId::new(2).expect("set command id");
+            let breakpoint = BreakpointSpec {
+                id: BreakpointId::new(7).expect("breakpoint id"),
+                address: MemoryAddress::new(0x0000_7ff6_8000_1234),
+                kind: BreakpointKind::Software,
+                scope: BreakpointScope::Process,
+            };
+            let refreshed_stop = StopToken {
+                state: StateToken {
+                    session_id: session_id(),
+                    generation: stop
+                        .state
+                        .generation
+                        .checked_next()
+                        .expect("refreshed state generation"),
+                },
+                stop_id: StopId::new(stop.stop_id.get() + 1).expect("refreshed stop id"),
+            };
+            let refreshed_state = SessionState::Stopped {
+                token: refreshed_stop,
+                reason: StopReason::Initial,
+                thread_id: ThreadId::new(9).expect("initial thread"),
+            };
+            client.transport.scripted.push_back(vec![
+                correlated_event_frame(
+                    2,
+                    1,
+                    command_id,
+                    refreshed_stop.state,
+                    DebugEvent::StateChanged(refreshed_state.clone()),
+                ),
+                correlated_event_frame(
+                    3,
+                    2,
+                    command_id,
+                    refreshed_stop.state,
+                    DebugEvent::BreakpointChanged {
+                        stop,
+                        breakpoint: breakpoint.clone(),
+                        change: BreakpointChange::Set { persistence },
+                    },
+                ),
+                correlated_event_frame(
+                    4,
+                    3,
+                    command_id,
+                    refreshed_stop.state,
+                    DebugEvent::CommandResult {
+                        command_id,
+                        outcome: CommandOutcome::Succeeded,
+                    },
+                ),
+            ]);
+            let command = DebugCommand::SetBreakpoint {
+                stop,
+                breakpoint: breakpoint.clone(),
+                persistence,
+            };
+
+            let receipt = client
+                .submit(command.clone())
+                .expect("exact breakpoint policy evidence");
+            assert_eq!(receipt.outcome, CommandOutcome::Succeeded);
+            assert!(matches!(
+                &receipt.events[1].event,
+                DebugEvent::BreakpointChanged {
+                    stop: actual_stop,
+                    breakpoint: actual_breakpoint,
+                    change: BreakpointChange::Set {
+                        persistence: actual_persistence,
+                    },
+                } if *actual_stop == stop
+                    && actual_breakpoint == &breakpoint
+                    && *actual_persistence == persistence
+            ));
+            assert_eq!(client.session_state(), Some(&refreshed_state));
+            assert_eq!(
+                client.submit(command),
+                Err(DebugHostClientError::Protocol(
+                    ProtocolValidationError::StaleStateToken
+                ))
+            );
+            assert_eq!(
+                client.connection_state(),
+                ClientConnectionState::SessionOpen
+            );
+        }
+    }
+
+    #[test]
+    fn breakpoint_evidence_replay_and_post_result_order_are_terminal() {
+        let breakpoint = BreakpointSpec {
+            id: BreakpointId::new(7).expect("breakpoint id"),
+            address: MemoryAddress::new(0x0000_7ff6_8000_1234),
+            kind: BreakpointKind::Software,
+            scope: BreakpointScope::Process,
+        };
+
+        let (mut replayed, stop) = prime_stopped_scripted_exchange_client();
+        let command_id = CommandId::new(2).expect("set command id");
+        let refreshed_stop = StopToken {
+            state: StateToken {
+                session_id: session_id(),
+                generation: stop
+                    .state
+                    .generation
+                    .checked_next()
+                    .expect("refreshed state generation"),
+            },
+            stop_id: StopId::new(stop.stop_id.get() + 1).expect("refreshed stop id"),
+        };
+        let refreshed_state = SessionState::Stopped {
+            token: refreshed_stop,
+            reason: StopReason::Initial,
+            thread_id: ThreadId::new(9).expect("initial thread"),
+        };
+        let breakpoint_event = DebugEvent::BreakpointChanged {
+            stop,
+            breakpoint: breakpoint.clone(),
+            change: BreakpointChange::Set {
+                persistence: BreakpointPersistence::Temporary,
+            },
+        };
+        replayed.transport.scripted.push_back(vec![
+            correlated_event_frame(
+                2,
+                1,
+                command_id,
+                refreshed_stop.state,
+                DebugEvent::StateChanged(refreshed_state.clone()),
+            ),
+            correlated_event_frame(
+                3,
+                2,
+                command_id,
+                refreshed_stop.state,
+                breakpoint_event.clone(),
+            ),
+            correlated_event_frame(4, 3, command_id, refreshed_stop.state, breakpoint_event),
+            correlated_event_frame(
+                5,
+                4,
+                command_id,
+                refreshed_stop.state,
+                DebugEvent::CommandResult {
+                    command_id,
+                    outcome: CommandOutcome::Succeeded,
+                },
+            ),
+        ]);
+        assert_eq!(
+            replayed.submit(DebugCommand::SetBreakpoint {
+                stop,
+                breakpoint: breakpoint.clone(),
+                persistence: BreakpointPersistence::Temporary,
+            }),
+            Err(DebugHostClientError::DuplicateCommandEvidence {
+                evidence: "breakpoint-change",
+            })
+        );
+        assert_eq!(replayed.connection_state(), ClientConnectionState::Failed);
+
+        let (mut reordered, stop) = prime_stopped_scripted_exchange_client();
+        let refreshed_stop = StopToken {
+            state: StateToken {
+                session_id: session_id(),
+                generation: stop
+                    .state
+                    .generation
+                    .checked_next()
+                    .expect("refreshed state generation"),
+            },
+            stop_id: StopId::new(stop.stop_id.get() + 1).expect("refreshed stop id"),
+        };
+        let refreshed_state = SessionState::Stopped {
+            token: refreshed_stop,
+            reason: StopReason::Initial,
+            thread_id: ThreadId::new(9).expect("initial thread"),
+        };
+        reordered.transport.scripted.push_back(vec![
+            correlated_event_frame(
+                2,
+                1,
+                command_id,
+                refreshed_stop.state,
+                DebugEvent::StateChanged(refreshed_state),
+            ),
+            correlated_event_frame(
+                3,
+                2,
+                command_id,
+                refreshed_stop.state,
+                DebugEvent::CommandResult {
+                    command_id,
+                    outcome: CommandOutcome::Succeeded,
+                },
+            ),
+            correlated_event_frame(
+                4,
+                3,
+                command_id,
+                refreshed_stop.state,
+                DebugEvent::BreakpointChanged {
+                    stop,
+                    breakpoint: breakpoint.clone(),
+                    change: BreakpointChange::Set {
+                        persistence: BreakpointPersistence::Temporary,
+                    },
+                },
+            ),
+        ]);
+        assert_eq!(
+            reordered.submit(DebugCommand::SetBreakpoint {
+                stop,
+                breakpoint,
+                persistence: BreakpointPersistence::Temporary,
+            }),
+            Err(DebugHostClientError::EventAfterCommandResult { command_id })
+        );
+        assert_eq!(reordered.connection_state(), ClientConnectionState::Failed);
     }
 
     #[test]
@@ -7195,12 +7575,15 @@ mod tests {
             wrong_version.pump_inbound(HostPollWait::immediate()),
             Err(DebugHostClientError::Codec(
                 HostCodecError::ProtocolVersionMismatch {
-                    wire_major: 1,
-                    wire_minor: 4,
-                    envelope_major: 1,
-                    envelope_minor: 3,
+                    wire_major,
+                    wire_minor,
+                    envelope_major,
+                    envelope_minor,
                 }
-            ))
+            )) if wire_major == crate::host_wire::PROTOCOL_MAJOR
+                && wire_minor == crate::host_wire::PROTOCOL_MINOR
+                && envelope_major == crate::protocol::PROTOCOL_MAJOR
+                && envelope_minor == crate::protocol::PROTOCOL_MINOR - 1
         ));
         assert_eq!(
             wrong_version.connection_state(),

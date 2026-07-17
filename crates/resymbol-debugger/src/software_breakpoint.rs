@@ -14,20 +14,14 @@ use crate::{
     SessionId, StopToken,
 };
 
+/// Compatibility name for the protocol-level breakpoint lifetime policy.
+pub use crate::protocol::BreakpointPersistence as SoftwareBreakpointPersistence;
+
 /// The x86/x64 one-byte `INT3` opcode used by software breakpoints.
 pub const INT3_OPCODE: u8 = 0xcc;
 
 /// Hard upper bound for breakpoints retained by one state machine.
 pub const MAX_SOFTWARE_BREAKPOINTS: usize = 1_024;
-
-/// Whether a breakpoint survives its first acknowledged hit restoration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SoftwareBreakpointPersistence {
-    /// Restore for one externally driven single step, then rearm.
-    Persistent,
-    /// Restore and forget the breakpoint after its first acknowledged hit.
-    Temporary,
-}
 
 /// Monotonic identity for one planned byte operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

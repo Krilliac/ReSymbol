@@ -22,7 +22,7 @@ use crate::sandbox::{
 use resymbol_core::BinaryId;
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 4;
+pub const PROTOCOL_MINOR: u16 = 5;
 pub const MAX_LAUNCH_ARGUMENTS: usize = 128;
 pub const MAX_LAUNCH_ARGUMENT_BYTES: usize = 256 * 1024;
 pub const MAX_MEMORY_READ_BYTES: u32 = 1024 * 1024;
@@ -696,6 +696,20 @@ pub struct BreakpointSpec {
     pub scope: BreakpointScope,
 }
 
+/// Whether a breakpoint remains registered after its first hit.
+///
+/// This policy is carried by the set command and echoed by correlated host
+/// evidence. `Temporary` is the typed policy used by higher-level operations
+/// such as Run to Cursor; it does not itself authorize a continue command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BreakpointPersistence {
+    /// Keep the logical breakpoint registered after an acknowledged hit.
+    Persistent,
+    /// Remove the logical breakpoint after its first acknowledged hit.
+    Temporary,
+}
+
 impl BreakpointSpec {
     pub fn validate(self) -> Result<(), ProtocolValidationError> {
         let size = match self.kind {
@@ -833,6 +847,7 @@ pub enum DebugCommand {
     SetBreakpoint {
         stop: StopToken,
         breakpoint: BreakpointSpec,
+        persistence: BreakpointPersistence,
     },
     RemoveBreakpoint {
         stop: StopToken,
@@ -1305,9 +1320,11 @@ impl SessionState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub enum BreakpointChange {
-    Set,
+    /// A breakpoint was set with the exact policy echoed from its command.
+    Set { persistence: BreakpointPersistence },
+    /// A breakpoint was removed. Removal evidence makes no lifetime claim.
     Removed,
 }
 
@@ -2014,7 +2031,7 @@ mod tests {
     }
 
     #[test]
-    fn step_capability_report_is_complete_and_legacy_minor_is_rejected() {
+    fn step_capability_report_is_complete_and_previous_minor_is_rejected() {
         assert_eq!(DebugCapability::ALL.len(), 17);
         for capability in [
             DebugCapability::StepInto,
@@ -2036,12 +2053,12 @@ mod tests {
         assert_eq!(
             ProtocolVersion {
                 major: PROTOCOL_MAJOR,
-                minor: 3,
+                minor: PROTOCOL_MINOR - 1,
             }
             .validate(),
             Err(ProtocolValidationError::UnsupportedProtocolVersion {
                 major: PROTOCOL_MAJOR,
-                minor: 3,
+                minor: PROTOCOL_MINOR - 1,
             })
         );
     }

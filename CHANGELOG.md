@@ -18,6 +18,13 @@ prereleases; breaking changes remain explicit.
   workbench and verified offline host now expose exact file-backed ELF bytes as hex without
   materializing virtual gaps; zero-fill, gaps, cross-segment spans, and partial file backing fail
   closed. PE loader partitions and x64-only disassembly/patch behavior remain unchanged.
+- Added explicit debugger-protocol `BreakpointPersistence`. Every set-breakpoint command now carries
+  `Persistent` or `Temporary`, successful set evidence must echo the exact policy, and removal
+  evidence deliberately carries no persistence claim. The host client rejects missing, substituted,
+  duplicate/replayed, or post-result set evidence; an accepted set consumes its old stop token. The
+  Workbench route preview uses the same typed policy for persistent breakpoints and Run to Cursor,
+  whose software-breakpoint and execution-control capabilities remain independently fail-closed.
+  This is protocol plumbing for a future live provider, not a claim that one ships today.
 - Added `resymbol patch EXACT_SOURCE_PE PATCH_SET.respatch.json --output NEW_BINARY` for audited
   non-GUI patch publication. The command bounded-loads the strict manifest through `AppServices`,
   verifies its complete identity against a freshly analyzed exact PE, rebuilds a checked plan from
@@ -32,7 +39,8 @@ prereleases; breaking changes remain explicit.
   disappear after exact hit restoration, while persistent breakpoints require an exact later-stop
   correlation before rearming. Wrong, duplicate, or out-of-order acknowledgements poison the
   reducer and retain bounded cleanup evidence including any operation with an unknown outcome. This
-  is a pure planner: it performs no target write or single step and changes no debugger wire version.
+  is a pure planner: it performs no target write or single step; protocol 1.5 now carries its
+  persistence policy explicitly.
 - Added reproducible static patch-set documents and worker-owned **Save Patch Set...** / **Load
   Patch Set...** controls. The required `.respatch.json` format is strict schema v1: it records the
   complete source `BinaryIdentity` plus deterministically RVA-ordered, bounded NOP-instruction or
@@ -393,8 +401,10 @@ prereleases; breaking changes remain explicit.
 
 ### Changed
 
-- Bumped the debugger wire and typed-command protocol to 1.4. Every successful host or sandbox
-  launch and every debug attach now requires one correlated, validated `LiveTargetBinding`. Host
+- Bumped the debugger wire and typed-command protocol to 1.5 for the required breakpoint-persistence
+  field and exact set-evidence binding; 1.4 and older peers are rejected before dispatch.
+- Protocol 1.4 introduced the requirement that every successful host or sandbox
+  launch and every debug attach requires one correlated, validated `LiveTargetBinding`. Host
   launches bind the runtime main module to the exact requested binary; sandbox launches additionally
   bind it to the exact attested PID, trusted process-start key, and binary identity; debug attaches
   bind it to the exact process identity retained by the active open command. The binding carries the
@@ -602,7 +612,7 @@ schema versions independently.
   attaches additionally bind provider, policy digest, and provisioning epoch. Attestation and
   cleanup receipts carry that fresh epoch, rejecting evidence replay from an otherwise identical
   earlier provisioning instance. These remain contracts for future providers, not shipped process
-  execution or containment. The debugger-host typed-command protocol is now 1.4, so legacy 1.3 and
+  execution or containment. The debugger-host typed-command protocol is now 1.5, so legacy 1.4 and
   older payload shapes fail typed validation before dispatch instead of being interpreted ambiguously.
 - The default WASM invocation accepts a component up to 64 MiB, enforces a 256 MiB linear-memory
   store limit, 100,000,000 fuel, a 2 MiB WebAssembly stack, one memory, two tables, 32 instances,

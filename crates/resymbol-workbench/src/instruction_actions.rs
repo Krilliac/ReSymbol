@@ -12,8 +12,8 @@ use resymbol_app::{
     StaticPatchKind,
 };
 use resymbol_debugger::{
-    BreakpointKind, CapabilityAvailability, CapabilityReport, DebugCapability, MemoryAddress,
-    SessionState, SessionStateKind, StepKind, StopToken, ThreadId,
+    BreakpointKind, BreakpointPersistence, CapabilityAvailability, CapabilityReport,
+    DebugCapability, MemoryAddress, SessionState, SessionStateKind, StepKind, StopToken, ThreadId,
 };
 use thiserror::Error;
 
@@ -450,12 +450,12 @@ impl LiveInstructionAction {
             },
             Self::SetSoftwareBreakpoint => LiveDebuggerProtocolRoute::SetBreakpoint {
                 kind: BreakpointKind::Software,
-                temporary: false,
+                persistence: BreakpointPersistence::Persistent,
                 continue_after_set: false,
             },
             Self::RunToCursor => LiveDebuggerProtocolRoute::SetBreakpoint {
                 kind: BreakpointKind::Software,
-                temporary: true,
+                persistence: BreakpointPersistence::Temporary,
                 continue_after_set: true,
             },
             Self::Step(kind) => LiveDebuggerProtocolRoute::Step { kind },
@@ -473,7 +473,7 @@ pub(crate) enum LiveDebuggerProtocolRoute {
     },
     SetBreakpoint {
         kind: BreakpointKind,
-        temporary: bool,
+        persistence: BreakpointPersistence,
         continue_after_set: bool,
     },
     Step {
@@ -1023,6 +1023,14 @@ mod tests {
             ),
             (
                 DebugCapability::SoftwareBreakpoints,
+                LiveInstructionAction::SetSoftwareBreakpoint,
+            ),
+            (
+                DebugCapability::SoftwareBreakpoints,
+                LiveInstructionAction::RunToCursor,
+            ),
+            (
+                DebugCapability::ExecutionControl,
                 LiveInstructionAction::RunToCursor,
             ),
         ] {
@@ -1146,10 +1154,18 @@ mod tests {
             assert_eq!(availability.disabled_reason(), None);
         }
         assert_eq!(
+            LiveInstructionAction::SetSoftwareBreakpoint.protocol_route_preview(&[0xCC]),
+            LiveDebuggerProtocolRoute::SetBreakpoint {
+                kind: BreakpointKind::Software,
+                persistence: BreakpointPersistence::Persistent,
+                continue_after_set: false,
+            }
+        );
+        assert_eq!(
             LiveInstructionAction::RunToCursor.protocol_route_preview(&[0x75, 0x02]),
             LiveDebuggerProtocolRoute::SetBreakpoint {
                 kind: BreakpointKind::Software,
-                temporary: true,
+                persistence: BreakpointPersistence::Temporary,
                 continue_after_set: true,
             }
         );
