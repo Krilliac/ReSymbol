@@ -1,6 +1,11 @@
 #![forbid(unsafe_code)]
 
-use std::{collections::BTreeSet, fs};
+use std::{
+    collections::BTreeSet,
+    fs,
+    sync::{Arc, Barrier},
+    thread,
+};
 
 use resymbol_analysis::BinaryAnalysis;
 use resymbol_app::{
@@ -279,4 +284,122 @@ fn publication_is_create_new_and_cleans_staging_on_failure() {
         &[0x90; 5]
     );
     assert_eq!(fs::read(&source).expect("read unchanged source"), EXACT_PE);
+}
+
+#[test]
+fn competing_publications_create_exactly_one_deterministic_output() {
+    let temp = TempDir::new().expect("create temp directory");
+    let source = write_source(&temp);
+    let services = AppServices::default();
+    let project = services.analyze_binary(&source).expect("analyze exact PE");
+    let identity = project.session().base_analysis().identity();
+    let nop_plan = StaticPatchPlan::new(
+        identity,
+        project.session().base_analysis(),
+        vec![
+            StaticPatchEditRequest::nop_instruction(THUNK_RVA, THUNK_BYTES, "Disable jump")
+                .expect("valid NOP request"),
+        ],
+    )
+    .expect("valid NOP plan");
+    let breakpoint_plan = StaticPatchPlan::new(
+        identity,
+        project.session().base_analysis(),
+        vec![
+            StaticPatchEditRequest::replace_bytes(0x1000, [0x48], [0xcc], "Set entry breakpoint")
+                .expect("valid breakpoint request"),
+        ],
+    )
+    .expect("valid breakpoint plan");
+    let expected_images = [
+        services
+            .apply_static_patch(&project, &nop_plan)
+            .expect("apply deterministic NOP plan"),
+        services
+            .apply_static_patch(&project, &breakpoint_plan)
+            .expect("apply deterministic breakpoint plan"),
+    ];
+    assert_ne!(
+        expected_images[0].output_identity(),
+        expected_images[1].output_identity()
+    );
+
+    let output = temp.path().join("competing-patched.exe");
+    assert!(!output.exists());
+    let entries_before_race = directory_entries(temp.path());
+    let barrier = Arc::new(Barrier::new(3));
+    let first = {
+        let services = services.clone();
+        let project = Arc::clone(&project);
+        let plan = nop_plan.clone();
+        let output = output.clone();
+        let barrier = Arc::clone(&barrier);
+        thread::spawn(move || {
+            barrier.wait();
+            services
+                .publish_static_patch_new(&project, &plan, output)
+                .map(|receipt| (0usize, receipt))
+        })
+    };
+    let second = {
+        let services = services.clone();
+        let project = Arc::clone(&project);
+        let plan = breakpoint_plan.clone();
+        let output = output.clone();
+        let barrier = Arc::clone(&barrier);
+        thread::spawn(move || {
+            barrier.wait();
+            services
+                .publish_static_patch_new(&project, &plan, output)
+                .map(|receipt| (1usize, receipt))
+        })
+    };
+
+    barrier.wait();
+    let outcomes = [
+        first.join().expect("first publisher did not panic"),
+        second.join().expect("second publisher did not panic"),
+    ];
+    assert_eq!(
+        outcomes.iter().filter(|outcome| outcome.is_ok()).count(),
+        1,
+        "exactly one competing create-new publication must succeed: {outcomes:?}"
+    );
+    assert_eq!(
+        outcomes.iter().filter(|outcome| outcome.is_err()).count(),
+        1
+    );
+
+    let (winner, receipt) = outcomes
+        .iter()
+        .find_map(|outcome| outcome.as_ref().ok())
+        .expect("one publisher succeeded");
+    let expected = &expected_images[*winner];
+    let published_bytes = fs::read(&output).expect("read winning publication");
+    assert_eq!(published_bytes, expected.bytes());
+    assert_eq!(receipt.path(), output);
+    assert_eq!(receipt.output_identity(), expected.output_identity());
+    assert_eq!(
+        receipt.output_identity().id,
+        resymbol_core::BinaryId::digest(&published_bytes)
+    );
+
+    match outcomes.iter().find_map(|outcome| outcome.as_ref().err()) {
+        Some(StaticPatchError::TargetAlreadyExists { path }) => assert_eq!(path, &output),
+        other => panic!("losing publication did not report no-clobber failure: {other:?}"),
+    }
+    assert_eq!(fs::read(&source).expect("read unchanged source"), EXACT_PE);
+
+    let mut expected_entries = entries_before_race;
+    expected_entries.insert(
+        output
+            .file_name()
+            .expect("output has a file name")
+            .to_os_string(),
+    );
+    assert_eq!(
+        directory_entries(temp.path()),
+        expected_entries,
+        "competing publication left staging residue"
+    );
 }
