@@ -39,9 +39,10 @@ use crate::{
         ReconstructionGraph, ReconstructionGraphView, ReconstructionGraphViewNode,
     },
     instruction_actions::{
-        InstructionSelectionMove, LiveDebuggerActionContext, LiveDebuggerProtocolRoute,
-        LiveInstructionAction, MAX_PENDING_STATIC_PATCH_DRAFTS, PatchDraftQueueOutcome,
-        PendingStaticPatchDrafts, navigate_instruction_selection,
+        ConditionalBranchPatch, InstructionSelectionMove, LiveDebuggerActionContext,
+        LiveDebuggerProtocolRoute, LiveInstructionAction, MAX_PENDING_STATIC_PATCH_DRAFTS,
+        PatchDraftQueueOutcome, PendingStaticPatchDrafts, StaticPatchDraftKind,
+        navigate_instruction_selection,
     },
     model::{
         FunctionFilter, FunctionRow, FunctionSort, FunctionSortKey, FunctionStatus, LoadedProject,
@@ -5266,8 +5267,29 @@ impl WorkbenchApp {
             self.queue_static_nop_draft(row);
             ui.close();
         }
+        let static_edit_disabled_reason = self.static_instruction_patchability(row).err();
+        for branch_patch in [
+            ConditionalBranchPatch::InvertCondition,
+            ConditionalBranchPatch::AlwaysTaken,
+        ] {
+            let replacement = branch_patch.replacement(row.bytes());
+            let branch_edit = ui
+                .add_enabled(
+                    static_edit_disabled_reason.is_none() && replacement.is_some(),
+                    egui::Button::new(branch_patch.label()),
+                )
+                .on_disabled_hover_text(static_edit_disabled_reason.unwrap_or(
+                    "Only an exact canonical short or near x86-64 conditional branch can use this action.",
+                ));
+            if branch_edit.clicked() {
+                self.queue_static_conditional_branch_draft(row, branch_patch);
+                ui.close();
+            }
+        }
         ui.label(
-            RichText::new("Draft only; no file or live memory is modified")
+            RichText::new(
+                "Draft only; NOP means never take a Jcc, while always-taken and invert preserve the exact original target.",
+            )
                 .small()
                 .color(colors.secondary_text),
         );
@@ -5327,15 +5349,15 @@ impl WorkbenchApp {
             })
     }
 
-    fn static_nop_patchability(&self, row: &LinearInstructionRow) -> Result<(), &'static str> {
+    fn static_instruction_patchability(
+        &self,
+        row: &LinearInstructionRow,
+    ) -> Result<(), &'static str> {
         if self.static_patch_operation.is_pending() {
             return Err("A static patch publication is already running.");
         }
         if row.bytes().is_empty() {
             return Err("The selected instruction has no exact source bytes.");
-        }
-        if row.bytes().iter().all(|byte| *byte == 0x90) {
-            return Err("The selected instruction is already NOP-filled.");
         }
         let project = self.project.as_ref().ok_or("No static project is open.")?;
         if !project.snapshot.has_verified_source() {
@@ -5352,12 +5374,20 @@ impl WorkbenchApp {
             .region_at(start)
             .ok_or("The selected instruction is outside the preferred static image.")?;
         if !region.access.executable || !matches!(&region.kind, StaticRegionKind::Section { .. }) {
-            return Err("Static NOP edits are limited to executable PE sections.");
+            return Err("Static instruction edits are limited to executable PE sections.");
         }
         if region.file_offset_at(start).is_none() || region.file_offset_at(last).is_none() {
             return Err(
                 "The complete instruction is not in one exact file-backed executable region.",
             );
+        }
+        Ok(())
+    }
+
+    fn static_nop_patchability(&self, row: &LinearInstructionRow) -> Result<(), &'static str> {
+        self.static_instruction_patchability(row)?;
+        if row.bytes().iter().all(|byte| *byte == 0x90) {
+            return Err("The selected instruction is already NOP-filled.");
         }
         Ok(())
     }
@@ -5427,6 +5457,63 @@ impl WorkbenchApp {
         }
     }
 
+    fn queue_static_conditional_branch_draft(
+        &mut self,
+        row: &LinearInstructionRow,
+        action: ConditionalBranchPatch,
+    ) {
+        if let Err(reason) = self.static_instruction_patchability(row) {
+            self.log(
+                ActivityLevel::Error,
+                format!("Cannot queue conditional-branch edit: {reason}"),
+            );
+            return;
+        }
+        let Some(replacement) = action.replacement(row.bytes()) else {
+            self.log(
+                ActivityLevel::Error,
+                "Cannot queue conditional-branch edit: the instruction is not a supported canonical Jcc encoding",
+            );
+            return;
+        };
+        let label = format!(
+            "{} at RVA 0x{:016X}",
+            match action {
+                ConditionalBranchPatch::InvertCondition => "Invert Jcc condition",
+                ConditionalBranchPatch::AlwaysTaken => "Make Jcc always taken",
+            },
+            row.rva()
+        );
+        match self.pending_static_patch_drafts.queue_replace(
+            row.rva(),
+            row.bytes(),
+            &replacement,
+            label,
+        ) {
+            Ok(PatchDraftQueueOutcome::Added) => {
+                self.static_patch_result = None;
+                self.log(
+                    ActivityLevel::Success,
+                    format!(
+                        "Queued unpublished conditional-branch edit for RVA 0x{:016X}; no file or process was modified",
+                        row.rva()
+                    ),
+                );
+            }
+            Ok(PatchDraftQueueOutcome::AlreadyQueued) => self.log(
+                ActivityLevel::Info,
+                format!(
+                    "Conditional-branch edit for RVA 0x{:016X} is already queued",
+                    row.rva()
+                ),
+            ),
+            Err(error) => self.log(
+                ActivityLevel::Error,
+                format!("Cannot queue conditional-branch edit: {error}"),
+            ),
+        }
+    }
+
     fn choose_static_patch_destination(&self) -> Option<PathBuf> {
         let default = self.project.as_ref().and_then(default_static_patch_path)?;
         let mut dialog = rfd::FileDialog::new()
@@ -5458,11 +5545,19 @@ impl WorkbenchApp {
                     draft.rva()
                 )
             })?;
-            let request = StaticPatchEditRequest::nop_instruction(
-                rva,
-                draft.expected().to_vec(),
-                draft.label().to_owned(),
-            )
+            let request = match draft.kind() {
+                StaticPatchDraftKind::NopInstruction => StaticPatchEditRequest::nop_instruction(
+                    rva,
+                    draft.expected().to_vec(),
+                    draft.label().to_owned(),
+                ),
+                StaticPatchDraftKind::ReplaceBytes => StaticPatchEditRequest::replace_bytes(
+                    rva,
+                    draft.expected().to_vec(),
+                    draft.replacement().to_vec(),
+                    draft.label().to_owned(),
+                ),
+            }
             .map_err(|error| format!("static patch draft at RVA 0x{rva:08X}: {error}"))?;
             requests.push(request);
         }
@@ -5584,7 +5679,7 @@ impl WorkbenchApp {
                             ui.monospace(format!("0x{:016X}", draft.rva()));
                             ui.monospace(format_instruction_bytes(expected));
                             ui.label("->");
-                            ui.monospace(format_instruction_bytes(&replacement));
+                            ui.monospace(format_instruction_bytes(replacement));
                             ui.label(draft.label());
                             if ui
                                 .add_enabled(
@@ -8760,5 +8855,20 @@ mod tests {
                 .len(),
             1
         );
+
+        app.pending_static_patch_drafts.clear();
+        app.pending_static_patch_drafts
+            .queue_replace(0x1000, &[0x74, 0x05], &[0x75, 0x05], "Invert Jcc")
+            .expect("shape-valid branch replacement draft");
+        let requests = app
+            .build_static_patch_requests()
+            .expect("general exact-byte replacement request");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].kind(),
+            resymbol_app::StaticPatchKind::ReplaceBytes
+        );
+        assert_eq!(requests[0].expected(), &[0x74, 0x05]);
+        assert_eq!(requests[0].replacement(), &[0x75, 0x05]);
     }
 }

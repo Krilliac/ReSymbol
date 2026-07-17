@@ -50,6 +50,12 @@ prereleases; breaking changes remain explicit.
   synchronization is reported, while Windows makes no power-loss durability claim for the
   destination directory entry. Every result explicitly warns that Authenticode signature validity
   and the PE checksum may be invalidated, and ReSymbol does not repair, recompute, or re-sign them.
+- Expanded each disassembly-row context menu with static conditional-branch edits. Exact canonical
+  short and near Jcc instructions can be inverted or made always-taken as same-size unpublished
+  drafts; NOP remains the never-taken choice. Near always-taken conversion adjusts its displacement
+  before appending a NOP so the original target is preserved. Prefix-bearing, displacement-overflow,
+  and non-Jcc encodings fail closed, and all edits still pass exact-source compare-before-write and
+  create-new publication.
 - Added a refreshable exact-artifact policy catalog to the desktop workbench. Scans run on the
   bounded application-service worker and replace one owned snapshot, while the UI remains strictly
   non-executing. Every fingerprintable unpacked candidate with a valid manifest reports its exact

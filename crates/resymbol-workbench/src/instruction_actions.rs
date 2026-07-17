@@ -1,10 +1,10 @@
 //! UI-thread models for instruction actions and unpublished static patch drafts.
 //!
 //! This module owns no debugger client, target process, file writer, or patch
-//! publication service. The workbench converts [`StaticNopPatchDraft`] values
-//! through the fallible `StaticPatchEditRequest::nop_instruction` constructor,
-//! then sends those owned requests to the application-service worker for
-//! checked plan construction and create-new publication.
+//! publication service. The workbench converts [`StaticPatchDraft`] values
+//! through fallible application-service request constructors, then sends those
+//! owned requests to the worker for checked plan construction and create-new
+//! publication.
 
 use resymbol_debugger::{
     BreakpointKind, CapabilityAvailability, CapabilityReport, DebugCapability, MemoryAddress,
@@ -16,18 +16,62 @@ const MAX_X64_INSTRUCTION_BYTES: usize = 15;
 const MAX_PATCH_DRAFT_LABEL_BYTES: usize = 128;
 pub(crate) const MAX_PENDING_STATIC_PATCH_DRAFTS: usize = 128;
 
-/// One bounded, unpublished same-length NOP edit owned by the workbench UI.
+/// The application-service constructor used when a draft is published.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StaticPatchDraftKind {
+    NopInstruction,
+    ReplaceBytes,
+}
+
+/// One bounded, unpublished same-length instruction edit owned by the UI.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct StaticNopPatchDraft {
+pub(crate) struct StaticPatchDraft {
+    kind: StaticPatchDraftKind,
     rva: u64,
     expected: Vec<u8>,
+    replacement: Vec<u8>,
     label: String,
 }
 
-impl StaticNopPatchDraft {
-    pub(crate) fn new(
+impl StaticPatchDraft {
+    pub(crate) fn nop_instruction(
         rva: u64,
         expected: &[u8],
+        label: impl Into<String>,
+    ) -> Result<Self, StaticPatchDraftError> {
+        if expected.iter().all(|byte| *byte == 0x90) && !expected.is_empty() {
+            return Err(StaticPatchDraftError::AlreadyNopFilled);
+        }
+        let replacement = vec![0x90; expected.len()];
+        Self::new(
+            StaticPatchDraftKind::NopInstruction,
+            rva,
+            expected,
+            &replacement,
+            label,
+        )
+    }
+
+    pub(crate) fn replace_bytes(
+        rva: u64,
+        expected: &[u8],
+        replacement: &[u8],
+        label: impl Into<String>,
+    ) -> Result<Self, StaticPatchDraftError> {
+        Self::new(
+            StaticPatchDraftKind::ReplaceBytes,
+            rva,
+            expected,
+            replacement,
+            label,
+        )
+    }
+
+    fn new(
+        kind: StaticPatchDraftKind,
+        rva: u64,
+        expected: &[u8],
+        replacement: &[u8],
         label: impl Into<String>,
     ) -> Result<Self, StaticPatchDraftError> {
         if expected.is_empty() {
@@ -39,8 +83,14 @@ impl StaticNopPatchDraft {
                 maximum: MAX_X64_INSTRUCTION_BYTES,
             });
         }
-        if expected.iter().all(|byte| *byte == 0x90) {
-            return Err(StaticPatchDraftError::AlreadyNopFilled);
+        if expected.len() != replacement.len() {
+            return Err(StaticPatchDraftError::ReplacementLengthMismatch {
+                expected: expected.len(),
+                replacement: replacement.len(),
+            });
+        }
+        if expected == replacement {
+            return Err(StaticPatchDraftError::UnchangedReplacement);
         }
         if rva.checked_add(expected.len() as u64).is_none() {
             return Err(StaticPatchDraftError::AddressOverflow);
@@ -54,10 +104,17 @@ impl StaticNopPatchDraft {
             return Err(StaticPatchDraftError::InvalidLabel);
         }
         Ok(Self {
+            kind,
             rva,
             expected: expected.to_vec(),
+            replacement: replacement.to_vec(),
             label,
         })
+    }
+
+    #[must_use]
+    pub(crate) const fn kind(&self) -> StaticPatchDraftKind {
+        self.kind
     }
 
     #[must_use]
@@ -76,15 +133,15 @@ impl StaticNopPatchDraft {
     }
 
     #[must_use]
-    pub(crate) fn replacement(&self) -> Vec<u8> {
-        vec![0x90; self.expected.len()]
+    pub(crate) fn replacement(&self) -> &[u8] {
+        &self.replacement
     }
 
     /// Exact source-check bytes and same-length replacement for a future
     /// fallible static-patch adapter. No file or process is modified here.
     #[must_use]
-    pub(crate) fn source_check_and_replacement(&self) -> (&[u8], Vec<u8>) {
-        (&self.expected, self.replacement())
+    pub(crate) fn source_check_and_replacement(&self) -> (&[u8], &[u8]) {
+        (&self.expected, &self.replacement)
     }
 
     fn end_rva(&self) -> u64 {
@@ -95,12 +152,12 @@ impl StaticNopPatchDraft {
 /// Bounded collection of unpublished static edits.
 #[derive(Debug, Default)]
 pub(crate) struct PendingStaticPatchDrafts {
-    drafts: Vec<StaticNopPatchDraft>,
+    drafts: Vec<StaticPatchDraft>,
 }
 
 impl PendingStaticPatchDrafts {
     #[must_use]
-    pub(crate) fn drafts(&self) -> &[StaticNopPatchDraft] {
+    pub(crate) fn drafts(&self) -> &[StaticPatchDraft] {
         &self.drafts
     }
 
@@ -110,7 +167,28 @@ impl PendingStaticPatchDrafts {
         expected: &[u8],
         label: impl Into<String>,
     ) -> Result<PatchDraftQueueOutcome, StaticPatchDraftError> {
-        let draft = StaticNopPatchDraft::new(rva, expected, label)?;
+        self.queue(StaticPatchDraft::nop_instruction(rva, expected, label)?)
+    }
+
+    pub(crate) fn queue_replace(
+        &mut self,
+        rva: u64,
+        expected: &[u8],
+        replacement: &[u8],
+        label: impl Into<String>,
+    ) -> Result<PatchDraftQueueOutcome, StaticPatchDraftError> {
+        self.queue(StaticPatchDraft::replace_bytes(
+            rva,
+            expected,
+            replacement,
+            label,
+        )?)
+    }
+
+    fn queue(
+        &mut self,
+        draft: StaticPatchDraft,
+    ) -> Result<PatchDraftQueueOutcome, StaticPatchDraftError> {
         if self.drafts.iter().any(|existing| existing == &draft) {
             return Ok(PatchDraftQueueOutcome::AlreadyQueued);
         }
@@ -129,7 +207,7 @@ impl PendingStaticPatchDrafts {
             });
         }
         self.drafts.push(draft);
-        self.drafts.sort_by_key(StaticNopPatchDraft::rva);
+        self.drafts.sort_by_key(StaticPatchDraft::rva);
         Ok(PatchDraftQueueOutcome::Added)
     }
 
@@ -154,10 +232,16 @@ pub(crate) enum PatchDraftQueueOutcome {
 pub(crate) enum StaticPatchDraftError {
     #[error("cannot queue a NOP edit for an empty instruction")]
     EmptyInstruction,
-    #[error("instruction is {actual} bytes; x64 instructions are limited to {maximum}")]
+    #[error("instruction is {actual} bytes; x86-64 instructions are limited to {maximum}")]
     InstructionTooLarge { actual: usize, maximum: usize },
     #[error("instruction is already NOP-filled")]
     AlreadyNopFilled,
+    #[error(
+        "replacement length {replacement} does not match expected instruction length {expected}"
+    )]
+    ReplacementLengthMismatch { expected: usize, replacement: usize },
+    #[error("replacement bytes are identical to the expected instruction bytes")]
+    UnchangedReplacement,
     #[error("instruction range overflows the RVA address space")]
     AddressOverflow,
     #[error("patch draft label must be printable, nonempty, and at most 128 UTF-8 bytes")]
@@ -166,6 +250,57 @@ pub(crate) enum StaticPatchDraftError {
     OverlappingDraft { existing_rva: u64 },
     #[error("pending static patch draft limit {maximum} reached")]
     DraftLimitReached { maximum: usize },
+}
+
+/// Same-size edits available for canonical x86-64 conditional branches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConditionalBranchPatch {
+    InvertCondition,
+    AlwaysTaken,
+}
+
+impl ConditionalBranchPatch {
+    #[must_use]
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::InvertCondition => "Invert Conditional Branch for Patched Binary",
+            Self::AlwaysTaken => "Make Conditional Branch Always Taken",
+        }
+    }
+
+    /// Produces a same-size replacement only for canonical, unprefixed Jcc
+    /// encodings. Prefix-bearing or otherwise ambiguous encodings fail closed.
+    #[must_use]
+    pub(crate) fn replacement(self, bytes: &[u8]) -> Option<Vec<u8>> {
+        match (bytes, self) {
+            ([opcode @ 0x70..=0x7f, displacement], Self::InvertCondition) => {
+                Some(vec![opcode ^ 1, *displacement])
+            }
+            ([opcode @ 0x70..=0x7f, displacement], Self::AlwaysTaken) => {
+                let _ = opcode;
+                Some(vec![0xeb, *displacement])
+            }
+            ([0x0f, opcode @ 0x80..=0x8f, displacement @ ..], Self::InvertCondition)
+                if displacement.len() == 4 =>
+            {
+                let mut replacement = bytes.to_vec();
+                replacement[1] = opcode ^ 1;
+                Some(replacement)
+            }
+            ([0x0f, _opcode @ 0x80..=0x8f, displacement @ ..], Self::AlwaysTaken)
+                if displacement.len() == 4 =>
+            {
+                let original = i32::from_le_bytes(displacement.try_into().ok()?);
+                let adjusted = original.checked_add(1)?;
+                let mut replacement = Vec::with_capacity(6);
+                replacement.push(0xe9);
+                replacement.extend_from_slice(&adjusted.to_le_bytes());
+                replacement.push(0x90);
+                Some(replacement)
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Live debugger actions surfaced beside a static instruction preview.
@@ -552,12 +687,16 @@ mod tests {
                 .expect("queue draft"),
             PatchDraftQueueOutcome::Added
         );
-        assert_eq!(drafts.drafts()[0].replacement(), vec![0x90; 3]);
+        assert_eq!(drafts.drafts()[0].replacement(), &[0x90; 3]);
+        assert_eq!(
+            drafts.drafts()[0].kind(),
+            StaticPatchDraftKind::NopInstruction
+        );
         assert_eq!(drafts.drafts()[0].expected(), &[0x48, 0x89, 0xE5]);
         assert_eq!(drafts.drafts()[0].label(), "NOP mov rbp,rsp");
         assert_eq!(
             drafts.drafts()[0].source_check_and_replacement(),
-            (&[0x48, 0x89, 0xE5][..], vec![0x90; 3])
+            (&[0x48, 0x89, 0xE5][..], &[0x90, 0x90, 0x90][..])
         );
         assert_eq!(
             drafts
@@ -578,29 +717,72 @@ mod tests {
     #[test]
     fn nop_draft_rejects_empty_oversized_overflowing_and_control_labels() {
         assert!(matches!(
-            StaticNopPatchDraft::new(0, &[], "empty"),
+            StaticPatchDraft::nop_instruction(0, &[], "empty"),
             Err(StaticPatchDraftError::EmptyInstruction)
         ));
         assert!(matches!(
-            StaticNopPatchDraft::new(0, &[0; 16], "large"),
+            StaticPatchDraft::nop_instruction(0, &[0; 16], "large"),
             Err(StaticPatchDraftError::InstructionTooLarge { .. })
         ));
         assert!(matches!(
-            StaticNopPatchDraft::new(0, &[0x90, 0x90], "already NOP-filled"),
+            StaticPatchDraft::nop_instruction(0, &[0x90, 0x90], "already NOP-filled"),
             Err(StaticPatchDraftError::AlreadyNopFilled)
         ));
         assert!(matches!(
-            StaticNopPatchDraft::new(u64::MAX, &[0xCC], "overflow"),
+            StaticPatchDraft::nop_instruction(u64::MAX, &[0xCC], "overflow"),
             Err(StaticPatchDraftError::AddressOverflow)
         ));
         assert!(matches!(
-            StaticNopPatchDraft::new(0, &[0xCC], "bad\nlabel"),
+            StaticPatchDraft::nop_instruction(0, &[0xCC], "bad\nlabel"),
             Err(StaticPatchDraftError::InvalidLabel)
         ));
         assert!(matches!(
-            StaticNopPatchDraft::new(0, &[0xCC], " padded"),
+            StaticPatchDraft::nop_instruction(0, &[0xCC], " padded"),
             Err(StaticPatchDraftError::InvalidLabel)
         ));
+    }
+
+    #[test]
+    fn conditional_branch_edits_are_exact_same_size_and_fail_closed() {
+        assert_eq!(
+            ConditionalBranchPatch::InvertCondition.replacement(&[0x74, 0x05]),
+            Some(vec![0x75, 0x05])
+        );
+        assert_eq!(
+            ConditionalBranchPatch::AlwaysTaken.replacement(&[0x75, 0xfb]),
+            Some(vec![0xeb, 0xfb])
+        );
+        assert_eq!(
+            ConditionalBranchPatch::InvertCondition
+                .replacement(&[0x0f, 0x84, 0x12, 0x34, 0x56, 0x78]),
+            Some(vec![0x0f, 0x85, 0x12, 0x34, 0x56, 0x78])
+        );
+        assert_eq!(
+            ConditionalBranchPatch::AlwaysTaken.replacement(&[0x0f, 0x85, 0, 0, 0, 0]),
+            Some(vec![0xe9, 1, 0, 0, 0, 0x90])
+        );
+        assert_eq!(
+            ConditionalBranchPatch::AlwaysTaken.replacement(&[0x0f, 0x85, 0xff, 0xff, 0xff, 0x7f]),
+            None
+        );
+        assert_eq!(
+            ConditionalBranchPatch::InvertCondition.replacement(&[0x66, 0x74, 0x05]),
+            None
+        );
+        assert_eq!(
+            ConditionalBranchPatch::AlwaysTaken.replacement(&[0xe9, 0, 0, 0, 0]),
+            None
+        );
+
+        let mut drafts = PendingStaticPatchDrafts::default();
+        drafts
+            .queue_replace(0x2000, &[0x74, 0x05], &[0x75, 0x05], "Invert je")
+            .expect("queue conditional replacement");
+        assert_eq!(
+            drafts.drafts()[0].kind(),
+            StaticPatchDraftKind::ReplaceBytes
+        );
+        assert_eq!(drafts.drafts()[0].replacement(), &[0x75, 0x05]);
     }
 
     #[test]
@@ -728,8 +910,8 @@ mod tests {
                 Some(exact_live_address()),
                 Some(selected_thread()),
             );
-            let reason = context
-                .availability(action, &[0xCC])
+            let availability = context.availability(action, &[0xCC]);
+            let reason = availability
                 .disabled_reason()
                 .expect("required capability reason");
             assert!(reason.contains(&format!("{capability:?}")));

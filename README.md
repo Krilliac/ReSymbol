@@ -80,12 +80,16 @@ The current alpha implements and tests an end-to-end, deliberately narrow analys
   is a non-mutating preflight only: it does not provision a sandbox, launch or attach to a target, or
   attest containment. The Address Space reader serves at most 256 bytes from the frozen exact source
   through the in-process offline host; its disassembly is a capped linear preview, not CFG or
-  function-boundary truth, and neither view opens a process or claims a live mapping. See
+  function-boundary truth. Its row context menu can queue exact NOP, invert-condition, and
+  always-taken edits for canonical conditional branches; these remain unpublished drafts, and
+  neither view opens a process or claims a live mapping. See
   [the debugger and sandbox architecture](docs/debugger-sandbox.md);
 - a UI-neutral, same-size static patch service for exact PE source snapshots. An immutable patch
   plan is bound to the complete source `BinaryIdentity`; each labeled NOP instruction must decode
   as exactly one complete valid x86-64 instruction, while an explicit general byte replacement
-  remains available for arbitrary same-size edits. Each edit provisionally resolves an executable,
+  remains available for arbitrary same-size edits. Canonical short and near Jcc menu actions use
+  that same-size path to invert the condition or preserve the target while making the branch
+  unconditional. Each edit provisionally resolves an executable,
   fully file-backed RVA to a file offset and retains the expected original bytes. Plans are
   deterministically ordered and bounded, reject duplicate, overlapping, unbacked, virtual-tail,
   non-executable, and out-of-image ranges, and reparse the exact source's strict PE layout before
