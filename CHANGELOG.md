@@ -12,8 +12,12 @@ prereleases; breaking changes remain explicit.
   header and table parsing retains sparse non-empty `PT_LOAD` mappings and a deterministic
   identity-only graph without decoding or executing instructions. A source-built synthetic fixture
   covers zero-sized load records, large virtual gaps, package round trips, and malformed identity
-  and segment fields. PE/x86-64-only plugin hosts, patching, linear preview, MAP, PDB, protection,
-  and workbench offline-address-space actions remain explicitly unavailable for this format.
+  and segment fields. PE/x86-64-only plugin hosts, patching, linear preview, MAP, PDB, and
+  protection actions remain explicitly unavailable for this format.
+- Added a format-neutral sparse static address-space model for ELF `PT_LOAD` mappings. The
+  workbench and verified offline host now expose exact file-backed ELF bytes as hex without
+  materializing virtual gaps; zero-fill, gaps, cross-segment spans, and partial file backing fail
+  closed. PE loader partitions and x64-only disassembly/patch behavior remain unchanged.
 - Added `resymbol patch EXACT_SOURCE_PE PATCH_SET.respatch.json --output NEW_BINARY` for audited
   non-GUI patch publication. The command bounded-loads the strict manifest through `AppServices`,
   verifies its complete identity against a freshly analyzed exact PE, rebuilds a checked plan from

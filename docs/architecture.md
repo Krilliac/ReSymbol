@@ -555,9 +555,10 @@ exists.
 `VerifiedOfflineImage` and `OfflineImageDebugHost` provide the first production host without target
 execution. They retain one exact identity-verified `Arc<[u8]>`, publish a complete capability matrix
 with only `OfflineAnalysis` available, and serve bounded canonical file-backed RVA spans from that
-frozen snapshot. Gaps, zero-fill, loader padding, raw tails, crossings, mutation, execution, launch,
-attach, and sandbox commands fail closed. This host is in-process and owns no helper process or
-operating-system sandbox.
+frozen snapshot. PE keeps a complete loader partition; ELF keeps only sorted non-overlapping
+`PT_LOAD` mappings, so large virtual gaps consume no region storage. Gaps, zero-fill, loader padding,
+raw tails, crossings, mutation, execution, launch, attach, and sandbox commands fail closed. This
+host is in-process and owns no helper process or operating-system sandbox.
 
 The feature-gated `SyntheticDebugHost` remains only for tests and explicit test-support builds. It
 reports no platform capability and fabricates no target, attestation, or cleanup evidence. The

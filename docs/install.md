@@ -210,8 +210,9 @@ resymbol plugin doctor
 ```
 
 On Windows, start the desktop workbench with a supported PE or bounded ELF32 path, or launch it
-without a path and use the file picker. PE-only address-space, offline-byte, MAP, and PDB actions
-remain disabled for ELF projects:
+without a path and use the file picker. ELF projects provide a sparse `PT_LOAD` map and exact
+file-backed offline hex reads; x64 disassembly, static patching, protection analysis, MAP, and PDB
+remain PE-only:
 
 ```powershell
 .\resymbol-workbench.exe .\path\to\application.exe
