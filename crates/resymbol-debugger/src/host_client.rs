@@ -24,8 +24,9 @@ use crate::identity::ProvisioningEpoch;
 use crate::protocol::{
     BreakpointChange, CapabilityReport, CommandEnvelope, CommandId, CommandOutcome, DebugCommand,
     DebugEvent, DebugTargetRequest, EventEnvelope, EventSequenceCursor, LiveTargetBinding,
-    ProcessIdentity, ProtocolValidationError, ProtocolVersion, SessionId, SessionState,
-    SessionStateKind, StateToken,
+    MEMORY_WRITE_FAILURE_REJECTION_CODE, MemoryWriteFailure, ProcessIdentity,
+    ProtocolValidationError, ProtocolVersion, SessionId, SessionState, SessionStateKind,
+    StateToken,
 };
 use crate::sandbox::{
     AttestationMismatch, CleanupAttemptFailureError, CleanupReceiptError, DiagnosticText,
@@ -185,6 +186,7 @@ struct ClientSession {
 #[derive(Debug, Default)]
 struct ResponseEvidence {
     state_changed: bool,
+    state_change_count: usize,
     command_state_observed: bool,
     failure_state_observed: bool,
     attestation_accepted: bool,
@@ -192,6 +194,7 @@ struct ResponseEvidence {
     incomplete_cleanup_receipt: Option<SandboxCleanupReceipt>,
     memory_read: bool,
     memory_written: bool,
+    memory_write_failure: Option<MemoryWriteFailure>,
     breakpoint_changed: bool,
     live_target_bound: bool,
     sandbox_event: bool,
@@ -226,6 +229,7 @@ enum SandboxRejectionDiagnostic {
 enum RejectedResponseDisposition {
     RollBack,
     RetainCleanupRequiredFailure,
+    RetainTerminalWriteFailure,
 }
 
 impl<T: HostFrameExchange> DebugHostClient<T> {
@@ -1046,6 +1050,7 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
                 command_id,
                 &event.event,
                 evidence.sandbox_rejection_diagnostic.as_ref(),
+                evidence.memory_write_failure.as_ref(),
             )?;
             if !matches!(&event.event, DebugEvent::StateChanged(_)) {
                 let expected =
@@ -1089,6 +1094,7 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
                         )?;
                     }
                     evidence.state_changed = true;
+                    evidence.state_change_count += 1;
                 }
                 DebugEvent::LiveTargetBound { binding, .. } => {
                     accept_live_target_binding(
@@ -1144,26 +1150,40 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
                     address,
                     before,
                     after,
-                } => match &envelope.command {
-                    DebugCommand::WriteMemory {
-                        stop: expected_stop,
-                        address: expected_address,
-                        expected,
-                        replacement,
-                    } if stop == expected_stop
-                        && address == expected_address
-                        && before == expected
-                        && after == replacement =>
-                    {
-                        require_unique_evidence(&mut evidence.memory_written, "memory-written")?;
-                    }
-                    _ => {
+                } => {
+                    if evidence.memory_write_failure.is_some() {
                         return Err(DebugHostClientError::UnexpectedCommandEvidence {
                             command_id,
-                            evidence: "memory-written",
+                            evidence: "memory-written-after-failure",
                         });
                     }
-                },
+                    match &envelope.command {
+                        DebugCommand::WriteMemory {
+                            stop: expected_stop,
+                            address: expected_address,
+                            expected,
+                            replacement,
+                        } if stop == expected_stop
+                            && address == expected_address
+                            && before == expected
+                            && after == replacement =>
+                        {
+                            require_unique_evidence(
+                                &mut evidence.memory_written,
+                                "memory-written",
+                            )?;
+                        }
+                        _ => {
+                            return Err(DebugHostClientError::UnexpectedCommandEvidence {
+                                command_id,
+                                evidence: "memory-written",
+                            });
+                        }
+                    }
+                }
+                DebugEvent::MemoryWriteFailed(failure) => {
+                    accept_memory_write_failure(envelope, failure, &mut evidence)?;
+                }
                 DebugEvent::BreakpointChanged {
                     stop,
                     breakpoint,
@@ -1226,8 +1246,14 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
         }
         let outcome = outcome.ok_or(DebugHostClientError::MissingCommandResult { command_id })?;
         match &outcome {
-            CommandOutcome::Rejected { .. } => {
-                match classify_rejected_response(envelope, &session.reducer, &evidence)? {
+            CommandOutcome::Rejected { code, message } => {
+                match classify_rejected_response(
+                    envelope,
+                    &session.reducer,
+                    &evidence,
+                    code,
+                    message,
+                )? {
                     RejectedResponseDisposition::RollBack => {
                         session
                             .reducer
@@ -1247,6 +1273,14 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
                         session.sandbox_cleanup_verified = false;
                         invalidate_binding_for_state(session);
                     }
+                    RejectedResponseDisposition::RetainTerminalWriteFailure => {
+                        session
+                            .reducer
+                            .commit_remote_command(checkpoint, command_id)?;
+                        session.verified_state = session.reducer.state().clone();
+                        session.sandbox_cleanup_verified = false;
+                        invalidate_binding_for_state(session);
+                    }
                 }
             }
             CommandOutcome::Succeeded => {
@@ -1254,6 +1288,12 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
                     return Err(DebugHostClientError::UnexpectedCommandEvidence {
                         command_id,
                         evidence: "sandbox-rejection-diagnostic",
+                    });
+                }
+                if evidence.memory_write_failure.is_some() {
+                    return Err(DebugHostClientError::UnexpectedCommandEvidence {
+                        command_id,
+                        evidence: "memory-write-failure-reported-as-success",
                     });
                 }
                 if required_command_state.is_some() && !evidence.command_state_observed {
@@ -1443,6 +1483,45 @@ fn require_live_target_process(
     }
 }
 
+fn accept_memory_write_failure(
+    envelope: &CommandEnvelope,
+    failure: &MemoryWriteFailure,
+    evidence: &mut ResponseEvidence,
+) -> Result<(), DebugHostClientError> {
+    let exact_command = match &envelope.command {
+        DebugCommand::WriteMemory {
+            stop,
+            address,
+            replacement,
+            ..
+        } => {
+            failure.stop == *stop
+                && failure.address == *address
+                && usize::try_from(failure.size).ok() == Some(replacement.len())
+        }
+        _ => false,
+    };
+    if !exact_command || evidence.state_changed || evidence.command_state_observed {
+        return Err(DebugHostClientError::UnexpectedCommandEvidence {
+            command_id: envelope.command_id,
+            evidence: "memory-write-failure",
+        });
+    }
+    if evidence.memory_written {
+        return Err(DebugHostClientError::UnexpectedCommandEvidence {
+            command_id: envelope.command_id,
+            evidence: "memory-write-failure-after-success",
+        });
+    }
+    if evidence.memory_write_failure.is_some() {
+        return Err(DebugHostClientError::DuplicateCommandEvidence {
+            evidence: "memory-write-failure",
+        });
+    }
+    evidence.memory_write_failure = Some(failure.clone());
+    Ok(())
+}
+
 fn invalidate_binding_for_state(session: &mut ClientSession) {
     if !matches!(
         session.verified_state.kind(),
@@ -1538,9 +1617,28 @@ fn accept_attestation_event(
 fn validate_post_rejection_event(
     command_id: CommandId,
     event: &DebugEvent,
-    diagnostic: Option<&SandboxRejectionDiagnostic>,
+    sandbox_diagnostic: Option<&SandboxRejectionDiagnostic>,
+    memory_write_failure: Option<&MemoryWriteFailure>,
 ) -> Result<(), DebugHostClientError> {
-    let Some(diagnostic) = diagnostic else {
+    if let Some(failure) = memory_write_failure {
+        let allowed = match event {
+            DebugEvent::CommandResult { .. } | DebugEvent::Warning { .. } => true,
+            DebugEvent::StateChanged(_) => !failure.recovery.is_rollback_safe(),
+            // Let a replay reach the exact uniqueness check.
+            DebugEvent::MemoryWriteFailed(_) => true,
+            _ => false,
+        };
+        return if allowed {
+            Ok(())
+        } else {
+            Err(DebugHostClientError::UnexpectedCommandEvidence {
+                command_id,
+                evidence: "evidence-after-memory-write-failure",
+            })
+        };
+    }
+
+    let Some(diagnostic) = sandbox_diagnostic else {
         return Ok(());
     };
     let allowed = match event {
@@ -1939,10 +2037,59 @@ fn classify_rejected_response(
     envelope: &CommandEnvelope,
     reducer: &SessionMachine,
     evidence: &ResponseEvidence,
+    rejection_code: &str,
+    rejection_message: &str,
 ) -> Result<RejectedResponseDisposition, DebugHostClientError> {
     let invalid = || DebugHostClientError::RejectedCommandProducedEvidence {
         command_id: envelope.command_id,
     };
+
+    if let Some(failure) = &evidence.memory_write_failure {
+        if evidence.sandbox_rejection_diagnostic.is_some()
+            || rejection_code != MEMORY_WRITE_FAILURE_REJECTION_CODE
+            || rejection_message != failure.detail.as_str()
+        {
+            return Err(invalid());
+        }
+
+        if failure.recovery.is_rollback_safe() {
+            if evidence.state_change_count == 0
+                && !evidence.command_state_observed
+                && !evidence.failure_state_observed
+                && !evidence.has_effect()
+            {
+                return Ok(RejectedResponseDisposition::RollBack);
+            }
+            return Err(invalid());
+        }
+
+        let exact_failed_state = matches!(
+            reducer.state(),
+            SessionState::Failed { message, .. } if message == &failure.detail
+        );
+        if evidence.state_change_count == 2
+            && evidence.state_changed
+            && evidence.command_state_observed
+            && evidence.failure_state_observed
+            && exact_failed_state
+            && !evidence.attestation_accepted
+            && evidence.cleanup_receipt.is_none()
+            && evidence.incomplete_cleanup_receipt.is_none()
+            && !evidence.memory_read
+            && !evidence.memory_written
+            && !evidence.breakpoint_changed
+            && !evidence.live_target_bound
+            && !evidence.sandbox_event
+        {
+            return Ok(RejectedResponseDisposition::RetainTerminalWriteFailure);
+        }
+        return Err(invalid());
+    }
+
+    if rejection_code == MEMORY_WRITE_FAILURE_REJECTION_CODE {
+        return Err(invalid());
+    }
+
     match &evidence.sandbox_rejection_diagnostic {
         None => {
             if evidence.has_effect() {
@@ -2816,9 +2963,9 @@ mod tests {
     use crate::protocol::{
         AttachMode, AttachScope, AttachTarget, BreakpointId, BreakpointKind, BreakpointPersistence,
         BreakpointScope, BreakpointSpec, ExecutionToken, LaunchEnvironment, LaunchTarget,
-        MAX_MEMORY_READ_BYTES, MemoryAddress, OfflineTarget, ProcessId, ProcessIdentity,
-        ProcessStartKey, ReadViewToken, RunId, RunToken, StateGeneration, StepKind, StopId,
-        StopReason, StopToken, ThreadId,
+        MAX_MEMORY_READ_BYTES, MemoryAddress, MemoryWriteRecovery, MemoryWriteStage, OfflineTarget,
+        ProcessId, ProcessIdentity, ProcessStartKey, ReadViewToken, RunId, RunToken,
+        StateGeneration, StepKind, StopId, StopReason, StopToken, ThreadId,
     };
     use crate::sandbox::{
         ChildProcessProfile, CleanupOutcome, CleanupReceiptId, CleanupResidual,
@@ -4636,6 +4783,416 @@ mod tests {
         (client, token)
     }
 
+    fn memory_write_command(stop: StopToken) -> DebugCommand {
+        DebugCommand::WriteMemory {
+            stop,
+            address: MemoryAddress::new(0x0000_7ff6_8000_1400),
+            expected: vec![0x90, 0x91],
+            replacement: vec![0xcc, 0xcc],
+        }
+    }
+
+    fn memory_write_failure(
+        stop: StopToken,
+        stage: MemoryWriteStage,
+        recovery: MemoryWriteRecovery,
+        detail: &str,
+    ) -> MemoryWriteFailure {
+        MemoryWriteFailure {
+            stop,
+            address: MemoryAddress::new(0x0000_7ff6_8000_1400),
+            size: 2,
+            stage,
+            recovery,
+            detail: detail.to_owned(),
+        }
+    }
+
+    fn refreshed_write_state(stop: StopToken) -> (StopToken, SessionState) {
+        let refreshed_stop = StopToken {
+            state: StateToken {
+                session_id: session_id(),
+                generation: stop
+                    .state
+                    .generation
+                    .checked_next()
+                    .expect("refreshed state generation"),
+            },
+            stop_id: StopId::new(stop.stop_id.get() + 1).expect("refreshed stop id"),
+        };
+        (
+            refreshed_stop,
+            SessionState::Stopped {
+                token: refreshed_stop,
+                reason: StopReason::Initial,
+                thread_id: ThreadId::new(9).expect("initial thread"),
+            },
+        )
+    }
+
+    #[test]
+    fn rollback_safe_memory_write_failures_restore_the_verified_stop_and_binding() {
+        for (stage, recovery) in [
+            (
+                MemoryWriteStage::ChangeProtection,
+                MemoryWriteRecovery::NoWriteAttempted {
+                    protection_restored: true,
+                },
+            ),
+            (
+                MemoryWriteStage::WriteReplacement,
+                MemoryWriteRecovery::Restored,
+            ),
+        ] {
+            let (mut client, stop) = prime_stopped_scripted_exchange_client();
+            let binding = async_live_binding();
+            client
+                .session
+                .as_mut()
+                .expect("test session")
+                .live_target_binding = Some(binding.clone());
+            let command_id = CommandId::new(2).expect("write command id");
+            let detail = "target memory write was fully rolled back";
+            let failure = memory_write_failure(stop, stage, recovery, detail);
+            client.transport.scripted.push_back(vec![
+                correlated_event_frame(
+                    2,
+                    1,
+                    command_id,
+                    stop.state,
+                    DebugEvent::MemoryWriteFailed(failure.clone()),
+                ),
+                correlated_event_frame(
+                    3,
+                    2,
+                    command_id,
+                    stop.state,
+                    DebugEvent::CommandResult {
+                        command_id,
+                        outcome: CommandOutcome::Rejected {
+                            code: MEMORY_WRITE_FAILURE_REJECTION_CODE.to_owned(),
+                            message: detail.to_owned(),
+                        },
+                    },
+                ),
+            ]);
+
+            let receipt = client
+                .submit(memory_write_command(stop))
+                .expect("rollback-safe rejection");
+            assert_eq!(
+                receipt.outcome,
+                CommandOutcome::Rejected {
+                    code: MEMORY_WRITE_FAILURE_REJECTION_CODE.to_owned(),
+                    message: detail.to_owned(),
+                }
+            );
+            assert!(matches!(
+                &receipt.events[0].event,
+                DebugEvent::MemoryWriteFailed(actual) if actual == &failure
+            ));
+            assert!(matches!(
+                client.session_state(),
+                Some(SessionState::Stopped { token, .. }) if *token == stop
+            ));
+            assert_eq!(client.live_target_binding(), Some(&binding));
+            assert_eq!(client.next_command_id, 3);
+            assert_eq!(
+                client.connection_state(),
+                ClientConnectionState::SessionOpen
+            );
+        }
+    }
+
+    #[test]
+    fn indeterminate_memory_write_failures_retain_terminal_failed_state() {
+        for (stage, recovery) in [
+            (
+                MemoryWriteStage::ChangeProtection,
+                MemoryWriteRecovery::NoWriteAttempted {
+                    protection_restored: false,
+                },
+            ),
+            (
+                MemoryWriteStage::WriteReplacement,
+                MemoryWriteRecovery::Indeterminate {
+                    bytes_restored: true,
+                    instruction_cache_flushed: false,
+                    protection_restored: true,
+                },
+            ),
+        ] {
+            let (mut client, stop) = prime_stopped_scripted_exchange_client();
+            client
+                .session
+                .as_mut()
+                .expect("test session")
+                .live_target_binding = Some(async_live_binding());
+            let command_id = CommandId::new(2).expect("write command id");
+            let detail = "target memory write recovery is indeterminate";
+            let failure = memory_write_failure(stop, stage, recovery, detail);
+            let (refreshed_stop, refreshed_state) = refreshed_write_state(stop);
+            let failed_token = StateToken {
+                session_id: session_id(),
+                generation: refreshed_stop
+                    .state
+                    .generation
+                    .checked_next()
+                    .expect("failed state generation"),
+            };
+            let failed_state = SessionState::Failed {
+                token: failed_token,
+                message: detail.to_owned(),
+            };
+            client.transport.scripted.push_back(vec![
+                correlated_event_frame(
+                    2,
+                    1,
+                    command_id,
+                    stop.state,
+                    DebugEvent::MemoryWriteFailed(failure),
+                ),
+                correlated_event_frame(
+                    3,
+                    2,
+                    command_id,
+                    refreshed_stop.state,
+                    DebugEvent::StateChanged(refreshed_state),
+                ),
+                correlated_event_frame(
+                    4,
+                    3,
+                    command_id,
+                    failed_token,
+                    DebugEvent::StateChanged(failed_state.clone()),
+                ),
+                correlated_event_frame(
+                    5,
+                    4,
+                    command_id,
+                    failed_token,
+                    DebugEvent::CommandResult {
+                        command_id,
+                        outcome: CommandOutcome::Rejected {
+                            code: MEMORY_WRITE_FAILURE_REJECTION_CODE.to_owned(),
+                            message: detail.to_owned(),
+                        },
+                    },
+                ),
+            ]);
+
+            let receipt = client
+                .submit(memory_write_command(stop))
+                .expect("terminal write rejection");
+            assert!(matches!(receipt.outcome, CommandOutcome::Rejected { .. }));
+            assert_eq!(client.session_state(), Some(&failed_state));
+            assert!(client.live_target_binding().is_none());
+            assert_eq!(client.next_command_id, 3);
+            assert_eq!(
+                client.connection_state(),
+                ClientConnectionState::SessionOpen
+            );
+        }
+    }
+
+    #[test]
+    fn memory_write_failure_requires_exact_command_and_rejection_result() {
+        let (mut mismatched, stop) = prime_stopped_scripted_exchange_client();
+        let command_id = CommandId::new(2).expect("write command id");
+        let detail = "target memory write was fully rolled back";
+        let mut wrong_size = memory_write_failure(
+            stop,
+            MemoryWriteStage::WriteReplacement,
+            MemoryWriteRecovery::Restored,
+            detail,
+        );
+        wrong_size.size = 1;
+        mismatched.transport.scripted.push_back(vec![
+            correlated_event_frame(
+                2,
+                1,
+                command_id,
+                stop.state,
+                DebugEvent::MemoryWriteFailed(wrong_size),
+            ),
+            correlated_event_frame(
+                3,
+                2,
+                command_id,
+                stop.state,
+                DebugEvent::CommandResult {
+                    command_id,
+                    outcome: CommandOutcome::Rejected {
+                        code: MEMORY_WRITE_FAILURE_REJECTION_CODE.to_owned(),
+                        message: detail.to_owned(),
+                    },
+                },
+            ),
+        ]);
+        assert_eq!(
+            mismatched.submit(memory_write_command(stop)),
+            Err(DebugHostClientError::UnexpectedCommandEvidence {
+                command_id,
+                evidence: "memory-write-failure",
+            })
+        );
+        assert_eq!(mismatched.connection_state(), ClientConnectionState::Failed);
+
+        let (mut wrong_result, stop) = prime_stopped_scripted_exchange_client();
+        let failure = memory_write_failure(
+            stop,
+            MemoryWriteStage::WriteReplacement,
+            MemoryWriteRecovery::Restored,
+            detail,
+        );
+        wrong_result.transport.scripted.push_back(vec![
+            correlated_event_frame(
+                2,
+                1,
+                command_id,
+                stop.state,
+                DebugEvent::MemoryWriteFailed(failure),
+            ),
+            correlated_event_frame(
+                3,
+                2,
+                command_id,
+                stop.state,
+                DebugEvent::CommandResult {
+                    command_id,
+                    outcome: CommandOutcome::Rejected {
+                        code: "command-rejected".to_owned(),
+                        message: detail.to_owned(),
+                    },
+                },
+            ),
+        ]);
+        assert_eq!(
+            wrong_result.submit(memory_write_command(stop)),
+            Err(DebugHostClientError::RejectedCommandProducedEvidence { command_id })
+        );
+        assert_eq!(
+            wrong_result.connection_state(),
+            ClientConnectionState::Failed
+        );
+
+        let (mut missing_failure, stop) = prime_stopped_scripted_exchange_client();
+        missing_failure
+            .transport
+            .scripted
+            .push_back(vec![correlated_event_frame(
+                2,
+                1,
+                command_id,
+                stop.state,
+                DebugEvent::CommandResult {
+                    command_id,
+                    outcome: CommandOutcome::Rejected {
+                        code: MEMORY_WRITE_FAILURE_REJECTION_CODE.to_owned(),
+                        message: detail.to_owned(),
+                    },
+                },
+            )]);
+        assert_eq!(
+            missing_failure.submit(memory_write_command(stop)),
+            Err(DebugHostClientError::RejectedCommandProducedEvidence { command_id })
+        );
+        assert_eq!(
+            missing_failure.connection_state(),
+            ClientConnectionState::Failed
+        );
+    }
+
+    #[test]
+    fn memory_write_failure_cannot_be_reported_as_success_or_skip_failed_state() {
+        let command_id = CommandId::new(2).expect("write command id");
+        let detail = "target memory write was fully rolled back";
+        let (mut success, stop) = prime_stopped_scripted_exchange_client();
+        let failure = memory_write_failure(
+            stop,
+            MemoryWriteStage::WriteReplacement,
+            MemoryWriteRecovery::Restored,
+            detail,
+        );
+        success.transport.scripted.push_back(vec![
+            correlated_event_frame(
+                2,
+                1,
+                command_id,
+                stop.state,
+                DebugEvent::MemoryWriteFailed(failure),
+            ),
+            correlated_event_frame(
+                3,
+                2,
+                command_id,
+                stop.state,
+                DebugEvent::CommandResult {
+                    command_id,
+                    outcome: CommandOutcome::Succeeded,
+                },
+            ),
+        ]);
+        assert_eq!(
+            success.submit(memory_write_command(stop)),
+            Err(DebugHostClientError::UnexpectedCommandEvidence {
+                command_id,
+                evidence: "memory-write-failure-reported-as-success",
+            })
+        );
+
+        let (mut missing_failed, stop) = prime_stopped_scripted_exchange_client();
+        let terminal_detail = "target memory write recovery is indeterminate";
+        let failure = memory_write_failure(
+            stop,
+            MemoryWriteStage::WriteReplacement,
+            MemoryWriteRecovery::Indeterminate {
+                bytes_restored: false,
+                instruction_cache_flushed: false,
+                protection_restored: false,
+            },
+            terminal_detail,
+        );
+        let (refreshed_stop, refreshed_state) = refreshed_write_state(stop);
+        missing_failed.transport.scripted.push_back(vec![
+            correlated_event_frame(
+                2,
+                1,
+                command_id,
+                stop.state,
+                DebugEvent::MemoryWriteFailed(failure),
+            ),
+            correlated_event_frame(
+                3,
+                2,
+                command_id,
+                refreshed_stop.state,
+                DebugEvent::StateChanged(refreshed_state),
+            ),
+            correlated_event_frame(
+                4,
+                3,
+                command_id,
+                refreshed_stop.state,
+                DebugEvent::CommandResult {
+                    command_id,
+                    outcome: CommandOutcome::Rejected {
+                        code: MEMORY_WRITE_FAILURE_REJECTION_CODE.to_owned(),
+                        message: terminal_detail.to_owned(),
+                    },
+                },
+            ),
+        ]);
+        assert_eq!(
+            missing_failed.submit(memory_write_command(stop)),
+            Err(DebugHostClientError::RejectedCommandProducedEvidence { command_id })
+        );
+        assert_eq!(
+            missing_failed.connection_state(),
+            ClientConnectionState::Failed
+        );
+    }
+
     #[test]
     fn breakpoint_policy_substitution_is_rejected_and_poisons_connection() {
         let (mut client, stop) = prime_stopped_scripted_exchange_client();
@@ -5220,6 +5777,7 @@ mod tests {
                 envelope.command_id,
                 &DebugEvent::StateChanged(wrong),
                 Some(&diagnostic),
+                None,
             )
             .is_err()
         );
@@ -5231,6 +5789,7 @@ mod tests {
             envelope.command_id,
             &DebugEvent::StateChanged(exact),
             Some(&diagnostic),
+            None,
         )
         .expect("one exact final failure state");
         require_unique_evidence(

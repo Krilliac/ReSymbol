@@ -8,6 +8,14 @@ prereleases; breaking changes remain explicit.
 
 ### Added
 
+- Added protocol-1.6 `MemoryWriteFailed` evidence for future live providers. A failure is bound to
+  the exact write command's stop, address, and size and reports one canonical mutation stage plus
+  explicit recovery proof. A fully restored operation or a byte-write that was never attempted with
+  protection proved restored may reject without consuming the visible stop; unknown protection,
+  bytes, or instruction-cache state instead requires the accepted fresh stop followed by an exact
+  terminal `Failed` state. The host client rejects substituted, duplicate, contradictory,
+  misordered, post-result, or success-labeled failure evidence. This is a provider contract, not a
+  claim that live mutation ships or that an indeterminate target can safely be resumed or detached.
 - Added schema-14, container-only intake for ELF32 little-endian `EM_MIPS` executables. Checked
   header and table parsing retains sparse non-empty `PT_LOAD` mappings and a deterministic
   identity-only graph without decoding or executing instructions. A source-built synthetic fixture
@@ -401,8 +409,9 @@ prereleases; breaking changes remain explicit.
 
 ### Changed
 
-- Bumped the debugger wire and typed-command protocol to 1.5 for the required breakpoint-persistence
-  field and exact set-evidence binding; 1.4 and older peers are rejected before dispatch.
+- Bumped the debugger wire and typed-command protocol to 1.6 for command-correlated memory-write
+  failure and recovery evidence; 1.5 and older peers are rejected before dispatch. Protocol 1.5
+  introduced the required breakpoint-persistence field and exact set-evidence binding.
 - Protocol 1.4 introduced the requirement that every successful host or sandbox
   launch and every debug attach requires one correlated, validated `LiveTargetBinding`. Host
   launches bind the runtime main module to the exact requested binary; sandbox launches additionally
@@ -612,7 +621,7 @@ schema versions independently.
   attaches additionally bind provider, policy digest, and provisioning epoch. Attestation and
   cleanup receipts carry that fresh epoch, rejecting evidence replay from an otherwise identical
   earlier provisioning instance. These remain contracts for future providers, not shipped process
-  execution or containment. The debugger-host typed-command protocol is now 1.5, so legacy 1.4 and
+  execution or containment. The debugger-host typed-command protocol is now 1.6, so legacy 1.5 and
   older payload shapes fail typed validation before dispatch instead of being interpreted ambiguously.
 - The default WASM invocation accepts a component up to 64 MiB, enforces a 256 MiB linear-memory
   store limit, 100,000,000 fuel, a 2 MiB WebAssembly stack, one memory, two tables, 32 instances,
