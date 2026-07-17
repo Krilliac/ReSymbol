@@ -54,8 +54,8 @@
                          "view":  "overview",
                          "width":  1440,
                          "height":  900,
-                         "bytes":  247482,
-                         "sha256":  "184d13fed645fa1d330f4178a1106aee59e6e69b10e7a7cecc1690c737cce719"
+                         "bytes":  243358,
+                         "sha256":  "942ff913afa09afd014d0d3bf6643eea1a3dc7c9eb220b95d2800f569f81e2f8"
                      },
                      {
                          "file":  "workbench-functions.png",
@@ -86,32 +86,32 @@
                          "view":  "disassembly",
                          "width":  1440,
                          "height":  900,
-                         "bytes":  287962,
-                         "sha256":  "2d1987b12af20188e31e39c8c8e88c235ffdb2a4a5c1505e7081108ef9a9bda5"
+                         "bytes":  279884,
+                         "sha256":  "c88af1af6028ece68f0ec77898fb6e3e0ad05a49ae75a0a93aba28ad5b8033d2"
                      },
                      {
                          "file":  "workbench-disassembly-actions.png",
                          "view":  "disassembly-actions",
                          "width":  1440,
                          "height":  900,
-                         "bytes":  293981,
-                         "sha256":  "defbccc8945e771496e68c79140e5aceea24383db2df40b1df9401676db9dd56"
+                         "bytes":  292351,
+                         "sha256":  "c380d3a5f6fe1db614b8850943569fe0318584b23e03f434999caa654d8842bb"
                      },
                      {
                          "file":  "workbench-binary-switch-confirmation.png",
                          "view":  "binary-switch-confirmation",
                          "width":  1440,
                          "height":  900,
-                         "bytes":  400083,
-                         "sha256":  "5dc8104a7088940af256021fbc4a6f19b7648159ea36c7117b4303307986e17c"
+                         "bytes":  395511,
+                         "sha256":  "2734fc1ce54bfff6d595276a3c67a2b44f5c7195e5c170505dfd44671d705bb3"
                      },
                      {
                          "file":  "workbench-debugger-sandbox.png",
                          "view":  "debugger-sandbox",
                          "width":  1440,
                          "height":  900,
-                         "bytes":  274915,
-                         "sha256":  "5b0ea1fd155036e7e0f3024bfb291cef21b7bb7a29172691ecd369832c3bd714"
+                         "bytes":  274917,
+                         "sha256":  "82ddba0a52d411c6988c649a145ddb3e6d44003cb5686474e2552dc06e08dcd4"
                      },
                      {
                          "file":  "workbench-debugger-readiness-result.png",
@@ -126,8 +126,8 @@
                          "view":  "exports",
                          "width":  1440,
                          "height":  900,
-                         "bytes":  259306,
-                         "sha256":  "4c7978ef1032cfd1371cd16e46f5f589eb296dc7b85282348cbed94d6f5fe4a7"
+                         "bytes":  254393,
+                         "sha256":  "0c13f490788c23754ea8b963423607ddeb70e59ba8d566b43df59fae7289679d"
                      }
                  ]
 }
