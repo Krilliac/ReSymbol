@@ -62,8 +62,8 @@ use crate::{
     worker::{
         MAX_OFFLINE_IMAGE_UI_READ_BYTES, OfflineImageReadAvailability, OfflineImageReadFailure,
         OfflineImageReadOutcome, OfflineImageReadSpan, OperationGate, OperationId,
-        OperationSequence, ReviewSaveOutcome, ServiceWorker, WorkerCommand, WorkerEvent,
-        WorkerExportKind,
+        OperationSequence, PublicationDestination, PublicationGate, PublicationKind,
+        ReviewSaveOutcome, ServiceWorker, WorkerCommand, WorkerEvent, WorkerExportKind,
     },
 };
 
@@ -542,11 +542,10 @@ pub struct WorkbenchApp {
     service_worker: ServiceWorker,
     operation_sequence: OperationSequence,
     project_operation: OperationGate,
-    export_operation: OperationGate,
+    publication_operation: PublicationGate,
     review_operation: OperationGate,
     plugin_operation: OperationGate,
     readiness_operation: OperationGate,
-    static_patch_operation: OperationGate,
     worker_disconnected: bool,
     analysis_path: Option<PathBuf>,
     function_filter: FunctionFilter,
@@ -656,11 +655,10 @@ impl WorkbenchApp {
             service_worker: ServiceWorker::start(creation_context.egui_ctx.clone()),
             operation_sequence: OperationSequence::default(),
             project_operation: OperationGate::default(),
-            export_operation: OperationGate::default(),
+            publication_operation: PublicationGate::default(),
             review_operation: OperationGate::default(),
             plugin_operation: OperationGate::default(),
             readiness_operation: OperationGate::default(),
-            static_patch_operation: OperationGate::default(),
             worker_disconnected: false,
             analysis_path: None,
             function_filter: FunctionFilter::default(),
@@ -855,10 +853,14 @@ impl WorkbenchApp {
     }
 
     fn request_close(&mut self, context: &egui::Context) -> bool {
-        if self.static_patch_operation.is_pending() {
+        if self.publication_operation.is_pending() {
+            let kind = self
+                .publication_operation
+                .kind()
+                .map_or("file", PublicationKind::label);
             self.log(
                 ActivityLevel::Warning,
-                "Close paused until the worker-owned static patch publication finishes",
+                format!("Close paused until the worker-owned {kind} publication finishes"),
             );
             return false;
         }
@@ -922,8 +924,7 @@ impl WorkbenchApp {
 
         let review_busy = self.project_operation.is_pending()
             || self.review_operation.is_pending()
-            || self.export_operation.is_pending()
-            || self.static_patch_operation.is_pending();
+            || self.publication_operation.is_pending();
         let response = egui::Modal::new(egui::Id::new("dirty_review_close_confirmation")).show(
             context,
             |ui| {
@@ -961,7 +962,7 @@ impl WorkbenchApp {
                     }
                     if ui
                         .add_enabled(
-                            !self.static_patch_operation.is_pending(),
+                            !self.publication_operation.is_pending(),
                             egui::Button::new("Discard and Close"),
                         )
                         .clicked()
@@ -1038,10 +1039,9 @@ impl WorkbenchApp {
 
         let replacement_busy = self.project_operation.is_pending()
             || self.review_operation.is_pending()
-            || self.export_operation.is_pending()
+            || self.publication_operation.is_pending()
             || self.readiness_operation.is_pending()
-            || self.offline_read.is_pending()
-            || self.static_patch_operation.is_pending();
+            || self.offline_read.is_pending();
         let response = egui::Modal::new(egui::Id::new("dirty_review_binary_switch_confirmation"))
             .show(context, |ui| {
                 ui.set_min_width(470.0);
@@ -1407,10 +1407,10 @@ impl WorkbenchApp {
             );
             return;
         }
-        if self.export_operation.is_pending() || self.review_operation.is_pending() {
+        if self.publication_operation.is_pending() || self.review_operation.is_pending() {
             self.log(
                 ActivityLevel::Warning,
-                "Wait for the current export or review operation before opening another binary",
+                "Wait for the current file publication or review operation before opening another binary",
             );
             return;
         }
@@ -1425,13 +1425,6 @@ impl WorkbenchApp {
             self.log(
                 ActivityLevel::Warning,
                 "Wait for the debugger sandbox readiness probe before opening another binary",
-            );
-            return;
-        }
-        if self.static_patch_operation.is_pending() {
-            self.log(
-                ActivityLevel::Warning,
-                "Wait for static patch publication before opening another binary",
             );
             return;
         }
@@ -1469,8 +1462,10 @@ impl WorkbenchApp {
         if self.project_operation.is_pending() {
             return Err("a project operation is already running".to_owned());
         }
-        if self.export_operation.is_pending() || self.review_operation.is_pending() {
-            return Err("wait for the current export or review operation first".to_owned());
+        if self.publication_operation.is_pending() || self.review_operation.is_pending() {
+            return Err(
+                "wait for the current file publication or review operation first".to_owned(),
+            );
         }
         if self.offline_read.is_pending() {
             return Err(
@@ -1481,11 +1476,6 @@ impl WorkbenchApp {
             return Err(
                 "wait for the debugger sandbox readiness probe before replacing the project"
                     .to_owned(),
-            );
-        }
-        if self.static_patch_operation.is_pending() {
-            return Err(
-                "wait for static patch publication before replacing the project".to_owned(),
             );
         }
         if self
@@ -1677,41 +1667,55 @@ impl WorkbenchApp {
         if path.as_os_str().is_empty() {
             return Err("choose a destination path".to_owned());
         }
-        if self.export_operation.is_pending() {
-            return Err("an export is already running".to_owned());
-        }
         if self.project_operation.is_pending() {
             return Err("wait for the current project operation before exporting".to_owned());
         }
         if self.review_operation.is_pending() {
             return Err("wait for the current review save or load before exporting".to_owned());
         }
-        let project = self
-            .project
-            .as_ref()
-            .ok_or_else(|| "open a binary or package before exporting".to_owned())?;
-        if kind == ExportKind::Pdb && !project.snapshot.has_verified_source() {
-            return Err(
-                "PDB export requires the exact source binary; package-only projects must verify it first"
-                    .to_owned(),
-            );
-        }
-        let reviews = self
-            .review
-            .as_ref()
-            .ok_or_else(|| "the current project has no bound review ledger".to_owned())?
-            .ledger()
-            .clone();
+        let (project, reviews) = {
+            let project = self
+                .project
+                .as_ref()
+                .ok_or_else(|| "open a binary or package before exporting".to_owned())?;
+            if kind == ExportKind::Pdb && !project.snapshot.has_verified_source() {
+                return Err(
+                    "PDB export requires the exact source binary; package-only projects must verify it first"
+                        .to_owned(),
+                );
+            }
+            let reviews = self
+                .review
+                .as_ref()
+                .ok_or_else(|| "the current project has no bound review ledger".to_owned())?
+                .ledger()
+                .clone();
+            (Arc::clone(&project.snapshot), reviews)
+        };
+        let destination =
+            PublicationDestination::resolve(&path).map_err(|error| error.to_string())?;
 
         let operation = self.operation_sequence.issue();
-        self.service_worker.submit(WorkerCommand::Export {
+        self.publication_operation
+            .begin(operation, PublicationKind::Export, destination)
+            .map_err(|error| error.to_string())?;
+        let submit = self.service_worker.submit(WorkerCommand::Export {
             operation,
-            project: Arc::clone(&project.snapshot),
+            project,
             reviews,
             kind: kind.worker_kind(),
             path: path.clone(),
-        })?;
-        self.export_operation.begin(operation);
+        });
+        if let Err(error) = submit {
+            let finished = self
+                .publication_operation
+                .finish(operation, PublicationKind::Export);
+            debug_assert!(
+                finished,
+                "failed export submission releases its reservation"
+            );
+            return Err(error);
+        }
         self.export_result = None;
         let message = format!("Queued {} export to {}", kind.label(), path.display());
         self.log(ActivityLevel::Info, &message);
@@ -1725,8 +1729,8 @@ impl WorkbenchApp {
         if self.review_operation.is_pending() {
             return Err("wait for the current review save or load first".to_owned());
         }
-        if self.static_patch_operation.is_pending() {
-            return Err("wait for static patch publication first".to_owned());
+        if self.publication_operation.is_pending() {
+            return Err("wait for the current file publication first".to_owned());
         }
         let project = self
             .project
@@ -1799,8 +1803,8 @@ impl WorkbenchApp {
         if self.project_operation.is_pending() {
             return Err("wait for the current project operation before loading reviews".to_owned());
         }
-        if self.export_operation.is_pending() {
-            return Err("wait for the current export before loading reviews".to_owned());
+        if self.publication_operation.is_pending() {
+            return Err("wait for the current file publication before loading reviews".to_owned());
         }
         if self.review_operation.is_pending() {
             return Err("a review save or load is already running".to_owned());
@@ -1840,8 +1844,8 @@ impl WorkbenchApp {
         if self.project_operation.is_pending() {
             return Err("wait for the current project operation before reviewing".to_owned());
         }
-        if self.export_operation.is_pending() {
-            return Err("wait for the current export before changing reviews".to_owned());
+        if self.publication_operation.is_pending() {
+            return Err("wait for the current file publication before changing reviews".to_owned());
         }
         if self.review_operation.is_pending() {
             return Err("a review operation is already running".to_owned());
@@ -2002,7 +2006,10 @@ impl WorkbenchApp {
                     }
                 }
                 WorkerEvent::ExportCompleted { operation, result } => {
-                    if !self.export_operation.finish(operation) {
+                    if !self
+                        .publication_operation
+                        .finish(operation, PublicationKind::Export)
+                    {
                         self.log(
                             ActivityLevel::Warning,
                             format!(
@@ -2269,51 +2276,69 @@ impl WorkbenchApp {
                     }
                 }
                 WorkerEvent::StaticPatchPublished { operation, result } => {
-                    if !self.static_patch_operation.finish(operation) {
-                        self.log(
-                            ActivityLevel::Warning,
-                            format!(
-                                "Ignored stale static patch result for operation {}",
-                                operation.get()
-                            ),
-                        );
-                        continue;
-                    }
-                    match result {
-                        Ok(outcome) => {
-                            let matches_current = self.project.as_ref().is_some_and(|project| {
-                                project.session().base_analysis().identity()
-                                    == outcome.source_identity()
-                            });
-                            if !matches_current {
-                                let error = "Static patch receipt did not match the current project identity"
-                                    .to_owned();
-                                self.static_patch_result = Some(Err(error.clone()));
-                                self.console_reply(false, &error);
-                                self.log(ActivityLevel::Error, error);
-                                continue;
-                            }
-                            let warning_count = outcome.warnings().len();
-                            let message = format!(
-                                "Created patched binary {} with SHA-256 {} and {warning_count} integrity warning(s)",
-                                outcome.path().display(),
-                                outcome.output_identity().id.as_str()
-                            );
-                            self.pending_static_patch_drafts.clear();
-                            self.static_patch_result = Some(Ok(outcome));
-                            self.console_reply(true, &message);
-                            self.log(ActivityLevel::Success, message);
-                        }
-                        Err(error) => {
-                            self.static_patch_result = Some(Err(error.clone()));
-                            self.console_reply(false, &error);
-                            self.log(
-                                ActivityLevel::Error,
-                                format!("Static patch publication failed: {error}"),
-                            );
-                        }
-                    }
+                    self.finish_static_patch_publication(operation, result);
                 }
+            }
+        }
+    }
+
+    fn finish_static_patch_publication(
+        &mut self,
+        operation: OperationId,
+        result: Result<PublishedStaticPatch, String>,
+    ) {
+        if !self
+            .publication_operation
+            .finish(operation, PublicationKind::StaticPatch)
+        {
+            self.log(
+                ActivityLevel::Warning,
+                format!(
+                    "Ignored stale static patch result for operation {}",
+                    operation.get()
+                ),
+            );
+            return;
+        }
+        match result {
+            Ok(outcome) => {
+                let matches_current = self.project.as_ref().is_some_and(|project| {
+                    project.session().base_analysis().identity() == outcome.source_identity()
+                });
+                if !matches_current {
+                    let error = "Static patch receipt did not match the current project identity"
+                        .to_owned();
+                    self.static_patch_result = Some(Err(error.clone()));
+                    self.console_reply(false, &error);
+                    self.log(ActivityLevel::Error, error);
+                    return;
+                }
+                let warning_count = outcome.warnings().len();
+                let durability = outcome.durability().to_string();
+                let durability_warning = !outcome.durability().is_fully_synchronized();
+                let message = format!(
+                    "Created and reopened-verified patched binary {} with SHA-256 {}, {warning_count} integrity warning(s), and durability status: {durability}",
+                    outcome.path().display(),
+                    outcome.output_identity().id.as_str()
+                );
+                self.pending_static_patch_drafts.clear();
+                self.static_patch_result = Some(Ok(outcome));
+                self.console_reply(true, &message);
+                self.log(ActivityLevel::Success, &message);
+                if durability_warning {
+                    self.log(
+                        ActivityLevel::Warning,
+                        format!("Patched binary durability warning: {durability}"),
+                    );
+                }
+            }
+            Err(error) => {
+                self.static_patch_result = Some(Err(error.clone()));
+                self.console_reply(false, &error);
+                self.log(
+                    ActivityLevel::Error,
+                    format!("Static patch publication failed: {error}"),
+                );
             }
         }
     }
@@ -2325,12 +2350,10 @@ impl WorkbenchApp {
         let project_operation_was_pending = self.project_operation.is_pending();
         self.worker_disconnected = true;
         self.project_operation.invalidate();
-        self.export_operation.invalidate();
+        let interrupted_publication = self.publication_operation.invalidate();
         self.review_operation.invalidate();
         self.plugin_operation.invalidate();
         self.readiness_operation.invalidate();
-        let static_patch_was_pending = self.static_patch_operation.is_pending();
-        self.static_patch_operation.invalidate();
         self.offline_read.clear();
         if let Some(previous) = self.pending_review_rollback.take() {
             self.review = Some(previous);
@@ -2339,11 +2362,20 @@ impl WorkbenchApp {
             self.restore_project_context_after_failed_open();
         }
         self.close_after_review_save = false;
-        if static_patch_was_pending {
-            self.static_patch_result = Some(Err(
-                "the application-service worker disconnected during static patch publication"
-                    .to_owned(),
-            ));
+        match interrupted_publication {
+            Some(PublicationKind::StaticPatch) => {
+                self.static_patch_result = Some(Err(
+                    "the application-service worker disconnected during static patch publication"
+                        .to_owned(),
+                ));
+            }
+            Some(PublicationKind::Export) => {
+                self.export_result = Some(Err(
+                    "the application-service worker disconnected during export publication"
+                        .to_owned(),
+                ));
+            }
+            None => {}
         }
         self.log(ActivityLevel::Error, error);
     }
@@ -2482,10 +2514,9 @@ impl WorkbenchApp {
             .protection_assessment
             .unavailable_reason()
             .map(ToOwned::to_owned);
-        self.export_operation.invalidate();
+        self.publication_operation.invalidate();
         self.review_operation.invalidate();
         self.readiness_operation.invalidate();
-        self.static_patch_operation.invalidate();
         self.offline_read.clear();
         self.pending_review_rollback = None;
         self.readiness_outcome = None;
@@ -2779,7 +2810,7 @@ impl WorkbenchApp {
         if !another_widget_owns_keyboard
             && !self.project_operation.is_pending()
             && !self.review_operation.is_pending()
-            && !self.export_operation.is_pending()
+            && !self.publication_operation.is_pending()
         {
             if undo_review {
                 self.apply_review_ui_action(ReviewUiAction::Undo);
@@ -2859,11 +2890,10 @@ impl WorkbenchApp {
         let viewport = context.screen_rect().size();
         let chrome = shell_chrome_layout(viewport.x, viewport.y);
         let can_open_binary = !self.project_operation.is_pending()
-            && !self.export_operation.is_pending()
+            && !self.publication_operation.is_pending()
             && !self.review_operation.is_pending()
             && !self.readiness_operation.is_pending()
             && !self.offline_read.is_pending()
-            && !self.static_patch_operation.is_pending()
             && self.pending_binary_open.is_none();
         let recent_binaries = self.preferences.recent_binaries.clone();
         let mut choose_binary_requested = false;
@@ -3599,7 +3629,7 @@ impl WorkbenchApp {
                         ui.label(RichText::new("Review decisions").strong());
                         let review_busy = self.project_operation.is_pending()
                             || self.review_operation.is_pending()
-                            || self.export_operation.is_pending();
+                            || self.publication_operation.is_pending();
                         let selected_subject = self.selected_review_subject.as_ref();
                         let (current, history, can_undo, can_redo, dirty, persisted_path) = self
                             .review
@@ -5353,8 +5383,8 @@ impl WorkbenchApp {
         &self,
         row: &LinearInstructionRow,
     ) -> Result<(), &'static str> {
-        if self.static_patch_operation.is_pending() {
-            return Err("A static patch publication is already running.");
+        if self.publication_operation.is_pending() {
+            return Err("A file publication is already running.");
         }
         if row.bytes().is_empty() {
             return Err("The selected instruction has no exact source bytes.");
@@ -5577,9 +5607,6 @@ impl WorkbenchApp {
         if self.worker_disconnected {
             return Err("the application-service worker is unavailable".to_owned());
         }
-        if self.static_patch_operation.is_pending() {
-            return Err("a static patch publication is already running".to_owned());
-        }
         if self.project_operation.is_pending() {
             return Err(
                 "wait for the current project or source operation before publishing a patch"
@@ -5607,16 +5634,31 @@ impl WorkbenchApp {
                 "the patched destination must differ from the verified source path".to_owned(),
             );
         }
+        let destination =
+            PublicationDestination::resolve(&path).map_err(|error| error.to_string())?;
         let edit_count = requests.len();
         let operation = self.operation_sequence.issue();
-        self.service_worker
+        self.publication_operation
+            .begin(operation, PublicationKind::StaticPatch, destination)
+            .map_err(|error| error.to_string())?;
+        let submit = self
+            .service_worker
             .submit(WorkerCommand::PublishStaticPatch {
                 operation,
                 project,
                 requests,
                 path: path.clone(),
-            })?;
-        self.static_patch_operation.begin(operation);
+            });
+        if let Err(error) = submit {
+            let finished = self
+                .publication_operation
+                .finish(operation, PublicationKind::StaticPatch);
+            debug_assert!(
+                finished,
+                "failed static-patch submission releases its reservation"
+            );
+            return Err(error);
+        }
         self.static_patch_result = None;
         let message = format!(
             "Queued {edit_count} exact static edit(s) for create-new publication to {} from {project_name}",
@@ -5631,7 +5673,10 @@ impl WorkbenchApp {
         let mut remove_rva = None;
         let mut clear_all = false;
         let mut publish_requested = false;
-        let publication_pending = self.static_patch_operation.is_pending();
+        let publication_pending = self.publication_operation.is_pending();
+        let static_publication_pending = self
+            .publication_operation
+            .is_kind(PublicationKind::StaticPatch);
         let exact_source_ready = self
             .project
             .as_ref()
@@ -5699,15 +5744,17 @@ impl WorkbenchApp {
                     && !self.project_operation.is_pending()
                     && exact_source_ready
                     && !self.pending_static_patch_drafts.drafts().is_empty();
-                let publish_label = if publication_pending {
+                let publish_label = if static_publication_pending {
                     "Publishing patched binary..."
+                } else if publication_pending {
+                    "Another file publication is running..."
                 } else {
                     "Create New Patched Binary..."
                 };
                 let publish = ui
                     .add_enabled(can_publish, egui::Button::new(publish_label))
                     .on_disabled_hover_text(if publication_pending {
-                        "A worker-owned create-new publication is already running."
+                        "A worker-owned create-new file publication is already running."
                     } else if !exact_source_ready {
                         "Verify the exact source binary before publishing static edits."
                     } else if self.pending_static_patch_drafts.drafts().is_empty() {
@@ -5721,7 +5768,7 @@ impl WorkbenchApp {
                 }
                 ui.label(
                     RichText::new(
-                        "Publication revalidates the exact source identity and expected bytes on the service worker, then creates a new file without replacing source or destination.",
+                        "Publication revalidates the exact source identity and expected bytes, creates a new file without replacing source or destination, then reopens and hashes that destination before issuing a receipt.",
                     )
                     .small()
                     .color(colors.secondary_text),
@@ -5742,6 +5789,30 @@ impl WorkbenchApp {
                                 .monospace()
                                 .small()
                                 .color(colors.exact_extracted),
+                            );
+                            ui.colored_label(
+                                colors.healthy,
+                                "[REOPEN VERIFIED] Destination size and SHA-256 match the receipt",
+                            );
+                            let durability_color = if outcome
+                                .durability()
+                                .is_fully_synchronized()
+                            {
+                                colors.healthy
+                            } else {
+                                colors.warning_conflict
+                            };
+                            let durability_cue = if outcome
+                                .durability()
+                                .is_fully_synchronized()
+                            {
+                                "DURABLE"
+                            } else {
+                                "DURABILITY WARNING"
+                            };
+                            ui.colored_label(
+                                durability_color,
+                                format!("[{durability_cue}] {}", outcome.durability()),
                             );
                             for warning in outcome.warnings() {
                                 ui.colored_label(
@@ -6640,12 +6711,17 @@ impl WorkbenchApp {
 
             ui.add_space(12.0);
             let exact_source_ready = project.snapshot.has_verified_source();
-            let can_export = !self.export_operation.is_pending()
+            let can_export = !self.publication_operation.is_pending()
                 && !self.project_operation.is_pending()
                 && !self.review_operation.is_pending()
                 && (self.export_kind != ExportKind::Pdb || exact_source_ready);
-            let action_label = if self.export_operation.is_pending() {
+            let action_label = if self
+                .publication_operation
+                .is_kind(PublicationKind::Export)
+            {
                 "Exporting...".to_owned()
+            } else if self.publication_operation.is_pending() {
+                "Another file publication is running...".to_owned()
             } else if self.project_operation.is_pending() {
                 "Project operation running...".to_owned()
             } else {
@@ -6723,11 +6799,10 @@ impl eframe::App for WorkbenchApp {
         self.advance_screenshot_capture(context);
         if !cfg!(feature = "screenshot")
             && (self.project_operation.is_pending()
-                || self.export_operation.is_pending()
+                || self.publication_operation.is_pending()
                 || self.review_operation.is_pending()
                 || self.readiness_operation.is_pending()
                 || self.offline_read.is_pending()
-                || self.static_patch_operation.is_pending()
                 || self.console_host.is_enabled())
         {
             context.request_repaint_after(std::time::Duration::from_millis(100));
@@ -8048,7 +8123,7 @@ mod tests {
     use super::*;
     use std::{io::Write as _, path::Path};
 
-    use resymbol_app::AppServices;
+    use resymbol_app::{AppServices, StaticPatchPlan};
     use resymbol_core::{
         ClaimProducer, ClaimProvenance, Confidence, Evidence, EvidenceKind, SymbolAssertion,
         SymbolClaim, SymbolSubject,
@@ -8057,15 +8132,38 @@ mod tests {
 
     const STRIPPED_FIXTURE: &[u8] =
         include_bytes!("../../../fixtures/pe-x64-msvc/artifacts/milestone2-stripped.exe");
+    const SYMBOLIZED_FIXTURE: &[u8] =
+        include_bytes!("../../../fixtures/pe-x64-msvc/artifacts/milestone2-symbolized.exe");
+    const THUNK_RVA: u32 = 0x1184;
+    const THUNK_BYTES: [u8; 5] = [0xe9, 0x03, 0x00, 0x00, 0x00];
 
     fn loaded_project_with_source() -> (NamedTempFile, LoadedProject) {
+        loaded_project_with_bytes(STRIPPED_FIXTURE)
+    }
+
+    fn loaded_project_with_bytes(bytes: &[u8]) -> (NamedTempFile, LoadedProject) {
         let mut source = NamedTempFile::new().expect("temporary PE");
-        source.write_all(STRIPPED_FIXTURE).expect("write PE");
+        source.write_all(bytes).expect("write PE");
         let snapshot = AppServices::default()
             .analyze_binary(source.path())
             .expect("analyze PE");
         let project = LoadedProject::from_snapshot(snapshot).expect("loaded project");
         (source, project)
+    }
+
+    fn publish_test_patch(project: &LoadedProject, output: &Path) -> PublishedStaticPatch {
+        let request = StaticPatchEditRequest::nop_instruction(
+            THUNK_RVA,
+            THUNK_BYTES,
+            "Disable internal jump thunk",
+        )
+        .expect("valid exact instruction request");
+        let analysis = project.session().base_analysis();
+        let plan = StaticPatchPlan::new(analysis.identity(), analysis, vec![request])
+            .expect("valid fixture patch plan");
+        AppServices::default()
+            .publish_static_patch_new(&project.snapshot, &plan, output)
+            .expect("publish fixture patch")
     }
 
     fn test_app() -> (egui::Context, WorkbenchApp) {
@@ -8872,5 +8970,129 @@ mod tests {
         );
         assert_eq!(requests[0].expected(), &[0x74, 0x05]);
         assert_eq!(requests[0].replacement(), &[0x75, 0x05]);
+    }
+
+    #[test]
+    fn stale_static_publication_result_cannot_clear_the_current_reservation_or_drafts() {
+        let (_context, mut app) = test_app();
+        app.pending_static_patch_drafts
+            .queue_nop(THUNK_RVA.into(), &THUNK_BYTES, "current draft")
+            .expect("queue current draft");
+        let directory = tempfile::tempdir().expect("temporary publication directory");
+        let destination =
+            PublicationDestination::resolve(&directory.path().join("current-patch.exe"))
+                .expect("canonical destination");
+        let stale = app.operation_sequence.issue();
+        let current = app.operation_sequence.issue();
+        app.publication_operation
+            .begin(current, PublicationKind::StaticPatch, destination)
+            .expect("reserve current publication");
+
+        app.finish_static_patch_publication(stale, Err("stale result".to_owned()));
+
+        assert!(app.publication_operation.is_pending());
+        assert!(
+            app.publication_operation
+                .is_kind(PublicationKind::StaticPatch)
+        );
+        assert_eq!(app.pending_static_patch_drafts.drafts().len(), 1);
+        assert!(app.static_patch_result.is_none());
+    }
+
+    #[test]
+    fn wrong_source_static_receipt_fails_closed_and_preserves_drafts() {
+        let (_context, mut app) = test_app();
+        let (active_source, active_project) = loaded_project_with_source();
+        app.analysis_path = Some(active_source.path().to_path_buf());
+        app.finish_project_open(Ok(active_project));
+        app.pending_static_patch_drafts
+            .queue_nop(THUNK_RVA.into(), &THUNK_BYTES, "retained draft")
+            .expect("queue retained draft");
+
+        let (_other_source, other_project) = loaded_project_with_bytes(SYMBOLIZED_FIXTURE);
+        let directory = tempfile::tempdir().expect("temporary publication directory");
+        let output = directory.path().join("other-source-patch.exe");
+        let destination = PublicationDestination::resolve(&output).expect("canonical destination");
+        let operation = app.operation_sequence.issue();
+        app.publication_operation
+            .begin(operation, PublicationKind::StaticPatch, destination)
+            .expect("reserve static publication");
+        let receipt = publish_test_patch(&other_project, &output);
+
+        app.finish_static_patch_publication(operation, Ok(receipt));
+
+        assert!(!app.publication_operation.is_pending());
+        assert_eq!(app.pending_static_patch_drafts.drafts().len(), 1);
+        assert!(matches!(
+            app.static_patch_result.as_ref(),
+            Some(Err(error)) if error.contains("did not match the current project identity")
+        ));
+    }
+
+    #[test]
+    fn matching_static_receipt_completes_lifecycle_and_clears_only_published_drafts() {
+        let (_context, mut app) = test_app();
+        let (source, project) = loaded_project_with_bytes(SYMBOLIZED_FIXTURE);
+        let directory = tempfile::tempdir().expect("temporary publication directory");
+        let output = directory.path().join("matching-source-patch.exe");
+        let receipt = publish_test_patch(&project, &output);
+        app.analysis_path = Some(source.path().to_path_buf());
+        app.finish_project_open(Ok(project));
+        app.pending_static_patch_drafts
+            .queue_nop(THUNK_RVA.into(), &THUNK_BYTES, "published draft")
+            .expect("queue published draft");
+        let destination = PublicationDestination::resolve(&output).expect("canonical destination");
+        let operation = app.operation_sequence.issue();
+        app.publication_operation
+            .begin(operation, PublicationKind::StaticPatch, destination)
+            .expect("reserve static publication");
+
+        app.finish_static_patch_publication(operation, Ok(receipt));
+
+        assert!(!app.publication_operation.is_pending());
+        assert!(app.pending_static_patch_drafts.drafts().is_empty());
+        assert!(matches!(app.static_patch_result.as_ref(), Some(Ok(_))));
+    }
+
+    #[test]
+    fn worker_disconnect_releases_static_publication_but_retains_unpublished_drafts() {
+        let (_context, mut app) = test_app();
+        app.pending_static_patch_drafts
+            .queue_nop(THUNK_RVA.into(), &THUNK_BYTES, "recoverable draft")
+            .expect("queue recoverable draft");
+        let directory = tempfile::tempdir().expect("temporary publication directory");
+        let destination =
+            PublicationDestination::resolve(&directory.path().join("interrupted-patch.exe"))
+                .expect("canonical destination");
+        let operation = app.operation_sequence.issue();
+        app.publication_operation
+            .begin(operation, PublicationKind::StaticPatch, destination)
+            .expect("reserve static publication");
+
+        app.handle_worker_disconnect("deterministic worker disconnect".to_owned());
+
+        assert!(!app.publication_operation.is_pending());
+        assert_eq!(app.pending_static_patch_drafts.drafts().len(), 1);
+        assert!(matches!(
+            app.static_patch_result.as_ref(),
+            Some(Err(error)) if error.contains("disconnected during static patch publication")
+        ));
+    }
+
+    #[test]
+    fn close_remains_paused_during_any_file_publication() {
+        let (context, mut app) = test_app();
+        let directory = tempfile::tempdir().expect("temporary publication directory");
+        let destination =
+            PublicationDestination::resolve(&directory.path().join("pending-export.pdb"))
+                .expect("canonical destination");
+        let operation = app.operation_sequence.issue();
+        app.publication_operation
+            .begin(operation, PublicationKind::Export, destination)
+            .expect("reserve export publication");
+
+        assert!(!app.request_close(&context));
+        assert!(app.publication_operation.is_pending());
+        assert!(app.publication_operation.is_kind(PublicationKind::Export));
     }
 }

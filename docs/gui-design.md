@@ -177,7 +177,11 @@ Instruction actions keep static and live mutation separate. **Queue NOP for Patc
 an exact-RVA, exact-source-byte draft. **Create New Patched Binary** accepts only drafts that decode
 as exactly one complete x64 instruction, then performs checked plan construction, source identity and
 byte revalidation, and create-new publication on the application-service worker. It writes only a
-new binary, never the open source or a process, and presents signature/checksum warnings. **NOP instruction in
+new binary, never the open source or a process, and presents signature/checksum warnings. Static
+patches and ordinary exports share one canonical destination reservation, so their worker-owned
+publication lifecycles cannot overlap. A successful patch receipt requires the named destination to
+be reopened and match the expected exact size and SHA-256; post-publication directory-sync failure
+is shown as a durability warning without hiding the created output. **NOP instruction in
 live memory** is a different typed action: it requires an authenticated stopped session, a complete
 capability report with `LiveMemoryWrite`, an exact live-address binding, and
 `DebugCommand::WriteMemory` compare-before-write using the exact selected bytes and a same-length

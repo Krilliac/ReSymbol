@@ -1,6 +1,7 @@
 use std::{
     fmt::Write as _,
-    path::PathBuf,
+    fs, io,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -105,6 +106,184 @@ impl OperationGate {
 
     pub fn invalidate(&mut self) {
         self.current = None;
+    }
+}
+
+/// Mutating file-publication domains that share one exclusive reservation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicationKind {
+    Export,
+    StaticPatch,
+}
+
+impl PublicationKind {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Export => "export",
+            Self::StaticPatch => "static patch",
+        }
+    }
+}
+
+/// Canonical parent plus final create-new filename reserved by the UI loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicationDestination {
+    canonical_path: PathBuf,
+}
+
+impl PublicationDestination {
+    pub fn resolve(path: &Path) -> Result<Self, PublicationReservationError> {
+        let file_name =
+            path.file_name()
+                .ok_or_else(|| PublicationReservationError::InvalidDestination {
+                    path: path.to_path_buf(),
+                })?;
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let canonical_parent = fs::canonicalize(parent).map_err(|source| {
+            PublicationReservationError::ResolveParent {
+                path: path.to_path_buf(),
+                source,
+            }
+        })?;
+        Ok(Self {
+            canonical_path: canonical_parent.join(file_name),
+        })
+    }
+
+    #[must_use]
+    pub fn canonical_path(&self) -> &Path {
+        &self.canonical_path
+    }
+
+    fn refers_to_same_destination(&self, other: &Self) -> bool {
+        #[cfg(windows)]
+        {
+            let left = self.canonical_path.to_string_lossy();
+            let right = other.canonical_path.to_string_lossy();
+            left.eq_ignore_ascii_case(right.as_ref())
+        }
+        #[cfg(not(windows))]
+        {
+            self.canonical_path == other.canonical_path
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum PublicationReservationError {
+    #[error("publication destination `{path}` does not name a file")]
+    InvalidDestination { path: PathBuf },
+    #[error("cannot resolve publication destination parent for `{path}`: {source}")]
+    ResolveParent {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error(
+        "{requested_kind} publication cannot use `{destination}` because the current {active_kind} publication already reserves that destination"
+    )]
+    DestinationReserved {
+        requested_kind: &'static str,
+        active_kind: &'static str,
+        destination: PathBuf,
+    },
+    #[error(
+        "wait for the current {active_kind} publication to `{destination}` before starting a {requested_kind} publication"
+    )]
+    PublicationBusy {
+        requested_kind: &'static str,
+        active_kind: &'static str,
+        destination: PathBuf,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PublicationReservation {
+    operation: OperationId,
+    kind: PublicationKind,
+    destination: PublicationDestination,
+}
+
+/// One exclusive, canonical destination reservation for every mutating export.
+#[derive(Debug, Default)]
+pub struct PublicationGate {
+    current: Option<PublicationReservation>,
+}
+
+impl PublicationGate {
+    pub fn begin(
+        &mut self,
+        operation: OperationId,
+        kind: PublicationKind,
+        destination: PublicationDestination,
+    ) -> Result<(), PublicationReservationError> {
+        if let Some(current) = &self.current {
+            let error = if current.destination.refers_to_same_destination(&destination) {
+                PublicationReservationError::DestinationReserved {
+                    requested_kind: kind.label(),
+                    active_kind: current.kind.label(),
+                    destination: current.destination.canonical_path.clone(),
+                }
+            } else {
+                PublicationReservationError::PublicationBusy {
+                    requested_kind: kind.label(),
+                    active_kind: current.kind.label(),
+                    destination: current.destination.canonical_path.clone(),
+                }
+            };
+            return Err(error);
+        }
+        self.current = Some(PublicationReservation {
+            operation,
+            kind,
+            destination,
+        });
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn is_pending(&self) -> bool {
+        self.current.is_some()
+    }
+
+    #[must_use]
+    pub fn is_kind(&self, kind: PublicationKind) -> bool {
+        self.current
+            .as_ref()
+            .is_some_and(|current| current.kind == kind)
+    }
+
+    #[must_use]
+    pub fn kind(&self) -> Option<PublicationKind> {
+        self.current.as_ref().map(|current| current.kind)
+    }
+
+    #[must_use]
+    pub fn destination(&self) -> Option<&Path> {
+        self.current
+            .as_ref()
+            .map(|current| current.destination.canonical_path())
+    }
+
+    /// Complete only the current operation in its exact publication domain.
+    pub fn finish(&mut self, operation: OperationId, kind: PublicationKind) -> bool {
+        if !self
+            .current
+            .as_ref()
+            .is_some_and(|current| current.operation == operation && current.kind == kind)
+        {
+            return false;
+        }
+        self.current = None;
+        true
+    }
+
+    pub fn invalidate(&mut self) -> Option<PublicationKind> {
+        self.current.take().map(|current| current.kind)
     }
 }
 
@@ -1221,6 +1400,83 @@ entrypoint = "plugin.wasm"
         assert!(gate.is_pending());
         assert!(gate.finish(second));
         assert!(!gate.is_pending());
+    }
+
+    #[test]
+    fn publication_gate_exclusively_reserves_canonical_destinations_across_domains() {
+        let directory = tempdir().expect("temporary publication directory");
+        let export_destination =
+            PublicationDestination::resolve(&directory.path().join(".").join("artifact.exe"))
+                .expect("canonical export destination");
+        let same_destination =
+            PublicationDestination::resolve(&directory.path().join("artifact.exe"))
+                .expect("canonical patch destination");
+        let other_destination =
+            PublicationDestination::resolve(&directory.path().join("other.exe"))
+                .expect("other canonical destination");
+        assert!(export_destination.refers_to_same_destination(&same_destination));
+
+        let mut sequence = OperationSequence::default();
+        let export = sequence.issue();
+        let patch = sequence.issue();
+        let mut gate = PublicationGate::default();
+        gate.begin(export, PublicationKind::Export, export_destination)
+            .expect("reserve export destination");
+
+        assert!(matches!(
+            gate.begin(patch, PublicationKind::StaticPatch, same_destination),
+            Err(PublicationReservationError::DestinationReserved {
+                requested_kind: "static patch",
+                active_kind: "export",
+                ..
+            })
+        ));
+        assert!(matches!(
+            gate.begin(patch, PublicationKind::StaticPatch, other_destination),
+            Err(PublicationReservationError::PublicationBusy {
+                requested_kind: "static patch",
+                active_kind: "export",
+                ..
+            })
+        ));
+        assert!(!gate.finish(export, PublicationKind::StaticPatch));
+        assert!(!gate.finish(patch, PublicationKind::Export));
+        assert!(gate.is_pending());
+        assert_eq!(gate.kind(), Some(PublicationKind::Export));
+        assert!(gate.destination().is_some());
+        assert!(gate.finish(export, PublicationKind::Export));
+        assert!(!gate.is_pending());
+
+        let patch = sequence.issue();
+        let export = sequence.issue();
+        let patch_destination =
+            PublicationDestination::resolve(&directory.path().join("artifact.exe"))
+                .expect("reverse patch destination");
+        let export_destination =
+            PublicationDestination::resolve(&directory.path().join(".").join("artifact.exe"))
+                .expect("reverse export destination");
+        gate.begin(patch, PublicationKind::StaticPatch, patch_destination)
+            .expect("reserve patch destination");
+        assert!(matches!(
+            gate.begin(export, PublicationKind::Export, export_destination),
+            Err(PublicationReservationError::DestinationReserved {
+                requested_kind: "export",
+                active_kind: "static patch",
+                ..
+            })
+        ));
+        assert!(gate.finish(patch, PublicationKind::StaticPatch));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn publication_destination_reservation_is_case_insensitive_on_windows() {
+        let directory = tempdir().expect("temporary publication directory");
+        let lowercase = PublicationDestination::resolve(&directory.path().join("artifact.exe"))
+            .expect("lowercase destination");
+        let uppercase = PublicationDestination::resolve(&directory.path().join("ARTIFACT.EXE"))
+            .expect("uppercase destination");
+        assert!(lowercase.refers_to_same_destination(&uppercase));
     }
 
     #[test]
