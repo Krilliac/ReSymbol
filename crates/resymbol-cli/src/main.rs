@@ -145,6 +145,10 @@ struct ExportArgs {
     /// Reject before rendering or publishing if neutral warnings or target-specific loss exist.
     #[arg(long)]
     fail_on_loss: bool,
+
+    /// Validate and render the export without creating a destination or staging file.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -1553,6 +1557,7 @@ fn export(args: ExportArgs) -> Result<()> {
         output,
         binary,
         fail_on_loss,
+        dry_run,
     } = args;
     if format != ExportFormat::Pdb && binary.is_some() {
         bail!("--binary is accepted only with --format pdb");
@@ -1628,14 +1633,21 @@ fn export(args: ExportArgs) -> Result<()> {
                 .into_bytes()
         }
     };
-    write_export_new(&output, &rendered)?;
+    if !dry_run {
+        write_export_new(&output, &rendered)?;
+    }
 
     println!("package: {}", package_path.display());
     if let Some(source) = &source_binary {
         println!("source binary: {}", source.path().display());
     }
     println!("format: {}", format.label());
-    println!("output: {}", output.display());
+    if dry_run {
+        println!("mode: dry run (rendered and validated; destination not written)");
+        println!("output: {} (not written)", output.display());
+    } else {
+        println!("output: {}", output.display());
+    }
     println!("binary SHA-256: {}", projection.binary.id);
     println!(
         "symbols: {} function(s), {} global(s), {} type(s)",
@@ -4273,6 +4285,7 @@ entrypoint = "Plugin.dll"
                 "--output",
                 "symbols.out",
                 "--fail-on-loss",
+                "--dry-run",
             ])
             .expect("export arguments parse");
             let Command::Export(args) = cli.command else {
@@ -4283,6 +4296,7 @@ entrypoint = "Plugin.dll"
             assert_eq!(args.output, Some(PathBuf::from("symbols.out")));
             assert_eq!(args.binary, None);
             assert!(args.fail_on_loss);
+            assert!(args.dry_run);
         }
 
         let error =
@@ -4302,6 +4316,7 @@ entrypoint = "Plugin.dll"
             "pdb",
             "--binary",
             "application.exe",
+            "--dry-run",
         ])
         .expect("PDB source binary argument parses");
         let Command::Export(args) = cli.command else {
@@ -4309,6 +4324,7 @@ entrypoint = "Plugin.dll"
         };
         assert_eq!(args.binary, Some(PathBuf::from("application.exe")));
         assert!(!args.fail_on_loss);
+        assert!(args.dry_run);
     }
 
     #[test]
@@ -4332,6 +4348,7 @@ entrypoint = "Plugin.dll"
             output: None,
             binary: Some(PathBuf::from("application.exe")),
             fail_on_loss: false,
+            dry_run: false,
         })
         .expect_err("non-PDB export must not accept a misleading source binary");
         assert!(error.to_string().contains("only with --format pdb"));
@@ -5255,6 +5272,7 @@ entrypoint = "Plugin.dll"
             output: Some(strict_output.clone()),
             binary: None,
             fail_on_loss: true,
+            dry_run: false,
         })
         .expect_err("lossy target must fail strict export");
         assert!(error.to_string().contains("--fail-on-loss rejected export"));
@@ -5277,6 +5295,7 @@ entrypoint = "Plugin.dll"
             output: None,
             binary: None,
             fail_on_loss: false,
+            dry_run: false,
         })
         .expect("export JSON");
         let json_path = package.with_extension("symbols.json");
@@ -5294,6 +5313,7 @@ entrypoint = "Plugin.dll"
             output: None,
             binary: None,
             fail_on_loss: false,
+            dry_run: false,
         })
         .expect_err("existing export must not be overwritten");
         assert!(error.to_string().contains("refusing to overwrite"));
@@ -5308,6 +5328,7 @@ entrypoint = "Plugin.dll"
             output: None,
             binary: None,
             fail_on_loss: false,
+            dry_run: false,
         })
         .expect("export Markdown report");
         let markdown_path = package.with_extension("symbols.md");
@@ -5321,6 +5342,7 @@ entrypoint = "Plugin.dll"
             output: None,
             binary: None,
             fail_on_loss: false,
+            dry_run: false,
         })
         .expect_err("existing Markdown export must not be overwritten");
         assert!(error.to_string().contains("refusing to overwrite"));
@@ -5335,6 +5357,7 @@ entrypoint = "Plugin.dll"
             output: None,
             binary: None,
             fail_on_loss: false,
+            dry_run: false,
         })
         .expect("export Microsoft-linker-style MAP");
         let map_path = package.with_extension("map");
@@ -5349,6 +5372,7 @@ entrypoint = "Plugin.dll"
             output: None,
             binary: None,
             fail_on_loss: false,
+            dry_run: false,
         })
         .expect_err("existing MAP export must not be overwritten");
         assert!(error.to_string().contains("refusing to overwrite"));
@@ -5363,6 +5387,7 @@ entrypoint = "Plugin.dll"
             output: Some(temp.path().join("missing-source.pdb")),
             binary: None,
             fail_on_loss: false,
+            dry_run: false,
         })
         .expect_err("PDB export requires the exact source PE");
         assert!(error.to_string().contains("requires --binary"));
@@ -5378,6 +5403,7 @@ entrypoint = "Plugin.dll"
             output: Some(mismatched_output.clone()),
             binary: Some(wrong_binary),
             fail_on_loss: false,
+            dry_run: false,
         })
         .expect_err("PDB export binds the exact PE digest");
         assert!(format!("{error:#}").contains("SHA-256"));
@@ -5392,6 +5418,7 @@ entrypoint = "Plugin.dll"
             output: Some(short_output.clone()),
             binary: Some(short_binary),
             fail_on_loss: false,
+            dry_run: false,
         })
         .expect_err("PDB export binds the exact PE size before rendering");
         assert!(format!("{error:#}").contains("project describes exactly"));
@@ -5403,6 +5430,7 @@ entrypoint = "Plugin.dll"
             output: None,
             binary: Some(binary.clone()),
             fail_on_loss: false,
+            dry_run: false,
         })
         .expect("export exact-RSDS public-symbol PDB");
         let pdb_path = package.with_extension("pdb");
@@ -5416,6 +5444,7 @@ entrypoint = "Plugin.dll"
             output: None,
             binary: Some(binary.clone()),
             fail_on_loss: false,
+            dry_run: false,
         })
         .expect_err("existing PDB export must not be overwritten");
         assert!(error.to_string().contains("refusing to overwrite"));
@@ -5430,6 +5459,7 @@ entrypoint = "Plugin.dll"
             output: None,
             binary: None,
             fail_on_loss: false,
+            dry_run: false,
         })
         .expect("export IDA script");
         let ida_script =
@@ -5443,6 +5473,7 @@ entrypoint = "Plugin.dll"
             output: None,
             binary: None,
             fail_on_loss: false,
+            dry_run: false,
         })
         .expect("export Ghidra script");
         let ghidra_path = default_export_path(
@@ -6479,6 +6510,7 @@ entrypoint = "Plugin.dll"
             output: Some(output.clone()),
             binary: None,
             fail_on_loss: false,
+            dry_run: false,
         })
         .expect("JSON export accepts schema 3");
         let projection: Value =
@@ -6583,6 +6615,7 @@ entrypoint = "Plugin.dll"
             output: Some(output.clone()),
             binary: None,
             fail_on_loss: false,
+            dry_run: false,
         })
         .expect("JSON export accepts schema 4");
         let projection: Value =
@@ -6657,6 +6690,7 @@ entrypoint = "Plugin.dll"
             output: Some(output.clone()),
             binary: None,
             fail_on_loss: false,
+            dry_run: false,
         })
         .expect("JSON export accepts schema 5");
         let projection: Value =
@@ -6753,6 +6787,7 @@ entrypoint = "Plugin.dll"
             output: Some(output.clone()),
             binary: None,
             fail_on_loss: false,
+            dry_run: false,
         })
         .expect("JSON export accepts schema 6");
         let projection: Value =
@@ -6824,6 +6859,7 @@ entrypoint = "Plugin.dll"
             output: Some(output.clone()),
             binary: None,
             fail_on_loss: false,
+            dry_run: false,
         })
         .expect("JSON export accepts schema 7");
         let projection: Value =
@@ -7809,6 +7845,7 @@ entrypoint = "Plugin.dll"
             output: Some(output.clone()),
             binary: None,
             fail_on_loss: false,
+            dry_run: false,
         })
         .expect("JSON export accepts schema 11");
         let projection: Value =
@@ -7882,6 +7919,7 @@ entrypoint = "Plugin.dll"
             output: Some(output.clone()),
             binary: None,
             fail_on_loss: false,
+            dry_run: false,
         })
         .expect("JSON export accepts schema 10");
         let projection: Value =
@@ -7952,6 +7990,7 @@ entrypoint = "Plugin.dll"
             output: Some(output.clone()),
             binary: None,
             fail_on_loss: false,
+            dry_run: false,
         })
         .expect("JSON export accepts schema 9");
         let projection: Value =
@@ -8035,6 +8074,7 @@ entrypoint = "Plugin.dll"
             output: Some(output.clone()),
             binary: None,
             fail_on_loss: false,
+            dry_run: false,
         })
         .expect("JSON export accepts schema 8");
         let projection: Value =

@@ -77,6 +77,38 @@ const OFFLINE_DISASSEMBLY_INSTRUCTION_LIMIT: usize = 64;
 const FUNCTION_KEYBOARD_PAGE_ROWS: usize = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BinaryPickerPurpose {
+    OpenBinaryOrPackage,
+    VerifyExactBinary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BinaryPickerFilterSpec {
+    label: &'static str,
+    extensions: &'static [&'static str],
+}
+
+const PE_CONTAINER_FILTER: BinaryPickerFilterSpec = BinaryPickerFilterSpec {
+    label: "PE containers",
+    extensions: &["exe", "dll", "sys", "cpl", "ocx", "scr", "efi"],
+};
+const RESYMBOL_PACKAGE_FILTER: BinaryPickerFilterSpec = BinaryPickerFilterSpec {
+    label: "ReSymbol packages",
+    extensions: &["resym"],
+};
+const ALL_FILES_FILTER: BinaryPickerFilterSpec = BinaryPickerFilterSpec {
+    label: "All files (including extensionless PE)",
+    extensions: &["*"],
+};
+const OPEN_BINARY_OR_PACKAGE_FILTERS: &[BinaryPickerFilterSpec] = &[
+    PE_CONTAINER_FILTER,
+    RESYMBOL_PACKAGE_FILTER,
+    ALL_FILES_FILTER,
+];
+const VERIFY_EXACT_BINARY_FILTERS: &[BinaryPickerFilterSpec] =
+    &[PE_CONTAINER_FILTER, ALL_FILES_FILTER];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkflowStage {
     Open,
     Analyze,
@@ -2413,10 +2445,10 @@ impl WorkbenchApp {
     }
 
     fn choose_binary(&mut self, _context: &egui::Context) {
-        let mut dialog = rfd::FileDialog::new()
-            .set_title("Open a PE32+ x86-64 binary or current ReSymbol package")
-            .add_filter("Windows binaries", &["exe", "dll", "sys"])
-            .add_filter("ReSymbol packages", &["resym"]);
+        let mut dialog = binary_picker_dialog(
+            "Open a PE32+ x86-64 container or current ReSymbol package",
+            BinaryPickerPurpose::OpenBinaryOrPackage,
+        );
         if let Some(directory) = self
             .project
             .as_ref()
@@ -2653,7 +2685,7 @@ impl WorkbenchApp {
                                 "Drop exactly one binary"
                             });
                             ui.label(
-                                "PE32+ .exe/.dll/.sys and current .resym packages are supported.",
+                                "PE32+ .exe/.dll/.sys/.cpl/.ocx/.scr/.efi or extensionless files, plus current .resym packages, are supported.",
                             );
                             ui.small(
                                 "The active project remains intact unless the replacement opens successfully.",
@@ -2720,63 +2752,69 @@ impl WorkbenchApp {
                             .inner_margin(egui::Margin::symmetric(10, 5))
                             .corner_radius(4)
                             .show(ui, |ui| {
-                                if chrome.compact_header {
-                                    ui.set_max_width(280.0);
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(&project.identity.display_name).strong(),
+                                // A Frame inherits its parent's horizontal layout. Keep the
+                                // identity lines in an explicit vertical child so their widths
+                                // do not add together and collide with the trailing controls.
+                                ui.vertical(|ui| {
+                                    if chrome.compact_header {
+                                        ui.set_max_width(280.0);
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(&project.identity.display_name)
+                                                    .strong(),
+                                            )
+                                            .truncate(),
                                         )
-                                        .truncate(),
-                                    )
-                                    .on_hover_text(&project.identity.display_name);
-                                } else {
-                                    ui.label(
-                                        RichText::new(&project.identity.display_name).strong(),
-                                    );
-                                }
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        RichText::new(if chrome.compact_header {
-                                            "[EXACT] Identity bound"
-                                        } else {
-                                            "[EXACT] Exact identity"
-                                        })
-                                            .color(colors.exact_extracted),
-                                    )
-                                    .on_hover_text(format!(
-                                        "SHA-256 {}",
-                                        project.identity.sha256.as_str()
-                                    ));
-                                    if !chrome.compact_header {
+                                        .on_hover_text(&project.identity.display_name);
+                                    } else {
                                         ui.label(
-                                            RichText::new(short_hash(
-                                                project.identity.sha256.as_str(),
-                                            ))
-                                            .monospace()
-                                            .small()
-                                            .color(colors.secondary_text),
+                                            RichText::new(&project.identity.display_name).strong(),
+                                        );
+                                    }
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            RichText::new(if chrome.compact_header {
+                                                "[EXACT] Identity bound"
+                                            } else {
+                                                "[EXACT] Exact identity"
+                                            })
+                                            .color(colors.exact_extracted),
                                         )
                                         .on_hover_text(format!(
                                             "SHA-256 {}",
                                             project.identity.sha256.as_str()
                                         ));
+                                        if !chrome.compact_header {
+                                            ui.label(
+                                                RichText::new(short_hash(
+                                                    project.identity.sha256.as_str(),
+                                                ))
+                                                .monospace()
+                                                .small()
+                                                .color(colors.secondary_text),
+                                            )
+                                            .on_hover_text(format!(
+                                                "SHA-256 {}",
+                                                project.identity.sha256.as_str()
+                                            ));
+                                        }
+                                    });
+                                    if self.project_operation.is_pending() {
+                                        if let Some(path) = &self.analysis_path {
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "[OPENING] {}",
+                                                    path.file_name()
+                                                        .and_then(|name| name.to_str())
+                                                        .unwrap_or("selected binary")
+                                                ))
+                                                .small()
+                                                .color(colors.inferred),
+                                            )
+                                            .on_hover_text(path.display().to_string());
+                                        }
                                     }
                                 });
-                                if self.project_operation.is_pending() {
-                                    if let Some(path) = &self.analysis_path {
-                                        ui.label(
-                                            RichText::new(format!(
-                                                "[OPENING] {}",
-                                                path.file_name()
-                                                    .and_then(|name| name.to_str())
-                                                    .unwrap_or("selected binary")
-                                            ))
-                                            .small()
-                                            .color(colors.inferred),
-                                        )
-                                        .on_hover_text(path.display().to_string());
-                                    }
-                                }
                             });
                     } else if let Some(path) = &self.analysis_path {
                         ui.label(path.display().to_string());
@@ -4057,11 +4095,11 @@ impl WorkbenchApp {
             });
 
         if verify_source {
-            let Some(path) = rfd::FileDialog::new()
-                .set_title("Verify the exact original PE for this package")
-                .add_filter("Windows binaries", &["exe", "dll", "sys"])
-                .pick_file()
-            else {
+            let Some(path) = binary_picker_dialog(
+                "Verify the exact original PE for this package",
+                BinaryPickerPurpose::VerifyExactBinary,
+            )
+            .pick_file() else {
                 return;
             };
             if let Err(error) = self.queue_source_verification(path) {
@@ -4097,7 +4135,9 @@ impl WorkbenchApp {
                 self.choose_binary(context);
             }
             ui.add_space(10.0);
-            ui.small("You can also drag an .exe, .dll, .sys, or .resym file onto this window.");
+            ui.small(
+                "You can also drag a supported PE container, an extensionless PE, or a .resym package onto this window.",
+            );
         });
     }
 
@@ -7334,6 +7374,23 @@ fn bounded_text_preview(value: &str, maximum_bytes: usize) -> String {
     format!("{}...", &value[..end])
 }
 
+const fn binary_picker_filter_specs(
+    purpose: BinaryPickerPurpose,
+) -> &'static [BinaryPickerFilterSpec] {
+    match purpose {
+        BinaryPickerPurpose::OpenBinaryOrPackage => OPEN_BINARY_OR_PACKAGE_FILTERS,
+        BinaryPickerPurpose::VerifyExactBinary => VERIFY_EXACT_BINARY_FILTERS,
+    }
+}
+
+fn binary_picker_dialog(title: &str, purpose: BinaryPickerPurpose) -> rfd::FileDialog {
+    binary_picker_filter_specs(purpose)
+        .iter()
+        .fold(rfd::FileDialog::new().set_title(title), |dialog, filter| {
+            dialog.add_filter(filter.label, filter.extensions)
+        })
+}
+
 fn is_package_path(path: &std::path::Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
@@ -7499,6 +7556,50 @@ mod tests {
         assert!(close_requires_confirmation(true, false));
         assert!(!close_requires_confirmation(false, false));
         assert!(!close_requires_confirmation(true, true));
+    }
+
+    #[test]
+    fn project_picker_covers_common_and_extensionless_pe_containers() {
+        let filters = binary_picker_filter_specs(BinaryPickerPurpose::OpenBinaryOrPackage);
+
+        assert_eq!(filters.len(), 3);
+        assert_eq!(filters[0].label, "PE containers");
+        assert_eq!(
+            filters[0].extensions,
+            &["exe", "dll", "sys", "cpl", "ocx", "scr", "efi"]
+        );
+        assert_eq!(
+            filters[1],
+            BinaryPickerFilterSpec {
+                label: "ReSymbol packages",
+                extensions: &["resym"],
+            }
+        );
+        assert_eq!(filters[2].extensions, &["*"]);
+        assert!(filters[2].label.contains("extensionless"));
+    }
+
+    #[test]
+    fn exact_source_picker_keeps_packages_out_of_the_binary_filter_set() {
+        let filters = binary_picker_filter_specs(BinaryPickerPurpose::VerifyExactBinary);
+
+        assert_eq!(filters.len(), 2);
+        assert_eq!(filters[0].label, "PE containers");
+        assert_eq!(filters[1].extensions, &["*"]);
+        assert!(filters.iter().all(|filter| {
+            !filter
+                .extensions
+                .iter()
+                .any(|extension| extension.eq_ignore_ascii_case("resym"))
+        }));
+    }
+
+    #[test]
+    fn resymbol_package_routing_remains_explicit_and_case_insensitive() {
+        assert!(is_package_path(Path::new("saved-project.resym")));
+        assert!(is_package_path(Path::new("SAVED-PROJECT.RESYM")));
+        assert!(!is_package_path(Path::new("extensionless-pe")));
+        assert!(!is_package_path(Path::new("control-panel.cpl")));
     }
 
     #[test]

@@ -266,8 +266,9 @@ The current seam is intentionally narrow:
   accepted and released. The reducer retains the provider attestation it accepted rather than only
   a Boolean gate. A trusted host path must record explicit `NotCreated` before binding a pre-target
   launch failure; the binder rejects an unknown target-creation result. Missing target-creation
-  state is not treated as evidence. Raw expected-attestation and cleanup comparison helpers are
-  crate-private; public acceptance routes through reducer-held identity;
+  state is not treated as evidence, and an inbound failure event can only confirm an outcome already
+  retained by the controller rather than establish `NotCreated`. Raw expected-attestation and cleanup
+  comparison helpers are crate-private; public acceptance routes through reducer-held identity;
 - connection-level capability probing is explicit and complete: every protocol capability must
   appear exactly once as available or with a typed unavailability reason. The synthetic host
   reports every platform capability as unavailable, supports only offline open/close, and rejects

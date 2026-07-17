@@ -22,6 +22,28 @@ prereleases; breaking changes remain explicit.
   compare-before-write with an equal-length `0x90` replacement; Run to Cursor composes a temporary
   software breakpoint with Continue. Static and live NOP actions reject instructions whose exact
   bytes are already entirely `0x90` instead of queuing an unpublishable no-op.
+- Added an explicit, guarded binary-replacement workflow to the desktop workbench. Users can open
+  another binary or `.resym` package from the loaded-project header, the File menu, Ctrl+O, the
+  Open Binary workflow stage, Open Recent, or single-file drag and drop. Dirty review state requires
+  Save, Discard, or Cancel before replacement; failed and stale opens preserve the active project,
+  review ledger, and recent-file history.
+- Added read-only native Windows debugger-readiness observations for AppContainer API availability,
+  virtualization-firmware reporting, and Windows Hypervisor Platform presence. The probes load only
+  system modules, never enable features or request elevation, and only remove requirements supported
+  by positive evidence; they do not claim that a process-executing provider is ready.
+- Added `resymbol export --dry-run` for every export format. It preserves package validation,
+  target-loss assessment, exact-source PDB verification, and complete writer rendering while
+  creating neither the prospective destination nor a staging file; `--fail-on-loss` remains
+  enforceable in the same pre-publication flow.
+- Added a UI-independent, same-size static PE patch subsystem. Immutable plans bind to the full
+  source binary identity and retain deterministic labeled NOP-instruction or general-byte edits
+  with exact RVA, derived file offset, expected bytes, and equal-length replacement bytes. Bounded
+  validation rejects empty, duplicate, overlapping, out-of-image, cross-section, non-executable,
+  unbacked, and virtual-tail edits before compare-before-write application creates a separate
+  deterministic output image. `AppServices` can stage, flush, synchronize, and create-new publish
+  that image without modifying the source or replacing an existing target; failed staging is
+  cleaned automatically. Every result explicitly warns that Authenticode signature validity and
+  the PE checksum may be invalidated, and ReSymbol does not repair, recompute, or re-sign them.
 - Added a responsive, keyboard-first workbench navigation slice. The default 1440x900 review shell
   keeps all eight main views on one compact row and fits all six Function columns with both side
   panels open; the documented 1024x680 minimum uses an explicit all-view selector and a labeled
@@ -286,9 +308,11 @@ prereleases; breaking changes remain explicit.
   identity and the accepted attestation. Launch failures now carry explicit `NotCreated` or exact
   `Created` process evidence bound from retained reducer state; binding an unknown outcome fails.
   Processless cleanup requires a retained `NotCreated` result instead of inferring success from a
-  missing state transition. Missing, mismatched, and replayed evidence fails closed, and the wire
-  rejects legacy 1.2 negotiation because that schema lacks the required process fields. These remain
-  contracts for a future execution provider; no process-executing sandbox provider is shipped.
+  missing state transition. A received failure can only confirm a controller-retained outcome and
+  cannot establish `NotCreated` or authorize processless cleanup by itself. Missing, mismatched, and
+  replayed evidence fails closed, and the wire rejects legacy 1.2 negotiation because that schema
+  lacks the required process fields. These remain contracts for a future execution provider; no
+  process-executing sandbox provider is shipped.
 - Debugger capability probes must now report every protocol capability exactly once. Unsupported
   capabilities remain explicit typed `Unavailable` entries instead of becoming ambiguous through
   omission; duplicate and partial reports fail protocol validation.
@@ -442,6 +466,12 @@ schema versions independently.
 
 ### Safety and limits
 
+- Static patch plans retain at most 1,024 edits, 4 KiB per general edit, 15 bytes per x86
+  instruction-to-NOP edit, and 1 MiB of aggregate replacement bytes. They accept only equal-length
+  changes to one fully file-backed executable PE section,
+  verify the exact source size and SHA-256 before checking every expected byte, and mutate only a
+  newly allocated output image. Same-directory staged publication is no-clobber; it does not make
+  a patched executable trusted, signed, checksum-correct, safe to run, or semantically valid.
 - macOS executable-plugin containment now observes direct-child exit with a `kqueue` process filter,
   terminates the still-stable process group, and only then reaps the leader. XNU registration
   races resolve through an already-exited path that also kills the group before collecting status,
@@ -452,8 +482,8 @@ schema versions independently.
   attaches additionally bind provider, policy digest, and provisioning epoch. Attestation and
   cleanup receipts carry that fresh epoch, rejecting evidence replay from an otherwise identical
   earlier provisioning instance. These remain contracts for future providers, not shipped process
-  execution or containment. The debugger-host typed-command protocol is now 1.2, so older
-  payload shapes fail typed validation before dispatch instead of being interpreted ambiguously.
+  execution or containment. The debugger-host typed-command protocol is now 1.3, so legacy 1.2 and
+  older payload shapes fail typed validation before dispatch instead of being interpreted ambiguously.
 - The default WASM invocation accepts a component up to 64 MiB, enforces a 256 MiB linear-memory
   store limit, 100,000,000 fuel, a 2 MiB WebAssembly stack, one memory, two tables, 32 instances,
   and a 100,000-element table limit. It has a 30-second epoch deadline, permits at most 4,096
