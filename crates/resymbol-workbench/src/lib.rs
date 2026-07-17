@@ -4,6 +4,7 @@ mod app;
 pub mod console;
 mod console_host;
 mod graph;
+mod instruction_actions;
 mod model;
 mod readiness;
 mod review_state;

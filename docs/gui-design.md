@@ -4,8 +4,9 @@ This document records both the first implemented ReSymbol workbench slice and th
 long-term direction. `crates/resymbol-workbench` is a Windows-first desktop application built with
 the pinned eframe/egui 0.32.3 stack; that version was selected to preserve the workspace's Rust 1.86
 minimum. The `resymbol` CLI remains supported and currently exposes capabilities that the GUI does
-not. Sections that describe later bulk review, docking, disassembly, or live debugger integration
-are target design rather than current behavior.
+not. Sections that describe later bulk review, docking, synchronized disassembly/pseudocode, or live
+debugger integration are target design rather than current behavior; the bounded linear preview
+described below is implemented.
 
 The workbench should feel familiar to people who spend time in disassemblers and debuggers while
 making ReSymbol's evidence, confidence, provenance, and plugin health more visible than a typical
@@ -159,8 +160,24 @@ against the exact canonical `OfflineTarget` backed by the retained source snapsh
 accepts it only when the monotonic operation, full binary identity, canonical source path, requested
 span, and completed lifecycle still match the current project.
 File gaps, zero-fill, loader padding, raw tails, and crossing spans are shown as typed unavailability;
-package-only projects remain **SOURCE REQUIRED**. This is a frozen-source hex preview, not
-disassembly, a process-memory view, or a sandbox operation.
+package-only projects remain **SOURCE REQUIRED**. The exact result can be viewed as hex/ASCII or as
+a bounded x64 linear-disassembly preview with independent byte and instruction caps and an explicit
+stop reason. The preview is non-executing and visibly states that it is not CFG or function-boundary
+truth. It retains exact instruction bytes and offers a follow action only for decoder-proven direct
+branch/call targets that land in readable exact file backing in the static image; indirect control
+flow is unavailable rather than guessed.
+
+Instruction actions keep static and live mutation separate. **Queue NOP for Patched Binary** records
+an exact-RVA, exact-source-byte draft; a static publisher may accept it only after compare-to-source
+validation and may write only a new binary, never the open source or a process. **NOP instruction in
+live memory** is a different typed action: it requires an authenticated stopped session, a complete
+capability report with `LiveMemoryWrite`, an exact live-address binding, and
+`DebugCommand::WriteMemory` compare-before-write using the exact selected bytes and a same-length
+`0x90` replacement. Software breakpoint, Run to Cursor, Step Into/Over/Out, and Continue are also
+listed, but the current workbench has no live client adapter and leaves every action visibly disabled
+with the missing authority. Run to Cursor is explicitly a temporary software breakpoint followed by
+Continue. A future adapter must validate the current stop token and any required thread/address
+binding; the static preview never supplies live authority.
 
 Protection assessment shows bounded artifact evidence for entry-point placement and backing,
 TLS-before-entry behavior, anti-debug imports, common packer section names, high-entropy samples, and
@@ -378,12 +395,13 @@ portable Windows archive is the first packaging target. Cross-platform release p
 later validation task.
 
 The current slice has no GUI plugin execution, legacy-package migration, bulk-review workflow,
-docking, disassembly/pseudocode views, editable or exhaustive control-flow graphing, live debugger
-bridge, process-executing debugger host, verified AppContainer/VM provider, multi-binary workspace,
-or remote collaboration. Current-package opening, exact-claim Accept Primary/Keep as Alias/Reject,
-transaction-level undo/redo, binary-bound versioned review sidecars, dirty-close protection, static
-Address Space/protection assessment with bounded verified-source RVA reads, read-only provider
-readiness, and all six symbol export formats are implemented. The backend-neutral debugger and
+docking, synchronized disassembly/pseudocode workspace, editable or exhaustive control-flow
+graphing, live debugger bridge, process-executing debugger host, verified AppContainer/VM provider,
+multi-binary workspace, or remote collaboration. Current-package opening, exact-claim Accept
+Primary/Keep as Alias/Reject, transaction-level undo/redo, binary-bound versioned review sidecars,
+dirty-close protection, static Address Space/protection assessment with bounded verified-source RVA
+hex and linear-disassembly previews, read-only provider readiness, and all six symbol export formats
+are implemented. The backend-neutral debugger and
 sandbox contracts, offline host, and readiness result are foundations for later live features, not
 proof that an operating-system boundary exists. Future
 choices must still be evaluated against startup size, portability, accessibility, crash isolation,

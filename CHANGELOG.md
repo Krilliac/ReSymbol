@@ -8,6 +8,20 @@ prereleases; breaking changes remain explicit.
 
 ### Added
 
+- Added a bounded x64 linear-disassembly preview to the workbench Address Space reader. Hex and
+  disassembly views share the same verified frozen-source bytes; independent byte and instruction
+  limits, explicit stop reasons, and the visible "not CFG or function-boundary truth" disclaimer
+  keep the preview non-executing and non-authoritative. Rows retain exact instruction bytes and only
+  expose decoder-proven direct branch/call targets, with keyboard-accessible copy, follow, and action
+  menus available from every RVA/opcode/instruction/flow/length cell. Static NOP requests are queued
+  as exact-byte drafts and may publish only through a checked
+  static patch plan that verifies the source bytes and creates a new binary. The separate live NOP,
+  software-breakpoint, Run to Cursor, Step Into/Over/Out, and Continue actions expose their typed
+  debugger routes but remain visibly disabled until an authenticated live provider supplies a
+  complete capability report plus current stop/address/thread bindings. Live NOP uses
+  compare-before-write with an equal-length `0x90` replacement; Run to Cursor composes a temporary
+  software breakpoint with Continue. Static and live NOP actions reject instructions whose exact
+  bytes are already entirely `0x90` instead of queuing an unpublishable no-op.
 - Added a responsive, keyboard-first workbench navigation slice. The default 1440x900 review shell
   keeps all eight main views on one compact row and fits all six Function columns with both side
   panels open; the documented 1024x680 minimum uses an explicit all-view selector and a labeled

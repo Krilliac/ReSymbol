@@ -6,6 +6,7 @@
 
 mod code_recovery;
 mod error;
+mod linear_disassembly;
 mod msvc_rtti;
 mod pe;
 mod session;
@@ -13,6 +14,12 @@ mod string_recovery;
 mod types;
 
 pub use error::AnalysisError;
+pub use linear_disassembly::{
+    LinearDisassemblyError, LinearDisassemblyLimits, LinearDisassemblyPreview,
+    LinearDisassemblyStopReason, LinearFlowControlCategory, LinearInstructionRow,
+    LinearTruncationBoundary, MAX_LINEAR_DISASSEMBLY_BYTES, MAX_LINEAR_DISASSEMBLY_INSTRUCTIONS,
+    disassemble_x64_linear,
+};
 pub use pe::{PeCodeViewInspection, PeCodeViewRsds, analyze_pe, inspect_pe_codeview};
 pub use session::{AnalysisSession, PluginRunRecord, PluginRunStatus, SessionValidationError};
 pub use types::{

@@ -166,7 +166,11 @@ boundary; they do not claim target or sandbox cleanup.
 The Workbench Address Space reader owns this client only on the bounded application-service worker.
 Each request is limited to 256 bytes, and the UI publishes bytes only after the full identity,
 canonical source path, operation, span, and close/release/disconnect receipt match the current
-project. A package without verified source bytes cannot queue a read.
+project. A package without verified source bytes cannot queue a read. The UI may render those exact
+bytes as hex/ASCII or pass them through the pure bounded x64 linear-preview transformer. That
+transformer has independent byte and instruction caps, reports an explicit stop reason, never
+executes the input, and does not claim CFG or function-boundary truth. It exposes only decoded direct
+branch/call targets; indirect targets remain unavailable and are never inferred.
 
 ## Session safety contract
 
@@ -372,7 +376,22 @@ separate address spaces.
 Its optional byte reader is a bounded view of the frozen verified source snapshot. It never reads a
 process, maps the image through the operating-system loader, provisions a sandbox, or treats virtual
 zero-fill and loader padding as file bytes. Typed range unavailability remains evidence, not a reason
-to guess or fall back to disk.
+to guess or fall back to disk. Its linear disassembly is only another bounded rendering of those
+bytes, not execution or authoritative control-flow recovery.
+
+The instruction action menu maintains three separate authority domains:
+
+1. Static preview is read-only and non-executing. Copy and decoder-proven direct-target navigation
+   operate only on the frozen preferred-image model.
+2. A queued static NOP is an exact-RVA, exact-byte draft. Publication requires revalidating the source
+   bytes and writing a new binary; it must never alter the open source file or a live process.
+3. Live actions are typed and visible but remain disabled until a real authenticated provider
+   supplies a complete capability report, a current authenticated stop token, and the exact address
+   or stopped-thread bindings required by the action. Live NOP requires `LiveMemoryWrite` and a
+   `DebugCommand::WriteMemory` compare-before-write with the exact selected bytes and an equal-length
+   `0x90` replacement. Run to Cursor requires both software-breakpoint and execution-control
+   capability and composes a temporary software breakpoint with Continue. Step Into/Over/Out,
+   Continue, and persistent software breakpoint creation stay on the same typed command path.
 
 Protection findings are bounded artifact evidence. They are neither malware signatures nor an
 authorization to execute. Offline opening should keep those findings reviewable without training the
