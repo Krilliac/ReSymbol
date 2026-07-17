@@ -245,17 +245,22 @@ impl ContainedChild {
     /// Explicit termination keeps ordinary cleanup authoritative even if
     /// hostile same-account code duplicated the handle. `KILL_ON_JOB_CLOSE`
     /// remains the abrupt-parent fallback when no out-of-scope process retains
-    /// a duplicate.
+    /// a duplicate. A failed termination retains the handle so callers and
+    /// [`Drop`] can retry instead of silently discarding the cleanup authority.
     pub fn terminate_tree(&mut self) -> io::Result<()> {
         let Some(job) = self.job.take() else {
             return Ok(());
         };
         // SAFETY: `job` is ReSymbol's live Job handle. All processes currently
         // assigned to the Job receive the fixed non-success termination code.
-        let result = unsafe { TerminateJobObject(raw_handle(&job), 1) };
-        let error = (result == FALSE).then(|| last_error("terminate contained process Job"));
-        drop(job);
-        error.map_or(Ok(()), Err)
+        if unsafe { TerminateJobObject(raw_handle(&job), 1) } == FALSE {
+            let error = last_error("terminate contained process Job");
+            self.job = Some(job);
+            Err(error)
+        } else {
+            drop(job);
+            Ok(())
+        }
     }
 }
 
@@ -1014,6 +1019,49 @@ mod tests {
     }
 
     #[test]
+    fn failed_tree_termination_retains_job_handle_for_retry() {
+        const JOB_OBJECT_QUERY_ACCESS: u32 = 0x0004;
+
+        let mut child = spawn_fixture(LONG_RUNNING_FIXTURE, "long-running", Stdio::null());
+        let full_access_job = child
+            .job
+            .take()
+            .expect("contained child owns a full-access Job handle");
+        let restricted_job =
+            duplicate_job_handle_with_access(&full_access_job, JOB_OBJECT_QUERY_ACCESS);
+        let restricted_raw = raw_handle(&restricted_job);
+        child.job = Some(restricted_job);
+
+        for attempt in 1..=2 {
+            let error = child
+                .terminate_tree()
+                .expect_err("query-only Job handle must not terminate the Job");
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(
+                child.job.as_ref().map(raw_handle),
+                Some(restricted_raw),
+                "attempt {attempt} discarded or replaced the retryable Job handle"
+            );
+            assert!(
+                child.try_wait().expect("poll live fixture").is_none(),
+                "failed termination attempt {attempt} unexpectedly stopped the fixture"
+            );
+        }
+
+        let restricted_job = child
+            .job
+            .replace(full_access_job)
+            .expect("replace retained query-only Job handle");
+        drop(restricted_job);
+        child
+            .terminate_tree()
+            .expect("restored full-access Job handle must terminate the Job");
+        let status = wait_for_exit_bounded(&mut child, Duration::from_secs(2))
+            .expect("fixture must exit after successful retry");
+        assert_eq!(status.code(), Some(1));
+    }
+
+    #[test]
     fn wait_closes_attached_piped_stdin_to_deliver_eof() {
         let mut child = spawn_fixture(STDIN_EOF_FIXTURE, "stdin-eof", Stdio::piped());
         let started = Instant::now();
@@ -1099,6 +1147,18 @@ mod tests {
             .job
             .as_ref()
             .expect("contained child owns a Job handle");
+        duplicate_job_handle_with_options(source, 0, DUPLICATE_SAME_ACCESS)
+    }
+
+    fn duplicate_job_handle_with_access(source: &OwnedHandle, desired_access: u32) -> OwnedHandle {
+        duplicate_job_handle_with_options(source, desired_access, 0)
+    }
+
+    fn duplicate_job_handle_with_options(
+        source: &OwnedHandle,
+        desired_access: u32,
+        options: u32,
+    ) -> OwnedHandle {
         let mut duplicate = std::ptr::null_mut();
         // SAFETY: both pseudo process handles denote this process, `source` is a
         // live Job handle, and `duplicate` is writable storage. Success transfers
@@ -1109,9 +1169,9 @@ mod tests {
                 raw_handle(source),
                 GetCurrentProcess(),
                 &mut duplicate,
-                0,
+                desired_access,
                 FALSE,
-                DUPLICATE_SAME_ACCESS,
+                options,
             )
         };
         assert_ne!(result, FALSE, "duplicate contained Job handle");
