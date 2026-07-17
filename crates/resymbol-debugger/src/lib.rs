@@ -32,7 +32,7 @@ pub use host_client::SyntheticDebugHost;
 pub use host_client::{
     ClientConnectionState, CommandReceipt, ControlShutdownReason, DebugHostClient,
     DebugHostClientError, HostFrameExchange, HostPollWait, HostPollWaitError, HostTransportError,
-    MAX_HOST_POLL_WAIT_MILLIS, MAX_PENDING_COMMANDS,
+    MAX_HOST_POLL_WAIT_MILLIS, MAX_PENDING_COMMANDS, MAX_PENDING_UNSOLICITED_EVENTS,
 };
 pub use host_codec::{
     HostCodecError, HostFrame, decode_command_frame, decode_event_frame, encode_command_frame,
