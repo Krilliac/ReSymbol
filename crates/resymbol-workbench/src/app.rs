@@ -2721,63 +2721,69 @@ impl WorkbenchApp {
                             .inner_margin(egui::Margin::symmetric(10, 5))
                             .corner_radius(4)
                             .show(ui, |ui| {
-                                if chrome.compact_header {
-                                    ui.set_max_width(280.0);
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(&project.identity.display_name).strong(),
+                                // A Frame inherits its parent's horizontal layout. Keep the
+                                // identity lines in an explicit vertical child so their widths
+                                // do not add together and collide with the trailing controls.
+                                ui.vertical(|ui| {
+                                    if chrome.compact_header {
+                                        ui.set_max_width(280.0);
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(&project.identity.display_name)
+                                                    .strong(),
+                                            )
+                                            .truncate(),
                                         )
-                                        .truncate(),
-                                    )
-                                    .on_hover_text(&project.identity.display_name);
-                                } else {
-                                    ui.label(
-                                        RichText::new(&project.identity.display_name).strong(),
-                                    );
-                                }
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        RichText::new(if chrome.compact_header {
-                                            "[EXACT] Identity bound"
-                                        } else {
-                                            "[EXACT] Exact identity"
-                                        })
-                                            .color(colors.exact_extracted),
-                                    )
-                                    .on_hover_text(format!(
-                                        "SHA-256 {}",
-                                        project.identity.sha256.as_str()
-                                    ));
-                                    if !chrome.compact_header {
+                                        .on_hover_text(&project.identity.display_name);
+                                    } else {
                                         ui.label(
-                                            RichText::new(short_hash(
-                                                project.identity.sha256.as_str(),
-                                            ))
-                                            .monospace()
-                                            .small()
-                                            .color(colors.secondary_text),
+                                            RichText::new(&project.identity.display_name).strong(),
+                                        );
+                                    }
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            RichText::new(if chrome.compact_header {
+                                                "[EXACT] Identity bound"
+                                            } else {
+                                                "[EXACT] Exact identity"
+                                            })
+                                            .color(colors.exact_extracted),
                                         )
                                         .on_hover_text(format!(
                                             "SHA-256 {}",
                                             project.identity.sha256.as_str()
                                         ));
+                                        if !chrome.compact_header {
+                                            ui.label(
+                                                RichText::new(short_hash(
+                                                    project.identity.sha256.as_str(),
+                                                ))
+                                                .monospace()
+                                                .small()
+                                                .color(colors.secondary_text),
+                                            )
+                                            .on_hover_text(format!(
+                                                "SHA-256 {}",
+                                                project.identity.sha256.as_str()
+                                            ));
+                                        }
+                                    });
+                                    if self.project_operation.is_pending() {
+                                        if let Some(path) = &self.analysis_path {
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "[OPENING] {}",
+                                                    path.file_name()
+                                                        .and_then(|name| name.to_str())
+                                                        .unwrap_or("selected binary")
+                                                ))
+                                                .small()
+                                                .color(colors.inferred),
+                                            )
+                                            .on_hover_text(path.display().to_string());
+                                        }
                                     }
                                 });
-                                if self.project_operation.is_pending() {
-                                    if let Some(path) = &self.analysis_path {
-                                        ui.label(
-                                            RichText::new(format!(
-                                                "[OPENING] {}",
-                                                path.file_name()
-                                                    .and_then(|name| name.to_str())
-                                                    .unwrap_or("selected binary")
-                                            ))
-                                            .small()
-                                            .color(colors.inferred),
-                                        )
-                                        .on_hover_text(path.display().to_string());
-                                    }
-                                }
                             });
                     } else if let Some(path) = &self.analysis_path {
                         ui.label(path.display().to_string());
