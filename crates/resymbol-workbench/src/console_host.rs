@@ -427,7 +427,7 @@ fn spawn_session() -> Result<ConsoleSession, String> {
             }
         })?;
 
-        Ok(InitializedConsoleSession {
+        Ok::<InitializedConsoleSession, String>(InitializedConsoleSession {
             output_sender,
             event_receiver,
         })
