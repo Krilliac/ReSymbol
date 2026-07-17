@@ -6,12 +6,12 @@ Microsoft-linker-style MAP text, an exact-RSDS public-symbol PDB, or a self-cont
 for IDA or Ghidra.
 
 ```console
-resymbol export PACKAGE --format json [--output PATH] [--fail-on-loss]
-resymbol export PACKAGE --format markdown [--output PATH] [--fail-on-loss]
-resymbol export PACKAGE --format map [--output PATH] [--fail-on-loss]
-resymbol export PACKAGE --format pdb --binary EXACT_ORIGINAL_PE [--output PATH] [--fail-on-loss]
-resymbol export PACKAGE --format ida-python [--output PATH] [--fail-on-loss]
-resymbol export PACKAGE --format ghidra-java [--output PATH] [--fail-on-loss]
+resymbol export PACKAGE --format json [--output PATH] [--fail-on-loss] [--dry-run]
+resymbol export PACKAGE --format markdown [--output PATH] [--fail-on-loss] [--dry-run]
+resymbol export PACKAGE --format map [--output PATH] [--fail-on-loss] [--dry-run]
+resymbol export PACKAGE --format pdb --binary EXACT_ORIGINAL_PE [--output PATH] [--fail-on-loss] [--dry-run]
+resymbol export PACKAGE --format ida-python [--output PATH] [--fail-on-loss] [--dry-run]
+resymbol export PACKAGE --format ghidra-java [--output PATH] [--fail-on-loss] [--dry-run]
 ```
 
 The current formats are deliberately small and auditable. JSON is the machine-consumable
@@ -43,6 +43,19 @@ All formats use create-new writes. ReSymbol stages and flushes the complete arti
 destination, then publishes it without replacing an existing path, so a failed write does not leave
 a truncated final export. Choose another path with `--output`, move the old export, or remove it
 intentionally before exporting again.
+
+Use `--dry-run` to validate the package, build the projection and loss report, verify any required
+exact PDB source, and render the complete selected artifact in memory without creating either the
+destination or a staging file:
+
+```console
+resymbol export application.resym --format map --output Reviewed.map --dry-run
+```
+
+The success summary labels the operation as a dry run and marks the prospective output as not
+written. `--fail-on-loss` keeps its normal behavior when combined with `--dry-run`. Dry-run mode
+does not exercise the final create-new filesystem publication, so a later real export can still
+fail if the destination exists or the destination directory cannot be written.
 
 A custom Ghidra output must use a lowercase `.java` extension. Its filename stem becomes the
 generated public class name and therefore must be a conservative Java identifier: 1 to 128 ASCII

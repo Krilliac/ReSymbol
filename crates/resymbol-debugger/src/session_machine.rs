@@ -812,12 +812,7 @@ impl SessionMachine {
                     target_creation, ..
                 },
             ) => {
-                let may_establish_not_created = matches!(
-                    failure.stage,
-                    SandboxFailureStage::Provisioning | SandboxFailureStage::Launch
-                ) && sandbox.state()
-                    == SandboxLifecycleState::Provisioning;
-                if sandbox.target_creation_outcome().is_none() && !may_establish_not_created {
+                if sandbox.target_creation_outcome().is_none() {
                     return Err(SandboxMachineError::TargetCreationOutcomeMismatch.into());
                 }
                 sandbox
@@ -1983,6 +1978,62 @@ mod tests {
     }
 
     #[test]
+    fn inbound_not_created_failure_cannot_establish_controller_creation_state() {
+        let mut machine = machine();
+        let initial = machine.state().state_token();
+        machine
+            .accept_command(&command(
+                1,
+                initial,
+                DebugCommand::Open(sandbox_target(BinaryId::digest(b"untrusted not-created"))),
+            ))
+            .expect("sandbox open");
+        let expected = machine
+            .expected_attestation()
+            .expect("sandbox expectation")
+            .clone();
+        let failure = SandboxFailure {
+            session_id: expected.session_id,
+            provisioning_epoch: expected.provisioning_epoch.clone(),
+            policy_digest: expected.policy_digest.clone(),
+            provider: expected.provider.clone(),
+            context: SandboxFailureContext::Launch {
+                binary_id: expected.binary_id.clone(),
+                helper_build: expected.helper_build.clone(),
+                target_creation: SandboxTargetCreationOutcome::NotCreated,
+            },
+            stage: SandboxFailureStage::Provisioning,
+            kind: SandboxFailureKind::HelperFailure,
+            retryable: true,
+            detail: DiagnosticText::new("untrusted host claimed no target was created")
+                .expect("bounded detail"),
+        };
+
+        let expected_error = Err(SessionMachineError::SandboxFailure(
+            SandboxFailureValidationError::TargetCreationOutcome,
+        ));
+        assert_eq!(machine.validate_sandbox_failure(&failure), expected_error);
+        assert_eq!(
+            machine.retain_sandbox_failure_target_creation(&failure),
+            expected_error
+        );
+        assert_eq!(machine.sandbox_target_creation_outcome(), None);
+
+        let opening = machine.state().state_token();
+        machine
+            .accept_command(&command(2, opening, DebugCommand::Close { state: opening }))
+            .expect("close while target creation remains unknown");
+        let mut cleanup = cleanup_receipt(&expected);
+        cleanup.process = None;
+        assert_eq!(
+            machine.complete_close(Some(&cleanup)),
+            Err(SessionMachineError::Sandbox(
+                SandboxMachineError::TargetCreationOutcomeMissing
+            ))
+        );
+    }
+
+    #[test]
     fn sandbox_terminal_state_requires_bound_complete_cleanup_receipt() {
         let mut machine = machine();
         let next_id = open_attested_and_stopped(&mut machine);
@@ -2504,7 +2555,7 @@ mod tests {
     }
 
     #[test]
-    fn controller_accepts_explicit_rollback_failure_without_restoring_command_authority() {
+    fn controller_rejects_untrusted_not_created_failure_then_rolls_back_command_state() {
         let mut machine = machine();
         let initial = machine.state().state_token();
         let open = command(
@@ -2534,12 +2585,14 @@ mod tests {
             retryable: true,
             detail: DiagnosticText::new("provider discovery failed").expect("detail"),
         };
-        machine
-            .validate_sandbox_failure(&failure)
-            .expect("explicit rollback evidence matches the controller binding");
-        machine
-            .retain_sandbox_failure_target_creation(&failure)
-            .expect("rollback-safe evidence has no retained effect");
+        let expected_error = Err(SessionMachineError::SandboxFailure(
+            SandboxFailureValidationError::TargetCreationOutcome,
+        ));
+        assert_eq!(machine.validate_sandbox_failure(&failure), expected_error);
+        assert_eq!(
+            machine.retain_sandbox_failure_target_creation(&failure),
+            expected_error
+        );
         assert!(matches!(
             failure.context,
             SandboxFailureContext::Launch {

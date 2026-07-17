@@ -410,6 +410,11 @@ resymbol export results/application.resym --format ida-python --output results/a
 resymbol export results/application.resym --format ghidra-java --output results/ReSymbolImport.java
 ```
 
+Add `--dry-run` to any format to perform the same package validation, loss assessment, required
+PDB source verification, and complete in-memory rendering without creating a destination or staging
+file. The summary identifies the prospective path as not written. A dry run does not test whether a
+later create-new publication can write to that directory.
+
 Without `--output`, those formats write `application.symbols.json`, `application.symbols.md`,
 `application.map`, `application.pdb`, `application.ida.py`, and
 `ReSymbolImport_<first-12-binary-sha256>.java` beside the package, respectively. Markdown is a

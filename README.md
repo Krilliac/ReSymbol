@@ -80,12 +80,24 @@ The current alpha implements and tests an end-to-end, deliberately narrow analys
   attest containment. The Address Space reader serves at most 256 bytes from the frozen exact source
   through the in-process offline host; it does not open a process or claim a live mapping. See
   [the debugger and sandbox architecture](docs/debugger-sandbox.md);
+- a UI-neutral, same-size static patch service for exact PE source snapshots. An immutable patch
+  plan is bound to the complete source `BinaryIdentity`; each labeled NOP-instruction or general
+  byte replacement resolves an executable, fully file-backed RVA to its exact file offset and
+  retains the expected original bytes. Plans are deterministically ordered and bounded, reject
+  duplicate, overlapping, unbacked, virtual-tail, non-executable, and out-of-image ranges, and
+  compare every expected span before producing a distinct patched image. Publication stages,
+  flushes, and synchronizes the complete image beside its destination before a create-new,
+  no-clobber publish. The source is never rewritten. A patched PE may no longer have a valid
+  Authenticode signature or PE checksum; ReSymbol reports both caveats and does not repair,
+  recompute, or re-sign either one;
 - a deterministic, debugger-neutral export projection plus `resymbol export`, which writes the
   projection as JSON, renders a bounded human-readable Markdown report, emits deterministic
   Microsoft-linker-style MAP text for compatible tools, creates an exact-RSDS public-symbol PDB
   from the exact original PE, or generates self-contained IDAPython and Ghidra Java import scripts
-  with exact-binary identity gates and RVA-aware rebasing; the projection correlates supported data
-  references with retained strings at exact or valid content-interior targets;
+  with exact-binary identity gates and RVA-aware rebasing; `--dry-run` performs the same validation,
+  loss assessment, exact-source gates, and in-memory rendering without publishing a destination;
+  the projection correlates supported data references with retained strings at exact or valid
+  content-interior targets;
 - versioned plugin manifests and health diagnostics for WASM, native, managed, external-process,
   and tool-adapter runtime families;
 - local plugin-directory discovery, manifest and entrypoint validation, API compatibility checks,
@@ -337,6 +349,7 @@ resymbol export application.resym --format map
 resymbol export application.resym --format pdb --binary application.exe
 resymbol export application.resym --format ida-python
 resymbol export application.resym --format ghidra-java
+resymbol export application.resym --format map --dry-run
 resymbol plugin list
 resymbol plugin doctor
 # After reviewing a dropped-in executable plugin:
@@ -370,6 +383,14 @@ current `.resym` packages and creates new `.resym`, neutral JSON, Markdown, MAP,
 IDA Python, or Ghidra Java artifacts. It does not execute plugins, migrate legacy packages, or
 overwrite an output or review-sidecar file.
 
+Static frontends build `StaticPatchEditRequest` values, freeze them with `StaticPatchPlan::new`,
+and publish through `AppServices::publish_static_patch_new`. The plan accepts only same-size edits
+in fully file-backed executable PE ranges and remains bound to the analysis SHA-256, size, format,
+architecture, and image base. Applying it rechecks the retained exact source identity and every
+expected byte before allocating and changing a separate output image. Publishing never overwrites
+the source or an existing destination. Patched outputs carry explicit warnings that Authenticode
+signature validity and the PE checksum may have been invalidated; neither is repaired or re-signed.
+
 The main review views stay on one responsive tab row at the default viewport and collapse into an
 explicit all-view selector at the documented minimum size. Use **Ctrl+Tab** or
 **Ctrl+Shift+Tab** to cycle views, **Ctrl+F** to focus Function search, and **Up/Down**,
@@ -390,7 +411,10 @@ become durable before the workbench exits.
 path. ReSymbol refuses to replace an existing package, so an earlier analysis cannot be lost by
 accident. `inspect` validates the package schema, payload, and embedded binary identity before
 displaying it. `export` stages and flushes a complete artifact before a no-clobber publish; use
-`--output` to choose a destination instead of replacing an existing export artifact.
+`--output` to choose a destination instead of replacing an existing export artifact. Add
+`--dry-run` to perform package validation, loss assessment, required PDB source verification, and
+complete in-memory rendering while leaving both the prospective destination and staging namespace
+untouched.
 
 Pass `inspect --binary EXACT_ORIGINAL_BINARY` to add an optional byte-identity gate. Before printing
 inspection data to stdout, ReSymbol validates the package and requires the supplied file's exact
