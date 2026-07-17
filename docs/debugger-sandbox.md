@@ -58,8 +58,9 @@ were stable. It does not stop threads or grant mutation authority: an authentica
 retain a current stopped-state token and keep the target stopped for the complete operation.
 
 The adapter compares Tool Help's reported main-module path with the retained file, requires the
-reported base to equal caller-supplied independent create-process debug-event evidence, and validates
-every reported image region; Tool Help itself remains target-loader-derived corroboration. The debug
+reported base to equal caller-supplied independent create-process debug-event evidence, rejects a
+size mismatch before a bounded region walk, and validates every reported image region; Tool Help
+itself remains target-loader-derived corroboration. The debug
 event's image-file handle should be retained when Windows supplies it.
 
 ## Ownership and thread affinity

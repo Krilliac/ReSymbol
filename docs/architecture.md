@@ -596,7 +596,8 @@ Tool Help module enumeration remains corroboration rather than security authorit
 that a target's corrupted or changing loader table can produce incorrect snapshot information. The
 adapter now requires Tool Help's module path to match the retained exact executable, requires its base
 to equal the caller's independent `CREATE_PROCESS_DEBUG_EVENT` `lpBaseOfImage` evidence, and walks the
-complete reported image extent as committed `MEM_IMAGE` regions from one allocation. A future live
+complete reported image extent through a fixed region-count budget as committed `MEM_IMAGE` regions
+from one allocation, after first matching its size to the retained file. A future live
 provider must supply that evidence (and retain the event's image-file handle when available) before
 authorizing reads or writes.
 
