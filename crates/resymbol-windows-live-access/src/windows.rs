@@ -15,7 +15,9 @@ use std::{
 
 use resymbol_core::BinaryId;
 use resymbol_debugger::protocol::{
-    LiveTargetBinding, LiveTargetBindingError, MemoryAddress, ProcessIdentity, ProcessStartKey,
+    LiveTargetBinding, LiveTargetBindingError, MAX_MEMORY_WRITE_BYTES, MAX_REASON_BYTES,
+    MemoryAddress, MemoryWriteFailure, MemoryWriteRecovery, MemoryWriteStage, ProcessIdentity,
+    ProcessStartKey, ProtocolValidationError, StopToken,
 };
 use thiserror::Error;
 use windows_sys::Win32::{
@@ -284,6 +286,8 @@ impl WriteReceipt {
 
 #[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
 pub enum MutationStage {
+    #[error("changing page protection")]
+    ChangeProtection,
     #[error("detecting a protection race")]
     ProtectionRace,
     #[error("revalidating expected bytes after changing protection")]
@@ -337,6 +341,43 @@ impl fmt::Display for MutationRecovery {
                 formatter,
                 "indeterminate (bytes_restored={bytes_restored}, cache_flushed={instruction_cache_flushed}, protection_restored={protection_restored})"
             ),
+        }
+    }
+}
+
+impl MutationStage {
+    const fn protocol_stage(self) -> MemoryWriteStage {
+        match self {
+            Self::ChangeProtection => MemoryWriteStage::ChangeProtection,
+            Self::ProtectionRace => MemoryWriteStage::ProtectionRace,
+            Self::RevalidateExpectedBytes => MemoryWriteStage::RevalidateExpectedBytes,
+            Self::WriteReplacement => MemoryWriteStage::WriteReplacement,
+            Self::FlushReplacement => MemoryWriteStage::FlushReplacement,
+            Self::RestoreProtection => MemoryWriteStage::RestoreProtection,
+            Self::VerifyReplacement => MemoryWriteStage::VerifyReplacement,
+            Self::ValidateFinalBinding => MemoryWriteStage::ValidateFinalBinding,
+        }
+    }
+}
+
+impl MutationRecovery {
+    const fn protocol_recovery(self) -> MemoryWriteRecovery {
+        match self {
+            Self::NoWriteAttempted {
+                protection_restored,
+            } => MemoryWriteRecovery::NoWriteAttempted {
+                protection_restored,
+            },
+            Self::Restored => MemoryWriteRecovery::Restored,
+            Self::Indeterminate {
+                bytes_restored,
+                instruction_cache_flushed,
+                protection_restored,
+            } => MemoryWriteRecovery::Indeterminate {
+                bytes_restored,
+                instruction_cache_flushed,
+                protection_restored,
+            },
         }
     }
 }
@@ -443,6 +484,75 @@ pub enum LiveAccessError {
         failure: String,
         recovery: MutationRecovery,
     },
+}
+
+impl LiveAccessError {
+    /// Adapts one local mutation failure into bounded protocol-1.6 evidence.
+    ///
+    /// The caller supplies the exact command context because this lower-level
+    /// boundary deliberately does not own debugger stop tokens. A non-mutation
+    /// failure returns `Ok(None)` and can therefore never be mislabeled as
+    /// write evidence. Every returned value has passed the protocol's complete
+    /// size, address, detail, stage, and recovery validation.
+    pub fn to_memory_write_failure(
+        &self,
+        stop: StopToken,
+        address: MemoryAddress,
+        size: usize,
+    ) -> Result<Option<MemoryWriteFailure>, ProtocolValidationError> {
+        let Self::MutationFailed {
+            stage,
+            failure,
+            recovery,
+        } = self
+        else {
+            return Ok(None);
+        };
+
+        if size > MAX_MEMORY_WRITE_BYTES {
+            return Err(ProtocolValidationError::MemoryWriteTooLarge {
+                actual: size,
+                maximum: MAX_MEMORY_WRITE_BYTES,
+            });
+        }
+        let size =
+            u32::try_from(size).map_err(|_| ProtocolValidationError::MemoryWriteTooLarge {
+                actual: size,
+                maximum: MAX_MEMORY_WRITE_BYTES,
+            })?;
+        let evidence = MemoryWriteFailure {
+            stop,
+            address,
+            size,
+            stage: stage.protocol_stage(),
+            recovery: recovery.protocol_recovery(),
+            detail: bounded_protocol_detail(failure),
+        };
+        evidence.validate()?;
+        Ok(Some(evidence))
+    }
+}
+
+fn bounded_protocol_detail(detail: &str) -> String {
+    const FALLBACK: &str = "live memory mutation failed without diagnostic detail";
+
+    let mut bounded = String::with_capacity(detail.len().min(MAX_REASON_BYTES));
+    for character in detail.chars() {
+        let character = if character.is_control() {
+            ' '
+        } else {
+            character
+        };
+        if bounded.len() + character.len_utf8() > MAX_REASON_BYTES {
+            break;
+        }
+        bounded.push(character);
+    }
+    if bounded.trim().is_empty() {
+        FALLBACK.to_owned()
+    } else {
+        bounded
+    }
 }
 
 #[derive(Debug)]
@@ -1290,7 +1400,27 @@ fn compare_before_write_transaction<O: MutationOperations>(
     operations.ensure_exact_binding(expected_binding)?;
     let region = operations.writable_code_region(expected_binding, address, expected.len())?;
     let original_protection =
-        operations.protect(address, expected.len(), PAGE_EXECUTE_READWRITE)?;
+        match operations.protect(address, expected.len(), PAGE_EXECUTE_READWRITE) {
+            Ok(protection) => protection,
+            Err(error) => {
+                // `VirtualProtectEx` does not return the old protection on
+                // failure. Do not infer that the original protection survived:
+                // claim it only when a fresh exact-binding region query proves
+                // the complete one-page span still has the previously observed
+                // protection. No byte-write or recovery write is attempted.
+                let protection_restored = operations.ensure_exact_binding(expected_binding).is_ok()
+                    && operations
+                        .writable_code_region(expected_binding, address, expected.len())
+                        .is_ok_and(|current| current.protection == region.protection);
+                return Err(LiveAccessError::MutationFailed {
+                    stage: MutationStage::ChangeProtection,
+                    failure: error.to_string(),
+                    recovery: MutationRecovery::NoWriteAttempted {
+                        protection_restored,
+                    },
+                });
+            }
+        };
     if original_protection != region.protection {
         // Protection changed, but no byte write was attempted. Do not run byte
         // recovery with a stale compare buffer; only undo our protection
@@ -1648,7 +1778,9 @@ mod tests {
 
     use resymbol_core::BinaryId;
     use resymbol_debugger::protocol::{
-        LiveTargetBinding, MemoryAddress, ProcessId, ProcessIdentity, ProcessStartKey,
+        LiveTargetBinding, MAX_MEMORY_WRITE_BYTES, MAX_REASON_BYTES, MemoryAddress,
+        MemoryWriteRecovery, MemoryWriteStage, ProcessId, ProcessIdentity, ProcessStartKey,
+        ProtocolValidationError, SessionId, StateGeneration, StateToken, StopId, StopToken,
     };
 
     use windows_sys::Win32::System::{
@@ -1709,6 +1841,8 @@ mod tests {
         flush_calls: usize,
         restore_calls: usize,
         fail_binding_calls: Vec<usize>,
+        fail_protect_before_calls: Vec<usize>,
+        fail_protect_after_calls: Vec<usize>,
         fail_write_before_calls: Vec<usize>,
         fail_write_after_calls: Vec<usize>,
         fail_flush_calls: Vec<usize>,
@@ -1736,6 +1870,8 @@ mod tests {
                 flush_calls: 0,
                 restore_calls: 0,
                 fail_binding_calls: Vec::new(),
+                fail_protect_before_calls: Vec::new(),
+                fail_protect_after_calls: Vec::new(),
                 fail_write_before_calls: Vec::new(),
                 fail_write_after_calls: Vec::new(),
                 fail_flush_calls: Vec::new(),
@@ -1816,6 +1952,9 @@ mod tests {
             self.protect_calls += 1;
             assert_eq!(address, TEST_ADDRESS);
             assert_eq!(size, self.bytes.len());
+            if self.fail_protect_before_calls.contains(&self.protect_calls) {
+                return Err(injected_error("change exact protection"));
+            }
             let observed = self.protect_observed_once.take().unwrap_or(self.protection);
             self.protection = protection;
             if self.protect_calls == 1 {
@@ -1823,7 +1962,11 @@ mod tests {
                     self.bytes = bytes;
                 }
             }
-            Ok(observed)
+            if self.fail_protect_after_calls.contains(&self.protect_calls) {
+                Err(injected_error("change exact protection after side effect"))
+            } else {
+                Ok(observed)
+            }
         }
 
         fn write_exact(&mut self, address: u64, bytes: &[u8]) -> Result<(), LiveAccessError> {
@@ -1895,6 +2038,16 @@ mod tests {
         .expect("valid deterministic live binding")
     }
 
+    fn test_stop() -> StopToken {
+        StopToken {
+            state: StateToken {
+                session_id: SessionId::new(17).expect("nonzero session"),
+                generation: StateGeneration::new(23).expect("nonzero generation"),
+            },
+            stop_id: StopId::new(29).expect("nonzero stop"),
+        }
+    }
+
     fn injected_error(operation: &'static str) -> LiveAccessError {
         LiveAccessError::Win32 {
             operation,
@@ -1950,6 +2103,348 @@ mod tests {
         );
         assert_eq!(operations.bytes, REPLACEMENT_BYTES);
         assert_eq!(operations.protection, PAGE_EXECUTE_READ);
+    }
+
+    #[test]
+    fn initial_protection_failure_reports_prewrite_evidence_only_after_fresh_proof() {
+        let mut operations = FaultMutationOperations::new();
+        operations.fail_protect_before_calls.push(1);
+
+        let (stage, recovery) = mutation_failure_parts(run_fault_transaction(&mut operations));
+
+        assert_eq!(stage, MutationStage::ChangeProtection);
+        assert_eq!(
+            recovery,
+            MutationRecovery::NoWriteAttempted {
+                protection_restored: true,
+            }
+        );
+        assert_eq!(
+            operations.operations,
+            [
+                RecordedMutationOperation::Read,
+                RecordedMutationOperation::EnsureBinding,
+                RecordedMutationOperation::QueryRegion,
+                RecordedMutationOperation::Protect,
+                RecordedMutationOperation::EnsureBinding,
+                RecordedMutationOperation::QueryRegion,
+            ]
+        );
+        assert_eq!(operations.count(RecordedMutationOperation::Write), 0);
+        assert_eq!(operations.count(RecordedMutationOperation::Restore), 0);
+        assert_eq!(operations.bytes, ORIGINAL_BYTES);
+        assert_eq!(operations.protection, PAGE_EXECUTE_READ);
+    }
+
+    #[test]
+    fn initial_protection_failure_never_infers_restoration_after_a_side_effect() {
+        let mut operations = FaultMutationOperations::new();
+        operations.fail_protect_after_calls.push(1);
+
+        let (stage, recovery) = mutation_failure_parts(run_fault_transaction(&mut operations));
+
+        assert_eq!(stage, MutationStage::ChangeProtection);
+        assert_eq!(
+            recovery,
+            MutationRecovery::NoWriteAttempted {
+                protection_restored: false,
+            }
+        );
+        assert_eq!(
+            operations.operations,
+            [
+                RecordedMutationOperation::Read,
+                RecordedMutationOperation::EnsureBinding,
+                RecordedMutationOperation::QueryRegion,
+                RecordedMutationOperation::Protect,
+                RecordedMutationOperation::EnsureBinding,
+                RecordedMutationOperation::QueryRegion,
+            ]
+        );
+        assert_eq!(operations.count(RecordedMutationOperation::Write), 0);
+        assert_eq!(operations.count(RecordedMutationOperation::Restore), 0);
+        assert_eq!(operations.bytes, ORIGINAL_BYTES);
+        assert_eq!(operations.protection, PAGE_EXECUTE_READWRITE);
+    }
+
+    #[test]
+    fn initial_protection_failure_without_exact_binding_proof_is_terminal() {
+        let mut operations = FaultMutationOperations::new();
+        operations.fail_protect_before_calls.push(1);
+        operations.fail_binding_calls.push(2);
+
+        let (stage, recovery) = mutation_failure_parts(run_fault_transaction(&mut operations));
+
+        assert_eq!(stage, MutationStage::ChangeProtection);
+        assert_eq!(
+            recovery,
+            MutationRecovery::NoWriteAttempted {
+                protection_restored: false,
+            }
+        );
+        assert_eq!(operations.count(RecordedMutationOperation::Write), 0);
+        assert_eq!(operations.count(RecordedMutationOperation::Restore), 0);
+    }
+
+    #[test]
+    fn protocol_adapter_maps_every_mutation_stage_and_recovery_shape() {
+        let stop = test_stop();
+        let address = MemoryAddress::new(TEST_ADDRESS);
+        let cases = [
+            (
+                MutationStage::ChangeProtection,
+                MutationRecovery::NoWriteAttempted {
+                    protection_restored: true,
+                },
+                MemoryWriteStage::ChangeProtection,
+                MemoryWriteRecovery::NoWriteAttempted {
+                    protection_restored: true,
+                },
+            ),
+            (
+                MutationStage::ProtectionRace,
+                MutationRecovery::NoWriteAttempted {
+                    protection_restored: false,
+                },
+                MemoryWriteStage::ProtectionRace,
+                MemoryWriteRecovery::NoWriteAttempted {
+                    protection_restored: false,
+                },
+            ),
+            (
+                MutationStage::RevalidateExpectedBytes,
+                MutationRecovery::NoWriteAttempted {
+                    protection_restored: true,
+                },
+                MemoryWriteStage::RevalidateExpectedBytes,
+                MemoryWriteRecovery::NoWriteAttempted {
+                    protection_restored: true,
+                },
+            ),
+            (
+                MutationStage::WriteReplacement,
+                MutationRecovery::Restored,
+                MemoryWriteStage::WriteReplacement,
+                MemoryWriteRecovery::Restored,
+            ),
+            (
+                MutationStage::FlushReplacement,
+                MutationRecovery::Indeterminate {
+                    bytes_restored: true,
+                    instruction_cache_flushed: false,
+                    protection_restored: true,
+                },
+                MemoryWriteStage::FlushReplacement,
+                MemoryWriteRecovery::Indeterminate {
+                    bytes_restored: true,
+                    instruction_cache_flushed: false,
+                    protection_restored: true,
+                },
+            ),
+            (
+                MutationStage::RestoreProtection,
+                MutationRecovery::Restored,
+                MemoryWriteStage::RestoreProtection,
+                MemoryWriteRecovery::Restored,
+            ),
+            (
+                MutationStage::VerifyReplacement,
+                MutationRecovery::Restored,
+                MemoryWriteStage::VerifyReplacement,
+                MemoryWriteRecovery::Restored,
+            ),
+            (
+                MutationStage::ValidateFinalBinding,
+                MutationRecovery::Indeterminate {
+                    bytes_restored: false,
+                    instruction_cache_flushed: true,
+                    protection_restored: true,
+                },
+                MemoryWriteStage::ValidateFinalBinding,
+                MemoryWriteRecovery::Indeterminate {
+                    bytes_restored: false,
+                    instruction_cache_flushed: true,
+                    protection_restored: true,
+                },
+            ),
+        ];
+
+        for (local_stage, local_recovery, protocol_stage, protocol_recovery) in cases {
+            let error = LiveAccessError::MutationFailed {
+                stage: local_stage,
+                failure: "deterministic adapter failure".to_owned(),
+                recovery: local_recovery,
+            };
+            let evidence = error
+                .to_memory_write_failure(stop, address, ORIGINAL_BYTES.len())
+                .expect("valid adapter context")
+                .expect("mutation failure evidence");
+
+            assert_eq!(evidence.stop, stop);
+            assert_eq!(evidence.address, address);
+            assert_eq!(evidence.size, ORIGINAL_BYTES.len() as u32);
+            assert_eq!(evidence.stage, protocol_stage);
+            assert_eq!(evidence.recovery, protocol_recovery);
+            evidence.validate().expect("adapter validates its result");
+        }
+    }
+
+    #[test]
+    fn protocol_adapter_bounds_empty_control_and_multibyte_details() {
+        let stop = test_stop();
+        let address = MemoryAddress::new(TEST_ADDRESS);
+        let adapted = |failure: String| {
+            LiveAccessError::MutationFailed {
+                stage: MutationStage::ChangeProtection,
+                failure,
+                recovery: MutationRecovery::NoWriteAttempted {
+                    protection_restored: true,
+                },
+            }
+            .to_memory_write_failure(stop, address, 1)
+            .expect("valid adapter context")
+            .expect("mutation failure evidence")
+        };
+
+        let empty = adapted(String::new());
+        assert_eq!(
+            empty.detail,
+            "live memory mutation failed without diagnostic detail"
+        );
+        empty.validate().expect("fallback detail validates");
+
+        let controls = adapted("\r\n\t".to_owned());
+        assert_eq!(
+            controls.detail,
+            "live memory mutation failed without diagnostic detail"
+        );
+        controls.validate().expect("sanitized detail validates");
+
+        let oversized = adapted(format!(
+            "C:\\\\very-long-target-path\\{}",
+            "é".repeat(MAX_REASON_BYTES)
+        ));
+        assert!(!oversized.detail.is_empty());
+        assert!(oversized.detail.len() <= MAX_REASON_BYTES);
+        assert!(!oversized.detail.chars().any(char::is_control));
+        oversized
+            .validate()
+            .expect("bounded multibyte detail validates");
+    }
+
+    #[test]
+    fn protocol_adapter_rejects_invalid_context_and_noncanonical_local_evidence() {
+        let stop = test_stop();
+        let address = MemoryAddress::new(TEST_ADDRESS);
+        let valid_error = || LiveAccessError::MutationFailed {
+            stage: MutationStage::ChangeProtection,
+            failure: "change protection failed".to_owned(),
+            recovery: MutationRecovery::NoWriteAttempted {
+                protection_restored: true,
+            },
+        };
+
+        assert_eq!(
+            valid_error().to_memory_write_failure(stop, address, 0),
+            Err(ProtocolValidationError::EmptyMemoryWrite)
+        );
+        assert_eq!(
+            valid_error().to_memory_write_failure(stop, address, MAX_MEMORY_WRITE_BYTES + 1),
+            Err(ProtocolValidationError::MemoryWriteTooLarge {
+                actual: MAX_MEMORY_WRITE_BYTES + 1,
+                maximum: MAX_MEMORY_WRITE_BYTES,
+            })
+        );
+        assert!(matches!(
+            valid_error().to_memory_write_failure(stop, MemoryAddress::new(u64::MAX), 2),
+            Err(ProtocolValidationError::AddressOverflow { .. })
+        ));
+
+        for invalid in [
+            LiveAccessError::MutationFailed {
+                stage: MutationStage::ChangeProtection,
+                failure: "invalid recovery".to_owned(),
+                recovery: MutationRecovery::Restored,
+            },
+            LiveAccessError::MutationFailed {
+                stage: MutationStage::WriteReplacement,
+                failure: "invalid recovery".to_owned(),
+                recovery: MutationRecovery::NoWriteAttempted {
+                    protection_restored: true,
+                },
+            },
+            LiveAccessError::MutationFailed {
+                stage: MutationStage::WriteReplacement,
+                failure: "noncanonical complete recovery".to_owned(),
+                recovery: MutationRecovery::Indeterminate {
+                    bytes_restored: true,
+                    instruction_cache_flushed: true,
+                    protection_restored: true,
+                },
+            },
+        ] {
+            assert!(matches!(
+                invalid.to_memory_write_failure(stop, address, 1),
+                Err(ProtocolValidationError::MemoryWriteFailureRecoveryMismatch { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn protocol_adapter_keeps_nonmutation_errors_distinct() {
+        let error = injected_error("read exact bytes");
+        assert_eq!(
+            error.to_memory_write_failure(test_stop(), MemoryAddress::new(TEST_ADDRESS), 1),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn protocol_adapter_preserves_rollback_safe_vs_terminal_recovery() {
+        let stop = test_stop();
+        let address = MemoryAddress::new(TEST_ADDRESS);
+        let cases = [
+            (
+                MutationStage::ChangeProtection,
+                MutationRecovery::NoWriteAttempted {
+                    protection_restored: true,
+                },
+                true,
+            ),
+            (
+                MutationStage::ProtectionRace,
+                MutationRecovery::NoWriteAttempted {
+                    protection_restored: false,
+                },
+                false,
+            ),
+            (
+                MutationStage::WriteReplacement,
+                MutationRecovery::Restored,
+                true,
+            ),
+            (
+                MutationStage::FlushReplacement,
+                MutationRecovery::Indeterminate {
+                    bytes_restored: true,
+                    instruction_cache_flushed: false,
+                    protection_restored: true,
+                },
+                false,
+            ),
+        ];
+
+        for (stage, recovery, rollback_safe) in cases {
+            let evidence = LiveAccessError::MutationFailed {
+                stage,
+                failure: "classified failure".to_owned(),
+                recovery,
+            }
+            .to_memory_write_failure(stop, address, 1)
+            .expect("valid adapter context")
+            .expect("mutation failure evidence");
+            assert_eq!(evidence.recovery.is_rollback_safe(), rollback_safe);
+        }
     }
 
     #[test]

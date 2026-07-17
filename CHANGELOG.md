@@ -71,7 +71,12 @@ prereleases; breaking changes remain explicit.
   committed executable `MEM_IMAGE` region and one system page. A mutation compare-checks before and
   after changing protection, restores protection without attempting a byte write if either race
   check fails, flushes the instruction cache, verifies readback, and reports truthful recovery
-  evidence after any post-protection failure. This primitive
+  evidence after any protection or later mutation failure. An initial protection-change failure is
+  now an explicit `ChangeProtection` stage and claims safe pre-write recovery only after a fresh
+  exact-binding region query proves the original protection still applies. A bounded adapter maps
+  only `MutationFailed` errors into fully validated protocol-1.6 `MemoryWriteFailure` evidence using
+  caller-supplied stop/address/size context; other access errors remain distinct, and diagnostic text
+  is control-free and truncated only at UTF-8 character boundaries. This primitive
   does not attach, stop, launch, resume, step, set breakpoints, authenticate a transport, or wire the
   workbench, and a future provider must hold the process stopped before granting mutation authority.
   Tool Help module discovery is only corroborating evidence; its size is compared with the retained
