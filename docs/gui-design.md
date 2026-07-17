@@ -199,8 +199,10 @@ capability report with `LiveMemoryWrite`, an exact live-address binding, and
 `0x90` replacement. Software breakpoint, Run to Cursor, Step Into/Over/Out, and Continue are also
 listed, but the current workbench has no live client adapter and leaves every action visibly disabled
 with the missing authority. Run to Cursor is explicitly a temporary software breakpoint followed by
-Continue. A future adapter must validate the current stop token and any required thread/address
-binding; the static preview never supplies live authority.
+Continue. A future adapter must validate the current stop token and any required address binding;
+Step Into/Over/Out may use only the thread carried by the authenticated stopped state, with UI thread
+selection treated as a non-authorizing match requirement. The static preview never supplies live
+authority.
 
 Pending static drafts have worker-owned **Save Patch Set...** and **Load Patch Set...** controls.
 The required `.respatch.json` document is deterministic, strict schema v1 and limited to 16 MiB. It

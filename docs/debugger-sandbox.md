@@ -528,7 +528,9 @@ The instruction action menu maintains three separate authority domains:
    output's Authenticode signature and PE checksum may be invalid.
 3. Live actions are typed and visible but remain disabled until a real authenticated provider
    supplies a complete capability report, a current authenticated stop token, and the exact address
-   or stopped-thread bindings required by the action. Live NOP requires `LiveMemoryWrite` and a
+   bindings required by the action. A step route derives its only trusted thread identity from the
+   authenticated `SessionState::Stopped`; a UI thread selection can enable the route only when it
+   exactly matches that identity. Live NOP requires `LiveMemoryWrite` and a
    `DebugCommand::WriteMemory` compare-before-write with the exact selected bytes and an equal-length
    `0x90` replacement. Run to Cursor requires both software-breakpoint and execution-control
    capability and composes `BreakpointPersistence::Temporary` with Continue. The protocol reports
