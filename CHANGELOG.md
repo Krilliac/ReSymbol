@@ -401,6 +401,12 @@ prereleases; breaking changes remain explicit.
 
 ### Changed
 
+- Made workbench visual evidence deterministic across machines and repeated captures. Offline
+  lifecycle rows no longer render request-local session identifiers, while exact-source and export
+  rows show compact artifact filenames instead of canonical capture-machine directories. Complete
+  identifiers and paths remain bound internally, offline evidence retains human-readable hover
+  details, and normal builds keep the editable export path; source verification and publication
+  destination semantics are unchanged.
 - Bumped the debugger wire and typed-command protocol to 1.5 for the required breakpoint-persistence
   field and exact set-evidence binding; 1.4 and older peers are rejected before dispatch.
 - Protocol 1.4 introduced the requirement that every successful host or sandbox

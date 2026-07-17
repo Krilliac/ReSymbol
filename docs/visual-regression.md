@@ -24,6 +24,14 @@ input. The screenshot build disables eframe's normal monitor-size clamp so a sma
 desktop cannot shrink the framebuffer. Every PNG must be exactly 1440x900 pixels in the default
 run.
 
+Scenario-visible text is also machine-independent. Offline lifecycle rows show stable completion
+evidence without the request-local session identifier, and exact-source and export rows use the
+compact artifact filename instead of a capture-machine directory. The complete session identifier
+and canonical paths remain bound in application state. Offline evidence exposes the exact details
+as hover text with Windows verbatim path prefixes removed, while normal builds retain the editable
+export path. This is only a capture-presentation boundary and does not weaken source identity,
+lifecycle validation, or publication destination binding.
+
 On Windows, regenerate the views with:
 
 ```powershell

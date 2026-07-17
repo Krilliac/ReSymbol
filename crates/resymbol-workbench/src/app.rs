@@ -5400,13 +5400,15 @@ impl WorkbenchApp {
                                     ui.label(
                                         RichText::new(offline_lifecycle_text(&outcome))
                                             .color(colors.secondary_text),
-                                    );
+                                    )
+                                    .on_hover_text(offline_lifecycle_hover_text(&outcome));
                                     ui.label(
                                         RichText::new(offline_binding_text(&outcome))
                                             .monospace()
                                             .small()
                                             .color(colors.secondary_text),
-                                    );
+                                    )
+                                    .on_hover_text(offline_binding_hover_text(&outcome));
                                     match self.offline_byte_view {
                                         OfflineByteView::Hex => {
                                             self.show_offline_hex_preview(
@@ -5439,13 +5441,15 @@ impl WorkbenchApp {
                                     ui.label(
                                         RichText::new(offline_lifecycle_text(&outcome))
                                             .color(colors.secondary_text),
-                                    );
+                                    )
+                                    .on_hover_text(offline_lifecycle_hover_text(&outcome));
                                     ui.label(
                                         RichText::new(offline_binding_text(&outcome))
                                             .monospace()
                                             .small()
                                             .color(colors.secondary_text),
-                                    );
+                                    )
+                                    .on_hover_text(offline_binding_hover_text(&outcome));
                                 }
                             }
                         }
@@ -7462,6 +7466,21 @@ impl WorkbenchApp {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("Destination").strong());
                         let destination_width = (ui.available_width() - 100.0).max(260.0);
+                        #[cfg(feature = "screenshot")]
+                        {
+                            let exact_destination = Path::new(&self.export_destination);
+                            let mut visible_destination = compact_path_text(exact_destination);
+                            ui.add(
+                                TextEdit::singleline(&mut visible_destination)
+                                    .desired_width(destination_width)
+                                    .interactive(false),
+                            )
+                            .on_hover_text(format!(
+                                "Full destination: {}\nUse Choose... to change the path.",
+                                human_readable_path(exact_destination)
+                            ));
+                        }
+                        #[cfg(not(feature = "screenshot"))]
                         ui.add(
                             TextEdit::singleline(&mut self.export_destination)
                                 .desired_width(destination_width),
@@ -8274,6 +8293,27 @@ fn lifecycle_flag(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
 }
 
+fn human_readable_path(path: &Path) -> String {
+    let path = path.to_string_lossy();
+    if let Some(path) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{path}")
+    } else if let Some(path) = path.strip_prefix(r"\\?\") {
+        path.to_owned()
+    } else {
+        path.into_owned()
+    }
+}
+
+fn compact_path_text(path: &Path) -> String {
+    let readable = human_readable_path(path);
+    let trimmed = readable.trim_end_matches(['/', '\\']);
+    trimmed
+        .rsplit(['/', '\\'])
+        .find(|component| !component.is_empty())
+        .unwrap_or(trimmed)
+        .to_owned()
+}
+
 fn offline_lifecycle_status(
     complete: bool,
     capability_count: usize,
@@ -8298,28 +8338,51 @@ fn offline_lifecycle_status(
 
 fn offline_lifecycle_text(outcome: &OfflineImageReadOutcome) -> String {
     let lifecycle = outcome.lifecycle();
+    offline_lifecycle_status(
+        lifecycle.is_complete(),
+        lifecycle.capability_count(),
+        lifecycle.session_opened(),
+        lifecycle.session_closed(),
+        lifecycle.session_released(),
+        lifecycle.control_disconnected(),
+    )
+}
+
+fn offline_lifecycle_exact_text(session_id: u64, visible_text: &str) -> String {
+    format!("Session {session_id} | {visible_text}")
+}
+
+fn offline_lifecycle_hover_text(outcome: &OfflineImageReadOutcome) -> String {
+    offline_lifecycle_exact_text(
+        outcome.lifecycle().session_id().get(),
+        &offline_lifecycle_text(outcome),
+    )
+}
+
+fn offline_binding_summary(identity_id: &str, size: u32, rva: u64, source_path: &Path) -> String {
     format!(
-        "Session {} | {}",
-        lifecycle.session_id().get(),
-        offline_lifecycle_status(
-            lifecycle.is_complete(),
-            lifecycle.capability_count(),
-            lifecycle.session_opened(),
-            lifecycle.session_closed(),
-            lifecycle.session_released(),
-            lifecycle.control_disconnected(),
-        )
+        "Exact source {} | {} byte span at RVA 0x{:X} | {}",
+        short_hash(identity_id),
+        size,
+        rva,
+        compact_path_text(source_path),
     )
 }
 
 fn offline_binding_text(outcome: &OfflineImageReadOutcome) -> String {
     let binding = outcome.binding();
-    format!(
-        "Exact source {} | {} byte span at RVA 0x{:X} | {}",
-        short_hash(binding.identity().id.as_str()),
+    offline_binding_summary(
+        binding.identity().id.as_str(),
         outcome.span().size(),
         outcome.span().rva(),
-        binding.source_path().display(),
+        binding.source_path(),
+    )
+}
+
+fn offline_binding_hover_text(outcome: &OfflineImageReadOutcome) -> String {
+    format!(
+        "Canonical exact source: {}",
+        human_readable_path(outcome.binding().source_path())
     )
 }
 
@@ -9766,6 +9829,55 @@ mod tests {
         assert_eq!(
             offline_read_failure_text(&OfflineImageReadFailure::VerifiedSourceRequired),
             "the project has no exact identity-verified source snapshot"
+        );
+    }
+
+    #[test]
+    fn visible_offline_lifecycle_omits_volatile_session_but_hover_retains_it() {
+        let capability_count = resymbol_debugger::DebugCapability::ALL.len();
+        let visible = offline_lifecycle_status(true, capability_count, true, true, true, true);
+        assert!(!visible.contains("Session"));
+        assert_eq!(
+            offline_lifecycle_exact_text(4_433_114_037_756_784_909, &visible),
+            format!("Session 4433114037756784909 | {visible}")
+        );
+    }
+
+    #[test]
+    fn visible_paths_are_machine_independent_and_exact_hover_paths_are_readable() {
+        let first = Path::new(r"\\?\C:\Users\alice\ReSymbol\fixtures\milestone2-symbolized.exe");
+        let second = Path::new(r"\\?\D:\hostedtoolcache\runner\fixtures\milestone2-symbolized.exe");
+        let first_export =
+            Path::new(r"\\?\C:\Users\alice\ReSymbol\fixtures\milestone2-symbolized.resym");
+        let second_export =
+            Path::new(r"\\?\D:\hostedtoolcache\runner\fixtures\milestone2-symbolized.resym");
+        let identity = "7ff221b4de7c6e4f6f2e4e227840ffa8ecc3d92a3553d8763755a3fafadc1a5e";
+
+        assert_eq!(compact_path_text(first), "milestone2-symbolized.exe");
+        assert_eq!(compact_path_text(first), compact_path_text(second));
+        assert_eq!(
+            compact_path_text(first_export),
+            "milestone2-symbolized.resym"
+        );
+        assert_eq!(
+            compact_path_text(first_export),
+            compact_path_text(second_export)
+        );
+        assert_eq!(
+            offline_binding_summary(identity, 128, 0x1060, first),
+            offline_binding_summary(identity, 128, 0x1060, second)
+        );
+        assert_eq!(
+            human_readable_path(first),
+            r"C:\Users\alice\ReSymbol\fixtures\milestone2-symbolized.exe"
+        );
+        assert_eq!(
+            human_readable_path(Path::new(r"\\?\UNC\build-server\captures\artifact.resym")),
+            r"\\build-server\captures\artifact.resym"
+        );
+        assert_eq!(
+            human_readable_path(Path::new("/home/alice/artifact.resym")),
+            "/home/alice/artifact.resym"
         );
     }
 
