@@ -64,10 +64,12 @@ pub use protocol::{
     EventEnvelope, EventSequence, EventSequenceCursor, ExecutionToken, HardwareAccess,
     LaunchEnvironment, LaunchTarget, LiveTargetBinding, LiveTargetBindingError, LiveToken,
     MAX_CAPABILITY_STATUSES, MAX_LAUNCH_ARGUMENT_BYTES, MAX_LAUNCH_ARGUMENTS,
-    MAX_MEMORY_READ_BYTES, MAX_MEMORY_WRITE_BYTES, MAX_REASON_BYTES, MemoryAddress, OfflineTarget,
-    ProcessId, ProcessIdentity, ProcessStartKey, ProtocolValidationError, ProtocolVersion,
-    ReadViewToken, RunId, RunToken, SessionId, SessionState, SessionStateKind, SnapshotId,
-    StateGeneration, StateToken, StepKind, StopId, StopReason, StopToken, ThreadId,
+    MAX_MEMORY_READ_BYTES, MAX_MEMORY_WRITE_BYTES, MAX_REASON_BYTES,
+    MEMORY_WRITE_FAILURE_REJECTION_CODE, MemoryAddress, MemoryWriteFailure, MemoryWriteRecovery,
+    MemoryWriteStage, OfflineTarget, ProcessId, ProcessIdentity, ProcessStartKey,
+    ProtocolValidationError, ProtocolVersion, ReadViewToken, RunId, RunToken, SessionId,
+    SessionState, SessionStateKind, SnapshotId, StateGeneration, StateToken, StepKind, StopId,
+    StopReason, StopToken, ThreadId,
 };
 pub use provider_probe::{
     MAX_PROBE_GUARANTEES, MAX_PROBE_REQUIREMENTS, ProviderProbeObservation,

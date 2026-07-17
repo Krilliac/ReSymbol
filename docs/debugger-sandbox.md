@@ -289,12 +289,14 @@ provider, not evidence that such a provider exists.
 
 The current seam is intentionally narrow:
 
-- debugger wire and typed-command protocol 1.5 carries the lease identifiers, provisioning epoch,
+- debugger wire and typed-command protocol 1.6 carries the lease identifiers, provisioning epoch,
   exact suspended-target process identity through state and attestation, exact failure operation
   context including the explicit target-creation outcome, and process-bound incomplete or complete
   cleanup evidence, plus exact live-target binding evidence, granular step capability statuses, and
-  explicit breakpoint persistence policy echoed by successful set evidence. The wire supports
-  exactly 1.5; a 1.4 or earlier Hello is rejected before negotiation because it
+  explicit breakpoint persistence policy echoed by successful set evidence. It also carries an exact
+  command-correlated memory-write stage and canonical recovery result: only proved full restoration
+  may roll back visible state, while indeterminate target state requires a terminal `Failed` event.
+  The wire supports exactly 1.6; a 1.5 or earlier Hello is rejected before negotiation because it
   cannot represent the complete current compatibility contract;
 - a four-byte length prefix is validated before allocating a bounded control buffer;
 - controller and host roles, directions, nonzero challenge nonce, expected plaintext build claims,
@@ -513,7 +515,7 @@ No process-executing provider should merge until the project has evidence for:
 - legal session transitions, cross-target and replayed lease rejection, stale generation/stop
   rejection, provisioning-epoch-bound attestation and cleanup, attestation-gated resume,
   compare-write conflicts, sequence overflow, and terminal cleanup behavior;
-- strict wire decoding, exact-1.5 Hello-first/once build-claim exchange including legacy-1.4
+- strict wire decoding, exact-1.6 Hello-first/once build-claim exchange including legacy-1.5
   rejection, role/build/version/nonce correlation, independent transport authentication, bounded
   allocation before payload reads, and crash recovery;
 - benign Windows probes showing allowed staged reads and scratch writes while profile sentinels,

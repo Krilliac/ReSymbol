@@ -22,13 +22,14 @@ use crate::sandbox::{
 use resymbol_core::BinaryId;
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 5;
+pub const PROTOCOL_MINOR: u16 = 6;
 pub const MAX_LAUNCH_ARGUMENTS: usize = 128;
 pub const MAX_LAUNCH_ARGUMENT_BYTES: usize = 256 * 1024;
 pub const MAX_MEMORY_READ_BYTES: u32 = 1024 * 1024;
 pub const MAX_MEMORY_WRITE_BYTES: usize = 64 * 1024;
 pub const MAX_REASON_BYTES: usize = 1024;
 pub const MAX_CAPABILITY_STATUSES: usize = 64;
+pub const MEMORY_WRITE_FAILURE_REJECTION_CODE: &str = "memory-write-failed";
 
 macro_rules! nonzero_id {
     ($name:ident, $raw:ty, $kind:literal) => {
@@ -1319,6 +1320,120 @@ impl SessionState {
     }
 }
 
+/// Provider-neutral stage at which a compare-before-write mutation failed.
+///
+/// The stage names describe observable protocol boundaries rather than any
+/// platform API. A platform adapter maps its calls onto these boundaries and
+/// reports recovery separately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub enum MemoryWriteStage {
+    ChangeProtection,
+    ProtectionRace,
+    RevalidateExpectedBytes,
+    WriteReplacement,
+    FlushReplacement,
+    RestoreProtection,
+    VerifyReplacement,
+    ValidateFinalBinding,
+}
+
+/// Bounded recovery evidence for a failed compare-before-write mutation.
+///
+/// `Restored` means the provider proved the original bytes, instruction-cache
+/// flush, and original protection. Boolean fields record only independently
+/// proven facts; an indeterminate result is never inferred to be safe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "recovery", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum MemoryWriteRecovery {
+    NoWriteAttempted {
+        protection_restored: bool,
+    },
+    Restored,
+    Indeterminate {
+        bytes_restored: bool,
+        instruction_cache_flushed: bool,
+        protection_restored: bool,
+    },
+}
+
+impl MemoryWriteRecovery {
+    /// Whether the remote-command checkpoint may be restored without hiding a
+    /// target-side effect.
+    #[must_use]
+    pub const fn is_rollback_safe(self) -> bool {
+        matches!(
+            self,
+            Self::NoWriteAttempted {
+                protection_restored: true
+            } | Self::Restored
+        )
+    }
+}
+
+/// Exact command-correlated diagnostic for one failed memory-write attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryWriteFailure {
+    pub stop: StopToken,
+    pub address: MemoryAddress,
+    pub size: u32,
+    pub stage: MemoryWriteStage,
+    pub recovery: MemoryWriteRecovery,
+    pub detail: String,
+}
+
+impl MemoryWriteFailure {
+    pub fn validate(&self) -> Result<(), ProtocolValidationError> {
+        if self.size == 0 {
+            return Err(ProtocolValidationError::EmptyMemoryWrite);
+        }
+        let size = usize::try_from(self.size).map_err(|_| {
+            ProtocolValidationError::MemoryWriteTooLarge {
+                actual: usize::MAX,
+                maximum: MAX_MEMORY_WRITE_BYTES,
+            }
+        })?;
+        if size > MAX_MEMORY_WRITE_BYTES {
+            return Err(ProtocolValidationError::MemoryWriteTooLarge {
+                actual: size,
+                maximum: MAX_MEMORY_WRITE_BYTES,
+            });
+        }
+        self.address.validate_span(size)?;
+        validate_reason(&self.detail)?;
+
+        let before_write = matches!(
+            self.stage,
+            MemoryWriteStage::ChangeProtection
+                | MemoryWriteStage::ProtectionRace
+                | MemoryWriteStage::RevalidateExpectedBytes
+        );
+        let canonical = match self.recovery {
+            MemoryWriteRecovery::NoWriteAttempted { .. } => before_write,
+            MemoryWriteRecovery::Restored => !before_write,
+            MemoryWriteRecovery::Indeterminate {
+                bytes_restored,
+                instruction_cache_flushed,
+                protection_restored,
+            } => {
+                !(before_write
+                    || (bytes_restored && instruction_cache_flushed && protection_restored))
+            }
+        };
+        if canonical {
+            Ok(())
+        } else {
+            Err(
+                ProtocolValidationError::MemoryWriteFailureRecoveryMismatch {
+                    stage: self.stage,
+                    recovery: self.recovery,
+                },
+            )
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub enum BreakpointChange {
@@ -1370,6 +1485,7 @@ pub enum DebugEvent {
         before: Vec<u8>,
         after: Vec<u8>,
     },
+    MemoryWriteFailed(MemoryWriteFailure),
     BreakpointChanged {
         stop: StopToken,
         breakpoint: BreakpointSpec,
@@ -1414,6 +1530,7 @@ impl DebugEvent {
                 after,
                 ..
             } => validate_memory_write(*address, before, after),
+            Self::MemoryWriteFailed(failure) => failure.validate(),
             Self::BreakpointChanged { breakpoint, .. } => breakpoint.validate(),
             Self::CommandResult { outcome, .. } => outcome.validate(),
             Self::Warning { code, message } => {
@@ -1431,6 +1548,7 @@ impl DebugEvent {
             Self::MemoryWritten { stop, .. } | Self::BreakpointChanged { stop, .. } => {
                 Some(stop.state)
             }
+            Self::MemoryWriteFailed(failure) => Some(failure.stop.state),
             Self::SandboxAttested(_) | Self::SandboxLifecycle(_) => None,
             Self::Capabilities(_) | Self::CommandResult { .. } | Self::Warning { .. } => None,
         }
@@ -1587,6 +1705,11 @@ pub enum ProtocolValidationError {
     AddressOverflow { address: u64, size: u64 },
     #[error("observed memory no longer matches the compare-before-write expectation")]
     MemoryWriteConflict,
+    #[error("memory-write failure stage {stage:?} is incompatible with recovery {recovery:?}")]
+    MemoryWriteFailureRecoveryMismatch {
+        stage: MemoryWriteStage,
+        recovery: MemoryWriteRecovery,
+    },
     #[error("command is not a memory-write command")]
     NotMemoryWriteCommand,
     #[error("hardware breakpoint size {size} is not 1, 2, 4, or 8")]
@@ -2144,6 +2267,220 @@ mod tests {
                 address: u64::MAX,
                 size: 1,
             })
+        );
+    }
+
+    #[test]
+    fn memory_write_failure_evidence_is_strict_canonical_and_state_bound() {
+        let stop = stop(1, 2, 3);
+        let address = MemoryAddress::new(0x2000);
+        let detail = "target memory mutation failed".to_owned();
+        let valid = [
+            (
+                MemoryWriteStage::ChangeProtection,
+                MemoryWriteRecovery::NoWriteAttempted {
+                    protection_restored: true,
+                },
+            ),
+            (
+                MemoryWriteStage::ProtectionRace,
+                MemoryWriteRecovery::NoWriteAttempted {
+                    protection_restored: false,
+                },
+            ),
+            (
+                MemoryWriteStage::RevalidateExpectedBytes,
+                MemoryWriteRecovery::NoWriteAttempted {
+                    protection_restored: true,
+                },
+            ),
+            (
+                MemoryWriteStage::WriteReplacement,
+                MemoryWriteRecovery::Restored,
+            ),
+            (
+                MemoryWriteStage::FlushReplacement,
+                MemoryWriteRecovery::Indeterminate {
+                    bytes_restored: true,
+                    instruction_cache_flushed: false,
+                    protection_restored: true,
+                },
+            ),
+            (
+                MemoryWriteStage::RestoreProtection,
+                MemoryWriteRecovery::Indeterminate {
+                    bytes_restored: false,
+                    instruction_cache_flushed: true,
+                    protection_restored: false,
+                },
+            ),
+            (
+                MemoryWriteStage::VerifyReplacement,
+                MemoryWriteRecovery::Restored,
+            ),
+            (
+                MemoryWriteStage::ValidateFinalBinding,
+                MemoryWriteRecovery::Indeterminate {
+                    bytes_restored: false,
+                    instruction_cache_flushed: false,
+                    protection_restored: false,
+                },
+            ),
+        ];
+
+        for (sequence, (stage, recovery)) in valid.into_iter().enumerate() {
+            let failure = MemoryWriteFailure {
+                stop,
+                address,
+                size: 2,
+                stage,
+                recovery,
+                detail: detail.clone(),
+            };
+            failure.validate().expect("canonical write failure");
+            let envelope = EventEnvelope {
+                version: ProtocolVersion::current(),
+                sequence: EventSequence::new(sequence as u64 + 1).expect("event sequence"),
+                session_id: Some(stop.state.session_id),
+                state: Some(stop.state),
+                caused_by: Some(CommandId::new(9).expect("command id")),
+                event: DebugEvent::MemoryWriteFailed(failure),
+            };
+            envelope.validate().expect("state-bound failure event");
+            let encoded = serde_json::to_value(&envelope).expect("serialize failure event");
+            assert_eq!(
+                serde_json::from_value::<EventEnvelope>(encoded)
+                    .expect("deserialize failure event"),
+                envelope
+            );
+        }
+
+        let base = MemoryWriteFailure {
+            stop,
+            address,
+            size: 2,
+            stage: MemoryWriteStage::WriteReplacement,
+            recovery: MemoryWriteRecovery::Restored,
+            detail,
+        };
+        let mut unknown = serde_json::to_value(&base).expect("serialize failure");
+        unknown
+            .as_object_mut()
+            .expect("failure object")
+            .insert("future".to_owned(), serde_json::json!(true));
+        assert!(serde_json::from_value::<MemoryWriteFailure>(unknown).is_err());
+        let mut missing = serde_json::to_value(&base).expect("serialize failure");
+        missing
+            .as_object_mut()
+            .expect("failure object")
+            .remove("detail");
+        assert!(serde_json::from_value::<MemoryWriteFailure>(missing).is_err());
+
+        let mut wrong_state = EventEnvelope {
+            version: ProtocolVersion::current(),
+            sequence: EventSequence::new(20).expect("event sequence"),
+            session_id: Some(stop.state.session_id),
+            state: Some(state(1, 3)),
+            caused_by: Some(CommandId::new(9).expect("command id")),
+            event: DebugEvent::MemoryWriteFailed(base),
+        };
+        assert_eq!(
+            wrong_state.validate(),
+            Err(ProtocolValidationError::StaleStateToken)
+        );
+        wrong_state.session_id = Some(session(2));
+        assert_eq!(
+            wrong_state.validate(),
+            Err(ProtocolValidationError::StaleSession)
+        );
+    }
+
+    #[test]
+    fn memory_write_failure_recovery_classification_rejects_ambiguous_shapes() {
+        assert!(
+            MemoryWriteRecovery::NoWriteAttempted {
+                protection_restored: true
+            }
+            .is_rollback_safe()
+        );
+        assert!(MemoryWriteRecovery::Restored.is_rollback_safe());
+        assert!(
+            !MemoryWriteRecovery::NoWriteAttempted {
+                protection_restored: false
+            }
+            .is_rollback_safe()
+        );
+        assert!(
+            !MemoryWriteRecovery::Indeterminate {
+                bytes_restored: true,
+                instruction_cache_flushed: true,
+                protection_restored: false,
+            }
+            .is_rollback_safe()
+        );
+
+        let stop = stop(1, 2, 3);
+        let failure = |stage, recovery| MemoryWriteFailure {
+            stop,
+            address: MemoryAddress::new(0x2000),
+            size: 1,
+            stage,
+            recovery,
+            detail: "target memory mutation failed".to_owned(),
+        };
+        for invalid in [
+            failure(
+                MemoryWriteStage::ChangeProtection,
+                MemoryWriteRecovery::Restored,
+            ),
+            failure(
+                MemoryWriteStage::WriteReplacement,
+                MemoryWriteRecovery::NoWriteAttempted {
+                    protection_restored: true,
+                },
+            ),
+            failure(
+                MemoryWriteStage::WriteReplacement,
+                MemoryWriteRecovery::Indeterminate {
+                    bytes_restored: true,
+                    instruction_cache_flushed: true,
+                    protection_restored: true,
+                },
+            ),
+        ] {
+            assert!(matches!(
+                invalid.validate(),
+                Err(ProtocolValidationError::MemoryWriteFailureRecoveryMismatch { .. })
+            ));
+        }
+
+        let mut empty = failure(
+            MemoryWriteStage::ChangeProtection,
+            MemoryWriteRecovery::NoWriteAttempted {
+                protection_restored: true,
+            },
+        );
+        empty.size = 0;
+        assert_eq!(
+            empty.validate(),
+            Err(ProtocolValidationError::EmptyMemoryWrite)
+        );
+        empty.size = u32::try_from(MAX_MEMORY_WRITE_BYTES).expect("write maximum") + 1;
+        assert!(matches!(
+            empty.validate(),
+            Err(ProtocolValidationError::MemoryWriteTooLarge { .. })
+        ));
+        empty.size = 1;
+        empty.address = MemoryAddress::new(u64::MAX);
+        assert!(matches!(
+            empty.validate(),
+            Err(ProtocolValidationError::AddressOverflow { .. })
+        ));
+        empty.address = MemoryAddress::new(0x2000);
+        empty.detail.clear();
+        assert_eq!(
+            empty.validate(),
+            Err(ProtocolValidationError::InvalidReason)
         );
     }
 

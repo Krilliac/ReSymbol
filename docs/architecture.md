@@ -597,6 +597,17 @@ ReSymbol made no byte-write attempt, without claiming a concurrent target left t
 Post-protection failure returns explicit recovery evidence; success requires a cache flush,
 protection restoration, replacement readback, and final binding validation.
 
+Debugger protocol 1.6 carries that failure evidence without exposing platform error codes. One
+`MemoryWriteFailed` event is correlated to the exact old stop, address, and write size and names the
+failed mutation stage plus canonical recovery evidence. `NoWriteAttempted` with protection proved
+restored and `Restored` permit the controller to restore only its pre-command visible state; the
+command identifier and one-use authority remain consumed. Unknown protection or any indeterminate
+byte/cache/protection recovery instead requires the accepted fresh stop and a following exact
+`Failed` state, which invalidates the live binding. The fixed rejected result code and detail must
+match the diagnostic exactly. This terminal evidence does not prove that detach, resume, or ordinary
+close is safe; no provider may advertise `LiveMemoryWrite` until it owns an explicit recovery,
+termination, or fail-closed teardown policy for that state.
+
 This adapter does not freeze the current executable path into an immutable loaded-image snapshot.
 The retained no-write/delete-sharing file handle, exact hash, and file/remote/module PE-header
 corroboration close ordinary path races, but an already-authorized same-account actor that can

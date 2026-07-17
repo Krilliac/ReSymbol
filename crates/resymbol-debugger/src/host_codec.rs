@@ -399,8 +399,8 @@ mod tests {
     use crate::protocol::{
         BreakpointChange, BreakpointId, BreakpointKind, BreakpointPersistence, BreakpointScope,
         BreakpointSpec, CommandId, DebugCommand, DebugEvent, EventEnvelope, EventSequence,
-        MemoryAddress, ProtocolVersion, ReadViewToken, SessionId, StateGeneration, StateToken,
-        StopId, StopToken,
+        MemoryAddress, MemoryWriteFailure, MemoryWriteRecovery, MemoryWriteStage, ProtocolVersion,
+        ReadViewToken, SessionId, StateGeneration, StateToken, StopId, StopToken,
     };
 
     fn close_command() -> CommandEnvelope {
@@ -754,6 +754,59 @@ mod tests {
         assert_eq!(frame.header().raw_address, None);
         assert_eq!(frame.raw(), &[1, 2, 3, 4]);
         assert_eq!(decode_event_frame(&frame).unwrap(), event);
+    }
+
+    #[test]
+    fn memory_write_failure_round_trips_without_raw_payload_or_address() {
+        let state = StateToken {
+            session_id: SessionId::new(7).unwrap(),
+            generation: StateGeneration::new(3).unwrap(),
+        };
+        let event = EventEnvelope {
+            version: ProtocolVersion::current(),
+            sequence: EventSequence::new(1).unwrap(),
+            session_id: Some(state.session_id),
+            state: Some(state),
+            caused_by: Some(CommandId::new(9).unwrap()),
+            event: DebugEvent::MemoryWriteFailed(MemoryWriteFailure {
+                stop: StopToken {
+                    state,
+                    stop_id: StopId::new(2).unwrap(),
+                },
+                address: MemoryAddress::new(0x2400),
+                size: 3,
+                stage: MemoryWriteStage::WriteReplacement,
+                recovery: MemoryWriteRecovery::Indeterminate {
+                    bytes_restored: true,
+                    instruction_cache_flushed: false,
+                    protection_restored: true,
+                },
+                detail: "target memory write could not be recovered".to_owned(),
+            }),
+        };
+        let frame = encode_event_frame(FrameSequence::new(2).unwrap(), &event).unwrap();
+        assert_eq!(frame.header().raw_len, 0);
+        assert_eq!(frame.header().raw_address, None);
+        assert!(frame.raw().is_empty());
+        assert_eq!(decode_event_frame(&frame).unwrap(), event);
+
+        let (mut header, _) = frame.clone().into_parts();
+        header.raw_len = 1;
+        let raw = HostFrame::new(header, vec![0]).expect("structurally valid raw frame");
+        assert_eq!(
+            decode_event_frame(&raw),
+            Err(HostCodecError::UnexpectedRawPayload)
+        );
+
+        let (mut header, _) = frame.into_parts();
+        header.raw_len = 1;
+        header.raw_address = Some(0x2400);
+        let addressed_raw =
+            HostFrame::new(header, vec![0]).expect("structurally valid addressed frame");
+        assert_eq!(
+            decode_event_frame(&addressed_raw),
+            Err(HostCodecError::UnexpectedRawPayload)
+        );
     }
 
     #[test]
