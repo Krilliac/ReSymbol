@@ -6,8 +6,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use resymbol_debugger::{LiveTargetBinding, MemoryAddress, ProcessId};
-use resymbol_windows_live_access::{OpenLiveProcessRequest, ReadOnlyLiveProcessAccess};
+use resymbol_debugger::{LiveTargetBinding, MemoryAddress, ProcessId, StopToken};
+use resymbol_windows_live_access::{
+    LiveAccessError, MutatingLiveProcessAccess, OpenLiveProcessRequest, ReadOnlyLiveProcessAccess,
+};
 use windows_sys::Win32::{
     Foundation::{DBG_CONTINUE, DBG_EXCEPTION_NOT_HANDLED, ERROR_SEM_TIMEOUT, FALSE, HANDLE},
     System::Diagnostics::Debug::{
@@ -20,9 +22,10 @@ use windows_sys::Win32::{
 };
 
 use crate::{
-    BackendFailure, ContinueDisposition, DebugAttachLimits, DebugBackend, DebugEventKind,
-    DebugEventRecord, DebugFileToken, DebugHostError, DebugHostWorker, DebugHostWorkerState,
-    PendingStopEvidence, phase_one_capability_report,
+    BackendFailure, BackendWriteFailure, BackendWriteReceipt, ContinueDisposition,
+    DebugAttachLimits, DebugBackend, DebugEventKind, DebugEventRecord, DebugFileToken,
+    DebugHostError, DebugHostMemoryWriteError, DebugHostMemoryWriteReceipt, DebugHostWorker,
+    DebugHostWorkerState, PendingStopEvidence, phase_one_capability_report,
 };
 
 /// Single-thread owner of one phase-one Windows debug attachment.
@@ -87,6 +90,28 @@ impl WindowsDebugHostWorker {
         size: usize,
     ) -> Result<Vec<u8>, DebugHostError> {
         self.inner.read_stopped_main_image(address, size)
+    }
+
+    /// Performs one exact compare-before-write while the retained OS debug
+    /// event remains pending. The outer session worker must already have
+    /// validated `validated_protocol_stop`; this layer only carries it into
+    /// typed failure evidence and does not store or validate logical tokens.
+    pub fn write_stopped_main_image_after_protocol_validation(
+        &mut self,
+        expected_pending_stop: &PendingStopEvidence,
+        validated_protocol_stop: StopToken,
+        address: MemoryAddress,
+        expected_bytes: &[u8],
+        replacement: &[u8],
+    ) -> Result<DebugHostMemoryWriteReceipt, DebugHostMemoryWriteError> {
+        self.inner
+            .write_stopped_main_image_after_protocol_validation(
+                expected_pending_stop,
+                validated_protocol_stop,
+                address,
+                expected_bytes,
+                replacement,
+            )
     }
 
     /// Continues any retained event with its conservative disposition, then
@@ -241,6 +266,49 @@ impl DebugBackend for WindowsDebugBackend {
             .map_err(|error| BackendFailure::new("read stopped main image", error.to_string()))
     }
 
+    fn write_exact_main_image_rva(
+        &mut self,
+        expected: &LiveTargetBinding,
+        validated_protocol_stop: StopToken,
+        address: MemoryAddress,
+        rva: u64,
+        expected_bytes: &[u8],
+        replacement: &[u8],
+    ) -> Result<BackendWriteReceipt, BackendWriteFailure> {
+        let process = expected.process();
+        let request = OpenLiveProcessRequest::new(
+            process.process_id,
+            process.start_key,
+            expected.actual_image_base(),
+            expected.main_module_binary_id().clone(),
+        );
+        // Mutation rights exist only for this one stopped write boundary. The
+        // long-lived preflight handle remains read-only.
+        let mut access = MutatingLiveProcessAccess::open_mutating(request).map_err(|error| {
+            adapt_write_failure(
+                &error,
+                validated_protocol_stop,
+                address,
+                expected_bytes.len(),
+            )
+        })?;
+        let receipt = access
+            .compare_before_write_rva(expected, rva, expected_bytes, replacement)
+            .map_err(|error| {
+                adapt_write_failure(
+                    &error,
+                    validated_protocol_stop,
+                    address,
+                    expected_bytes.len(),
+                )
+            })?;
+        Ok(BackendWriteReceipt {
+            binding: receipt.binding().clone(),
+            rva: receipt.rva(),
+            bytes_written: receipt.bytes_written(),
+        })
+    }
+
     fn detach(&mut self, process_id: ProcessId) -> Result<(), BackendFailure> {
         // SAFETY: the PID is the exact retained binding for the debug
         // connection established by this same worker thread.
@@ -250,6 +318,73 @@ impl DebugBackend for WindowsDebugBackend {
             Ok(())
         }
     }
+}
+
+fn adapt_write_failure(
+    error: &LiveAccessError,
+    validated_protocol_stop: StopToken,
+    address: MemoryAddress,
+    size: usize,
+) -> BackendWriteFailure {
+    let detail = error.to_string();
+    match error.to_memory_write_failure(validated_protocol_stop, address, size) {
+        Ok(Some(failure)) => BackendWriteFailure::MemoryWriteFailed(failure),
+        Ok(None) if target_invalidated(error) => BackendWriteFailure::TargetInvalidated { detail },
+        Ok(None) if safe_no_effect_rejection(error) => BackendWriteFailure::SafeNoEffect { detail },
+        Ok(None) => BackendWriteFailure::InvalidEvidence {
+            detail: format!("unexpected non-transaction write failure: {detail}"),
+        },
+        Err(evidence_error) => BackendWriteFailure::InvalidEvidence {
+            detail: format!("{detail}; invalid protocol evidence: {evidence_error}"),
+        },
+    }
+}
+
+fn safe_no_effect_rejection(error: &LiveAccessError) -> bool {
+    matches!(
+        error,
+        LiveAccessError::InvalidRequest(_)
+            | LiveAccessError::Win32 { .. }
+            | LiveAccessError::ExecutableIo { .. }
+            | LiveAccessError::RvaRange(_)
+            | LiveAccessError::AddressDoesNotFitPointer
+            | LiveAccessError::PartialRead { .. }
+            | LiveAccessError::PartialMemoryRegionQuery { .. }
+            | LiveAccessError::CompareMismatch { .. }
+            | LiveAccessError::UnsafeWriteRegion
+            | LiveAccessError::InvalidSystemPageSize
+    )
+}
+
+fn target_invalidated(error: &LiveAccessError) -> bool {
+    matches!(
+        error,
+        LiveAccessError::ProcessExited
+            | LiveAccessError::ProcessIdChanged
+            | LiveAccessError::ProcessStartIdentityChanged
+            | LiveAccessError::ProcessStartIdentityMismatch { .. }
+            | LiveAccessError::ZeroProcessStartKey
+            | LiveAccessError::InvalidExecutablePath
+            | LiveAccessError::ExecutableNotRegular { .. }
+            | LiveAccessError::ExecutableChangedDuringIdentity
+            | LiveAccessError::ExecutablePathChanged
+            | LiveAccessError::ExecutableEvidenceChanged
+            | LiveAccessError::BinaryIdentityMismatch { .. }
+            | LiveAccessError::InvalidPeImage { .. }
+            | LiveAccessError::PeHeaderOutOfRange
+            | LiveAccessError::ModuleProcessMismatch
+            | LiveAccessError::EmptyMainModule
+            | LiveAccessError::InvalidMainModulePath
+            | LiveAccessError::MainModulePathMismatch
+            | LiveAccessError::MainModuleBaseMismatch { .. }
+            | LiveAccessError::MainModuleRangeOverflow
+            | LiveAccessError::FileModuleSizeMismatch { .. }
+            | LiveAccessError::RemoteModuleSizeMismatch { .. }
+            | LiveAccessError::InvalidMainModuleMapping
+            | LiveAccessError::MainModuleRegionLimitExceeded { .. }
+            | LiveAccessError::BindingConstruction(_)
+            | LiveAccessError::BindingMismatch
+    )
 }
 
 fn debug_event_record(event: DEBUG_EVENT) -> DebugEventRecord {

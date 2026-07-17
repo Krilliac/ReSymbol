@@ -1,4 +1,4 @@
-//! Same-thread, read-only Windows debug-attach foundation.
+//! Same-thread Windows debug-attach and stopped-memory foundation.
 //!
 //! This crate is a low-level provider boundary, not ReSymbol's authenticated
 //! live-helper transport and not a UI bridge. `WindowsDebugHostWorker` makes
@@ -7,9 +7,9 @@
 //! `SessionWorker` must own this value, its `SessionMachine`, and the exact
 //! accepted command transaction on the same thread.
 //!
-//! Phase one deliberately exposes only host attach and stopped main-image
-//! reads. It has no continue, pause, step, register, breakpoint, write, launch,
-//! or sandbox-provisioning API.
+//! Phase one deliberately exposes only host attach plus stopped main-image
+//! reads and exact compare-before-write mutations. It has no continue, pause,
+//! step, register, breakpoint, launch, or sandbox-provisioning API.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
@@ -20,12 +20,13 @@ use std::{marker::PhantomData, rc::Rc};
 
 use resymbol_debugger::{
     CapabilityAvailability, CapabilityReport, CapabilityStatus, CapabilityUnavailableCode,
-    DebugCapability, LiveTargetBindingError, MemoryAddress, ProcessId, ThreadId,
+    DebugCapability, LiveTargetBinding, LiveTargetBindingError, MemoryAddress, MemoryWriteFailure,
+    ProcessId, ThreadId,
 };
 use thiserror::Error;
 
 #[cfg(any(windows, test))]
-use resymbol_debugger::LiveTargetBinding;
+use resymbol_debugger::{MAX_MEMORY_WRITE_BYTES, StopToken};
 
 #[cfg(windows)]
 mod windows;
@@ -107,17 +108,20 @@ fn phase_one_capability_status(
     windows_supported: bool,
 ) -> CapabilityStatus {
     let availability = match capability {
-        DebugCapability::LiveMemoryRead | DebugCapability::HostAttach if windows_supported => {
+        DebugCapability::LiveMemoryRead
+        | DebugCapability::LiveMemoryWrite
+        | DebugCapability::HostAttach
+            if windows_supported =>
+        {
             CapabilityAvailability::Available
         }
-        DebugCapability::LiveMemoryRead | DebugCapability::HostAttach => {
-            CapabilityAvailability::Unavailable {
-                code: CapabilityUnavailableCode::UnsupportedPlatform,
-                reason: "phase-one debug attach is available only on Windows".to_owned(),
-            }
-        }
-        DebugCapability::LiveMemoryWrite
-        | DebugCapability::ExecutionControl
+        DebugCapability::LiveMemoryRead
+        | DebugCapability::LiveMemoryWrite
+        | DebugCapability::HostAttach => CapabilityAvailability::Unavailable {
+            code: CapabilityUnavailableCode::UnsupportedPlatform,
+            reason: "phase-one debug attach is available only on Windows".to_owned(),
+        },
+        DebugCapability::ExecutionControl
         | DebugCapability::StepInto
         | DebugCapability::StepOver
         | DebugCapability::StepOut
@@ -126,7 +130,8 @@ fn phase_one_capability_status(
         | DebugCapability::SoftwareBreakpoints
         | DebugCapability::HardwareBreakpoints => CapabilityAvailability::Unavailable {
             code: CapabilityUnavailableCode::TargetModeReadOnly,
-            reason: "phase-one Windows debug attach is stopped and read-only".to_owned(),
+            reason: "phase-one Windows debug attach retains one stop without execution control"
+                .to_owned(),
         },
         DebugCapability::OfflineAnalysis
         | DebugCapability::DumpRead
@@ -135,7 +140,8 @@ fn phase_one_capability_status(
         | DebugCapability::SandboxedLaunch
         | DebugCapability::HostLaunch => CapabilityAvailability::Unavailable {
             code: CapabilityUnavailableCode::BackendUnavailable,
-            reason: "phase-one Windows debug host implements only attach and live reads".to_owned(),
+            reason: "phase-one Windows debug host implements only attach and stopped live memory"
+                .to_owned(),
         },
     };
     CapabilityStatus {
@@ -175,6 +181,72 @@ pub struct PendingStopEvidence {
     process_id: ProcessId,
     thread_id: ThreadId,
     exception_address: MemoryAddress,
+}
+
+/// Exact low-level receipt for one stopped main-image mutation.
+///
+/// This is correlated to the retained operating-system event and deliberately
+/// contains no logical stop token; this provider does not validate one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use = "a successful stopped-memory mutation must be correlated and published"]
+pub struct DebugHostMemoryWriteReceipt {
+    pending_stop: PendingStopEvidence,
+    binding: LiveTargetBinding,
+    address: MemoryAddress,
+    before: Vec<u8>,
+    after: Vec<u8>,
+}
+
+impl DebugHostMemoryWriteReceipt {
+    pub const fn pending_stop(&self) -> &PendingStopEvidence {
+        &self.pending_stop
+    }
+
+    #[must_use]
+    pub const fn binding(&self) -> &LiveTargetBinding {
+        &self.binding
+    }
+
+    #[must_use]
+    pub const fn address(&self) -> MemoryAddress {
+        self.address
+    }
+
+    #[must_use]
+    pub fn before(&self) -> &[u8] {
+        &self.before
+    }
+
+    #[must_use]
+    pub fn after(&self) -> &[u8] {
+        &self.after
+    }
+}
+
+/// Typed failure for a stopped exact-memory write.
+#[derive(Debug, Error)]
+pub enum DebugHostMemoryWriteError {
+    #[error("live memory is writable only while an operating-system debug event is pending")]
+    NotStopped,
+    #[error("the caller's operating-system stop evidence is not the worker's retained stop")]
+    PendingStopMismatch,
+    #[error("live memory write was safely rejected without a target-side effect: {detail}")]
+    SafeNoEffectRejected { detail: String },
+    #[error("live memory mutation failed with protocol evidence: {failure:?}")]
+    MemoryWriteFailed {
+        pending_stop: PendingStopEvidence,
+        failure: MemoryWriteFailure,
+    },
+    #[error("live memory mutation returned invalid or uncorrelated evidence: {detail}")]
+    InvalidEvidence {
+        pending_stop: PendingStopEvidence,
+        detail: String,
+    },
+    #[error("live target identity or mapping became invalid during the write boundary: {detail}")]
+    TargetInvalidated {
+        pending_stop: PendingStopEvidence,
+        detail: String,
+    },
 }
 
 impl PendingStopEvidence {
@@ -346,6 +418,23 @@ impl fmt::Display for BackendFailure {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(any(windows, test))]
+struct BackendWriteReceipt {
+    binding: LiveTargetBinding,
+    rva: u64,
+    bytes_written: usize,
+}
+
+#[derive(Debug)]
+#[cfg(any(windows, test))]
+enum BackendWriteFailure {
+    SafeNoEffect { detail: String },
+    MemoryWriteFailed(MemoryWriteFailure),
+    InvalidEvidence { detail: String },
+    TargetInvalidated { detail: String },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg(any(windows, test))]
 struct DebugFileToken(usize);
@@ -469,6 +558,16 @@ trait DebugBackend {
         rva: u64,
         size: usize,
     ) -> Result<Vec<u8>, BackendFailure>;
+
+    fn write_exact_main_image_rva(
+        &mut self,
+        expected: &LiveTargetBinding,
+        validated_protocol_stop: StopToken,
+        address: MemoryAddress,
+        rva: u64,
+        expected_bytes: &[u8],
+        replacement: &[u8],
+    ) -> Result<BackendWriteReceipt, BackendWriteFailure>;
 
     fn detach(&mut self, process_id: ProcessId) -> Result<(), BackendFailure>;
 }
@@ -699,6 +798,132 @@ impl<B: DebugBackend> DebugHostWorker<B> {
         self.backend
             .read_exact_main_image_rva(&binding, rva, size)
             .map_err(BackendFailure::into_public)
+    }
+
+    /// Writes only while the exact operating-system stop remains retained.
+    ///
+    /// `validated_protocol_stop` is carried solely into protocol failure
+    /// evidence. This low-level worker neither stores nor validates it; the
+    /// authenticated outer session worker must do that before calling.
+    fn write_stopped_main_image_after_protocol_validation(
+        &mut self,
+        expected_pending_stop: &PendingStopEvidence,
+        validated_protocol_stop: StopToken,
+        address: MemoryAddress,
+        expected_bytes: &[u8],
+        replacement: &[u8],
+    ) -> Result<DebugHostMemoryWriteReceipt, DebugHostMemoryWriteError> {
+        let (binding, pending_stop) = match &self.state {
+            WorkerState::Attached(AttachedState {
+                binding,
+                phase: AttachedPhase::Stopped,
+                pending: Some(_),
+                stop: Some(stop),
+                ..
+            }) => (binding.clone(), stop.clone()),
+            WorkerState::Detached | WorkerState::Attached(_) => {
+                return Err(DebugHostMemoryWriteError::NotStopped);
+            }
+        };
+        if &pending_stop != expected_pending_stop {
+            return Err(DebugHostMemoryWriteError::PendingStopMismatch);
+        }
+        let rejection = if expected_bytes.is_empty() {
+            Some("live memory writes must replace at least one byte".to_owned())
+        } else if expected_bytes.len() > MAX_MEMORY_WRITE_BYTES {
+            Some(format!(
+                "live memory write size {} exceeds the {}-byte limit",
+                expected_bytes.len(),
+                MAX_MEMORY_WRITE_BYTES
+            ))
+        } else if expected_bytes.len() != replacement.len() {
+            Some("compare-before-write lengths differ".to_owned())
+        } else if expected_bytes == replacement {
+            Some("compare-before-write replacement is identical".to_owned())
+        } else {
+            None
+        };
+        if let Some(detail) = rejection {
+            return Err(DebugHostMemoryWriteError::SafeNoEffectRejected { detail });
+        }
+        let size = u64::try_from(expected_bytes.len()).unwrap_or(u64::MAX);
+        let rva = binding
+            .rva_for_address_span(address, size)
+            .map_err(|error| DebugHostMemoryWriteError::SafeNoEffectRejected {
+                detail: error.to_string(),
+            })?;
+
+        let result = self.backend.write_exact_main_image_rva(
+            &binding,
+            validated_protocol_stop,
+            address,
+            rva,
+            expected_bytes,
+            replacement,
+        );
+        match result {
+            Ok(receipt)
+                if receipt.binding == binding
+                    && receipt.rva == rva
+                    && receipt.bytes_written == replacement.len() =>
+            {
+                Ok(DebugHostMemoryWriteReceipt {
+                    pending_stop,
+                    binding,
+                    address,
+                    before: expected_bytes.to_vec(),
+                    after: replacement.to_vec(),
+                })
+            }
+            Ok(_) => Err(self.invalid_write_evidence(
+                pending_stop,
+                "backend success receipt did not exactly match the request".to_owned(),
+            )),
+            Err(BackendWriteFailure::SafeNoEffect { detail }) => {
+                Err(DebugHostMemoryWriteError::SafeNoEffectRejected { detail })
+            }
+            Err(BackendWriteFailure::MemoryWriteFailed(failure)) => {
+                let evidence_valid = failure.validate().is_ok()
+                    && failure.stop == validated_protocol_stop
+                    && failure.address == address
+                    && usize::try_from(failure.size) == Ok(expected_bytes.len());
+                if !evidence_valid {
+                    return Err(self.invalid_write_evidence(
+                        pending_stop,
+                        "backend failure evidence did not exactly match the request".to_owned(),
+                    ));
+                }
+                if !failure.recovery.is_rollback_safe() {
+                    self.attached_mut().phase = AttachedPhase::CleanupRequired;
+                }
+                Err(DebugHostMemoryWriteError::MemoryWriteFailed {
+                    pending_stop,
+                    failure,
+                })
+            }
+            Err(BackendWriteFailure::InvalidEvidence { detail }) => {
+                Err(self.invalid_write_evidence(pending_stop, detail))
+            }
+            Err(BackendWriteFailure::TargetInvalidated { detail }) => {
+                self.attached_mut().phase = AttachedPhase::CleanupRequired;
+                Err(DebugHostMemoryWriteError::TargetInvalidated {
+                    pending_stop,
+                    detail,
+                })
+            }
+        }
+    }
+
+    fn invalid_write_evidence(
+        &mut self,
+        pending_stop: PendingStopEvidence,
+        detail: String,
+    ) -> DebugHostMemoryWriteError {
+        self.attached_mut().phase = AttachedPhase::CleanupRequired;
+        DebugHostMemoryWriteError::InvalidEvidence {
+            pending_stop,
+            detail,
+        }
     }
 
     fn detach(&mut self) -> Result<(), DebugHostError> {
@@ -954,15 +1179,18 @@ mod tests {
 
     use resymbol_core::BinaryId;
     use resymbol_debugger::{
-        CapabilityAvailability, DebugCapability, LiveTargetBinding, MemoryAddress, ProcessId,
-        ProcessIdentity, ProcessStartKey,
+        CapabilityAvailability, DebugCapability, LiveTargetBinding, MemoryAddress,
+        MemoryWriteFailure, MemoryWriteRecovery, MemoryWriteStage, ProcessId, ProcessIdentity,
+        ProcessStartKey, SessionId, StateGeneration, StateToken, StopId, StopToken,
     };
 
     use super::{
-        BackendFailure, CleanupStepOutcome, ContinueDisposition, DebugAttachLimits,
-        DebugAttachLimitsError, DebugBackend, DebugEventKind, DebugEventRecord, DebugFileToken,
-        DebugHostError, DebugHostWorker, DebugHostWorkerState, EXCEPTION_BREAKPOINT_CODE,
-        MAX_INITIAL_DRAIN_TIMEOUT, phase_one_capability_report_for_platform,
+        BackendFailure, BackendWriteFailure, BackendWriteReceipt, CleanupStepOutcome,
+        ContinueDisposition, DebugAttachLimits, DebugAttachLimitsError, DebugBackend,
+        DebugEventKind, DebugEventRecord, DebugFileToken, DebugHostError,
+        DebugHostMemoryWriteError, DebugHostWorker, DebugHostWorkerState,
+        EXCEPTION_BREAKPOINT_CODE, MAX_INITIAL_DRAIN_TIMEOUT, PendingStopEvidence,
+        phase_one_capability_report_for_platform,
     };
 
     const PID: u32 = 41;
@@ -989,6 +1217,12 @@ mod tests {
             rva: u64,
             size: usize,
         },
+        Write {
+            address: u64,
+            rva: u64,
+            expected: Vec<u8>,
+            replacement: Vec<u8>,
+        },
         Detach(u32),
         ClearPreflight,
     }
@@ -1006,6 +1240,8 @@ mod tests {
         fail_operation: Option<&'static str>,
         fail_detach: bool,
         bytes: Vec<u8>,
+        write_failure: Option<BackendWriteFailure>,
+        corrupt_write_receipt: bool,
     }
 
     impl FakeBackend {
@@ -1022,6 +1258,8 @@ mod tests {
                 fail_operation: None,
                 fail_detach: false,
                 bytes: b"phase-one-read".to_vec(),
+                write_failure: None,
+                corrupt_write_receipt: false,
             }
         }
 
@@ -1114,6 +1352,41 @@ mod tests {
             Ok(self.bytes[..size].to_vec())
         }
 
+        fn write_exact_main_image_rva(
+            &mut self,
+            _expected: &LiveTargetBinding,
+            _validated_protocol_stop: StopToken,
+            address: MemoryAddress,
+            rva: u64,
+            expected_bytes: &[u8],
+            replacement: &[u8],
+        ) -> Result<BackendWriteReceipt, BackendWriteFailure> {
+            self.operations.push(Operation::Write {
+                address: address.get(),
+                rva,
+                expected: expected_bytes.to_vec(),
+                replacement: replacement.to_vec(),
+            });
+            if let Some(failure) = self.write_failure.take() {
+                return Err(failure);
+            }
+            if self.bytes.get(..expected_bytes.len()) != Some(expected_bytes) {
+                return Err(BackendWriteFailure::SafeNoEffect {
+                    detail: "injected compare mismatch".to_owned(),
+                });
+            }
+            self.bytes[..replacement.len()].copy_from_slice(replacement);
+            Ok(BackendWriteReceipt {
+                binding: self.binding.clone(),
+                rva: if self.corrupt_write_receipt {
+                    rva.saturating_add(1)
+                } else {
+                    rva
+                },
+                bytes_written: replacement.len(),
+            })
+        }
+
         fn detach(&mut self, process_id: ProcessId) -> Result<(), BackendFailure> {
             self.operations.push(Operation::Detach(process_id.get()));
             if self.fail_detach {
@@ -1137,6 +1410,16 @@ mod tests {
             IMAGE_SIZE,
         )
         .expect("valid deterministic binding")
+    }
+
+    fn protocol_stop() -> StopToken {
+        StopToken {
+            state: StateToken {
+                session_id: SessionId::new(1).expect("nonzero test session"),
+                generation: StateGeneration::new(1).expect("nonzero test generation"),
+            },
+            stop_id: StopId::new(1).expect("nonzero test stop"),
+        }
     }
 
     fn create_process(image_base: u64, image_file: Option<usize>) -> DebugEventRecord {
@@ -1186,7 +1469,7 @@ mod tests {
     }
 
     #[test]
-    fn capability_report_advertises_only_attach_and_live_read() {
+    fn capability_report_advertises_attach_and_stopped_live_memory() {
         let report = phase_one_capability_report_for_platform(true);
         report.validate().expect("complete capability report");
         let available = report
@@ -1199,7 +1482,11 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             available,
-            [DebugCapability::LiveMemoryRead, DebugCapability::HostAttach]
+            [
+                DebugCapability::LiveMemoryRead,
+                DebugCapability::LiveMemoryWrite,
+                DebugCapability::HostAttach,
+            ]
         );
     }
 
@@ -1454,6 +1741,419 @@ mod tests {
         );
         assert_eq!(worker.state(), DebugHostWorkerState::Stopped);
         assert!(worker.pending_stop().is_some());
+    }
+
+    #[test]
+    fn stopped_exact_write_returns_correlated_receipt_without_continuing_stop() {
+        let binding = test_binding();
+        let mut worker = attached_worker();
+        let pending_stop = worker
+            .attach_after_authorization(&binding, DebugAttachLimits::default())
+            .expect("attach reaches initial breakpoint");
+        let operations_before = worker.backend.operations.len();
+        let address = MemoryAddress::new(IMAGE_BASE + 0x40);
+        let receipt = worker
+            .write_stopped_main_image_after_protocol_validation(
+                &pending_stop,
+                protocol_stop(),
+                address,
+                b"phas",
+                b"PHAS",
+            )
+            .expect("exact stopped write succeeds");
+
+        assert_eq!(receipt.pending_stop(), &pending_stop);
+        assert_eq!(receipt.binding(), &binding);
+        assert_eq!(receipt.address(), address);
+        assert_eq!(receipt.before(), b"phas");
+        assert_eq!(receipt.after(), b"PHAS");
+        assert_eq!(worker.state(), DebugHostWorkerState::Stopped);
+        assert_eq!(worker.pending_stop(), Some(&pending_stop));
+        assert_eq!(
+            worker.backend.operations[operations_before..],
+            [Operation::Write {
+                address: address.get(),
+                rva: 0x40,
+                expected: b"phas".to_vec(),
+                replacement: b"PHAS".to_vec(),
+            }]
+        );
+    }
+
+    #[test]
+    fn compare_mismatch_is_safe_no_effect_and_preserves_stop() {
+        let binding = test_binding();
+        let mut worker = attached_worker();
+        let pending_stop = worker
+            .attach_after_authorization(&binding, DebugAttachLimits::default())
+            .expect("attach reaches initial breakpoint");
+        let error = worker
+            .write_stopped_main_image_after_protocol_validation(
+                &pending_stop,
+                protocol_stop(),
+                MemoryAddress::new(IMAGE_BASE + 0x40),
+                b"nope",
+                b"NOPE",
+            )
+            .expect_err("compare mismatch rejects without mutation");
+
+        assert!(matches!(
+            error,
+            DebugHostMemoryWriteError::SafeNoEffectRejected { .. }
+        ));
+        assert_eq!(worker.state(), DebugHostWorkerState::Stopped);
+        assert_eq!(worker.pending_stop(), Some(&pending_stop));
+    }
+
+    #[test]
+    fn mismatched_pending_stop_is_rejected_before_backend_write() {
+        let binding = test_binding();
+        let mut worker = attached_worker();
+        let pending_stop = worker
+            .attach_after_authorization(&binding, DebugAttachLimits::default())
+            .expect("attach reaches initial breakpoint");
+        let operations_before = worker.backend.operations.len();
+        let mismatched = PendingStopEvidence {
+            process_id: pending_stop.process_id(),
+            thread_id: pending_stop.thread_id(),
+            exception_address: MemoryAddress::new(pending_stop.exception_address().get() + 1),
+        };
+
+        let error = worker
+            .write_stopped_main_image_after_protocol_validation(
+                &mismatched,
+                protocol_stop(),
+                MemoryAddress::new(IMAGE_BASE + 0x40),
+                b"phas",
+                b"PHAS",
+            )
+            .expect_err("stale OS-stop evidence cannot authorize a write");
+
+        assert!(matches!(
+            error,
+            DebugHostMemoryWriteError::PendingStopMismatch
+        ));
+        assert_eq!(worker.backend.operations.len(), operations_before);
+        assert_eq!(worker.state(), DebugHostWorkerState::Stopped);
+    }
+
+    #[test]
+    fn write_rejects_when_no_operating_system_stop_is_retained() {
+        let mut worker = DebugHostWorker::new(FakeBackend::new([]));
+        let pending_stop = PendingStopEvidence {
+            process_id: ProcessId::new(PID).expect("nonzero PID"),
+            thread_id: resymbol_debugger::ThreadId::new(STOP_THREAD_ID).expect("nonzero thread"),
+            exception_address: MemoryAddress::new(IMAGE_BASE + 1),
+        };
+        let error = worker
+            .write_stopped_main_image_after_protocol_validation(
+                &pending_stop,
+                protocol_stop(),
+                MemoryAddress::new(IMAGE_BASE + 0x40),
+                b"phas",
+                b"PHAS",
+            )
+            .expect_err("detached worker cannot write");
+
+        assert!(matches!(error, DebugHostMemoryWriteError::NotStopped));
+        assert!(worker.backend.operations.is_empty());
+    }
+
+    #[test]
+    fn indeterminate_write_failure_enters_cleanup_required_with_event_retained() {
+        let binding = test_binding();
+        let protocol_stop = protocol_stop();
+        let address = MemoryAddress::new(IMAGE_BASE + 0x40);
+        let mut worker = attached_worker();
+        let pending_stop = worker
+            .attach_after_authorization(&binding, DebugAttachLimits::default())
+            .expect("attach reaches initial breakpoint");
+        worker.backend.write_failure =
+            Some(BackendWriteFailure::MemoryWriteFailed(MemoryWriteFailure {
+                stop: protocol_stop,
+                address,
+                size: 4,
+                stage: MemoryWriteStage::FlushReplacement,
+                recovery: MemoryWriteRecovery::Indeterminate {
+                    bytes_restored: false,
+                    instruction_cache_flushed: false,
+                    protection_restored: false,
+                },
+                detail: "injected indeterminate mutation".to_owned(),
+            }));
+
+        let error = worker
+            .write_stopped_main_image_after_protocol_validation(
+                &pending_stop,
+                protocol_stop,
+                address,
+                b"phas",
+                b"PHAS",
+            )
+            .expect_err("indeterminate write cannot publish success");
+
+        assert!(matches!(
+            error,
+            DebugHostMemoryWriteError::MemoryWriteFailed { .. }
+        ));
+        assert_eq!(worker.state(), DebugHostWorkerState::CleanupRequired);
+        assert!(worker.attached().pending.is_some());
+        worker.detach().expect("cleanup ability remains retained");
+        assert_eq!(worker.state(), DebugHostWorkerState::Detached);
+    }
+
+    #[test]
+    fn mismatched_success_receipt_enters_cleanup_required() {
+        let binding = test_binding();
+        let mut worker = attached_worker();
+        let pending_stop = worker
+            .attach_after_authorization(&binding, DebugAttachLimits::default())
+            .expect("attach reaches initial breakpoint");
+        worker.backend.corrupt_write_receipt = true;
+
+        let error = worker
+            .write_stopped_main_image_after_protocol_validation(
+                &pending_stop,
+                protocol_stop(),
+                MemoryAddress::new(IMAGE_BASE + 0x40),
+                b"phas",
+                b"PHAS",
+            )
+            .expect_err("uncorrelated success evidence cannot be published");
+
+        assert!(matches!(
+            error,
+            DebugHostMemoryWriteError::InvalidEvidence { .. }
+        ));
+        assert_eq!(worker.state(), DebugHostWorkerState::CleanupRequired);
+        assert!(worker.attached().pending.is_some());
+    }
+
+    #[test]
+    fn invalid_failure_evidence_enters_cleanup_required() {
+        let binding = test_binding();
+        let mut worker = attached_worker();
+        let pending_stop = worker
+            .attach_after_authorization(&binding, DebugAttachLimits::default())
+            .expect("attach reaches initial breakpoint");
+        worker.backend.write_failure = Some(BackendWriteFailure::InvalidEvidence {
+            detail: "injected malformed protocol evidence".to_owned(),
+        });
+
+        let error = worker
+            .write_stopped_main_image_after_protocol_validation(
+                &pending_stop,
+                protocol_stop(),
+                MemoryAddress::new(IMAGE_BASE + 0x40),
+                b"phas",
+                b"PHAS",
+            )
+            .expect_err("invalid failure evidence cannot be published");
+
+        assert!(matches!(
+            error,
+            DebugHostMemoryWriteError::InvalidEvidence { .. }
+        ));
+        assert_eq!(worker.state(), DebugHostWorkerState::CleanupRequired);
+        assert!(worker.attached().pending.is_some());
+    }
+
+    #[test]
+    fn mismatched_memory_write_failure_evidence_fails_closed() {
+        let binding = test_binding();
+        let protocol_stop = protocol_stop();
+        let address = MemoryAddress::new(IMAGE_BASE + 0x40);
+        let mismatched_stop = StopToken {
+            stop_id: StopId::new(protocol_stop.stop_id.get() + 1).expect("nonzero stop"),
+            ..protocol_stop
+        };
+        let cases = [
+            (
+                "stop token",
+                MemoryWriteFailure {
+                    stop: mismatched_stop,
+                    address,
+                    size: 4,
+                    stage: MemoryWriteStage::WriteReplacement,
+                    recovery: MemoryWriteRecovery::Restored,
+                    detail: "injected stop mismatch".to_owned(),
+                },
+            ),
+            (
+                "address",
+                MemoryWriteFailure {
+                    stop: protocol_stop,
+                    address: MemoryAddress::new(address.get() + 1),
+                    size: 4,
+                    stage: MemoryWriteStage::WriteReplacement,
+                    recovery: MemoryWriteRecovery::Restored,
+                    detail: "injected address mismatch".to_owned(),
+                },
+            ),
+            (
+                "size",
+                MemoryWriteFailure {
+                    stop: protocol_stop,
+                    address,
+                    size: 3,
+                    stage: MemoryWriteStage::WriteReplacement,
+                    recovery: MemoryWriteRecovery::Restored,
+                    detail: "injected size mismatch".to_owned(),
+                },
+            ),
+        ];
+
+        for (field, failure) in cases {
+            failure
+                .validate()
+                .unwrap_or_else(|error| panic!("{field} fixture must be valid: {error}"));
+            let mut worker = attached_worker();
+            let pending_stop = worker
+                .attach_after_authorization(&binding, DebugAttachLimits::default())
+                .expect("attach reaches initial breakpoint");
+            worker.backend.write_failure = Some(BackendWriteFailure::MemoryWriteFailed(failure));
+
+            let error = worker
+                .write_stopped_main_image_after_protocol_validation(
+                    &pending_stop,
+                    protocol_stop,
+                    address,
+                    b"phas",
+                    b"PHAS",
+                )
+                .unwrap_err();
+
+            assert!(
+                matches!(&error, DebugHostMemoryWriteError::InvalidEvidence { .. }),
+                "{field} mismatch must fail closed: {error:?}"
+            );
+            assert_eq!(worker.state(), DebugHostWorkerState::CleanupRequired);
+            assert_eq!(worker.attached().stop.as_ref(), Some(&pending_stop));
+            assert!(worker.attached().pending.is_some());
+            worker
+                .detach()
+                .unwrap_or_else(|error| panic!("{field} mismatch must retain cleanup: {error}"));
+            assert_eq!(worker.state(), DebugHostWorkerState::Detached);
+        }
+    }
+
+    #[test]
+    fn target_invalidation_enters_cleanup_required() {
+        let binding = test_binding();
+        let mut worker = attached_worker();
+        let pending_stop = worker
+            .attach_after_authorization(&binding, DebugAttachLimits::default())
+            .expect("attach reaches initial breakpoint");
+        worker.backend.write_failure = Some(BackendWriteFailure::TargetInvalidated {
+            detail: "injected process identity drift".to_owned(),
+        });
+
+        let error = worker
+            .write_stopped_main_image_after_protocol_validation(
+                &pending_stop,
+                protocol_stop(),
+                MemoryAddress::new(IMAGE_BASE + 0x40),
+                b"phas",
+                b"PHAS",
+            )
+            .expect_err("identity drift cannot preserve stopped authority");
+
+        assert!(matches!(
+            error,
+            DebugHostMemoryWriteError::TargetInvalidated { .. }
+        ));
+        assert_eq!(worker.state(), DebugHostWorkerState::CleanupRequired);
+        assert!(worker.attached().pending.is_some());
+    }
+
+    #[test]
+    fn unrestored_protection_enters_cleanup_required_even_before_write() {
+        let binding = test_binding();
+        let protocol_stop = protocol_stop();
+        let address = MemoryAddress::new(IMAGE_BASE + 0x40);
+        let mut worker = attached_worker();
+        let pending_stop = worker
+            .attach_after_authorization(&binding, DebugAttachLimits::default())
+            .expect("attach reaches initial breakpoint");
+        worker.backend.write_failure =
+            Some(BackendWriteFailure::MemoryWriteFailed(MemoryWriteFailure {
+                stop: protocol_stop,
+                address,
+                size: 4,
+                stage: MemoryWriteStage::ChangeProtection,
+                recovery: MemoryWriteRecovery::NoWriteAttempted {
+                    protection_restored: false,
+                },
+                detail: "injected unrestored protection".to_owned(),
+            }));
+
+        let error = worker
+            .write_stopped_main_image_after_protocol_validation(
+                &pending_stop,
+                protocol_stop,
+                address,
+                b"phas",
+                b"PHAS",
+            )
+            .expect_err("unrestored protection is not rollback-safe");
+
+        assert!(matches!(
+            error,
+            DebugHostMemoryWriteError::MemoryWriteFailed { .. }
+        ));
+        assert_eq!(worker.state(), DebugHostWorkerState::CleanupRequired);
+        assert!(worker.attached().pending.is_some());
+    }
+
+    #[test]
+    fn rollback_safe_failure_evidence_preserves_stopped_state() {
+        let cases = [
+            (
+                MemoryWriteStage::ChangeProtection,
+                MemoryWriteRecovery::NoWriteAttempted {
+                    protection_restored: true,
+                },
+            ),
+            (
+                MemoryWriteStage::VerifyReplacement,
+                MemoryWriteRecovery::Restored,
+            ),
+        ];
+        for (stage, recovery) in cases {
+            let binding = test_binding();
+            let protocol_stop = protocol_stop();
+            let address = MemoryAddress::new(IMAGE_BASE + 0x40);
+            let mut worker = attached_worker();
+            let pending_stop = worker
+                .attach_after_authorization(&binding, DebugAttachLimits::default())
+                .expect("attach reaches initial breakpoint");
+            worker.backend.write_failure =
+                Some(BackendWriteFailure::MemoryWriteFailed(MemoryWriteFailure {
+                    stop: protocol_stop,
+                    address,
+                    size: 4,
+                    stage,
+                    recovery,
+                    detail: "injected rollback-safe mutation failure".to_owned(),
+                }));
+
+            let error = worker
+                .write_stopped_main_image_after_protocol_validation(
+                    &pending_stop,
+                    protocol_stop,
+                    address,
+                    b"phas",
+                    b"PHAS",
+                )
+                .expect_err("failure evidence remains a failure");
+
+            assert!(matches!(
+                error,
+                DebugHostMemoryWriteError::MemoryWriteFailed { .. }
+            ));
+            assert_eq!(worker.state(), DebugHostWorkerState::Stopped);
+            assert_eq!(worker.pending_stop(), Some(&pending_stop));
+        }
     }
 
     #[test]

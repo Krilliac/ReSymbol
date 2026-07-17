@@ -634,23 +634,33 @@ provider must supply that evidence (and retain the event's image-file handle whe
 authorizing reads or writes.
 
 `crates/resymbol-windows-debug-host` now builds the smallest phase-one live provider primitive on top
-of that read-only access boundary. One deliberately `!Send`/`!Sync` worker performs the exact
+of that access boundary while keeping its long-lived handle read-only. One deliberately
+`!Send`/`!Sync` worker performs the exact
 preflight, attaches on its owning thread, immediately requests detach rather than target termination
 if that thread exits, and drains current-state events under both a finite total deadline and an event
 ceiling. It accepts only the exact create-process PID/base evidence, closes only create-process and
 load-DLL `hFile` values, retains the initial first-chance breakpoint, and exposes bounded exact
-main-image reads while that event remains pending. Its platform-aware capability report marks only
-`HostAttach` and `LiveMemoryRead` available on Windows. Explicit detach first continues any retained
-event and then attempts `DebugActiveProcessStop`, reporting kill-policy, continuation, and detach
-outcomes independently; destructor cleanup discards that evidence and is never cleanup proof.
+main-image reads and bounded, equal-length exact compare-before-write mutations while that event
+remains pending.
+The write requires exact retained `PendingStopEvidence` plus a logical `StopToken` already validated
+by an authenticated outer session; the low-level worker does not store or validate that token and
+carries it only into protocol failure evidence. Mutation rights are opened only for that one
+main-image-bounded transaction. Safe no-effect rejection or rollback-safe failure leaves the worker
+stopped; invalid evidence, target invalidation, or non-rollback-safe recovery enters
+`CleanupRequired` with the operating-system event retained for explicit teardown. Its platform-aware
+capability report marks
+`HostAttach`, `LiveMemoryRead`, and `LiveMemoryWrite` available on Windows. Explicit detach first
+continues any retained event and then attempts `DebugActiveProcessStop`, reporting kill-policy,
+continuation, and detach outcomes independently; destructor cleanup discards that evidence and is
+never cleanup proof.
 
 This is an in-process low-level API, not a Windows debugger-host helper process, authenticated live
 transport, or UI bridge. `attach_after_authorization` records a mandatory caller prerequisite but
 does not authenticate or enforce it; a future authenticated `SessionWorker` must consume exact
 host-risk authority before invoking it. No AppContainer or Hyper-V provider, guest agent, live
-launch, breakpoint engine, register service, stepping, writes, or sandbox provisioning is
-implemented. The offline host, low-level attach/read foundation, and readiness UI therefore remain
-far short of a working malware sandbox or end-user live debugger.
+launch, breakpoint engine, register service, execution stepping, Workbench live-memory bridge, or
+sandbox provisioning is implemented. The offline host, low-level attach/read/write foundation, and
+readiness UI therefore remain far short of a working malware sandbox or end-user live debugger.
 [debugger-sandbox.md](debugger-sandbox.md) records the exact ownership, authorization, containment,
 cleanup, and verification gates that future live providers must satisfy.
 
