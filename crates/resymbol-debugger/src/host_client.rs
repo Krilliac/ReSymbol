@@ -16,19 +16,114 @@ use crate::host_wire::{
     ProtocolVersion as WireProtocolVersion, SequenceTracker, WireError,
 };
 use crate::protocol::{
-    CommandEnvelope, CommandId, CommandOutcome, DebugCommand, DebugEvent, DebugTargetRequest,
-    EventEnvelope, EventSequence, EventSequenceCursor, ProtocolValidationError, ProtocolVersion,
-    SessionId, SessionState, SessionStateKind, StateGeneration, StateToken, StopReason, ThreadId,
+    BreakpointChange, CommandEnvelope, CommandId, CommandOutcome, DebugCommand, DebugEvent,
+    DebugTargetRequest, EventEnvelope, EventSequenceCursor, ProtocolValidationError,
+    ProtocolVersion, SessionId, SessionState, SessionStateKind,
 };
 use crate::sandbox::{
-    CleanupOutcome, CleanupReceiptId, DiagnosticText, ExpectedSandboxAttestation, HelperBuildId,
-    IsolationBoundary, SandboxAttestation, SandboxCleanupReceipt, SandboxLifecycleEvent,
-    SandboxLifecycleState,
+    AttestationMismatch, CleanupReceiptError, DiagnosticText, HelperBuildId,
+    SandboxCleanupReceipt, SandboxLifecycleEvent, SandboxLifecycleState,
 };
 use crate::{SessionMachine, SessionMachineError};
 
 pub const MAX_RESPONSE_FRAMES: usize = 256;
 pub const MAX_PENDING_COMMANDS: usize = 1;
+pub const MAX_RESPONSE_BATCH_BYTES: usize = 16 * 1024 * 1024;
+
+/// A transport response whose frame count and aggregate encoded size were
+/// bounded while frames were admitted.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HostResponseBatch {
+    frames: Vec<HostFrame>,
+    encoded_bytes: usize,
+}
+
+impl HostResponseBatch {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            frames: Vec::new(),
+            encoded_bytes: 0,
+        }
+    }
+
+    pub fn single(frame: HostFrame) -> Result<Self, ResponseBatchError> {
+        let mut batch = Self::new();
+        batch.push(frame)?;
+        Ok(batch)
+    }
+
+    /// Admits one frame after checking both count and aggregate bytes. Pipe
+    /// transports should call this immediately after decoding each frame.
+    pub fn push(&mut self, frame: HostFrame) -> Result<(), ResponseBatchError> {
+        if self.frames.len() >= MAX_RESPONSE_FRAMES {
+            return Err(ResponseBatchError::TooManyFrames {
+                maximum: MAX_RESPONSE_FRAMES,
+            });
+        }
+        let frame_bytes = frame.header().frame_len()?;
+        let encoded_bytes = self
+            .encoded_bytes
+            .checked_add(frame_bytes)
+            .ok_or(ResponseBatchError::ByteCountOverflow)?;
+        if encoded_bytes > MAX_RESPONSE_BATCH_BYTES {
+            return Err(ResponseBatchError::TooManyBytes {
+                actual: encoded_bytes,
+                maximum: MAX_RESPONSE_BATCH_BYTES,
+            });
+        }
+        self.encoded_bytes = encoded_bytes;
+        self.frames.push(frame);
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.frames.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+
+    #[must_use]
+    pub const fn encoded_bytes(&self) -> usize {
+        self.encoded_bytes
+    }
+
+    #[must_use]
+    pub fn first(&self) -> Option<&HostFrame> {
+        self.frames.first()
+    }
+
+    #[must_use]
+    pub fn into_frames(self) -> Vec<HostFrame> {
+        self.frames
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ResponseBatchError {
+    #[error("response exceeds the frame limit of {maximum}")]
+    TooManyFrames { maximum: usize },
+    #[error("response has {actual} encoded bytes; maximum is {maximum}")]
+    TooManyBytes { actual: usize, maximum: usize },
+    #[error("response byte count overflow")]
+    ByteCountOverflow,
+    #[error(transparent)]
+    Wire(#[from] WireError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlShutdownReason {
+    Graceful,
+    ExplicitAbandon,
+    ClientDropped,
+    HandshakeFailed,
+    ProtocolFailure,
+    TransportFailure,
+}
 
 /// A synchronous frame exchange owned by one connection worker.
 ///
@@ -37,9 +132,18 @@ pub const MAX_PENDING_COMMANDS: usize = 1;
 /// returns only complete, bounded frames. It must fail instead of silently
 /// reconnecting or changing the requested provider boundary.
 pub trait HostFrameExchange {
-    fn exchange(&mut self, request: HostFrame) -> Result<Vec<HostFrame>, HostTransportError>;
+    fn exchange(&mut self, request: HostFrame) -> Result<HostResponseBatch, HostTransportError>;
 
-    fn disconnect(&mut self) -> Result<(), HostTransportError>;
+    /// Releases host-side reducer state only after the client has independently
+    /// verified a terminal `Closed` state.
+    fn release_session(&mut self, session_id: SessionId) -> Result<(), HostTransportError>;
+
+    /// Tears down only the control transport. Success is not evidence that a
+    /// target exited or that sandbox cleanup completed.
+    fn shutdown_control(
+        &mut self,
+        reason: ControlShutdownReason,
+    ) -> Result<(), HostTransportError>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,18 +170,20 @@ pub struct DebugHostClient<T: HostFrameExchange> {
     transport: T,
     connection_state: ClientConnectionState,
     negotiated_version: WireProtocolVersion,
+    typed_version: ProtocolVersion,
     session: Option<ClientSession>,
     next_command_id: u64,
     next_outbound_frame_sequence: u64,
     next_inbound_frame_sequence: u64,
     event_cursor: EventSequenceCursor,
+    transport_shutdown: bool,
     _owner_thread: PhantomData<Rc<()>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ClientSession {
-    session_id: SessionId,
-    state: SessionState,
+    reducer: SessionMachine,
+    sandbox_cleanup_verified: bool,
 }
 
 impl<T: HostFrameExchange> DebugHostClient<T> {
@@ -100,42 +206,50 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
         let responses = match transport.exchange(HostFrame::new(hello, Vec::new())?) {
             Ok(responses) => responses,
             Err(error) => {
-                let _ = transport.disconnect();
+                let _ = transport.shutdown_control(ControlShutdownReason::TransportFailure);
                 return Err(error.into());
             }
         };
         if responses.len() != 1 {
-            let _ = transport.disconnect();
+            let _ = transport.shutdown_control(ControlShutdownReason::HandshakeFailed);
             return Err(DebugHostClientError::UnexpectedHandshakeResponseCount {
                 actual: responses.len(),
             });
         }
-        let acknowledgement = &responses[0];
+        let acknowledgement = responses
+            .first()
+            .ok_or(DebugHostClientError::HandshakeIncomplete)?;
         if !acknowledgement.raw().is_empty() {
-            let _ = transport.disconnect();
+            let _ = transport.shutdown_control(ControlShutdownReason::HandshakeFailed);
             return Err(DebugHostClientError::HandshakeCarriedRawPayload);
         }
         if let Err(error) = handshake.accept(acknowledgement.header()) {
-            let _ = transport.disconnect();
+            let _ = transport.shutdown_control(ControlShutdownReason::HandshakeFailed);
             return Err(error.into());
         }
         if handshake.state() != HandshakeState::Established {
-            let _ = transport.disconnect();
+            let _ = transport.shutdown_control(ControlShutdownReason::HandshakeFailed);
             return Err(DebugHostClientError::HandshakeIncomplete);
         }
         let Some(negotiated_version) = handshake.negotiated_version() else {
-            let _ = transport.disconnect();
+            let _ = transport.shutdown_control(ControlShutdownReason::HandshakeFailed);
             return Err(DebugHostClientError::HandshakeIncomplete);
         };
+        let typed_version = bind_typed_protocol_version(negotiated_version).map_err(|error| {
+            let _ = transport.shutdown_control(ControlShutdownReason::HandshakeFailed);
+            error
+        })?;
         Ok(Self {
             transport,
             connection_state: ClientConnectionState::Connected,
             negotiated_version,
+            typed_version,
             session: None,
             next_command_id: 1,
             next_outbound_frame_sequence: 2,
             next_inbound_frame_sequence: 2,
             event_cursor: EventSequenceCursor::default(),
+            transport_shutdown: false,
             _owner_thread: PhantomData,
         })
     }
@@ -152,12 +266,16 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
 
     #[must_use]
     pub fn session_id(&self) -> Option<SessionId> {
-        self.session.as_ref().map(|session| session.session_id)
+        self.session
+            .as_ref()
+            .map(|session| session.reducer.session_id())
     }
 
     #[must_use]
     pub fn session_state(&self) -> Option<&SessionState> {
-        self.session.as_ref().map(|session| &session.state)
+        self.session
+            .as_ref()
+            .map(|session| session.reducer.state())
     }
 
     /// Claims one logical session on this connection. The host independently
@@ -165,20 +283,18 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
     /// calling this method never claims a target has been opened.
     ///
     /// `[connection owner thread]`
-    pub fn begin_session(&mut self, session_id: SessionId) -> Result<(), DebugHostClientError> {
+    pub fn begin_session(
+        &mut self,
+        session_id: SessionId,
+        helper_build: HelperBuildId,
+    ) -> Result<(), DebugHostClientError> {
         self.require_connected()?;
         if self.session.is_some() {
             return Err(DebugHostClientError::SessionAlreadyOwned);
         }
         self.session = Some(ClientSession {
-            session_id,
-            state: SessionState::Idle {
-                token: StateToken {
-                    session_id,
-                    generation: StateGeneration::new(1)
-                        .expect("initial state generation is nonzero"),
-                },
-            },
+            reducer: SessionMachine::new(session_id, helper_build),
+            sandbox_cleanup_verified: false,
         });
         self.connection_state = ClientConnectionState::SessionOpen;
         Ok(())
@@ -202,15 +318,20 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
             .ok_or(DebugHostClientError::SessionNotOwned)?;
         let command_id =
             CommandId::new(self.next_command_id).map_err(DebugHostClientError::Protocol)?;
-        let state = session.state.state_token();
+        let state = session.reducer.state().state_token();
         let envelope = CommandEnvelope {
-            version: ProtocolVersion::current(),
+            version: self.typed_version,
             command_id,
-            session_id: Some(session.session_id),
+            session_id: Some(session.reducer.session_id()),
             expected_state: Some(state),
             command,
         };
-        envelope.validate_against(&session.state)?;
+        envelope.validate_against(session.reducer.state())?;
+        let original_reducer = session.reducer.clone();
+        let mut candidate_reducer = original_reducer.clone();
+        candidate_reducer.accept_command(&envelope)?;
+        let required_command_state = (candidate_reducer.state() != original_reducer.state())
+            .then(|| candidate_reducer.state().clone());
 
         let frame_sequence = FrameSequence::new(self.next_outbound_frame_sequence)?;
         let request = encode_command_frame(frame_sequence, &envelope)?;
@@ -230,11 +351,18 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
                 } else {
                     ClientConnectionState::Failed
                 };
-                let _ = self.transport.disconnect();
+                self.shutdown_transport(ControlShutdownReason::TransportFailure);
                 return Err(error.into());
             }
         };
-        self.accept_response_batch(command_id, responses)
+        self.accept_response_batch(
+            command_id,
+            &envelope,
+            original_reducer,
+            candidate_reducer,
+            required_command_state,
+            responses,
+        )
     }
 
     /// Releases only a terminal, reducer-confirmed session. This does not send
@@ -247,11 +375,16 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
             .session
             .as_ref()
             .ok_or(DebugHostClientError::SessionNotOwned)?;
-        if session.state.kind() != SessionStateKind::Closed {
+        if session.reducer.state().kind() != SessionStateKind::Closed {
             return Err(DebugHostClientError::SessionNotClosed {
-                state: session.state.kind(),
+                state: session.reducer.state().kind(),
             });
         }
+        if session.reducer.expected_attestation().is_some() && !session.sandbox_cleanup_verified {
+            return Err(DebugHostClientError::SandboxCleanupNotVerified);
+        }
+        let session_id = session.reducer.session_id();
+        self.transport.release_session(session_id)?;
         self.session = None;
         self.connection_state = ClientConnectionState::Connected;
         Ok(())
@@ -268,20 +401,47 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
         if self.session.is_some() {
             return Err(DebugHostClientError::SessionStillOwned);
         }
-        self.transport.disconnect()?;
+        self.transport
+            .shutdown_control(ControlShutdownReason::Graceful)?;
+        self.transport_shutdown = true;
         self.connection_state = ClientConnectionState::Disconnected;
         Ok(())
+    }
+
+    /// Abandons an active logical session by tearing down the control channel.
+    /// This deliberately returns no cleanup receipt and makes no claim that a
+    /// target exited, containment held, or provider cleanup completed.
+    pub fn abandon_session(&mut self) -> Result<(), DebugHostClientError> {
+        self.require_session_open()?;
+        let result = self
+            .transport
+            .shutdown_control(ControlShutdownReason::ExplicitAbandon);
+        self.transport_shutdown = true;
+        self.connection_state = ClientConnectionState::Disconnected;
+        self.session = None;
+        result.map_err(Into::into)
     }
 
     fn accept_response_batch(
         &mut self,
         command_id: CommandId,
-        responses: Vec<HostFrame>,
+        envelope: &CommandEnvelope,
+        original_reducer: SessionMachine,
+        candidate_reducer: SessionMachine,
+        required_command_state: Option<SessionState>,
+        responses: HostResponseBatch,
     ) -> Result<CommandReceipt, DebugHostClientError> {
-        let result = self.accept_response_batch_inner(command_id, responses);
+        let result = self.accept_response_batch_inner(
+            command_id,
+            envelope,
+            original_reducer,
+            candidate_reducer,
+            required_command_state,
+            responses,
+        );
         if result.is_err() {
             self.connection_state = ClientConnectionState::Failed;
-            let _ = self.transport.disconnect();
+            self.shutdown_transport(ControlShutdownReason::ProtocolFailure);
         }
         result
     }
@@ -289,29 +449,20 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
     fn accept_response_batch_inner(
         &mut self,
         command_id: CommandId,
-        responses: Vec<HostFrame>,
+        envelope: &CommandEnvelope,
+        original_reducer: SessionMachine,
+        mut candidate_reducer: SessionMachine,
+        required_command_state: Option<SessionState>,
+        responses: HostResponseBatch,
     ) -> Result<CommandReceipt, DebugHostClientError> {
         if responses.is_empty() {
-            self.connection_state = ClientConnectionState::Failed;
             return Err(DebugHostClientError::MissingCommandResult { command_id });
         }
-        if responses.len() > MAX_RESPONSE_FRAMES {
-            self.connection_state = ClientConnectionState::Failed;
-            return Err(DebugHostClientError::TooManyResponseFrames {
-                actual: responses.len(),
-                maximum: MAX_RESPONSE_FRAMES,
-            });
-        }
-        let original_state = self
-            .session
-            .as_ref()
-            .ok_or(DebugHostClientError::SessionNotOwned)?
-            .state
-            .clone();
         let mut events = Vec::with_capacity(responses.len());
         let mut outcome = None;
+        let mut evidence = ResponseEvidence::default();
 
-        for frame in responses {
+        for frame in responses.into_frames() {
             if frame.header().sequence.get() != self.next_inbound_frame_sequence {
                 return self.fail(DebugHostClientError::UnexpectedFrameSequence {
                     expected: self.next_inbound_frame_sequence,
@@ -323,6 +474,14 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
                 .checked_add(1)
                 .ok_or(DebugHostClientError::FrameSequenceOverflow)?;
             let event = decode_event_frame(&frame)?;
+            if event.version != self.typed_version {
+                return Err(DebugHostClientError::TypedProtocolVersionMismatch {
+                    negotiated_major: self.typed_version.major,
+                    negotiated_minor: self.typed_version.minor,
+                    received_major: event.version.major,
+                    received_minor: event.version.minor,
+                });
+            }
             self.event_cursor.observe(event.sequence)?;
             if event.caused_by != Some(command_id) {
                 return self.fail(DebugHostClientError::UnexpectedCommandCorrelation {
@@ -334,15 +493,117 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
                 .session
                 .as_ref()
                 .ok_or(DebugHostClientError::SessionNotOwned)?
-                .session_id;
+                .reducer
+                .session_id();
             if event.session_id != Some(session_id) {
                 return self.fail(DebugHostClientError::UnexpectedEventSession {
                     expected: session_id,
                     actual: event.session_id,
                 });
             }
+            if !matches!(&event.event, DebugEvent::StateChanged(_))
+                && event.state != Some(candidate_reducer.state().state_token())
+            {
+                return Err(DebugHostClientError::UnexpectedEventState {
+                    expected: candidate_reducer.state().state_token(),
+                    actual: event.state,
+                });
+            }
             match &event.event {
-                DebugEvent::StateChanged(state) => self.accept_state_change(state.clone())?,
+                DebugEvent::StateChanged(state) => {
+                    apply_state_event(
+                        &mut candidate_reducer,
+                        state,
+                        evidence.cleanup_receipt.as_ref(),
+                    )?;
+                    evidence.state_changed = true;
+                    if required_command_state.as_ref() == Some(state) {
+                        evidence.command_state_observed = true;
+                    }
+                }
+                DebugEvent::SandboxAttested(attestation) => accept_attestation_event(
+                    &mut candidate_reducer,
+                    attestation,
+                    &mut evidence,
+                )?,
+                DebugEvent::SandboxLifecycle(lifecycle) => validate_sandbox_lifecycle(
+                    &candidate_reducer,
+                    lifecycle,
+                    &mut evidence,
+                )?,
+                DebugEvent::MemoryRead {
+                    view,
+                    address,
+                    bytes,
+                } => match &envelope.command {
+                    DebugCommand::ReadMemory {
+                        view: expected_view,
+                        address: expected_address,
+                        size,
+                    } if view == expected_view
+                        && address == expected_address
+                        && bytes.len() == *size as usize =>
+                    {
+                        require_unique_evidence(&mut evidence.memory_read, "memory read")?;
+                    }
+                    _ => return Err(DebugHostClientError::UnexpectedCommandEvidence),
+                },
+                DebugEvent::MemoryWritten {
+                    stop,
+                    address,
+                    before,
+                    after,
+                } => match &envelope.command {
+                    DebugCommand::WriteMemory {
+                        address: expected_address,
+                        expected,
+                        replacement,
+                        ..
+                    } if address == expected_address
+                        && before == expected
+                        && after == replacement
+                        && matches!(
+                            candidate_reducer.state(),
+                            SessionState::Stopped { token, .. } if token == stop
+                        ) =>
+                    {
+                        require_unique_evidence(&mut evidence.memory_written, "memory write")?;
+                    }
+                    _ => return Err(DebugHostClientError::UnexpectedCommandEvidence),
+                },
+                DebugEvent::BreakpointChanged {
+                    stop,
+                    breakpoint,
+                    change,
+                } => {
+                    let current_stop = match candidate_reducer.state() {
+                        SessionState::Stopped { token, .. } => token,
+                        _ => return Err(DebugHostClientError::UnexpectedCommandEvidence),
+                    };
+                    if stop != current_stop {
+                        return Err(DebugHostClientError::UnexpectedCommandEvidence);
+                    }
+                    let matches_command = match (&envelope.command, change) {
+                        (
+                            DebugCommand::SetBreakpoint {
+                                breakpoint: expected,
+                                ..
+                            },
+                            BreakpointChange::Set,
+                        ) => breakpoint == expected,
+                        (
+                            DebugCommand::RemoveBreakpoint {
+                                breakpoint_id, ..
+                            },
+                            BreakpointChange::Removed,
+                        ) => breakpoint.id == *breakpoint_id,
+                        _ => false,
+                    };
+                    if !matches_command {
+                        return Err(DebugHostClientError::UnexpectedCommandEvidence);
+                    }
+                    require_unique_evidence(&mut evidence.breakpoint_changed, "breakpoint change")?;
+                }
                 DebugEvent::CommandResult {
                     command_id: result_id,
                     outcome: result,
@@ -358,7 +619,10 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
                             .fail(DebugHostClientError::DuplicateCommandResult { command_id });
                     }
                 }
-                _ => {}
+                DebugEvent::Warning { .. } => {}
+                DebugEvent::Capabilities(_) => {
+                    return Err(DebugHostClientError::UnexpectedCommandEvidence);
+                }
             }
             events.push(event);
         }
@@ -366,46 +630,50 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
             self.connection_state = ClientConnectionState::Failed;
             DebugHostClientError::MissingCommandResult { command_id }
         })?;
-        if matches!(&outcome, CommandOutcome::Rejected { .. })
-            && self.session.as_ref().map(|session| &session.state) != Some(&original_state)
-        {
-            return self.fail(DebugHostClientError::RejectedCommandChangedState { command_id });
+        match &outcome {
+            CommandOutcome::Rejected { .. } => {
+                if evidence.has_effect() {
+                    return Err(DebugHostClientError::RejectedCommandChangedState { command_id });
+                }
+            }
+            CommandOutcome::Succeeded => {
+                if required_command_state.is_some() && !evidence.command_state_observed {
+                    return Err(DebugHostClientError::MissingCommandState { command_id });
+                }
+                validate_success_evidence(
+                    &envelope.command,
+                    &candidate_reducer,
+                    &evidence,
+                    command_id,
+                )?;
+                let session = self
+                    .session
+                    .as_mut()
+                    .ok_or(DebugHostClientError::SessionNotOwned)?;
+                session.sandbox_cleanup_verified = candidate_reducer.state().kind()
+                    == SessionStateKind::Closed
+                    && candidate_reducer.expected_attestation().is_some()
+                    && evidence.cleanup_receipt.is_some();
+                session.reducer = candidate_reducer;
+            }
         }
+        debug_assert_eq!(
+            self.session
+                .as_ref()
+                .map(|session| session.reducer.state()),
+            if matches!(&outcome, CommandOutcome::Succeeded) {
+                self.session
+                    .as_ref()
+                    .map(|session| session.reducer.state())
+            } else {
+                Some(original_reducer.state())
+            }
+        );
         Ok(CommandReceipt {
             command_id,
             outcome,
             events,
         })
-    }
-
-    fn accept_state_change(&mut self, next: SessionState) -> Result<(), DebugHostClientError> {
-        let session = self
-            .session
-            .as_ref()
-            .ok_or(DebugHostClientError::SessionNotOwned)?;
-        let session_id = session.session_id;
-        let current_generation = session.state.state_token().generation.get();
-        let token = next.state_token();
-        if token.session_id != session_id {
-            return self.fail(DebugHostClientError::UnexpectedEventSession {
-                expected: session_id,
-                actual: Some(token.session_id),
-            });
-        }
-        let expected = current_generation
-            .checked_add(1)
-            .ok_or(DebugHostClientError::StateGenerationOverflow)?;
-        if token.generation.get() != expected {
-            return self.fail(DebugHostClientError::UnexpectedStateGeneration {
-                expected,
-                actual: token.generation.get(),
-            });
-        }
-        self.session
-            .as_mut()
-            .ok_or(DebugHostClientError::SessionNotOwned)?
-            .state = next;
-        Ok(())
     }
 
     fn require_connected(&self) -> Result<(), DebugHostClientError> {
