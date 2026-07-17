@@ -397,8 +397,10 @@ pub enum HostCodecError {
 mod tests {
     use super::*;
     use crate::protocol::{
-        CommandId, DebugCommand, DebugEvent, EventEnvelope, EventSequence, MemoryAddress,
-        ProtocolVersion, ReadViewToken, SessionId, StateGeneration, StateToken, StopId, StopToken,
+        BreakpointChange, BreakpointId, BreakpointKind, BreakpointPersistence, BreakpointScope,
+        BreakpointSpec, CommandId, DebugCommand, DebugEvent, EventEnvelope, EventSequence,
+        MemoryAddress, ProtocolVersion, ReadViewToken, SessionId, StateGeneration, StateToken,
+        StopId, StopToken,
     };
 
     fn close_command() -> CommandEnvelope {
@@ -435,6 +437,33 @@ mod tests {
                 address: MemoryAddress::new(0x1400),
                 expected: vec![1, 2, 3],
                 replacement: vec![4, 5, 6],
+            },
+        }
+    }
+
+    fn breakpoint_command(persistence: BreakpointPersistence) -> CommandEnvelope {
+        let session_id = SessionId::new(11).expect("session id");
+        let state = StateToken {
+            session_id,
+            generation: StateGeneration::new(5).expect("generation"),
+        };
+        CommandEnvelope {
+            version: ProtocolVersion::current(),
+            command_id: CommandId::new(12).expect("command id"),
+            session_id: Some(session_id),
+            expected_state: Some(state),
+            command: DebugCommand::SetBreakpoint {
+                stop: StopToken {
+                    state,
+                    stop_id: StopId::new(3).expect("stop id"),
+                },
+                breakpoint: BreakpointSpec {
+                    id: BreakpointId::new(4).expect("breakpoint id"),
+                    address: MemoryAddress::new(0x401234),
+                    kind: BreakpointKind::Software,
+                    scope: BreakpointScope::Process,
+                },
+                persistence,
             },
         }
     }
@@ -507,6 +536,130 @@ mod tests {
                 envelope_major,
                 ..
             }) if envelope_major == crate::protocol::PROTOCOL_MAJOR + 1
+        ));
+    }
+
+    #[test]
+    fn breakpoint_persistence_is_required_and_round_trips_on_set_commands() {
+        for (persistence, encoded_name) in [
+            (BreakpointPersistence::Persistent, "persistent"),
+            (BreakpointPersistence::Temporary, "temporary"),
+        ] {
+            let command = breakpoint_command(persistence);
+            let frame = encode_command_frame(FrameSequence::new(1).unwrap(), &command).unwrap();
+            assert_eq!(decode_command_frame(&frame).unwrap(), command);
+            let ControlBody::Bytes(control) = &frame.header().body else {
+                panic!("command control must be bytes")
+            };
+            let json: serde_json::Value = serde_json::from_slice(control).unwrap();
+            assert_eq!(
+                json.pointer("/envelope/command/parameters/persistence")
+                    .and_then(serde_json::Value::as_str),
+                Some(encoded_name)
+            );
+        }
+
+        let frame = encode_command_frame(
+            FrameSequence::new(1).unwrap(),
+            &breakpoint_command(BreakpointPersistence::Temporary),
+        )
+        .unwrap();
+        let ControlBody::Bytes(control) = &frame.header().body else {
+            panic!("command control must be bytes")
+        };
+        let mut missing: serde_json::Value = serde_json::from_slice(control).unwrap();
+        missing
+            .pointer_mut("/envelope/command/parameters")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("set-breakpoint parameters")
+            .remove("persistence");
+        let missing = HostFrame::new(
+            FrameHeader::new(
+                FrameSequence::new(1).unwrap(),
+                MessageKind::Command,
+                0,
+                None,
+                ControlBody::Bytes(serde_json::to_vec(&missing).unwrap()),
+            )
+            .unwrap(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(matches!(
+            decode_command_frame(&missing),
+            Err(HostCodecError::Json(_))
+        ));
+    }
+
+    #[test]
+    fn breakpoint_set_evidence_echoes_policy_and_removal_makes_no_policy_claim() {
+        let command = breakpoint_command(BreakpointPersistence::Temporary);
+        let DebugCommand::SetBreakpoint {
+            stop, breakpoint, ..
+        } = command.command
+        else {
+            unreachable!()
+        };
+        let event = |change| EventEnvelope {
+            version: ProtocolVersion::current(),
+            sequence: EventSequence::new(1).unwrap(),
+            session_id: Some(stop.state.session_id),
+            state: Some(stop.state),
+            caused_by: Some(command.command_id),
+            event: DebugEvent::BreakpointChanged {
+                stop,
+                breakpoint: breakpoint.clone(),
+                change,
+            },
+        };
+
+        let set = event(BreakpointChange::Set {
+            persistence: BreakpointPersistence::Temporary,
+        });
+        let set_frame = encode_event_frame(FrameSequence::new(2).unwrap(), &set).unwrap();
+        assert_eq!(decode_event_frame(&set_frame).unwrap(), set);
+        let ControlBody::Bytes(set_control) = &set_frame.header().body else {
+            panic!("event control must be bytes")
+        };
+        assert!(
+            std::str::from_utf8(set_control)
+                .unwrap()
+                .contains("\"persistence\":\"temporary\"")
+        );
+
+        let removed = event(BreakpointChange::Removed);
+        let removed_frame = encode_event_frame(FrameSequence::new(3).unwrap(), &removed).unwrap();
+        assert_eq!(decode_event_frame(&removed_frame).unwrap(), removed);
+        let ControlBody::Bytes(removed_control) = &removed_frame.header().body else {
+            panic!("event control must be bytes")
+        };
+        assert!(
+            !std::str::from_utf8(removed_control)
+                .unwrap()
+                .contains("persistence")
+        );
+
+        let mut claimed_policy: serde_json::Value =
+            serde_json::from_slice(removed_control).unwrap();
+        *claimed_policy
+            .pointer_mut("/envelope/event/payload/change")
+            .expect("breakpoint change") =
+            serde_json::json!({ "removed": { "persistence": "temporary" } });
+        let claimed_policy = HostFrame::new(
+            FrameHeader::new(
+                FrameSequence::new(4).unwrap(),
+                MessageKind::Event,
+                0,
+                None,
+                ControlBody::Bytes(serde_json::to_vec(&claimed_policy).unwrap()),
+            )
+            .unwrap(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(matches!(
+            decode_event_frame(&claimed_policy),
+            Err(HostCodecError::Json(_))
         ));
     }
 

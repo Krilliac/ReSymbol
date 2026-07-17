@@ -1778,7 +1778,11 @@ mod tests {
                 expected: vec![0x90],
                 replacement: vec![0xcc],
             },
-            DebugCommand::SetBreakpoint { stop, breakpoint },
+            DebugCommand::SetBreakpoint {
+                stop,
+                breakpoint,
+                persistence: crate::BreakpointPersistence::Persistent,
+            },
             DebugCommand::RemoveBreakpoint {
                 stop,
                 breakpoint_id: BreakpointId::new(1).unwrap(),

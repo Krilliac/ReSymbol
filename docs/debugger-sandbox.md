@@ -115,11 +115,19 @@ plans restoration. Its exact acknowledgement removes a temporary breakpoint; a p
 waits for an exact externally supplied later-stop correlation before it can plan rearming. That
 correlation is not evidence that an operating-system single step occurred.
 
+The same protocol-layer `BreakpointPersistence` policy drives the planner and the host seam.
+`DebugCommand::SetBreakpoint` carries either `Persistent` or `Temporary`, and correlated
+`BreakpointChanged::Set` evidence must echo that exact policy. `BreakpointChanged::Removed` carries
+no persistence field because removal makes no claim about the breakpoint's former lifetime. A
+successful set response requires exactly one matching change before its command result; missing,
+substituted, duplicate/replayed, or post-result evidence fails the connection. Acceptance refreshes
+the stopped state, so the command's old `StopToken` cannot authorize a replay.
+
 Any wrong, duplicate, stale, or out-of-order acknowledgement poisons the reducer permanently. The
 first mismatch freezes the last acknowledged table plus the exact pending plan whose physical
 outcome is now unknown, so cleanup can reconcile exact bytes without falsely reporting a clean
 target. The reducer itself performs no target access, continuation, single step, Win32 call, wire
-serialization, or protocol-version change and makes no claim that any planned operation succeeded.
+serialization, or protocol dispatch and makes no claim that any planned operation succeeded.
 
 ## Read-only provider discovery
 
@@ -280,11 +288,12 @@ provider, not evidence that such a provider exists.
 
 The current seam is intentionally narrow:
 
-- debugger wire and typed-command protocol 1.4 carries the lease identifiers, provisioning epoch,
+- debugger wire and typed-command protocol 1.5 carries the lease identifiers, provisioning epoch,
   exact suspended-target process identity through state and attestation, exact failure operation
   context including the explicit target-creation outcome, and process-bound incomplete or complete
-  cleanup evidence, plus exact live-target binding evidence and granular step capability statuses.
-  The wire supports exactly 1.4; a 1.3 or earlier Hello is rejected before negotiation because it
+  cleanup evidence, plus exact live-target binding evidence, granular step capability statuses, and
+  explicit breakpoint persistence policy echoed by successful set evidence. The wire supports
+  exactly 1.5; a 1.4 or earlier Hello is rejected before negotiation because it
   cannot represent the complete current compatibility contract;
 - a four-byte length prefix is validated before allocating a bounded control buffer;
 - controller and host roles, directions, nonzero challenge nonce, expected plaintext build claims,
@@ -308,7 +317,9 @@ The current seam is intentionally narrow:
   must contain exactly one command result and only events correlated to that command;
 - session generations and stop/run identifiers must advance exactly through the command-specific
   reducer path; non-transition events carry the exact current state token, and memory/breakpoint
-  evidence must match the request. Policy and discovery failures can roll back only before any
+  evidence must match the request. Breakpoint-set evidence must echo the requested persistence
+  policy exactly, while removal evidence carries no persistence claim. Policy and discovery
+  failures can roll back only before any
   command-state event or operation evidence is observed, from the exact accepted Opening or
   Provisioning post-state. A resource-retaining sandbox rejection must follow its exact
   command-state transition, match the command/stage/kind/reducer phase, bind the full launch and its
@@ -468,10 +479,11 @@ The instruction action menu maintains three separate authority domains:
    or stopped-thread bindings required by the action. Live NOP requires `LiveMemoryWrite` and a
    `DebugCommand::WriteMemory` compare-before-write with the exact selected bytes and an equal-length
    `0x90` replacement. Run to Cursor requires both software-breakpoint and execution-control
-   capability and composes a temporary software breakpoint with Continue. The protocol reports
+   capability and composes `BreakpointPersistence::Temporary` with Continue. The protocol reports
    Step Into/Over/Out through separate `StepInto`, `StepOver`, and `StepOut` statuses; wiring those
    statuses into the still-disabled workbench action policy remains part of live-provider
-   integration. Continue and persistent software breakpoint creation stay on the typed command path.
+   integration. Continue and `BreakpointPersistence::Persistent` breakpoint creation stay on the
+   typed command path.
 
 Protection findings are bounded artifact evidence. They are neither malware signatures nor an
 authorization to execute. Offline opening should keep those findings reviewable without training the
@@ -487,7 +499,7 @@ No process-executing provider should merge until the project has evidence for:
 - legal session transitions, cross-target and replayed lease rejection, stale generation/stop
   rejection, provisioning-epoch-bound attestation and cleanup, attestation-gated resume,
   compare-write conflicts, sequence overflow, and terminal cleanup behavior;
-- strict wire decoding, exact-1.4 Hello-first/once build-claim exchange including legacy-1.3
+- strict wire decoding, exact-1.5 Hello-first/once build-claim exchange including legacy-1.4
   rejection, role/build/version/nonce correlation, independent transport authentication, bounded
   allocation before payload reads, and crash recovery;
 - benign Windows probes showing allowed staged reads and scratch writes while profile sentinels,

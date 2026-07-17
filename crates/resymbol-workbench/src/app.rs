@@ -7794,10 +7794,10 @@ fn protocol_route_text(route: &LiveDebuggerProtocolRoute) -> String {
         ),
         LiveDebuggerProtocolRoute::SetBreakpoint {
             kind,
-            temporary,
+            persistence,
             continue_after_set,
         } => format!(
-            "DebugCommand::SetBreakpoint ({kind:?}, temporary={temporary}){}",
+            "DebugCommand::SetBreakpoint ({kind:?}, persistence={persistence:?}){}",
             if *continue_after_set {
                 " then DebugCommand::Continue"
             } else {
@@ -9286,14 +9286,20 @@ mod tests {
     }
 
     #[test]
-    fn live_route_text_keeps_run_to_cursor_and_nop_composition_explicit() {
+    fn live_route_text_keeps_breakpoint_policy_and_nop_composition_explicit() {
+        let persistent =
+            LiveInstructionAction::SetSoftwareBreakpoint.protocol_route_preview(&[0x90]);
         let run_to = LiveInstructionAction::RunToCursor.protocol_route_preview(&[0x90]);
         let live_nop =
             LiveInstructionAction::NopLiveMemory.protocol_route_preview(&[0x48, 0x89, 0xD8]);
 
         assert_eq!(
+            protocol_route_text(&persistent),
+            "DebugCommand::SetBreakpoint (Software, persistence=Persistent)"
+        );
+        assert_eq!(
             protocol_route_text(&run_to),
-            "DebugCommand::SetBreakpoint (Software, temporary=true) then DebugCommand::Continue"
+            "DebugCommand::SetBreakpoint (Software, persistence=Temporary) then DebugCommand::Continue"
         );
         assert_eq!(
             protocol_route_text(&live_nop),
