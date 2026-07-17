@@ -46,10 +46,14 @@ prereleases; breaking changes remain explicit.
   expected-byte comparisons before creating a deterministic output in one separately owned buffer.
   Persisted package section metadata therefore cannot authorize a write. `AppServices` can stage,
   flush, file-synchronize, and create-new publish that image without modifying the source or
-  replacing an existing target; failed staging is cleaned automatically. Unix parent-directory
-  synchronization is reported, while Windows makes no power-loss durability claim for the
-  destination directory entry. Every result explicitly warns that Authenticode signature validity
-  and the PE checksum may be invalidated, and ReSymbol does not repair, recompute, or re-sign them.
+  replacing an existing target; failed staging is cleaned automatically. The named destination is
+  reopened and its streamed size and SHA-256 must match before a success receipt is returned.
+  Static patch and ordinary export jobs share one mutually exclusive canonical destination
+  reservation in the workbench. Unix parent-directory synchronization failure after publication is
+  reported as a verified-file partial-success durability warning, while Windows reports file-only
+  synchronization and makes no power-loss durability claim for the destination directory entry.
+  Every result explicitly warns that Authenticode signature validity and the PE checksum may be
+  invalidated, and ReSymbol does not repair, recompute, or re-sign them.
 - Added a refreshable exact-artifact policy catalog to the desktop workbench. Scans run on the
   bounded application-service worker and replace one owned snapshot, while the UI remains strictly
   non-executing. Every fingerprintable unpacked candidate with a valid manifest reports its exact
@@ -497,8 +501,10 @@ schema versions independently.
   decode as one exact complete x86-64 instruction. Application computes the fresh complete identity
   once from the exact source, validates a strict source-byte-derived layout and every mapping,
   checks every expected byte, and mutates only a newly allocated output buffer. Same-directory
-  staged publication is no-clobber; it does not make a patched executable trusted, signed,
-  checksum-correct, safe to run, semantically valid, or necessarily power-loss durable on Windows.
+  staged publication is no-clobber and a success receipt additionally requires a reopened
+  destination with the expected exact size and SHA-256; it does not make a patched executable
+  trusted, signed, checksum-correct, safe to run, semantically valid, or necessarily power-loss
+  durable on Windows.
 - macOS executable-plugin containment now observes direct-child exit with a `kqueue` process filter,
   terminates the still-stable process group, and only then reaps the leader. XNU registration
   races resolve through an already-exited path that also kills the group before collecting status,

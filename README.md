@@ -91,9 +91,13 @@ The current alpha implements and tests an end-to-end, deliberately narrow analys
   non-executable, and out-of-image ranges, and reparse the exact source's strict PE layout before
   requiring every fresh mapping and expected span to match. Publication stages, flushes, and
   file-synchronizes the complete image beside its destination before a create-new, no-clobber
-  publish. Unix also synchronizes the parent directory; the Windows path does not claim that the
-  new directory entry survives sudden power loss. The source is never rewritten. A patched PE may
-  no longer have a valid
+  publish, then reopens the named destination and streams its exact size and SHA-256 before issuing
+  a success receipt. Unix also synchronizes the parent directory; a failure after publication is
+  reported as a verified-file durability warning instead of falsely claiming that no output was
+  created. The Windows path reports file-only synchronization and does not claim that the new
+  directory entry survives sudden power loss. The workbench reserves one canonical destination at
+  a time across ordinary exports and patched binaries. The source is never rewritten. A patched PE
+  may no longer have a valid
   Authenticode signature or PE checksum; ReSymbol reports both caveats and does not repair,
   recompute, or re-sign either one;
 - a deterministic, debugger-neutral export projection plus `resymbol export`, which writes the
@@ -407,8 +411,11 @@ bytes before allocating and changing one separate output buffer. Persisted packa
 therefore cannot authorize a patch. Publishing never overwrites the source or an existing
 destination. Patched outputs carry explicit warnings that Authenticode signature validity and the
 PE checksum may have been invalidated; neither is repaired or re-signed. The staged file is synced;
-Unix additionally syncs its parent directory, while Windows publication makes no power-loss
-durability guarantee for the destination directory entry.
+the named destination is then reopened and its streamed size and SHA-256 must match before a success
+receipt is returned. Unix additionally syncs its parent directory and reports post-publication sync
+failure as a partial-success durability warning, while Windows reports file-only synchronization
+and makes no power-loss durability guarantee for the destination directory entry. Static patch and
+ordinary export jobs share one canonical, mutually exclusive workbench publication reservation.
 
 The main review views stay on one responsive tab row at the default viewport and collapse into an
 explicit all-view selector at the documented minimum size. Use **Ctrl+Tab** or

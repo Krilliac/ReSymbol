@@ -8,6 +8,9 @@ use std::{
     sync::Arc,
 };
 
+#[cfg(windows)]
+use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt as _};
+
 use resymbol_analysis::{
     AnalysisError, BinaryAnalysis, ExactX64InstructionError, PeSection, inspect_pe_layout,
     validate_exact_x64_instruction,
@@ -435,6 +438,47 @@ impl fmt::Display for StaticPatchWarning {
     }
 }
 
+/// Filesystem durability established for a successfully verified publication.
+///
+/// Every successful receipt means the staged file was synchronized and the
+/// destination was reopened and matched by exact size and SHA-256. Directory
+/// entry durability is reported separately because it is platform-dependent
+/// and can fail after the create-new target has already become visible.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StaticPatchDurability {
+    /// Both the published file and its containing directory were synchronized.
+    FileAndParentDirectorySynchronized,
+    /// The file was synchronized, but this platform has no portable directory sync here.
+    FileSynchronizedOnly,
+    /// The file was published and verified, but synchronizing its parent failed.
+    ParentDirectorySyncFailed { detail: String },
+}
+
+impl StaticPatchDurability {
+    #[must_use]
+    pub const fn is_fully_synchronized(&self) -> bool {
+        matches!(self, Self::FileAndParentDirectorySynchronized)
+    }
+}
+
+impl fmt::Display for StaticPatchDurability {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::FileAndParentDirectorySynchronized => {
+                formatter.write_str("file and parent directory synchronized")
+            }
+            Self::FileSynchronizedOnly => formatter.write_str(
+                "file content synchronized; parent-directory durability is not available on this platform",
+            ),
+            Self::ParentDirectorySyncFailed { detail } => write!(
+                formatter,
+                "file was created and verified, but parent-directory synchronization failed: {detail}"
+            ),
+        }
+    }
+}
+
 /// Newly allocated patched bytes and their deterministic exact identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PatchedBinaryImage {
@@ -479,6 +523,7 @@ pub struct PublishedStaticPatch {
     source_identity: BinaryIdentity,
     output_identity: BinaryIdentity,
     warnings: [StaticPatchWarning; 2],
+    durability: StaticPatchDurability,
 }
 
 impl PublishedStaticPatch {
@@ -500,6 +545,11 @@ impl PublishedStaticPatch {
     #[must_use]
     pub const fn warnings(&self) -> &[StaticPatchWarning] {
         &self.warnings
+    }
+
+    #[must_use]
+    pub const fn durability(&self) -> &StaticPatchDurability {
+        &self.durability
     }
 }
 
@@ -538,10 +588,12 @@ impl AppServices {
     /// race-safe because no-clobber publication permits at most one success.
     /// Publication uses same-directory staging; an existing target is never
     /// replaced. A failed staging operation drops and removes its staging file.
-    /// On Unix, the parent directory is synchronized after publication and an
-    /// error can therefore be reported after the target becomes visible. The
-    /// Windows path has no portable parent-directory synchronization here, so
-    /// success does not claim that the new directory entry survives power loss.
+    /// The visible destination is reopened and its exact size and SHA-256 must
+    /// match before a success receipt is returned. On Unix, parent-directory
+    /// synchronization failure is a partial-success durability warning on that
+    /// receipt because the verified target already exists. The Windows path has
+    /// no portable parent-directory synchronization here, so success does not
+    /// claim that the new directory entry survives power loss.
     pub fn publish_static_patch_new(
         &self,
         project: &ProjectSnapshot,
@@ -804,6 +856,14 @@ fn publish_image_new(
     image: &PatchedBinaryImage,
     output: &Path,
 ) -> Result<PublishedStaticPatch, StaticPatchError> {
+    publish_image_new_with_durability_probe(image, output, publication_durability)
+}
+
+fn publish_image_new_with_durability_probe(
+    image: &PatchedBinaryImage,
+    output: &Path,
+    durability_probe: impl FnOnce(&Path, &Path) -> StaticPatchDurability,
+) -> Result<PublishedStaticPatch, StaticPatchError> {
     if output.file_name().is_none() {
         return Err(StaticPatchError::InvalidOutputPath {
             path: output.to_path_buf(),
@@ -829,8 +889,8 @@ fn publish_image_new(
         StaticPatchError::io("synchronize staged patched binary", output, source)
     })?;
 
-    match temporary.persist_noclobber(output) {
-        Ok(_) => sync_parent_directory(parent, output)?,
+    let published_file = match temporary.persist_noclobber(output) {
+        Ok(file) => file,
         Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
             return Err(StaticPatchError::TargetAlreadyExists {
                 path: output.to_path_buf(),
@@ -843,29 +903,93 @@ fn publish_image_new(
                 error.error,
             ));
         }
-    }
+    };
+
+    // On Windows the staging handle is writable. Close it before reopening the
+    // destination with write/delete sharing denied so verification observes the
+    // path that will be named in the receipt, not merely the pre-rename buffer.
+    drop(published_file);
+    let verification = verify_published_output(output, image.output_identity());
+    let durability = durability_probe(parent, output);
+    verification?;
 
     Ok(PublishedStaticPatch {
         path: output.to_path_buf(),
         source_identity: image.source_identity.clone(),
         output_identity: image.output_identity.clone(),
         warnings: image.warnings,
+        durability,
     })
 }
 
+fn verify_published_output(
+    output: &Path,
+    expected: &BinaryIdentity,
+) -> Result<(), StaticPatchError> {
+    let file = open_published_output_for_verification(output).map_err(|source| {
+        StaticPatchError::PublishedOutputVerificationIo {
+            path: output.to_path_buf(),
+            source,
+        }
+    })?;
+    let (actual_id, actual_size) = BinaryId::digest_reader(file).map_err(|source| {
+        StaticPatchError::PublishedOutputVerificationIo {
+            path: output.to_path_buf(),
+            source,
+        }
+    })?;
+    if actual_size != expected.size {
+        return Err(StaticPatchError::PublishedOutputSizeMismatch {
+            path: output.to_path_buf(),
+            expected: expected.size,
+            actual: actual_size,
+        });
+    }
+    if actual_id != expected.id {
+        return Err(StaticPatchError::PublishedOutputIdentityMismatch {
+            path: output.to_path_buf(),
+            expected: expected.id.clone(),
+            actual: actual_id,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn open_published_output_for_verification(output: &Path) -> io::Result<std::fs::File> {
+    // FILE_SHARE_READ. Excluding write/delete sharing keeps the reopened target
+    // stable for the complete streaming identity check.
+    const VERIFICATION_SHARE_MODE: u32 = 0x0000_0001;
+    OpenOptions::new()
+        .read(true)
+        .share_mode(VERIFICATION_SHARE_MODE)
+        .open(output)
+}
+
+#[cfg(not(windows))]
+fn open_published_output_for_verification(output: &Path) -> io::Result<std::fs::File> {
+    std::fs::File::open(output)
+}
+
 #[cfg(unix)]
-fn sync_parent_directory(parent: &Path, output: &Path) -> Result<(), StaticPatchError> {
-    std::fs::File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|source| StaticPatchError::io("synchronize parent directory for", output, source))
+fn publication_durability(parent: &Path, output: &Path) -> StaticPatchDurability {
+    match std::fs::File::open(parent).and_then(|directory| directory.sync_all()) {
+        Ok(()) => StaticPatchDurability::FileAndParentDirectorySynchronized,
+        Err(error) => StaticPatchDurability::ParentDirectorySyncFailed {
+            detail: format!(
+                "cannot synchronize parent directory for `{}`: {error}",
+                output.display()
+            ),
+        },
+    }
 }
 
 #[cfg(not(unix))]
-fn sync_parent_directory(_parent: &Path, _output: &Path) -> Result<(), StaticPatchError> {
+fn publication_durability(_parent: &Path, _output: &Path) -> StaticPatchDurability {
     // `std::fs::File::open` cannot portably open a Windows directory for
     // `sync_all`. The staged file itself was synchronized, but this no-op must
     // not be described as a power-loss durability guarantee for the rename.
-    Ok(())
+    StaticPatchDurability::FileSynchronizedOnly
 }
 
 /// Validation, identity, compare-before-write, allocation, and publication failures.
@@ -1028,6 +1152,30 @@ pub enum StaticPatchError {
     OutputMatchesSource { path: PathBuf },
     #[error("refusing to overwrite existing patched binary `{path}`")]
     TargetAlreadyExists { path: PathBuf },
+    #[error(
+        "patched output was created at `{path}`, but the reopened file has {actual} bytes instead of {expected}"
+    )]
+    PublishedOutputSizeMismatch {
+        path: PathBuf,
+        expected: u64,
+        actual: u64,
+    },
+    #[error(
+        "patched output was created at `{path}`, but the reopened SHA-256 is {actual}, not {expected}"
+    )]
+    PublishedOutputIdentityMismatch {
+        path: PathBuf,
+        expected: BinaryId,
+        actual: BinaryId,
+    },
+    #[error(
+        "patched output was created at `{path}`, but destination verification failed: {source}"
+    )]
+    PublishedOutputVerificationIo {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
     #[error("cannot {operation} `{path}`: {source}")]
     Io {
         operation: &'static str,
@@ -1049,11 +1197,44 @@ impl StaticPatchError {
             source,
         }
     }
+
+    /// Whether create-new publication completed before this verification error.
+    #[must_use]
+    pub const fn target_may_exist(&self) -> bool {
+        matches!(
+            self,
+            Self::PublishedOutputSizeMismatch { .. }
+                | Self::PublishedOutputIdentityMismatch { .. }
+                | Self::PublishedOutputVerificationIo { .. }
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_identity(bytes: &[u8]) -> BinaryIdentity {
+        BinaryIdentity {
+            id: BinaryId::digest(bytes),
+            size: u64::try_from(bytes.len()).expect("test input length"),
+            format: BinaryFormat::Pe,
+            architecture: "x86_64".to_owned(),
+            image_base: 0x0000_0001_4000_0000,
+        }
+    }
+
+    fn test_patched_image(bytes: &[u8]) -> PatchedBinaryImage {
+        PatchedBinaryImage {
+            bytes: Arc::new(bytes.to_vec()),
+            source_identity: test_identity(b"source image"),
+            output_identity: test_identity(bytes),
+            warnings: [
+                StaticPatchWarning::AuthenticodeMayBeInvalid,
+                StaticPatchWarning::PeChecksumMayBeInvalid,
+            ],
+        }
+    }
 
     fn section(
         virtual_address: u32,
@@ -1150,5 +1331,62 @@ mod tests {
             "general multi-instruction escape hatch",
         )
         .expect("general same-size replacements may span instructions");
+    }
+
+    #[test]
+    fn reopened_publication_verification_has_typed_size_and_identity_failures() {
+        let directory = tempfile::tempdir().expect("temporary publication directory");
+        let expected_bytes = b"verified patched output";
+        let expected = test_identity(expected_bytes);
+        let output = directory.path().join("patched.exe");
+
+        fs::write(&output, &expected_bytes[..expected_bytes.len() - 1])
+            .expect("write short publication");
+        let size_error = verify_published_output(&output, &expected)
+            .expect_err("short publication must fail verification");
+        assert!(matches!(
+            &size_error,
+            StaticPatchError::PublishedOutputSizeMismatch {
+                expected: 23,
+                actual: 22,
+                ..
+            }
+        ));
+        assert!(size_error.target_may_exist());
+
+        fs::write(&output, vec![0xA5; expected_bytes.len()])
+            .expect("write same-size wrong publication");
+        let identity_error = verify_published_output(&output, &expected)
+            .expect_err("wrong publication identity must fail verification");
+        assert!(matches!(
+            &identity_error,
+            StaticPatchError::PublishedOutputIdentityMismatch { .. }
+        ));
+        assert!(identity_error.target_may_exist());
+
+        fs::write(&output, expected_bytes).expect("write exact publication");
+        verify_published_output(&output, &expected).expect("exact publication verifies");
+    }
+
+    #[test]
+    fn parent_sync_failure_is_a_truthful_partial_success_receipt() {
+        let directory = tempfile::tempdir().expect("temporary publication directory");
+        let output = directory.path().join("patched.exe");
+        let image = test_patched_image(b"patched binary bytes");
+        let receipt = publish_image_new_with_durability_probe(&image, &output, |_, _| {
+            StaticPatchDurability::ParentDirectorySyncFailed {
+                detail: "deterministic directory sync failure".to_owned(),
+            }
+        })
+        .expect("visible verified publication remains successful");
+
+        assert_eq!(fs::read(&output).expect("read publication"), image.bytes());
+        assert_eq!(receipt.output_identity(), image.output_identity());
+        assert!(matches!(
+            receipt.durability(),
+            StaticPatchDurability::ParentDirectorySyncFailed { detail }
+                if detail == "deterministic directory sync failure"
+        ));
+        assert!(!receipt.durability().is_fully_synchronized());
     }
 }

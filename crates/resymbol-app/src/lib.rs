@@ -15,8 +15,8 @@ pub use export::{ExportFormat, PreparedExport};
 pub use patch::{
     MAX_STATIC_PATCH_BYTES, MAX_STATIC_PATCH_BYTES_PER_EDIT, MAX_STATIC_PATCH_EDITS,
     MAX_STATIC_PATCH_LABEL_BYTES, MAX_STATIC_PATCH_NOP_INSTRUCTION_BYTES, PatchedBinaryImage,
-    PublishedStaticPatch, StaticPatchEdit, StaticPatchEditRequest, StaticPatchError,
-    StaticPatchKind, StaticPatchPlan, StaticPatchWarning,
+    PublishedStaticPatch, StaticPatchDurability, StaticPatchEdit, StaticPatchEditRequest,
+    StaticPatchError, StaticPatchKind, StaticPatchPlan, StaticPatchWarning,
 };
 pub use plugins::{PluginArtifactPolicyStatus, PluginCatalog, PluginCatalogEntry};
 pub use project::{AppServices, DEFAULT_MAX_BINARY_BYTES, ExactBinary, ProjectSnapshot};
