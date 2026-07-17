@@ -20,6 +20,9 @@ ReSymbol currently implements the non-executing foundation for debugger and sand
 - a production, in-process `OfflineImageDebugHost` that freezes an identity-checked image snapshot,
   advertises only offline analysis, and serves bounded reads from exact canonical file-backed image
   ranges without opening a process or executing target code;
+- a Windows-only, same-thread phase-one attach provider that repeats exact live-target preflight,
+  retains the initial attach breakpoint, advertises only host attach and stopped main-image reads,
+  and records explicit continuation/detach cleanup outcomes without exposing execution control;
 - a pure, bounded software-breakpoint transaction reducer that retains exact original bytes and
   emits correlated one-byte action plans without reading, writing, or executing a target; and
 - sandbox policy, attestation, failure, lifecycle, resource-limit, and cleanup-receipt data models.
@@ -29,12 +32,12 @@ cannot execute a target, create an AppContainer profile, enable a Windows featur
 provision any other resource. A readiness result means only that a caller may attempt provisioning;
 the suspended target still needs the exact policy/provider/build attestation described below.
 
-The Windows debugger host process, pipe transport, AppContainer provider, Hyper-V provider, guest
-agent, live process attach, breakpoint engine, register access, provider-integrated live memory
-access, and live instruction editing are not implemented. `SyntheticDebugHost` is available only to
-crate tests or the explicit `test-support` feature. It is not a security boundary or platform
-provider. The current types and UI must not be described as a working malware sandbox or live
-debugger.
+The authenticated Windows debugger-host process and pipe transport, AppContainer provider, Hyper-V
+provider, guest agent, live launch, breakpoint engine, register access, execution control,
+provider-integrated UI, and live instruction editing are not implemented. `SyntheticDebugHost` is
+available only to crate tests or the explicit `test-support` feature. It is not a security boundary
+or platform provider. The phase-one Windows attach/read primitive is likewise not an end-user live
+debugger or sandbox boundary.
 
 The separate Windows-only `resymbol-windows-live-access` crate is a lower-level building block, not
 a provider. It opens one explicitly selected PID only when its creation `FILETIME`, debug-event image
@@ -64,6 +67,23 @@ reported base to equal caller-supplied independent create-process debug-event ev
 size mismatch before a bounded region walk, and validates every reported image region; Tool Help
 itself remains target-loader-derived corroboration. The debug
 event's image-file handle should be retained when Windows supplies it.
+
+The separate `resymbol-windows-debug-host` crate now consumes this exact read-only preflight for one
+narrow Windows phase. Its non-transferable worker calls `DebugActiveProcess`, immediately calls
+`DebugSetProcessKillOnExit(FALSE)`, and drains the attach-time current-state events under one finite
+total deadline plus a count ceiling. It requires the first event to be the exact process/base
+`CREATE_PROCESS_DEBUG_EVENT`, adopts and closes only documented create-process/load-DLL `hFile`
+handles, conservatively passes unexpected exceptions as not handled, and retains the first-chance
+attach breakpoint. While that event remains pending it permits only exact bounded reads inside the
+validated main image. Detach first continues the retained breakpoint and then attempts
+`DebugActiveProcessStop` even if continuation fails; kill-policy, continuation, and detach outcomes
+are reported separately. Drop performs only best-effort cleanup and cannot be used as detach proof.
+
+This low-level method is named `attach_after_authorization` to make its prerequisite explicit, but a
+name and `LiveTargetBinding` are not authority. The crate neither authenticates a transport nor
+verifies or consumes a move-only host-risk lease. Only a future authenticated, host-local
+`SessionWorker` may place it behind the command reducer and exact one-use authorization flow. The
+current Workbench never invokes it.
 
 ## Ownership and thread affinity
 
