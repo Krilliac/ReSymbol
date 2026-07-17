@@ -1120,8 +1120,8 @@ mod tests {
             ),
             Err(HandshakeError::Wire(WireError::UnsupportedVersion {
                 major: PROTOCOL_MAJOR,
-                minor: PROTOCOL_MINOR - 1,
-            }))
+                minor,
+            })) if minor == PROTOCOL_MINOR - 1
         ));
         assert!(matches!(
             BuildClaimHandshake::initiator_for_version(

@@ -4667,14 +4667,7 @@ mod tests {
                 2,
                 1,
                 command_id,
-                refreshed_stop.state,
-                DebugEvent::StateChanged(refreshed_state),
-            ),
-            correlated_event_frame(
-                3,
-                2,
-                command_id,
-                refreshed_stop.state,
+                stop.state,
                 DebugEvent::BreakpointChanged {
                     stop,
                     breakpoint: breakpoint.clone(),
@@ -4682,6 +4675,13 @@ mod tests {
                         persistence: BreakpointPersistence::Persistent,
                     },
                 },
+            ),
+            correlated_event_frame(
+                3,
+                2,
+                command_id,
+                refreshed_stop.state,
+                DebugEvent::StateChanged(refreshed_state),
             ),
             correlated_event_frame(
                 4,
@@ -4751,19 +4751,19 @@ mod tests {
                     2,
                     1,
                     command_id,
-                    refreshed_stop.state,
-                    DebugEvent::StateChanged(refreshed_state.clone()),
+                    stop.state,
+                    DebugEvent::BreakpointChanged {
+                        stop,
+                        breakpoint: breakpoint.clone(),
+                        change: BreakpointChange::Set { persistence },
+                    },
                 ),
                 correlated_event_frame(
                     3,
                     2,
                     command_id,
                     refreshed_stop.state,
-                    DebugEvent::BreakpointChanged {
-                        stop,
-                        breakpoint: breakpoint.clone(),
-                        change: BreakpointChange::Set { persistence },
-                    },
+                    DebugEvent::StateChanged(refreshed_state.clone()),
                 ),
                 correlated_event_frame(
                     4,
@@ -4787,7 +4787,7 @@ mod tests {
                 .expect("exact breakpoint policy evidence");
             assert_eq!(receipt.outcome, CommandOutcome::Succeeded);
             assert!(matches!(
-                &receipt.events[1].event,
+                &receipt.events[0].event,
                 DebugEvent::BreakpointChanged {
                     stop: actual_stop,
                     breakpoint: actual_breakpoint,
@@ -4847,21 +4847,15 @@ mod tests {
             },
         };
         replayed.transport.scripted.push_back(vec![
+            correlated_event_frame(2, 1, command_id, stop.state, breakpoint_event.clone()),
+            correlated_event_frame(3, 2, command_id, stop.state, breakpoint_event),
             correlated_event_frame(
-                2,
-                1,
+                4,
+                3,
                 command_id,
                 refreshed_stop.state,
                 DebugEvent::StateChanged(refreshed_state.clone()),
             ),
-            correlated_event_frame(
-                3,
-                2,
-                command_id,
-                refreshed_stop.state,
-                breakpoint_event.clone(),
-            ),
-            correlated_event_frame(4, 3, command_id, refreshed_stop.state, breakpoint_event),
             correlated_event_frame(
                 5,
                 4,
@@ -4924,7 +4918,7 @@ mod tests {
                 4,
                 3,
                 command_id,
-                refreshed_stop.state,
+                stop.state,
                 DebugEvent::BreakpointChanged {
                     stop,
                     breakpoint: breakpoint.clone(),
