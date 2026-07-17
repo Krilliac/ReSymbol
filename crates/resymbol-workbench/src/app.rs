@@ -10,8 +10,8 @@ use std::{fs::OpenOptions, io::BufWriter};
 use eframe::egui::{self, Align, Key, Layout, RichText, ScrollArea, Sense, TextEdit};
 use egui_extras::{Column, TableBuilder};
 use resymbol_analysis::{
-    BinaryAnalysis, LinearDisassemblyLimits, LinearDisassemblyPreview, LinearInstructionRow,
-    disassemble_x64_linear,
+    BinaryAnalysis, LinearDisassemblyLimits, LinearDisassemblyPreview, LinearDisassemblyStopReason,
+    LinearInstructionRow, disassemble_x64_linear,
 };
 use resymbol_app::{
     DecisionAction, ExportFormat, MAX_REVIEW_ANNOTATION_BYTES, MAX_REVIEWER_BYTES,
@@ -41,7 +41,8 @@ use crate::{
     instruction_actions::{
         ConditionalBranchPatch, InstructionSelectionMove, LiveDebuggerActionContext,
         LiveDebuggerProtocolRoute, LiveInstructionAction, MAX_PENDING_STATIC_PATCH_DRAFTS,
-        PatchDraftQueueOutcome, PendingStaticPatchDrafts, StaticPatchDraftKind,
+        PatchDraftQueueOutcome, PendingStaticPatchDrafts, StaticExactByteEdit,
+        StaticExactByteEditMode, StaticPatchDraft, StaticPatchDraftKind, canonical_hex_bytes,
         navigate_instruction_selection,
     },
     model::{
@@ -417,6 +418,12 @@ enum BinarySwitchDialogAction {
     Cancel,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StaticExactByteDialogAction {
+    Save,
+    Cancel,
+}
+
 impl ActivityLevel {
     const fn label(self) -> &'static str {
         match self {
@@ -676,6 +683,8 @@ pub struct WorkbenchApp {
     selected_disassembly_instruction: Option<usize>,
     disassembly_row_focus_target: Option<usize>,
     pending_static_patch_drafts: PendingStaticPatchDrafts,
+    static_exact_byte_edit: Option<StaticExactByteEdit>,
+    static_exact_byte_edit_error: Option<String>,
     static_patch_result: Option<Result<PublishedStaticPatch, String>>,
     patch_set_result: Option<Result<String, String>>,
 }
@@ -802,6 +811,8 @@ impl WorkbenchApp {
             selected_disassembly_instruction: None,
             disassembly_row_focus_target: None,
             pending_static_patch_drafts: PendingStaticPatchDrafts::default(),
+            static_exact_byte_edit: None,
+            static_exact_byte_edit_error: None,
             static_patch_result: None,
             patch_set_result: None,
         };
@@ -2568,6 +2579,8 @@ impl WorkbenchApp {
                     outcome.output_identity().id.as_str()
                 );
                 self.pending_static_patch_drafts.clear();
+                self.static_exact_byte_edit = None;
+                self.static_exact_byte_edit_error = None;
                 self.static_patch_result = Some(Ok(outcome));
                 self.patch_set_result = None;
                 self.console_reply(true, &message);
@@ -2675,6 +2688,8 @@ impl WorkbenchApp {
                 };
                 let message = patch_set_outcome_message("Loaded", &outcome);
                 self.pending_static_patch_drafts = replacement;
+                self.static_exact_byte_edit = None;
+                self.static_exact_byte_edit_error = None;
                 self.static_patch_result = None;
                 self.patch_set_result = Some(Ok(message.clone()));
                 self.console_reply(true, &message);
@@ -2894,6 +2909,8 @@ impl WorkbenchApp {
         self.export_result = None;
         if acceptance == ProjectAcceptance::NewProject {
             self.pending_static_patch_drafts.clear();
+            self.static_exact_byte_edit = None;
+            self.static_exact_byte_edit_error = None;
             self.selected_disassembly_instruction = None;
             self.disassembly_row_focus_target = None;
             self.static_patch_result = None;
@@ -5801,6 +5818,44 @@ impl WorkbenchApp {
             ui.close();
         }
         ui.separator();
+        let queued_exact_draft = self
+            .pending_static_patch_drafts
+            .draft_for_exact_selection(row.rva(), row.bytes())
+            .cloned();
+        let static_edit_disabled_reason = self.static_instruction_patchability(row).err();
+        let exact_edit_label = if queued_exact_draft.is_some() {
+            "Edit Queued Patch..."
+        } else {
+            "Edit Exact Bytes..."
+        };
+        let exact_edit = ui
+            .add_enabled(
+                static_edit_disabled_reason.is_none(),
+                egui::Button::new(exact_edit_label),
+            )
+            .on_disabled_hover_text(
+                static_edit_disabled_reason
+                    .unwrap_or("The static exact-byte editor is unavailable."),
+            );
+        if exact_edit.clicked() {
+            self.open_static_exact_byte_editor(row, queued_exact_draft.as_ref());
+            ui.close();
+        }
+        if let Some(draft) = queued_exact_draft.as_ref() {
+            let restore = ui
+                .add_enabled(
+                    static_edit_disabled_reason.is_none(),
+                    egui::Button::new("Restore Original (Remove Queued Patch)"),
+                )
+                .on_disabled_hover_text(
+                    static_edit_disabled_reason
+                        .unwrap_or("The queued patch cannot be changed while publication is busy."),
+                );
+            if restore.clicked() {
+                self.restore_original_static_instruction(draft.rva(), draft.expected());
+                ui.close();
+            }
+        }
         let already_nop_filled = row.bytes().iter().all(|byte| *byte == 0x90);
         let static_nop_disabled_reason = self.static_nop_patchability(row).err();
         let queue_static_nop = ui
@@ -5815,7 +5870,6 @@ impl WorkbenchApp {
             self.queue_static_nop_draft(row);
             ui.close();
         }
-        let static_edit_disabled_reason = self.static_instruction_patchability(row).err();
         for branch_patch in [
             ConditionalBranchPatch::InvertCondition,
             ConditionalBranchPatch::AlwaysTaken,
@@ -5983,6 +6037,205 @@ impl WorkbenchApp {
             });
     }
 
+    fn show_static_exact_byte_editor(&mut self, context: &egui::Context) {
+        let Some(mut edit) = self.static_exact_byte_edit.take() else {
+            return;
+        };
+        let colors = self.preferences.theme.semantic_colors();
+        let prior_input = edit.replacement_hex().to_owned();
+        let submission_error = self.static_exact_byte_edit_error.clone();
+        let response = egui::Modal::new(egui::Id::new("static_exact_byte_editor")).show(
+            context,
+            |ui| {
+                ui.set_min_width(560.0);
+                ui.heading(match edit.mode() {
+                    StaticExactByteEditMode::QueueNew => "Edit Exact Bytes",
+                    StaticExactByteEditMode::EditQueued => "Edit Queued Static Patch",
+                });
+                ui.label(
+                    RichText::new(
+                        "Static draft only. This editor never writes the open source binary or live memory.",
+                    )
+                    .strong()
+                    .color(colors.warning_conflict),
+                );
+                ui.separator();
+                egui::Grid::new("static_exact_byte_original_evidence")
+                    .num_columns(2)
+                    .spacing([12.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.strong("RVA");
+                        ui.monospace(format!("0x{:016X}", edit.rva()));
+                        ui.end_row();
+                        ui.strong("Original bytes");
+                        ui.monospace(canonical_hex_bytes(edit.original()));
+                        ui.end_row();
+                        ui.strong("Original instruction");
+                        ui.monospace(edit.original_instruction());
+                        ui.end_row();
+                    });
+                ui.small(
+                    "Original evidence is immutable. Restoring it removes the queued draft instead of writing another patch.",
+                );
+                ui.separator();
+                ui.label(RichText::new("Replacement bytes").strong());
+                let maximum_replacement_hex_characters =
+                    edit.maximum_replacement_hex_characters();
+                let replacement_edit = ui.add(
+                    TextEdit::singleline(edit.replacement_hex_mut())
+                        .font(egui::TextStyle::Monospace)
+                        .char_limit(maximum_replacement_hex_characters)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("75 05"),
+                );
+                replacement_edit.on_hover_text(
+                    "Enter exactly the original byte count as two hexadecimal digits per byte with one ASCII space between bytes.",
+                );
+
+                match edit.parsed_replacement() {
+                    Ok(replacement) => {
+                        let preview = exact_byte_replacement_preview(edit.rva(), &replacement);
+                        ui.add_space(6.0);
+                        ui.label(RichText::new("Bounded replacement decode preview").strong());
+                        if preview.rows().is_empty() {
+                            ui.label(
+                                RichText::new("No complete replacement instruction decoded.")
+                                    .monospace()
+                                    .color(colors.warning_conflict),
+                            );
+                        } else {
+                            egui::Grid::new("static_exact_byte_replacement_preview")
+                                .num_columns(3)
+                                .spacing([10.0, 3.0])
+                                .striped(true)
+                                .show(ui, |ui| {
+                                    ui.strong("RVA");
+                                    ui.strong("Bytes");
+                                    ui.strong("Instruction");
+                                    ui.end_row();
+                                    for row in preview.rows() {
+                                        ui.monospace(format!("0x{:016X}", row.rva()));
+                                        ui.monospace(canonical_hex_bytes(row.bytes()));
+                                        ui.monospace(row.text());
+                                        ui.end_row();
+                                    }
+                                });
+                        }
+                        if matches!(
+                            preview.stop_reason(),
+                            LinearDisassemblyStopReason::EndOfInput
+                        ) {
+                            ui.colored_label(
+                                colors.healthy,
+                                format!(
+                                    "[COMPLETE SPAN] {} replacement instruction(s) consume all {} byte(s).",
+                                    preview.rows().len(),
+                                    replacement.len()
+                                ),
+                            );
+                        } else {
+                            ui.colored_label(
+                                colors.warning_conflict,
+                                format!(
+                                    "[INVALID/PARTIAL ENCODING] {}",
+                                    preview.stop_reason().label()
+                                ),
+                            );
+                        }
+                        ui.small(
+                            "The preview is linear x64 decoding only. Invalid bytes remain an explicit arbitrary-byte edit; this preview is not CFG or execution validation.",
+                        );
+                    }
+                    Err(error) => {
+                        ui.add_space(6.0);
+                        ui.colored_label(
+                            colors.warning_conflict,
+                            format!("[INVALID REPLACEMENT] {error}"),
+                        );
+                    }
+                }
+
+                let validation = edit.validated_replacement();
+                if let Err(error) = &validation {
+                    ui.colored_label(colors.warning_conflict, error.to_string());
+                }
+                if let Some(error) = submission_error.as_deref() {
+                    ui.colored_label(
+                        colors.destructive_quarantined,
+                        format!("[DRAFT NOT CHANGED] {error}"),
+                    );
+                }
+                ui.separator();
+                let mut action = None;
+                ui.horizontal_wrapped(|ui| {
+                    let save_label = match edit.mode() {
+                        StaticExactByteEditMode::QueueNew => "Queue Exact-Byte Draft",
+                        StaticExactByteEditMode::EditQueued => "Update Queued Draft",
+                    };
+                    let save = ui
+                        .add_enabled(validation.is_ok(), egui::Button::new(save_label))
+                        .on_disabled_hover_text(
+                            validation
+                                .as_ref()
+                                .err()
+                                .map_or_else(
+                                    || "Replacement is not valid.".to_owned(),
+                                    ToString::to_string,
+                                ),
+                        );
+                    if save.clicked() {
+                        action = Some(StaticExactByteDialogAction::Save);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        action = Some(StaticExactByteDialogAction::Cancel);
+                    }
+                });
+                action
+            },
+        );
+        if edit.replacement_hex() != prior_input {
+            self.static_exact_byte_edit_error = None;
+        }
+        let should_cancel = response.should_close();
+        let action = response
+            .inner
+            .or_else(|| should_cancel.then_some(StaticExactByteDialogAction::Cancel));
+        match action {
+            Some(StaticExactByteDialogAction::Save) => {
+                let replacement = edit
+                    .validated_replacement()
+                    .expect("enabled exact-byte save has a validated replacement");
+                match self.apply_static_exact_byte_edit(&edit, &replacement) {
+                    Ok(PatchDraftQueueOutcome::Added) => {
+                        self.static_exact_byte_edit_error = None;
+                    }
+                    Ok(PatchDraftQueueOutcome::AlreadyQueued) => {
+                        self.static_exact_byte_edit_error = None;
+                        self.log(
+                            ActivityLevel::Info,
+                            format!(
+                                "The exact-byte draft at RVA 0x{:016X} already has those replacement bytes",
+                                edit.rva()
+                            ),
+                        );
+                    }
+                    Err(error) => {
+                        self.static_exact_byte_edit_error = Some(error.clone());
+                        self.log(
+                            ActivityLevel::Error,
+                            format!("Cannot save static exact-byte draft: {error}"),
+                        );
+                        self.static_exact_byte_edit = Some(edit);
+                    }
+                }
+            }
+            Some(StaticExactByteDialogAction::Cancel) => {
+                self.static_exact_byte_edit_error = None;
+            }
+            None => self.static_exact_byte_edit = Some(edit),
+        }
+    }
+
     fn static_rva_has_readable_file_backing(&self, rva: u64) -> bool {
         let address = RelativeAddress::new(rva);
         self.project
@@ -5998,23 +6251,30 @@ impl WorkbenchApp {
         &self,
         row: &LinearInstructionRow,
     ) -> Result<(), &'static str> {
+        self.static_exact_span_patchability(row.rva(), row.bytes())
+    }
+
+    fn static_exact_span_patchability(
+        &self,
+        rva: u64,
+        expected: &[u8],
+    ) -> Result<(), &'static str> {
         if self.publication_operation.is_pending() {
             return Err("A file publication is already running.");
         }
         if self.patch_set_load_operation.is_pending() {
             return Err("A patch-set load is already running.");
         }
-        if row.bytes().is_empty() {
+        if expected.is_empty() {
             return Err("The selected instruction has no exact source bytes.");
         }
         let project = self.project.as_ref().ok_or("No static project is open.")?;
         if !project.snapshot.has_verified_source() {
             return Err("The exact source binary must be verified before queuing a static edit.");
         }
-        let start = RelativeAddress::new(row.rva());
-        let last_rva = row
-            .rva()
-            .checked_add(row.bytes().len() as u64 - 1)
+        let start = RelativeAddress::new(rva);
+        let last_rva = rva
+            .checked_add(expected.len() as u64 - 1)
             .ok_or("The selected instruction range overflows the RVA address space.")?;
         let last = RelativeAddress::new(last_rva);
         let region = project
@@ -6069,6 +6329,108 @@ impl WorkbenchApp {
                 format!("Cannot follow direct target: {error}"),
             );
         }
+    }
+
+    fn open_static_exact_byte_editor(
+        &mut self,
+        row: &LinearInstructionRow,
+        queued: Option<&StaticPatchDraft>,
+    ) {
+        if let Err(reason) = self.static_instruction_patchability(row) {
+            self.log(
+                ActivityLevel::Error,
+                format!("Cannot open static exact-byte editor: {reason}"),
+            );
+            return;
+        }
+        let edit = queued.map_or_else(
+            || StaticExactByteEdit::for_instruction(row.rva(), row.bytes(), row.text()),
+            |draft| Ok(StaticExactByteEdit::for_queued_draft(draft, row.text())),
+        );
+        match edit {
+            Ok(edit) => {
+                self.static_exact_byte_edit = Some(edit);
+                self.static_exact_byte_edit_error = None;
+            }
+            Err(error) => self.log(
+                ActivityLevel::Error,
+                format!("Cannot open static exact-byte editor: {error}"),
+            ),
+        }
+    }
+
+    fn restore_original_static_instruction(&mut self, rva: u64, expected: &[u8]) {
+        if self.publication_operation.is_pending() || self.patch_set_load_operation.is_pending() {
+            self.log(
+                ActivityLevel::Error,
+                "Cannot restore the queued static instruction while a patch operation is running",
+            );
+            return;
+        }
+        if !self
+            .pending_static_patch_drafts
+            .remove_exact_selection(rva, expected)
+        {
+            self.log(
+                ActivityLevel::Warning,
+                format!(
+                    "No exact queued static patch remains at RVA 0x{rva:016X}; original source bytes were unchanged"
+                ),
+            );
+            return;
+        }
+        if self
+            .static_exact_byte_edit
+            .as_ref()
+            .is_some_and(|edit| edit.rva() == rva && edit.original() == expected)
+        {
+            self.static_exact_byte_edit = None;
+            self.static_exact_byte_edit_error = None;
+        }
+        self.static_patch_result = None;
+        self.patch_set_result = None;
+        self.log(
+            ActivityLevel::Success,
+            format!(
+                "Restored the original instruction at RVA 0x{rva:016X} by removing its unpublished draft; no source file or process was modified"
+            ),
+        );
+    }
+
+    fn apply_static_exact_byte_edit(
+        &mut self,
+        edit: &StaticExactByteEdit,
+        replacement: &[u8],
+    ) -> Result<PatchDraftQueueOutcome, String> {
+        self.static_exact_span_patchability(edit.rva(), edit.original())
+            .map_err(str::to_owned)?;
+        let label = format!("Exact byte edit at RVA 0x{:016X}", edit.rva());
+        let outcome =
+            match edit.mode() {
+                StaticExactByteEditMode::QueueNew => self
+                    .pending_static_patch_drafts
+                    .queue_replace(edit.rva(), edit.original(), replacement, label),
+                StaticExactByteEditMode::EditQueued => self
+                    .pending_static_patch_drafts
+                    .replace_exact_with_bytes(edit.rva(), edit.original(), replacement, label),
+            }
+            .map_err(|error| error.to_string())?;
+        if outcome == PatchDraftQueueOutcome::Added {
+            self.static_patch_result = None;
+            self.patch_set_result = None;
+            self.log(
+                ActivityLevel::Success,
+                format!(
+                    "{} unpublished exact-byte draft at RVA 0x{:016X}; no source file or process was modified",
+                    match edit.mode() {
+                        StaticExactByteEditMode::QueueNew => "Queued",
+                        StaticExactByteEditMode::EditQueued => "Updated",
+                    },
+                    edit.rva()
+                ),
+            );
+        }
+        Ok(outcome)
     }
 
     fn queue_static_nop_draft(&mut self, row: &LinearInstructionRow) {
@@ -6673,6 +7035,8 @@ impl WorkbenchApp {
         }
         if clear_all {
             self.pending_static_patch_drafts.clear();
+            self.static_exact_byte_edit = None;
+            self.static_exact_byte_edit_error = None;
             self.static_patch_result = None;
             self.patch_set_result = None;
         }
@@ -7688,6 +8052,7 @@ impl eframe::App for WorkbenchApp {
         self.show_binary_drop_target(context);
         #[cfg(feature = "screenshot")]
         self.show_screenshot_scenario_overlay(context);
+        self.show_static_exact_byte_editor(context);
         self.show_binary_switch_confirmation(context);
         self.show_close_confirmation(context);
 
@@ -8220,6 +8585,13 @@ fn format_instruction_bytes(bytes: &[u8]) -> String {
         .map(|byte| format!("{byte:02X}"))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn exact_byte_replacement_preview(rva: u64, replacement: &[u8]) -> LinearDisassemblyPreview {
+    let bounded_instruction_count = replacement.len().max(1);
+    let limits = LinearDisassemblyLimits::new(replacement.len().max(1), bounded_instruction_count)
+        .expect("one x64 instruction replacement fits the linear preview hard limits");
+    disassemble_x64_linear(replacement, rva, limits)
 }
 
 fn instruction_row_accessible_label(
@@ -10080,6 +10452,91 @@ mod tests {
             app.static_nop_patchability(&already_nop.rows()[0]),
             Err("The selected instruction is already NOP-filled.")
         );
+    }
+
+    #[test]
+    fn exact_byte_replacement_preview_is_bounded_and_reports_complete_or_partial_spans() {
+        let complete = exact_byte_replacement_preview(0x1000, &[0x90, 0xc3]);
+        assert_eq!(complete.rows().len(), 2);
+        assert!(matches!(
+            complete.stop_reason(),
+            LinearDisassemblyStopReason::EndOfInput
+        ));
+
+        let invalid = exact_byte_replacement_preview(0x2000, &[0xff, 0xf8]);
+        assert!(invalid.rows().is_empty());
+        assert!(matches!(
+            invalid.stop_reason(),
+            LinearDisassemblyStopReason::InvalidInstruction { .. }
+        ));
+
+        let partial = exact_byte_replacement_preview(0x3000, &[0x90, 0x0f]);
+        assert_eq!(partial.rows().len(), 1);
+        assert!(matches!(
+            partial.stop_reason(),
+            LinearDisassemblyStopReason::TruncatedInstruction { .. }
+        ));
+        assert_eq!(partial.considered_bytes(), 2);
+    }
+
+    #[test]
+    fn exact_byte_editor_queues_updates_and_restores_only_the_exact_selection() {
+        let (_source, project) = loaded_project_with_source();
+        let executable_backed = project
+            .static_address_space
+            .as_ref()
+            .expect("PE fixture has a static address space")
+            .regions()
+            .iter()
+            .find(|region| {
+                region.access.executable
+                    && matches!(&region.kind, StaticRegionKind::Section { .. })
+                    && region.file_backing.is_some_and(|backing| backing.size >= 2)
+            })
+            .expect("two-byte file-backed executable fixture region")
+            .range
+            .start()
+            .get();
+        let (_context, mut app) = test_app();
+        app.project = Some(project);
+
+        let mut queued =
+            StaticExactByteEdit::for_instruction(executable_backed, &[0x74, 0x05], "je short")
+                .expect("new exact edit");
+        *queued.replacement_hex_mut() = "75 05".to_owned();
+        let replacement = queued.validated_replacement().expect("changed bytes");
+        assert_eq!(
+            app.apply_static_exact_byte_edit(&queued, &replacement)
+                .expect("queue exact bytes"),
+            PatchDraftQueueOutcome::Added
+        );
+        let draft = app
+            .pending_static_patch_drafts
+            .draft_for_exact_selection(executable_backed, &[0x74, 0x05])
+            .expect("queued exact selection")
+            .clone();
+        assert_eq!(draft.replacement(), &[0x75, 0x05]);
+
+        let mut edit = StaticExactByteEdit::for_queued_draft(&draft, "je short");
+        *edit.replacement_hex_mut() = "EB 05".to_owned();
+        let replacement = edit.validated_replacement().expect("updated bytes");
+        assert_eq!(
+            app.apply_static_exact_byte_edit(&edit, &replacement)
+                .expect("update exact bytes"),
+            PatchDraftQueueOutcome::Added
+        );
+        assert_eq!(
+            app.pending_static_patch_drafts
+                .draft_for_exact_selection(executable_backed, &[0x74, 0x05])
+                .expect("updated exact selection")
+                .replacement(),
+            &[0xeb, 0x05]
+        );
+
+        app.restore_original_static_instruction(executable_backed, &[0x74, 0x06]);
+        assert_eq!(app.pending_static_patch_drafts.drafts().len(), 1);
+        app.restore_original_static_instruction(executable_backed, &[0x74, 0x05]);
+        assert!(app.pending_static_patch_drafts.drafts().is_empty());
     }
 
     #[test]
