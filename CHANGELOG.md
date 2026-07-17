@@ -54,8 +54,9 @@ prereleases; breaking changes remain explicit.
   evidence after any post-protection failure. This primitive
   does not attach, stop, launch, resume, step, set breakpoints, authenticate a transport, or wire the
   workbench, and a future provider must hold the process stopped before granting mutation authority.
-  Tool Help module discovery is only corroborating evidence; the request's image base must come from
-  independent authenticated debug-event evidence before the caller treats the binding as authority.
+  Tool Help module discovery is only corroborating evidence; its size is compared with the retained
+  file before a bounded full-image region walk, and the request's image base must come from independent
+  authenticated debug-event evidence before the caller treats the binding as authority.
 - Added a bounded x64 linear-disassembly preview to the workbench Address Space reader. Hex and
   disassembly views share the same verified frozen-source bytes; independent byte and instruction
   limits, explicit stop reasons, and the visible "not CFG or function-boundary truth" disclaimer

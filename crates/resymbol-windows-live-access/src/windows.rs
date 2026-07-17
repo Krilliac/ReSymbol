@@ -51,6 +51,7 @@ use crate::{
 };
 
 const MODULE_SNAPSHOT_ATTEMPTS: usize = 8;
+const MAX_MAIN_IMAGE_REGIONS: usize = 4_096;
 const INITIAL_IMAGE_PATH_CHARS: usize = 260;
 const MAX_IMAGE_PATH_CHARS: usize = 32_768;
 const DOS_HEADER_BYTES: usize = 64;
@@ -625,6 +626,8 @@ pub enum LiveAccessError {
     RemoteModuleSizeMismatch { remote: u32, module: u32 },
     #[error("main module is not one committed MEM_IMAGE allocation rooted at its image base")]
     InvalidMainModuleMapping,
+    #[error("main module contains more than {limit} distinct memory regions")]
+    MainModuleRegionLimitExceeded { limit: usize },
     #[error("live target binding construction failed: {0}")]
     BindingConstruction(LiveTargetBindingError),
     #[error("caller binding does not exactly match the retained live target")]
@@ -706,13 +709,13 @@ fn observe_live_target(
             actual: module.base,
         });
     }
-    validate_main_module_mapping(process, module)?;
     if executable.size_of_image != module.size_of_image {
         return Err(LiveAccessError::FileModuleSizeMismatch {
             file: executable.size_of_image,
             module: module.size_of_image,
         });
     }
+    validate_main_module_mapping(process, module)?;
     let remote_size_of_image = remote_pe_size_of_image(process, module)?;
     if remote_size_of_image != module.size_of_image {
         return Err(LiveAccessError::RemoteModuleSizeMismatch {
@@ -1101,7 +1104,10 @@ fn validate_main_module_mapping(
         .ok_or(LiveAccessError::MainModuleRangeOverflow)?;
 
     let mut cursor = module.base;
-    while cursor < module_end {
+    for _ in 0..MAX_MAIN_IMAGE_REGIONS {
+        if cursor == module_end {
+            return Ok(());
+        }
         let information = query_region(process, cursor)?;
         let allocation_base = pointer_to_u64(information.AllocationBase.cast_const());
         let region_base = pointer_to_u64(information.BaseAddress.cast_const());
@@ -1115,7 +1121,13 @@ fn validate_main_module_mapping(
             information.Type,
         )?;
     }
-    Ok(())
+    if cursor == module_end {
+        Ok(())
+    } else {
+        Err(LiveAccessError::MainModuleRegionLimitExceeded {
+            limit: MAX_MAIN_IMAGE_REGIONS,
+        })
+    }
 }
 
 fn next_main_image_cursor(
