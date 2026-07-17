@@ -17,6 +17,7 @@ pub mod protocol;
 mod provider_probe;
 pub mod sandbox;
 mod session_machine;
+mod software_breakpoint;
 
 pub use address_space::{
     AddressRange, FileBacking, MemoryAccess, RelativeAddress, StaticAddressSpace,
@@ -32,7 +33,7 @@ pub use host_client::SyntheticDebugHost;
 pub use host_client::{
     ClientConnectionState, CommandReceipt, ControlShutdownReason, DebugHostClient,
     DebugHostClientError, HostFrameExchange, HostPollWait, HostPollWaitError, HostTransportError,
-    MAX_HOST_POLL_WAIT_MILLIS, MAX_PENDING_COMMANDS,
+    MAX_HOST_POLL_WAIT_MILLIS, MAX_PENDING_COMMANDS, MAX_PENDING_UNSOLICITED_EVENTS,
 };
 pub use host_codec::{
     HostCodecError, HostFrame, decode_command_frame, decode_event_frame, encode_command_frame,
@@ -93,4 +94,14 @@ pub use sandbox::{
 pub use session_machine::{
     MAX_REGISTERED_AUTHORIZATION_LEASES, RemoteCommandCheckpoint, SessionMachine,
     SessionMachineError,
+};
+pub use software_breakpoint::{
+    INT3_OPCODE, MAX_SOFTWARE_BREAKPOINTS, SoftwareBreakpointAcknowledgement,
+    SoftwareBreakpointAcknowledgementRejection, SoftwareBreakpointAction,
+    SoftwareBreakpointActionAcknowledgement, SoftwareBreakpointActionPlan,
+    SoftwareBreakpointBytePlan, SoftwareBreakpointCleanupEvidence, SoftwareBreakpointError,
+    SoftwareBreakpointOperationId, SoftwareBreakpointOperationIdError,
+    SoftwareBreakpointPersistence, SoftwareBreakpointPhase, SoftwareBreakpointPoisonEvidence,
+    SoftwareBreakpointSingleStepAcknowledgement, SoftwareBreakpointSnapshot,
+    SoftwareBreakpointStateMachine, SoftwareBreakpointTransition,
 };

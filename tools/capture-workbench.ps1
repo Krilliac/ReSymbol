@@ -6,8 +6,33 @@ param(
     [int]$CaptureWidth = 1440,
     [ValidateRange(480, 2160)]
     [int]$CaptureHeight = 900,
-    [ValidateSet('overview', 'functions', 'functions-focused', 'graph', 'address-space', 'disassembly', 'debugger-sandbox')]
-    [string[]]$CaptureTabs = @('overview', 'functions', 'graph', 'address-space', 'disassembly', 'debugger-sandbox'),
+    [ValidateSet(
+        'open-empty',
+        'overview',
+        'functions',
+        'functions-focused',
+        'graph',
+        'address-space',
+        'disassembly',
+        'disassembly-actions',
+        'binary-switch-confirmation',
+        'debugger-sandbox',
+        'debugger-readiness-result',
+        'exports'
+    )]
+    [string[]]$CaptureTabs = @(
+        'open-empty',
+        'overview',
+        'functions',
+        'graph',
+        'address-space',
+        'disassembly',
+        'disassembly-actions',
+        'binary-switch-confirmation',
+        'debugger-sandbox',
+        'debugger-readiness-result',
+        'exports'
+    ),
     [switch]$SkipBuild,
     [ValidateRange(10, 600)]
     [int]$CaptureTimeoutSeconds = 90
@@ -15,6 +40,58 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+
+$standardCaptureTabs = @(
+    'open-empty',
+    'overview',
+    'functions',
+    'graph',
+    'address-space',
+    'disassembly',
+    'disassembly-actions',
+    'binary-switch-confirmation',
+    'debugger-sandbox',
+    'debugger-readiness-result',
+    'exports'
+)
+$CaptureTabs = @($CaptureTabs | ForEach-Object { $_.ToLowerInvariant() })
+if ($CaptureTabs.Count -eq 0) {
+    throw 'CaptureTabs must contain at least one deterministic scenario'
+}
+$duplicateTabs = @($CaptureTabs | Group-Object | Where-Object Count -gt 1)
+if ($duplicateTabs.Count -ne 0) {
+    throw "CaptureTabs contains duplicate scenario '$($duplicateTabs[0].Name)'"
+}
+$expectedArtifacts = @($CaptureTabs | ForEach-Object { "workbench-$_.png" })
+
+function Test-ExactStringSequence {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$Left,
+        [Parameter(Mandatory = $true)]
+        [string[]]$Right
+    )
+
+    if ($Left.Count -ne $Right.Count) {
+        return $false
+    }
+    for ($index = 0; $index -lt $Left.Count; $index++) {
+        if ($Left[$index] -cne $Right[$index]) {
+            return $false
+        }
+    }
+    return $true
+}
+
+$captureSet = if (Test-ExactStringSequence -Left $CaptureTabs -Right $standardCaptureTabs) {
+    'standard'
+}
+elseif ($CaptureTabs.Count -eq 1 -and $CaptureTabs[0] -ceq 'functions-focused') {
+    'keyboard-minimum'
+}
+else {
+    'custom'
+}
 
 $maxCapturedProcessLogChars = 16 * 1024
 $captureTerminationTimeoutMilliseconds = 5 * 1000
@@ -244,9 +321,16 @@ try {
     if ($captures.Count -ne $captureTabs.Count) {
         throw "Captured $($captures.Count) views, expected $($captureTabs.Count)"
     }
+    $capturedArtifacts = @($captures | ForEach-Object { $_.file })
+    if (-not (Test-ExactStringSequence -Left $capturedArtifacts -Right $expectedArtifacts)) {
+        throw "Captured artifact names do not exactly match the requested scenario contract: expected '$($expectedArtifacts -join ', ')', got '$($capturedArtifacts -join ', ')'"
+    }
 
     $manifest = [ordered]@{
-        schema_version = 1
+        schema_version = 2
+        capture_set = $captureSet
+        requested_views = $CaptureTabs
+        expected_artifacts = $expectedArtifacts
         fixture = [ordered]@{
             file = [IO.Path]::GetFileName($Binary)
             sha256 = (Get-FileHash -LiteralPath $Binary -Algorithm SHA256).Hash.ToLowerInvariant()

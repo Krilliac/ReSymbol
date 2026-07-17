@@ -204,6 +204,7 @@ resymbol export path/to/application.resym --format map
 resymbol export path/to/application.resym --format pdb --binary path/to/application.exe
 resymbol export path/to/application.resym --format ida-python
 resymbol export path/to/application.resym --format ghidra-java
+resymbol patch path/to/application.exe path/to/reviewed.respatch.json --output path/to/application-patched.exe
 resymbol plugin list
 resymbol plugin doctor
 ```
@@ -420,6 +421,20 @@ resymbol export results/application.resym \
 resymbol export results/application.resym --format ida-python --output results/application_ida.py
 resymbol export results/application.resym --format ghidra-java --output results/ReSymbolImport.java
 ```
+
+Apply a reviewed portable static patch set to its exact source PE and create a separate binary:
+
+```console
+resymbol patch path/to/application.exe \
+  results/reviewed.respatch.json \
+  --output results/application-patched.exe
+```
+
+`patch` analyzes and retains the exact source, bounded-loads the strict schema-v1 manifest, requires
+its complete source identity, reconstructs a fresh checked RVA plan, and publishes with the same
+no-clobber static-patch service as the workbench. It never executes or rewrites the input and never
+uses a serialized file offset. On success it prints the output SHA-256, signature/checksum warnings,
+and the filesystem durability established for the published file.
 
 Add `--dry-run` to any format to perform the same package validation, loss assessment, required
 PDB source verification, and complete in-memory rendering without creating a destination or staging

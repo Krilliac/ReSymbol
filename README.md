@@ -116,7 +116,10 @@ The current alpha implements and tests an end-to-end, deliberately narrow analys
   fail closed. Save is create-new/no-clobber and load is bounded to 16 MiB. The workbench performs
   both operations on its application-service worker, keeps the current drafts if either operation
   fails, and replaces them only after the complete imported document has passed constructor, plan,
-  source-identity, range, and overlap validation;
+  source-identity, range, and overlap validation. `resymbol patch` provides the same checked
+  create-new publication path for automation: it analyzes an exact source PE, bounded-loads the
+  strict patch set through `AppServices`, rebuilds a fresh plan without trusting serialized file
+  offsets, and prints the verified output SHA-256, warnings, and filesystem durability receipt;
 - a deterministic, debugger-neutral export projection plus `resymbol export`, which writes the
   projection as JSON, renders a bounded human-readable Markdown report, emits deterministic
   Microsoft-linker-style MAP text for compatible tools, creates an exact-RSDS public-symbol PDB
@@ -378,6 +381,7 @@ resymbol export application.resym --format pdb --binary application.exe
 resymbol export application.resym --format ida-python
 resymbol export application.resym --format ghidra-java
 resymbol export application.resym --format map --dry-run
+resymbol patch application.exe reviewed.respatch.json --output application-patched.exe
 resymbol plugin list
 resymbol plugin doctor
 # After reviewing a dropped-in executable plugin:
@@ -444,6 +448,18 @@ reconstructs every request and plan from its RVA and exact bytes. Serialized dat
 file offset or assembly command. A successful load atomically replaces the visible drafts; a stale,
 wrong-source, malformed, oversized, or overlapping document leaves them unchanged. The workbench
 shows the exact source identity and edit count for each successful save or load.
+
+Apply a reviewed patch set without opening the workbench:
+
+```console
+resymbol patch EXACT_SOURCE_PE PATCH_SET.respatch.json --output NEW_PATCHED_BINARY
+```
+
+The command retains the exact analyzed source snapshot, requires the manifest's complete identity,
+reconstructs a new checked plan from RVA plus expected/replacement bytes, and publishes only to a
+new path. It never executes the PE, rewrites the source, accepts a serialized file offset, or
+replaces an existing destination. The success receipt reports the output SHA-256, both PE integrity
+warnings, and the platform-specific file/directory synchronization result.
 
 The main review views stay on one responsive tab row at the default viewport and collapse into an
 explicit all-view selector at the documented minimum size. Use **Ctrl+Tab** or

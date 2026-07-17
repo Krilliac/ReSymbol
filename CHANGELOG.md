@@ -14,6 +14,21 @@ prereleases; breaking changes remain explicit.
   covers zero-sized load records, large virtual gaps, package round trips, and malformed identity
   and segment fields. PE/x86-64-only plugin hosts, patching, linear preview, MAP, PDB, protection,
   and workbench offline-address-space actions remain explicitly unavailable for this format.
+- Added `resymbol patch EXACT_SOURCE_PE PATCH_SET.respatch.json --output NEW_BINARY` for audited
+  non-GUI patch publication. The command bounded-loads the strict manifest through `AppServices`,
+  verifies its complete identity against a freshly analyzed exact PE, rebuilds a checked plan from
+  RVA and exact bytes without trusting file offsets, and uses the existing create-new static-patch
+  publisher. Success prints the verified output SHA-256, signature/checksum warnings, durability,
+  and an explicit no-execution receipt; failures leave the source and existing destinations intact.
+- Added a backend-neutral, bounded software-breakpoint transaction reducer. It retains exact
+  original bytes, rejects original `0xCC`, duplicate identities/addresses, capacity and token
+  violations, and emits one-byte `Arm`, hit-time `Restore`, post-step `Rearm`, and explicit `Remove`
+  compare/replace plans bound to unique operation, session, and complete stop identities. No
+  acknowledged lifecycle changes until every success field matches exactly; temporary breakpoints
+  disappear after exact hit restoration, while persistent breakpoints require an exact later-stop
+  correlation before rearming. Wrong, duplicate, or out-of-order acknowledgements poison the
+  reducer and retain bounded cleanup evidence including any operation with an unknown outcome. This
+  is a pure planner: it performs no target write or single step and changes no debugger wire version.
 - Added reproducible static patch-set documents and worker-owned **Save Patch Set...** / **Load
   Patch Set...** controls. The required `.respatch.json` format is strict schema v1: it records the
   complete source `BinaryIdentity` plus deterministically RVA-ordered, bounded NOP-instruction or
@@ -23,6 +38,24 @@ prereleases; breaking changes remain explicit.
   stale, wrong-source, duplicate, overlapping, unbacked, or non-executable edits before replacing
   drafts. Save is create-new/no-clobber, load preserves current drafts on every failure, and the UI
   reports the exact source identity and edit count.
+- Added `resymbol-windows-live-access`, a narrowly scoped Windows-only process-memory foundation
+  for a future authenticated debugger helper. It opens only an explicitly selected PID with an
+  expected executable SHA-256 plus previously observed creation `FILETIME` and debug-event image
+  base, independently re-derives both runtime values, and retains the exact
+  hashed/parsed executable file handle without write/delete sharing for the access object's lifetime.
+  Its PE `SizeOfImage` is corroborated against both the Tool Help main-module record and remote PE
+  header before constructing `LiveTargetBinding` with the actual ASLR base. Read-only and explicitly
+  mutating opens request different least-privilege process rights. Public operations re-derive the
+  binding from the retained evidence; reads are exact and bounded to the main image, while writes
+  require the exact binding, exact expected bytes, an equal-length changed replacement, and one
+  committed executable `MEM_IMAGE` region and one system page. A mutation compare-checks before and
+  after changing protection, restores protection without attempting a byte write if either race
+  check fails, flushes the instruction cache, verifies readback, and reports truthful recovery
+  evidence after any post-protection failure. This primitive
+  does not attach, stop, launch, resume, step, set breakpoints, authenticate a transport, or wire the
+  workbench, and a future provider must hold the process stopped before granting mutation authority.
+  Tool Help module discovery is only corroborating evidence; the request's image base must come from
+  independent authenticated debug-event evidence before the caller treats the binding as authority.
 - Added a bounded x64 linear-disassembly preview to the workbench Address Space reader. Hex and
   disassembly views share the same verified frozen-source bytes; independent byte and instruction
   limits, explicit stop reasons, and the visible "not CFG or function-boundary truth" disclaimer
@@ -121,9 +154,10 @@ prereleases; breaking changes remain explicit.
   host, read-only provider-readiness discovery, and fail-closed sandbox policy, attestation,
   lifecycle, and cleanup records. The workbench now exposes the preferred-image Address Space view
   and evidence for entry-point, TLS, anti-debug-import, packer, entropy, and writable/executable-section
-  findings. No process-executing debugger helper, Windows AppContainer provider, Hyper-V guest, attach
-  path, or live memory mutation is implemented yet; the test host and readiness reports must not be
-  represented as an operating-system security boundary.
+  findings. No process-executing debugger helper, Windows AppContainer provider, Hyper-V guest,
+  attach path, authenticated stopped-state authority, or provider/UI live-memory integration is
+  implemented yet; the test host, readiness reports, and lower-level Windows live-access primitive
+  must not be represented as an operating-system security boundary or working debugger.
 - Added a production, strictly non-executing `OfflineImageDebugHost`. It freezes one exact
   identity-verified image snapshot, exposes only bounded canonical file-backed RVA reads, reports a
   complete capability matrix with only `OfflineAnalysis` available, and rejects every live,
@@ -346,13 +380,16 @@ prereleases; breaking changes remain explicit.
 
 ### Changed
 
-- Bumped the debugger wire and typed-command protocol to 1.4. Debug attaches now require one
-  correlated, validated `LiveTargetBinding` that matches the exact PID, trusted process-start key,
-  and main-module binary identity retained by the active open command. It carries the actual ASLR
-  image base and checked PE `SizeOfImage` range for safe static-RVA translation; zero, overflowing,
-  out-of-image, stale, duplicate, and replacement bindings fail closed, while terminal/failure
-  lifecycle state invalidates accepted evidence. Step Into, Step Over, and Step Out now have
-  independent complete-report capability statuses instead of inheriting one coarse execution bit.
+- Bumped the debugger wire and typed-command protocol to 1.4. Every successful host or sandbox
+  launch and every debug attach now requires one correlated, validated `LiveTargetBinding`. Host
+  launches bind the runtime main module to the exact requested binary; sandbox launches additionally
+  bind it to the exact attested PID, trusted process-start key, and binary identity; debug attaches
+  bind it to the exact process identity retained by the active open command. The binding carries the
+  actual ASLR image base and checked PE `SizeOfImage` range for safe static-RVA translation; missing,
+  pre-attestation, mismatched, replayed, zero, overflowing, out-of-image, duplicate, and replacement
+  bindings fail closed, while terminal/failure lifecycle state invalidates accepted evidence. Step
+  Into, Step Over, and Step Out now have independent complete-report capability statuses instead of
+  inheriting one coarse execution bit.
   Unsolicited stop/exit batches are staged and validated in full before reducer/cursor commit, so a
   later hostile frame cannot expose an accepted prefix. Legacy 1.3 and earlier peers are rejected.
   These are provider/client contracts only; no process-executing Windows provider is shipped.

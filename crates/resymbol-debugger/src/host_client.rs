@@ -3,8 +3,9 @@
 //! This module performs no process operations. The feature-gated synthetic host
 //! exercises protocol mechanics but never claims target or sandbox work occurred.
 
-use std::{marker::PhantomData, rc::Rc};
+use std::{collections::VecDeque, marker::PhantomData, rc::Rc};
 
+use resymbol_core::BinaryId;
 use thiserror::Error;
 
 use crate::authorization::{HostRiskVerifier, SandboxOwnershipVerifier};
@@ -31,7 +32,7 @@ use crate::sandbox::{
     HelperBuildId, SandboxAttestation, SandboxCleanupReceipt, SandboxFailure, SandboxFailureStage,
     SandboxLifecycleEvent, SandboxLifecycleState, SandboxMachineError, SandboxProviderSelection,
 };
-use crate::session_machine::RemoteCommandCheckpoint;
+use crate::session_machine::{RemoteCommandCheckpoint, UnsolicitedObservationError};
 use crate::{SessionMachine, SessionMachineError};
 
 #[cfg(any(test, feature = "test-support"))]
@@ -40,6 +41,9 @@ use crate::protocol::{
     EventSequence,
 };
 pub const MAX_PENDING_COMMANDS: usize = 1;
+/// Maximum accepted unsolicited observations retained until the connection
+/// owner drains them through [`DebugHostClient::pump_inbound`].
+pub const MAX_PENDING_UNSOLICITED_EVENTS: usize = MAX_RESPONSE_FRAMES;
 /// Longest single wait a transport may perform for unsolicited host events.
 ///
 /// Callers can pump repeatedly, but one poll remains bounded so a connection
@@ -165,6 +169,7 @@ pub struct DebugHostClient<T: HostFrameExchange> {
     next_outbound_frame_sequence: u64,
     next_inbound_frame_sequence: u64,
     event_cursor: EventSequenceCursor,
+    pending_unsolicited_events: VecDeque<EventEnvelope>,
     transport_shutdown: bool,
     _owner_thread: PhantomData<Rc<()>>,
 }
@@ -297,6 +302,7 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
             next_outbound_frame_sequence: 2,
             next_inbound_frame_sequence: 2,
             event_cursor: EventSequenceCursor::default(),
+            pending_unsolicited_events: VecDeque::new(),
             transport_shutdown: false,
             _owner_thread: PhantomData,
         })
@@ -325,7 +331,8 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
     }
 
     /// Returns the exact validated main-module mapping for the active live
-    /// attach, if the host supplied it and the session remains live.
+    /// launch or debug attach, if the host supplied it and the session remains
+    /// live.
     ///
     /// The binding is invalidated on terminal state, connection failure, or
     /// replacement evidence. Callers receive no mutable access to it.
@@ -548,6 +555,9 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
         wait: HostPollWait,
     ) -> Result<Vec<EventEnvelope>, DebugHostClientError> {
         self.require_session_open()?;
+        if !self.pending_unsolicited_events.is_empty() {
+            return Ok(self.pending_unsolicited_events.drain(..).collect());
+        }
         let responses = match self
             .transport
             .poll_inbound(wait, DEFAULT_HOST_RESPONSE_LIMITS)
@@ -601,6 +611,7 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
         self.transport
             .release_session(session.reducer.session_id())?;
         self.session = None;
+        self.pending_unsolicited_events.clear();
         self.connection_state = ClientConnectionState::Connected;
         Ok(())
     }
@@ -618,10 +629,13 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
             return Err(DebugHostClientError::SessionAbandonRequiresFailedConnection);
         }
         self.abort_transport(ControlShutdownReason::ExplicitAbandon);
-        self.session
+        let state = self
+            .session
             .take()
             .map(|session| session.verified_state)
-            .ok_or(DebugHostClientError::SessionNotOwned)
+            .ok_or(DebugHostClientError::SessionNotOwned)?;
+        self.pending_unsolicited_events.clear();
+        Ok(state)
     }
 
     /// Abandons an active session and closes only the control channel.
@@ -637,6 +651,7 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
         self.abort_transport(ControlShutdownReason::ExplicitAbandon);
         self.connection_state = ClientConnectionState::Disconnected;
         self.session = None;
+        self.pending_unsolicited_events.clear();
         Ok(state)
     }
 
@@ -672,7 +687,7 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
             .session
             .take()
             .ok_or(DebugHostClientError::SessionNotOwned)?;
-        let result = self.accept_response_batch_inner(
+        let result = self.accept_dispatched_response_batch(
             &mut session,
             envelope,
             checkpoint,
@@ -688,6 +703,131 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
         result
     }
 
+    fn accept_dispatched_response_batch(
+        &mut self,
+        session: &mut ClientSession,
+        envelope: &CommandEnvelope,
+        checkpoint: RemoteCommandCheckpoint,
+        required_command_state: Option<SessionState>,
+        responses: HostResponseBatch,
+    ) -> Result<CommandReceipt, DebugHostClientError> {
+        let correlations = self.prevalidate_inbound_correlations(&responses)?;
+        let command_id = envelope.command_id;
+        let unsolicited_prefix = correlations
+            .iter()
+            .take_while(|correlation| correlation.is_none())
+            .count();
+
+        if unsolicited_prefix == 0 {
+            if let Some(actual) = correlations
+                .iter()
+                .copied()
+                .find(|correlation| *correlation != Some(command_id))
+            {
+                return Err(match actual {
+                    Some(actual) => DebugHostClientError::UnexpectedCommandCorrelation {
+                        expected: command_id,
+                        actual: Some(actual),
+                    },
+                    None => {
+                        DebugHostClientError::UnsolicitedEventAfterCorrelatedResponse { command_id }
+                    }
+                });
+            }
+            return self.accept_response_batch_inner(
+                session,
+                envelope,
+                checkpoint,
+                required_command_state,
+                responses,
+            );
+        }
+
+        if unsolicited_prefix == correlations.len() {
+            return Err(DebugHostClientError::MissingCommandResult { command_id });
+        }
+        for correlation in &correlations[unsolicited_prefix..] {
+            match correlation {
+                Some(actual) if *actual == command_id => {}
+                Some(actual) => {
+                    return Err(DebugHostClientError::UnexpectedCommandCorrelation {
+                        expected: command_id,
+                        actual: Some(*actual),
+                    });
+                }
+                None => {
+                    return Err(
+                        DebugHostClientError::UnsolicitedEventAfterCorrelatedResponse {
+                            command_id,
+                        },
+                    );
+                }
+            }
+        }
+
+        let pending_after = self
+            .pending_unsolicited_events
+            .len()
+            .checked_add(unsolicited_prefix)
+            .ok_or(DebugHostClientError::PendingUnsolicitedEventQueueOverflow)?;
+        if pending_after > MAX_PENDING_UNSOLICITED_EVENTS {
+            return Err(DebugHostClientError::PendingUnsolicitedEventQueueFull {
+                actual: pending_after,
+                maximum: MAX_PENDING_UNSOLICITED_EVENTS,
+            });
+        }
+
+        let mut frames = responses.into_frames();
+        let correlated_frames = frames.split_off(unsolicited_prefix);
+        let unsolicited = HostResponseBatch::try_from_frames(frames, DEFAULT_HOST_RESPONSE_LIMITS)?;
+        let correlated =
+            HostResponseBatch::try_from_frames(correlated_frames, DEFAULT_HOST_RESPONSE_LIMITS)?;
+        let accepted = self.accept_unsolicited_batch(session, unsolicited)?;
+        self.pending_unsolicited_events.extend(accepted);
+        self.accept_response_batch_inner(
+            session,
+            envelope,
+            checkpoint,
+            required_command_state,
+            correlated,
+        )
+    }
+
+    /// Decodes a bounded response once without committing stream cursors so a
+    /// complete mixed exchange is known structurally valid before any
+    /// unsolicited prefix is routed into the reducer.
+    fn prevalidate_inbound_correlations(
+        &self,
+        responses: &HostResponseBatch,
+    ) -> Result<Vec<Option<CommandId>>, DebugHostClientError> {
+        responses.validate(DEFAULT_HOST_RESPONSE_LIMITS)?;
+        let mut correlations = Vec::with_capacity(responses.len());
+        let mut next_inbound_frame_sequence = self.next_inbound_frame_sequence;
+        let mut event_cursor = self.event_cursor;
+        for frame in responses.as_slice() {
+            self.require_negotiated_frame_version(frame)?;
+            if frame.header().sequence.get() != next_inbound_frame_sequence {
+                return Err(DebugHostClientError::UnexpectedFrameSequence {
+                    expected: next_inbound_frame_sequence,
+                    actual: frame.header().sequence.get(),
+                });
+            }
+            next_inbound_frame_sequence = next_inbound_frame_sequence
+                .checked_add(1)
+                .ok_or(DebugHostClientError::FrameSequenceOverflow)?;
+            let event = decode_event_frame(frame)?;
+            if event.version != self.typed_version {
+                return Err(DebugHostClientError::UnexpectedTypedProtocolVersion {
+                    expected: self.typed_version,
+                    actual: event.version,
+                });
+            }
+            event_cursor.observe(event.sequence)?;
+            correlations.push(event.caused_by);
+        }
+        Ok(correlations)
+    }
+
     fn accept_unsolicited_batch(
         &mut self,
         session: &mut ClientSession,
@@ -700,7 +840,6 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
         let mut events = Vec::with_capacity(responses.len());
         let mut next_inbound_frame_sequence = self.next_inbound_frame_sequence;
         let mut event_cursor = self.event_cursor;
-        let mut staged_state = session.verified_state.clone();
         for frame in responses.into_frames() {
             self.require_negotiated_frame_version(&frame)?;
             if frame.header().sequence.get() != next_inbound_frame_sequence {
@@ -749,22 +888,30 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
                     actual: event.state,
                 });
             }
-            staged_state.validate_successor(next)?;
-            staged_state = next.clone();
             events.push(event);
         }
 
-        // The entire bounded batch is structurally and semantically valid.
-        // Apply only now so a hostile later frame cannot expose a poisoned
-        // reducer prefix. For these two event kinds, validate_successor and
-        // apply_state_event are the same pure reducer transition contract.
-        for event in &events {
-            let DebugEvent::StateChanged(next) = &event.event else {
-                unreachable!("unsolicited events were restricted above")
-            };
-            apply_state_event(&mut session.reducer, next, None)?;
-            session.verified_state = next.clone();
-        }
+        // Replay the complete decoded batch through the exact reducer contract
+        // in one transaction. Protocol successor validation alone is too broad:
+        // it also admits correlated stopped-token refreshes that are not valid
+        // unsolicited observations.
+        session
+            .reducer
+            .apply_unsolicited_observations(events.iter().map(|event| {
+                let DebugEvent::StateChanged(next) = &event.event else {
+                    unreachable!("unsolicited events were restricted above")
+                };
+                next
+            }))
+            .map_err(|error| match error {
+                UnsolicitedObservationError::Reducer(error) => {
+                    DebugHostClientError::SessionMachine(error)
+                }
+                UnsolicitedObservationError::StateMismatch { expected, actual } => {
+                    DebugHostClientError::ReducerStateMismatch { expected, actual }
+                }
+            })?;
+        session.verified_state = session.reducer.state().clone();
         self.next_inbound_frame_sequence = next_inbound_frame_sequence;
         self.event_cursor = event_cursor;
         invalidate_binding_for_state(session);
@@ -1206,13 +1353,13 @@ fn accept_live_target_binding(
     binding: &LiveTargetBinding,
     evidence: &mut ResponseEvidence,
 ) -> Result<(), DebugHostClientError> {
-    let DebugCommand::Open(request @ DebugTargetRequest::Attach(target)) = &envelope.command else {
+    let DebugCommand::Open(request) = &envelope.command else {
         return Err(DebugHostClientError::UnexpectedCommandEvidence {
             command_id: envelope.command_id,
             evidence: "live-target-binding",
         });
     };
-    if target.mode != crate::protocol::AttachMode::Debug || reducer.target() != Some(request) {
+    if reducer.target() != Some(request) {
         return Err(DebugHostClientError::UnexpectedCommandEvidence {
             command_id: envelope.command_id,
             evidence: "live-target-binding",
@@ -1223,15 +1370,48 @@ fn accept_live_target_binding(
             command_id: envelope.command_id,
         });
     }
-    let expected = match &target.scope {
-        crate::protocol::AttachScope::Host { process, .. }
-        | crate::protocol::AttachScope::OwnedSandbox { process, .. } => process,
-    };
-    if binding.process() != expected {
-        return Err(DebugHostClientError::LiveTargetProcessMismatch {
-            expected: expected.clone(),
-            actual: binding.process().clone(),
-        });
+    match request {
+        DebugTargetRequest::Attach(target) if target.mode == crate::protocol::AttachMode::Debug => {
+            let expected = match &target.scope {
+                crate::protocol::AttachScope::Host { process, .. }
+                | crate::protocol::AttachScope::OwnedSandbox { process, .. } => process,
+            };
+            require_live_target_process(binding, expected)?;
+        }
+        DebugTargetRequest::Launch(target) => {
+            if binding.main_module_binary_id() != &target.binary_id {
+                return Err(DebugHostClientError::LiveTargetBinaryMismatch {
+                    expected: target.binary_id.clone(),
+                    actual: binding.main_module_binary_id().clone(),
+                });
+            }
+            if matches!(
+                &target.environment,
+                crate::protocol::LaunchEnvironment::Sandboxed { .. }
+            ) {
+                if !evidence.attestation_accepted {
+                    return Err(
+                        DebugHostClientError::LiveTargetBindingBeforeSandboxAttestation {
+                            command_id: envelope.command_id,
+                        },
+                    );
+                }
+                let attested = reducer.accepted_sandbox_attestation().ok_or(
+                    DebugHostClientError::LiveTargetBindingBeforeSandboxAttestation {
+                        command_id: envelope.command_id,
+                    },
+                )?;
+                require_live_target_process(binding, &attested.process)?;
+            }
+        }
+        DebugTargetRequest::Attach(_)
+        | DebugTargetRequest::Dump(_)
+        | DebugTargetRequest::Offline(_) => {
+            return Err(DebugHostClientError::UnexpectedCommandEvidence {
+                command_id: envelope.command_id,
+                evidence: "live-target-binding",
+            });
+        }
     }
     if let Some(existing) = current.as_ref() {
         if existing == binding {
@@ -1243,6 +1423,20 @@ fn accept_live_target_binding(
     require_unique_evidence(&mut evidence.live_target_bound, "live-target-binding")?;
     *current = Some(binding.clone());
     Ok(())
+}
+
+fn require_live_target_process(
+    binding: &LiveTargetBinding,
+    expected: &ProcessIdentity,
+) -> Result<(), DebugHostClientError> {
+    if binding.process() == expected {
+        Ok(())
+    } else {
+        Err(DebugHostClientError::LiveTargetProcessMismatch {
+            expected: expected.clone(),
+            actual: binding.process().clone(),
+        })
+    }
 }
 
 fn invalidate_binding_for_state(session: &mut ClientSession) {
@@ -1910,19 +2104,29 @@ fn validate_success_evidence(
             final_state,
         });
     }
-    if matches!(
-        &envelope.command,
-        DebugCommand::Open(DebugTargetRequest::Attach(crate::protocol::AttachTarget {
-            mode: crate::protocol::AttachMode::Debug,
-            ..
-        }))
-    ) && !evidence.live_target_bound
-    {
-        return Err(DebugHostClientError::MissingCommandEvidence {
-            command_id,
-            command: "debug-attach-binding",
-            final_state,
-        });
+    if !evidence.live_target_bound {
+        let binding_command = match &envelope.command {
+            DebugCommand::Open(DebugTargetRequest::Attach(crate::protocol::AttachTarget {
+                mode: crate::protocol::AttachMode::Debug,
+                ..
+            })) => Some("debug-attach-binding"),
+            DebugCommand::Open(DebugTargetRequest::Launch(crate::protocol::LaunchTarget {
+                environment: crate::protocol::LaunchEnvironment::Host { .. },
+                ..
+            })) => Some("host-launch-binding"),
+            DebugCommand::Open(DebugTargetRequest::Launch(crate::protocol::LaunchTarget {
+                environment: crate::protocol::LaunchEnvironment::Sandboxed { .. },
+                ..
+            })) => Some("sandboxed-launch-binding"),
+            _ => None,
+        };
+        if let Some(command) = binding_command {
+            return Err(DebugHostClientError::MissingCommandEvidence {
+                command_id,
+                command,
+                final_state,
+            });
+        }
     }
     Ok(())
 }
@@ -2077,6 +2281,12 @@ pub enum DebugHostClientError {
     UnexpectedUnsolicitedState { state: SessionStateKind },
     #[error("unsolicited host batch carried a non-state event")]
     UnexpectedUnsolicitedEvent,
+    #[error("unsolicited host event followed correlated response frames for {command_id:?}")]
+    UnsolicitedEventAfterCorrelatedResponse { command_id: CommandId },
+    #[error("pending unsolicited event queue length overflow")]
+    PendingUnsolicitedEventQueueOverflow,
+    #[error("pending unsolicited event queue would contain {actual} events; maximum is {maximum}")]
+    PendingUnsolicitedEventQueueFull { actual: usize, maximum: usize },
     #[error("expected event session {expected:?}, received {actual:?}")]
     UnexpectedEventSession {
         expected: SessionId,
@@ -2093,9 +2303,18 @@ pub enum DebugHostClientError {
     EventAfterCommandResult { command_id: CommandId },
     #[error("host returned duplicate {evidence} evidence")]
     DuplicateCommandEvidence { evidence: &'static str },
-    #[error("live target binding arrived before the attach opening state for {command_id:?}")]
+    #[error("live target binding arrived before the target opening state for {command_id:?}")]
     LiveTargetBindingBeforeOpenState { command_id: CommandId },
-    #[error("live target binding process differs from the exact attach target")]
+    #[error(
+        "sandbox live target binding arrived before exact process attestation for {command_id:?}"
+    )]
+    LiveTargetBindingBeforeSandboxAttestation { command_id: CommandId },
+    #[error("live target binding main-module identity differs from the exact launch binary")]
+    LiveTargetBinaryMismatch {
+        expected: BinaryId,
+        actual: BinaryId,
+    },
+    #[error("live target binding process differs from the exact target process")]
     LiveTargetProcessMismatch {
         expected: ProcessIdentity,
         actual: ProcessIdentity,
@@ -2731,13 +2950,19 @@ mod tests {
     }
 
     fn running_async_client(inbound: Vec<Vec<HostFrame>>) -> DebugHostClient<AsyncQueueHost> {
-        let mut client = DebugHostClient::connect(
+        let client = DebugHostClient::connect(
             AsyncQueueHost::new(inbound),
             [0x6d; 16],
             "controller/build-7",
             "host/build-4",
         )
         .expect("connect async test host");
+        prime_running_client(client)
+    }
+
+    fn prime_running_client<T: HostFrameExchange>(
+        mut client: DebugHostClient<T>,
+    ) -> DebugHostClient<T> {
         client
             .begin_session(session_id(), provisioning_epoch(), helper_build())
             .expect("begin async test session");
@@ -2843,12 +3068,28 @@ mod tests {
         poll_error: Option<HostTransportError>,
     }
 
+    struct ScriptedExchangeHost {
+        inner: SyntheticDebugHost,
+        scripted: VecDeque<Vec<HostFrame>>,
+        exchanges: usize,
+    }
+
     impl AsyncQueueHost {
         fn new(inbound: Vec<Vec<HostFrame>>) -> Self {
             Self {
                 inner: host(),
                 inbound: inbound.into(),
                 poll_error: None,
+            }
+        }
+    }
+
+    impl ScriptedExchangeHost {
+        fn new(scripted: Vec<Vec<HostFrame>>) -> Self {
+            Self {
+                inner: host(),
+                scripted: scripted.into(),
+                exchanges: 0,
             }
         }
     }
@@ -3074,6 +3315,40 @@ mod tests {
                         .map_err(HostTransportError::from)
                 })
                 .transpose()
+        }
+
+        fn release_session(&mut self, session_id: SessionId) -> Result<(), HostTransportError> {
+            self.inner.release_session(session_id)
+        }
+
+        fn shutdown_control(
+            &mut self,
+            reason: ControlShutdownReason,
+        ) -> Result<(), HostTransportError> {
+            self.inner.shutdown_control(reason)
+        }
+
+        fn abort_control(&mut self, reason: ControlShutdownReason) {
+            self.inner.abort_control(reason);
+        }
+    }
+
+    impl HostFrameExchange for ScriptedExchangeHost {
+        fn exchange(
+            &mut self,
+            request: HostFrame,
+            limits: HostResponseLimits,
+        ) -> Result<HostResponseBatch, HostTransportError> {
+            if self.exchanges == 0 {
+                self.exchanges += 1;
+                return self.inner.exchange(request, limits);
+            }
+            self.exchanges += 1;
+            let frames = self
+                .scripted
+                .pop_front()
+                .ok_or_else(|| HostTransportError::backend("scripted response exhausted"))?;
+            HostResponseBatch::try_from_frames(frames, limits).map_err(HostTransportError::from)
         }
 
         fn release_session(&mut self, session_id: SessionId) -> Result<(), HostTransportError> {
@@ -5904,6 +6179,530 @@ mod tests {
     }
 
     #[test]
+    fn correlated_host_launch_requires_and_stores_exact_aslr_binding() {
+        let binary_id = BinaryId::digest(b"correlated host launch image");
+        let risk_id = HostRiskLeaseId::new("e".repeat(64)).expect("host-risk id");
+        let target = LaunchTarget {
+            binary_id: binary_id.clone(),
+            executable: PathBuf::from("host-launch.exe"),
+            arguments: vec!["--stopped".to_owned()],
+            working_directory: None,
+            environment: LaunchEnvironment::Host {
+                risk_lease: risk_id.clone(),
+            },
+            stop_before_entry: true,
+        };
+        let mut client = DebugHostClient::connect(
+            AsyncQueueHost::new(Vec::new()),
+            [0x6d; 16],
+            "controller/build-7",
+            "host/build-4",
+        )
+        .expect("connect test client");
+        client
+            .begin_session(session_id(), provisioning_epoch(), helper_build())
+            .expect("begin session");
+        client
+            .register_host_risk_verifier(HostRiskVerifier::new(
+                risk_id,
+                session_id(),
+                provisioning_epoch(),
+                HostRiskOperation::Launch {
+                    intent: HostLaunchIntent::from_target(&target).expect("host launch intent"),
+                },
+            ))
+            .expect("register verifier");
+
+        let command_id = CommandId::new(1).expect("command id");
+        let envelope = CommandEnvelope {
+            version: ProtocolVersion::current(),
+            command_id,
+            session_id: Some(session_id()),
+            expected_state: Some(client.session_state().expect("idle state").state_token()),
+            command: DebugCommand::Open(DebugTargetRequest::Launch(target)),
+        };
+        let (checkpoint, opening) = {
+            let session = client.session.as_mut().expect("client session");
+            let checkpoint = session
+                .reducer
+                .begin_remote_command(&envelope)
+                .expect("begin remote host launch");
+            (checkpoint, session.reducer.state().clone())
+        };
+        let opening_token = opening.state_token();
+        let stopped = SessionState::Stopped {
+            token: StopToken {
+                state: StateToken {
+                    session_id: session_id(),
+                    generation: opening_token
+                        .generation
+                        .checked_next()
+                        .expect("next generation"),
+                },
+                stop_id: StopId::new(1).expect("initial stop id"),
+            },
+            reason: StopReason::Initial,
+            thread_id: ThreadId::new(9).expect("initial thread"),
+        };
+        let stopped_token = stopped.state_token();
+        let process = ProcessIdentity {
+            process_id: ProcessId::new(8_001).expect("launched process id"),
+            start_key: ProcessStartKey::new(55_001).expect("launched process start key"),
+            binary_id: binary_id.clone(),
+        };
+        let binding = LiveTargetBinding::new(
+            process,
+            binary_id,
+            MemoryAddress::new(0x0000_7ff7_2000_0000),
+            0x7_0000,
+        )
+        .expect("host launch binding");
+        let frames = vec![
+            correlated_event_frame(
+                2,
+                1,
+                command_id,
+                opening_token,
+                DebugEvent::StateChanged(opening.clone()),
+            ),
+            correlated_event_frame(
+                3,
+                2,
+                command_id,
+                opening_token,
+                DebugEvent::LiveTargetBound {
+                    state: opening_token,
+                    binding: binding.clone(),
+                },
+            ),
+            correlated_event_frame(
+                4,
+                3,
+                command_id,
+                stopped_token,
+                DebugEvent::StateChanged(stopped.clone()),
+            ),
+            correlated_event_frame(
+                5,
+                4,
+                command_id,
+                stopped_token,
+                DebugEvent::CommandResult {
+                    command_id,
+                    outcome: CommandOutcome::Succeeded,
+                },
+            ),
+        ];
+        let batch = HostResponseBatch::try_from_frames(frames, DEFAULT_HOST_RESPONSE_LIMITS)
+            .expect("bounded host launch response");
+
+        let receipt = client
+            .accept_response_batch(&envelope, checkpoint, Some(opening), batch)
+            .expect("accept exact host launch response");
+        assert_eq!(receipt.outcome, CommandOutcome::Succeeded);
+        assert_eq!(client.session_state(), Some(&stopped));
+        assert_eq!(client.live_target_binding(), Some(&binding));
+        assert_eq!(
+            client
+                .live_target_binding()
+                .expect("stored launch binding")
+                .address_for_rva(0x2_4000)
+                .expect("translate ASLR-adjusted RVA"),
+            MemoryAddress::new(0x0000_7ff7_2002_4000)
+        );
+    }
+
+    #[test]
+    fn correlated_sandbox_launch_binds_mapping_to_attested_process_identity() {
+        let target = sandbox_target();
+        let mut client = DebugHostClient::connect(
+            AsyncQueueHost::new(Vec::new()),
+            [0x6d; 16],
+            "controller/build-7",
+            "host/build-4",
+        )
+        .expect("connect test client");
+        client
+            .begin_session(session_id(), provisioning_epoch(), helper_build())
+            .expect("begin session");
+
+        let command_id = CommandId::new(1).expect("command id");
+        let envelope = CommandEnvelope {
+            version: ProtocolVersion::current(),
+            command_id,
+            session_id: Some(session_id()),
+            expected_state: Some(client.session_state().expect("idle state").state_token()),
+            command: DebugCommand::Open(target),
+        };
+        let (checkpoint, opening, expected) = {
+            let session = client.session.as_mut().expect("client session");
+            let checkpoint = session
+                .reducer
+                .begin_remote_command(&envelope)
+                .expect("begin remote sandbox launch");
+            (
+                checkpoint,
+                session.reducer.state().clone(),
+                session
+                    .reducer
+                    .expected_attestation()
+                    .expect("sandbox attestation expectation")
+                    .clone(),
+            )
+        };
+        let opening_token = opening.state_token();
+        let process = test_process_identity(&expected);
+        let awaiting_token = StateToken {
+            session_id: session_id(),
+            generation: opening_token
+                .generation
+                .checked_next()
+                .expect("awaiting-attestation generation"),
+        };
+        let awaiting = SessionState::AwaitingAttestation {
+            token: awaiting_token,
+            process: process.clone(),
+        };
+        let attestation = test_attestation(&expected);
+        assert_eq!(attestation.process, process);
+        let attested_token = StateToken {
+            session_id: session_id(),
+            generation: awaiting_token
+                .generation
+                .checked_next()
+                .expect("attestation-accepted generation"),
+        };
+        let stopped = SessionState::Stopped {
+            token: StopToken {
+                state: StateToken {
+                    session_id: session_id(),
+                    generation: attested_token
+                        .generation
+                        .checked_next()
+                        .expect("stopped generation"),
+                },
+                stop_id: StopId::new(1).expect("initial stop id"),
+            },
+            reason: StopReason::Initial,
+            thread_id: ThreadId::new(9).expect("initial thread"),
+        };
+        let stopped_token = stopped.state_token();
+        let binding = LiveTargetBinding::new(
+            process.clone(),
+            process.binary_id.clone(),
+            MemoryAddress::new(0x0000_7ff8_6000_0000),
+            0x9_0000,
+        )
+        .expect("sandbox launch binding");
+        let frames = vec![
+            correlated_event_frame(
+                2,
+                1,
+                command_id,
+                opening_token,
+                DebugEvent::StateChanged(opening.clone()),
+            ),
+            correlated_event_frame(
+                3,
+                2,
+                command_id,
+                awaiting_token,
+                DebugEvent::StateChanged(awaiting),
+            ),
+            correlated_event_frame(
+                4,
+                3,
+                command_id,
+                awaiting_token,
+                DebugEvent::SandboxAttested(attestation),
+            ),
+            correlated_event_frame(
+                5,
+                4,
+                command_id,
+                attested_token,
+                DebugEvent::LiveTargetBound {
+                    state: attested_token,
+                    binding: binding.clone(),
+                },
+            ),
+            correlated_event_frame(
+                6,
+                5,
+                command_id,
+                stopped_token,
+                DebugEvent::StateChanged(stopped.clone()),
+            ),
+            correlated_event_frame(
+                7,
+                6,
+                command_id,
+                stopped_token,
+                DebugEvent::CommandResult {
+                    command_id,
+                    outcome: CommandOutcome::Succeeded,
+                },
+            ),
+        ];
+        let batch = HostResponseBatch::try_from_frames(frames, DEFAULT_HOST_RESPONSE_LIMITS)
+            .expect("bounded sandbox launch response");
+
+        let receipt = client
+            .accept_response_batch(&envelope, checkpoint, Some(opening), batch)
+            .expect("accept exact sandbox launch response");
+        assert_eq!(receipt.outcome, CommandOutcome::Succeeded);
+        assert_eq!(client.session_state(), Some(&stopped));
+        assert_eq!(client.live_target_binding(), Some(&binding));
+        assert_eq!(binding.process(), &process);
+        assert_eq!(
+            binding
+                .address_for_rva(0x1_1000)
+                .expect("translate sandbox RVA"),
+            MemoryAddress::new(0x0000_7ff8_6001_1000)
+        );
+    }
+
+    #[test]
+    fn launch_binding_rejects_missing_forged_and_replayed_evidence() {
+        let host_binary = BinaryId::digest(b"host launch binding requirement");
+        let risk_id = HostRiskLeaseId::new("f".repeat(64)).expect("host-risk id");
+        let host_target = LaunchTarget {
+            binary_id: host_binary.clone(),
+            executable: PathBuf::from("host-launch.exe"),
+            arguments: Vec::new(),
+            working_directory: None,
+            environment: LaunchEnvironment::Host {
+                risk_lease: risk_id.clone(),
+            },
+            stop_before_entry: true,
+        };
+        let mut host_reducer =
+            SessionMachine::new(session_id(), provisioning_epoch(), helper_build());
+        host_reducer
+            .register_host_risk_verifier(HostRiskVerifier::new(
+                risk_id,
+                session_id(),
+                provisioning_epoch(),
+                HostRiskOperation::Launch {
+                    intent: HostLaunchIntent::from_target(&host_target)
+                        .expect("host launch intent"),
+                },
+            ))
+            .expect("register verifier");
+        let host_envelope = CommandEnvelope {
+            version: ProtocolVersion::current(),
+            command_id: CommandId::new(1).expect("command id"),
+            session_id: Some(session_id()),
+            expected_state: Some(host_reducer.state().state_token()),
+            command: DebugCommand::Open(DebugTargetRequest::Launch(host_target)),
+        };
+        let _host_checkpoint = host_reducer
+            .begin_remote_command(&host_envelope)
+            .expect("begin host launch");
+        host_reducer
+            .mark_stopped(
+                StopReason::Initial,
+                ThreadId::new(3).expect("host launch thread"),
+            )
+            .expect("host launch stopped");
+        let mut host_evidence = ResponseEvidence {
+            state_changed: true,
+            command_state_observed: true,
+            ..ResponseEvidence::default()
+        };
+        assert_eq!(
+            validate_success_evidence(&host_envelope, &host_reducer, &host_evidence),
+            Err(DebugHostClientError::MissingCommandEvidence {
+                command_id: host_envelope.command_id,
+                command: "host-launch-binding",
+                final_state: SessionStateKind::Stopped,
+            })
+        );
+        let forged_binary = BinaryId::digest(b"forged host launch mapping");
+        let forged_process = ProcessIdentity {
+            process_id: ProcessId::new(8_002).expect("forged process id"),
+            start_key: ProcessStartKey::new(55_002).expect("forged process start key"),
+            binary_id: forged_binary.clone(),
+        };
+        let forged = LiveTargetBinding::new(
+            forged_process,
+            forged_binary.clone(),
+            MemoryAddress::new(0x0000_7ff7_3000_0000),
+            0x5_0000,
+        )
+        .expect("structurally valid forged binding");
+        let mut current = None;
+        assert_eq!(
+            accept_live_target_binding(
+                &host_envelope,
+                &host_reducer,
+                &mut current,
+                &forged,
+                &mut host_evidence,
+            ),
+            Err(DebugHostClientError::LiveTargetBinaryMismatch {
+                expected: host_binary,
+                actual: forged_binary,
+            })
+        );
+        assert!(current.is_none());
+
+        let mut sandbox_reducer =
+            SessionMachine::new(session_id(), provisioning_epoch(), helper_build());
+        let sandbox_envelope = CommandEnvelope {
+            version: ProtocolVersion::current(),
+            command_id: CommandId::new(1).expect("command id"),
+            session_id: Some(session_id()),
+            expected_state: Some(sandbox_reducer.state().state_token()),
+            command: DebugCommand::Open(sandbox_target()),
+        };
+        let _sandbox_checkpoint = sandbox_reducer
+            .begin_remote_command(&sandbox_envelope)
+            .expect("begin sandbox launch");
+        let expected = sandbox_reducer
+            .expected_attestation()
+            .expect("sandbox expectation")
+            .clone();
+        let process = test_process_identity(&expected);
+        let exact = LiveTargetBinding::new(
+            process.clone(),
+            process.binary_id.clone(),
+            MemoryAddress::new(0x0000_7ff8_7000_0000),
+            0x8_0000,
+        )
+        .expect("exact sandbox mapping");
+        let mut sandbox_evidence = ResponseEvidence {
+            command_state_observed: true,
+            ..ResponseEvidence::default()
+        };
+        assert_eq!(
+            accept_live_target_binding(
+                &sandbox_envelope,
+                &sandbox_reducer,
+                &mut current,
+                &exact,
+                &mut sandbox_evidence,
+            ),
+            Err(
+                DebugHostClientError::LiveTargetBindingBeforeSandboxAttestation {
+                    command_id: sandbox_envelope.command_id,
+                }
+            )
+        );
+        sandbox_reducer
+            .target_created_suspended(process.clone())
+            .expect("record suspended sandbox target");
+        let attestation = test_attestation(&expected);
+        sandbox_reducer
+            .accept_sandbox_attestation(&attestation)
+            .expect("accept exact sandbox attestation");
+        sandbox_evidence.attestation_accepted = true;
+        sandbox_reducer
+            .mark_stopped(
+                StopReason::Initial,
+                ThreadId::new(4).expect("sandbox launch thread"),
+            )
+            .expect("sandbox launch stopped");
+        let missing_sandbox_evidence = ResponseEvidence {
+            state_changed: true,
+            command_state_observed: true,
+            attestation_accepted: true,
+            ..ResponseEvidence::default()
+        };
+        assert_eq!(
+            validate_success_evidence(
+                &sandbox_envelope,
+                &sandbox_reducer,
+                &missing_sandbox_evidence,
+            ),
+            Err(DebugHostClientError::MissingCommandEvidence {
+                command_id: sandbox_envelope.command_id,
+                command: "sandboxed-launch-binding",
+                final_state: SessionStateKind::Stopped,
+            })
+        );
+
+        let replayed_process = ProcessIdentity {
+            process_id: process.process_id,
+            start_key: ProcessStartKey::new(process.start_key.get() + 1)
+                .expect("replayed process start key"),
+            binary_id: process.binary_id.clone(),
+        };
+        let replayed = LiveTargetBinding::new(
+            replayed_process.clone(),
+            replayed_process.binary_id.clone(),
+            MemoryAddress::new(0x0000_7ff8_7000_0000),
+            0x8_0000,
+        )
+        .expect("structurally valid replayed mapping");
+        assert_eq!(
+            accept_live_target_binding(
+                &sandbox_envelope,
+                &sandbox_reducer,
+                &mut current,
+                &replayed,
+                &mut sandbox_evidence,
+            ),
+            Err(DebugHostClientError::LiveTargetProcessMismatch {
+                expected: process,
+                actual: replayed_process,
+            })
+        );
+        accept_live_target_binding(
+            &sandbox_envelope,
+            &sandbox_reducer,
+            &mut current,
+            &exact,
+            &mut sandbox_evidence,
+        )
+        .expect("accept exact sandbox mapping once");
+        assert_eq!(
+            accept_live_target_binding(
+                &sandbox_envelope,
+                &sandbox_reducer,
+                &mut current,
+                &exact,
+                &mut sandbox_evidence,
+            ),
+            Err(DebugHostClientError::DuplicateLiveTargetBinding)
+        );
+
+        let mut offline_reducer =
+            SessionMachine::new(session_id(), provisioning_epoch(), helper_build());
+        let offline_envelope = CommandEnvelope {
+            version: ProtocolVersion::current(),
+            command_id: CommandId::new(1).expect("command id"),
+            session_id: Some(session_id()),
+            expected_state: Some(offline_reducer.state().state_token()),
+            command: DebugCommand::Open(DebugTargetRequest::Offline(OfflineTarget {
+                path: PathBuf::from("offline.exe"),
+            })),
+        };
+        let _offline_checkpoint = offline_reducer
+            .begin_remote_command(&offline_envelope)
+            .expect("begin offline open");
+        let mut offline_binding = None;
+        let mut offline_evidence = ResponseEvidence {
+            command_state_observed: true,
+            ..ResponseEvidence::default()
+        };
+        assert_eq!(
+            accept_live_target_binding(
+                &offline_envelope,
+                &offline_reducer,
+                &mut offline_binding,
+                &exact,
+                &mut offline_evidence,
+            ),
+            Err(DebugHostClientError::UnexpectedCommandEvidence {
+                command_id: offline_envelope.command_id,
+                evidence: "live-target-binding",
+            })
+        );
+        assert!(offline_binding.is_none());
+    }
+
+    #[test]
     fn async_pump_accepts_exact_uncorrelated_stop_observation() {
         let stopped = SessionState::Stopped {
             token: StopToken {
@@ -5938,6 +6737,121 @@ mod tests {
     }
 
     #[test]
+    fn async_pump_rejects_wrong_stop_id_without_mutating_reducer() {
+        let forged = SessionState::Stopped {
+            token: StopToken {
+                state: next_async_state_token(),
+                stop_id: StopId::new(99).expect("forged stop id"),
+            },
+            reason: StopReason::UserPause,
+            thread_id: ThreadId::new(10).expect("stopped thread id"),
+        };
+        let frame = async_state_frame(2, 1, forged.clone(), None);
+        let mut client = running_async_client(vec![vec![frame]]);
+        let before = client.session_state().expect("running state").clone();
+
+        assert!(matches!(
+            client.pump_inbound(HostPollWait::immediate()),
+            Err(DebugHostClientError::ReducerStateMismatch {
+                expected: SessionState::Stopped {
+                    token: StopToken { stop_id, .. },
+                    ..
+                },
+                actual,
+            }) if stop_id == StopId::new(2).expect("canonical stop id") && actual == forged
+        ));
+        let session = client
+            .session
+            .as_ref()
+            .expect("diagnostic session retained");
+        assert_eq!(session.reducer.state(), &before);
+        assert_eq!(session.verified_state, before);
+        assert_eq!(client.next_inbound_frame_sequence, 2);
+        assert_eq!(client.event_cursor, EventSequenceCursor::default());
+        let replayed = client
+            .session
+            .as_mut()
+            .expect("diagnostic session retained")
+            .reducer
+            .mark_stopped(
+                StopReason::UserPause,
+                ThreadId::new(10).expect("stopped thread id"),
+            )
+            .expect("rollback restored running reducer and stop watermark");
+        assert!(matches!(
+            replayed,
+            SessionState::Stopped {
+                token: StopToken { stop_id, .. },
+                ..
+            } if *stop_id == StopId::new(2).expect("canonical stop id")
+        ));
+    }
+
+    #[test]
+    fn async_pump_stopped_to_stopped_matches_reducer_contract() {
+        let first = SessionState::Stopped {
+            token: StopToken {
+                state: next_async_state_token(),
+                stop_id: StopId::new(2).expect("second stop id"),
+            },
+            reason: StopReason::UserPause,
+            thread_id: ThreadId::new(10).expect("first stopped thread"),
+        };
+        let second = SessionState::Stopped {
+            token: StopToken {
+                state: StateToken {
+                    session_id: session_id(),
+                    generation: StateGeneration::new(6).expect("following generation"),
+                },
+                stop_id: StopId::new(3).expect("third stop id"),
+            },
+            reason: StopReason::SingleStep,
+            thread_id: ThreadId::new(11).expect("second stopped thread"),
+        };
+        let frames = vec![
+            async_state_frame(2, 1, first, None),
+            async_state_frame(3, 2, second, None),
+        ];
+        let mut client = running_async_client(vec![frames]);
+        let before = client.session_state().expect("running state").clone();
+
+        assert!(matches!(
+            client.pump_inbound(HostPollWait::immediate()),
+            Err(DebugHostClientError::SessionMachine(
+                SessionMachineError::InvalidTransition {
+                    from: SessionStateKind::Stopped,
+                    action: "mark stopped",
+                }
+            ))
+        ));
+        let session = client
+            .session
+            .as_ref()
+            .expect("diagnostic session retained");
+        assert_eq!(session.reducer.state(), &before);
+        assert_eq!(session.verified_state, before);
+        assert_eq!(client.next_inbound_frame_sequence, 2);
+        assert_eq!(client.event_cursor, EventSequenceCursor::default());
+        let replayed = client
+            .session
+            .as_mut()
+            .expect("diagnostic session retained")
+            .reducer
+            .mark_stopped(
+                StopReason::UserPause,
+                ThreadId::new(10).expect("stopped thread id"),
+            )
+            .expect("whole-batch rollback restored reducer");
+        assert!(matches!(
+            replayed,
+            SessionState::Stopped {
+                token: StopToken { stop_id, .. },
+                ..
+            } if *stop_id == StopId::new(2).expect("canonical stop id")
+        ));
+    }
+
+    #[test]
     fn async_pump_accepts_exact_uncorrelated_exit_observation() {
         let exited = SessionState::Exited {
             token: next_async_state_token(),
@@ -5966,6 +6880,251 @@ mod tests {
             })
         ));
         assert!(client.live_target_binding().is_none());
+    }
+
+    #[test]
+    fn submit_routes_unsolicited_event_preceding_correlated_response_in_sequence() {
+        let command_id = CommandId::new(3).expect("next command id");
+        let pausing_token = StateToken {
+            session_id: session_id(),
+            generation: StateGeneration::new(5).expect("pausing generation"),
+        };
+        let pausing = SessionState::Pausing {
+            token: pausing_token,
+        };
+        let stopped = SessionState::Stopped {
+            token: StopToken {
+                state: StateToken {
+                    session_id: session_id(),
+                    generation: StateGeneration::new(6).expect("stopped generation"),
+                },
+                stop_id: StopId::new(2).expect("second stop id"),
+            },
+            reason: StopReason::UserPause,
+            thread_id: ThreadId::new(10).expect("stopped thread"),
+        };
+        let frames = vec![
+            async_state_frame(2, 1, stopped.clone(), None),
+            correlated_event_frame(
+                3,
+                2,
+                command_id,
+                pausing_token,
+                DebugEvent::StateChanged(pausing),
+            ),
+            correlated_event_frame(
+                4,
+                3,
+                command_id,
+                stopped.state_token(),
+                DebugEvent::CommandResult {
+                    command_id,
+                    outcome: CommandOutcome::Succeeded,
+                },
+            ),
+        ];
+        let transport = ScriptedExchangeHost::new(vec![frames]);
+        let connected =
+            DebugHostClient::connect(transport, [0x6d; 16], "controller/build-7", "host/build-4")
+                .expect("connect scripted test host");
+        let mut client = prime_running_client(connected);
+        client.next_command_id = command_id.get();
+        let SessionState::Running { token: run } = client
+            .session_state()
+            .expect("running state before pause")
+            .clone()
+        else {
+            panic!("synthetic client is not running")
+        };
+
+        let receipt = client
+            .submit(DebugCommand::Pause { run })
+            .expect("route async stop before correlated pause response");
+
+        assert_eq!(receipt.command_id, command_id);
+        assert_eq!(receipt.outcome, CommandOutcome::Succeeded);
+        assert_eq!(receipt.events.len(), 2);
+        assert!(
+            receipt
+                .events
+                .iter()
+                .all(|event| event.caused_by == Some(command_id))
+        );
+        assert_eq!(client.session_state(), Some(&stopped));
+        assert_eq!(client.next_inbound_frame_sequence, 5);
+        let mut expected_cursor = EventSequenceCursor::default();
+        for sequence in 1..=3 {
+            expected_cursor
+                .observe(EventSequence::new(sequence).expect("event sequence"))
+                .expect("contiguous event sequence");
+        }
+        assert_eq!(client.event_cursor, expected_cursor);
+        assert_eq!(client.pending_unsolicited_events.len(), 1);
+
+        let routed = client
+            .pump_inbound(HostPollWait::immediate())
+            .expect("drain routed async event without another transport read");
+        assert_eq!(routed.len(), 1);
+        assert_eq!(routed[0].caused_by, None);
+        assert!(matches!(
+            &routed[0].event,
+            DebugEvent::StateChanged(state) if state == &stopped
+        ));
+        assert!(client.pending_unsolicited_events.is_empty());
+    }
+
+    #[test]
+    fn submit_rejects_unsolicited_event_after_correlated_response_without_cursor_advance() {
+        let command_id = CommandId::new(3).expect("next command id");
+        let pausing_token = StateToken {
+            session_id: session_id(),
+            generation: StateGeneration::new(5).expect("pausing generation"),
+        };
+        let stopped = SessionState::Stopped {
+            token: StopToken {
+                state: StateToken {
+                    session_id: session_id(),
+                    generation: StateGeneration::new(6).expect("stopped generation"),
+                },
+                stop_id: StopId::new(2).expect("second stop id"),
+            },
+            reason: StopReason::UserPause,
+            thread_id: ThreadId::new(10).expect("stopped thread"),
+        };
+        let frames = vec![
+            correlated_event_frame(
+                2,
+                1,
+                command_id,
+                pausing_token,
+                DebugEvent::StateChanged(SessionState::Pausing {
+                    token: pausing_token,
+                }),
+            ),
+            async_state_frame(3, 2, stopped.clone(), None),
+            correlated_event_frame(
+                4,
+                3,
+                command_id,
+                stopped.state_token(),
+                DebugEvent::CommandResult {
+                    command_id,
+                    outcome: CommandOutcome::Succeeded,
+                },
+            ),
+        ];
+        let transport = ScriptedExchangeHost::new(vec![frames]);
+        let connected =
+            DebugHostClient::connect(transport, [0x6d; 16], "controller/build-7", "host/build-4")
+                .expect("connect scripted test host");
+        let mut client = prime_running_client(connected);
+        client.next_command_id = command_id.get();
+        let verified_before = client.session_state().expect("running state").clone();
+        let SessionState::Running { token: run } = verified_before.clone() else {
+            panic!("synthetic client is not running")
+        };
+
+        assert_eq!(
+            client.submit(DebugCommand::Pause { run }),
+            Err(DebugHostClientError::UnsolicitedEventAfterCorrelatedResponse { command_id })
+        );
+        assert_eq!(client.connection_state(), ClientConnectionState::Failed);
+        assert_eq!(client.session_state(), Some(&verified_before));
+        assert_eq!(
+            client
+                .session
+                .as_ref()
+                .expect("diagnostic session")
+                .reducer
+                .state()
+                .kind(),
+            SessionStateKind::Pausing
+        );
+        assert_eq!(client.next_inbound_frame_sequence, 2);
+        assert_eq!(client.event_cursor, EventSequenceCursor::default());
+        assert!(client.pending_unsolicited_events.is_empty());
+    }
+
+    #[test]
+    fn submit_poisons_before_applying_prefix_when_unsolicited_queue_is_full() {
+        let command_id = CommandId::new(3).expect("next command id");
+        let pausing_token = StateToken {
+            session_id: session_id(),
+            generation: StateGeneration::new(5).expect("pausing generation"),
+        };
+        let stopped = SessionState::Stopped {
+            token: StopToken {
+                state: StateToken {
+                    session_id: session_id(),
+                    generation: StateGeneration::new(6).expect("stopped generation"),
+                },
+                stop_id: StopId::new(2).expect("second stop id"),
+            },
+            reason: StopReason::UserPause,
+            thread_id: ThreadId::new(10).expect("stopped thread"),
+        };
+        let prefix = async_state_frame(2, 1, stopped.clone(), None);
+        let queued = decode_event_frame(&prefix).expect("decode queue fixture");
+        let frames = vec![
+            prefix,
+            correlated_event_frame(
+                3,
+                2,
+                command_id,
+                pausing_token,
+                DebugEvent::StateChanged(SessionState::Pausing {
+                    token: pausing_token,
+                }),
+            ),
+            correlated_event_frame(
+                4,
+                3,
+                command_id,
+                stopped.state_token(),
+                DebugEvent::CommandResult {
+                    command_id,
+                    outcome: CommandOutcome::Succeeded,
+                },
+            ),
+        ];
+        let transport = ScriptedExchangeHost::new(vec![frames]);
+        let connected =
+            DebugHostClient::connect(transport, [0x6d; 16], "controller/build-7", "host/build-4")
+                .expect("connect scripted test host");
+        let mut client = prime_running_client(connected);
+        client.next_command_id = command_id.get();
+        client.pending_unsolicited_events =
+            std::iter::repeat_n(queued, MAX_PENDING_UNSOLICITED_EVENTS).collect();
+        let verified_before = client.session_state().expect("running state").clone();
+        let SessionState::Running { token: run } = verified_before.clone() else {
+            panic!("synthetic client is not running")
+        };
+
+        assert_eq!(
+            client.submit(DebugCommand::Pause { run }),
+            Err(DebugHostClientError::PendingUnsolicitedEventQueueFull {
+                actual: MAX_PENDING_UNSOLICITED_EVENTS + 1,
+                maximum: MAX_PENDING_UNSOLICITED_EVENTS,
+            })
+        );
+        assert_eq!(client.connection_state(), ClientConnectionState::Failed);
+        assert_eq!(client.session_state(), Some(&verified_before));
+        assert_eq!(
+            client
+                .session
+                .as_ref()
+                .expect("diagnostic session")
+                .reducer
+                .state()
+                .kind(),
+            SessionStateKind::Pausing
+        );
+        assert_eq!(client.next_inbound_frame_sequence, 2);
+        assert_eq!(client.event_cursor, EventSequenceCursor::default());
+        assert_eq!(
+            client.pending_unsolicited_events.len(),
+            MAX_PENDING_UNSOLICITED_EVENTS
+        );
     }
 
     #[test]

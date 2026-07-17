@@ -408,6 +408,12 @@ impl LiveInstructionAction {
 
     const fn required_capabilities(self) -> &'static [DebugCapability] {
         const EXECUTION: &[DebugCapability] = &[DebugCapability::ExecutionControl];
+        const STEP_INTO: &[DebugCapability] =
+            &[DebugCapability::ExecutionControl, DebugCapability::StepInto];
+        const STEP_OVER: &[DebugCapability] =
+            &[DebugCapability::ExecutionControl, DebugCapability::StepOver];
+        const STEP_OUT: &[DebugCapability] =
+            &[DebugCapability::ExecutionControl, DebugCapability::StepOut];
         const LIVE_WRITE: &[DebugCapability] = &[DebugCapability::LiveMemoryWrite];
         const BREAKPOINT: &[DebugCapability] = &[DebugCapability::SoftwareBreakpoints];
         const RUN_TO_CURSOR: &[DebugCapability] = &[
@@ -418,7 +424,10 @@ impl LiveInstructionAction {
             Self::NopLiveMemory => LIVE_WRITE,
             Self::SetSoftwareBreakpoint => BREAKPOINT,
             Self::RunToCursor => RUN_TO_CURSOR,
-            Self::Step(_) | Self::Continue => EXECUTION,
+            Self::Step(StepKind::Into) => STEP_INTO,
+            Self::Step(StepKind::Over) => STEP_OVER,
+            Self::Step(StepKind::Out) => STEP_OUT,
+            Self::Continue => EXECUTION,
         }
     }
 
@@ -596,6 +605,17 @@ impl<'a> LiveDebuggerActionContext<'a> {
                 "The live session has no complete validated capability report.",
             );
         };
+        for capability in action.required_capabilities() {
+            if !report
+                .statuses
+                .iter()
+                .any(|status| status.capability == *capability)
+            {
+                return ActionAvailability::disabled(format!(
+                    "Required capability {capability:?} is missing from the live session capability report."
+                ));
+            }
+        }
         if report.validate().is_err() {
             return ActionAvailability::disabled(
                 "The live session capability report failed complete protocol validation.",
@@ -999,6 +1019,85 @@ mod tests {
                 .expect("required capability reason");
             assert!(reason.contains(&format!("{capability:?}")));
             assert!(reason.contains("provider denied required capability"));
+        }
+    }
+
+    #[test]
+    fn step_actions_require_matching_granular_capability() {
+        let stopped_state = authenticated_stopped_state();
+        let step_matrix = [
+            (StepKind::Into, DebugCapability::StepInto),
+            (StepKind::Over, DebugCapability::StepOver),
+            (StepKind::Out, DebugCapability::StepOut),
+        ];
+
+        for &(unavailable_kind, unavailable_capability) in &step_matrix {
+            let report = capability_report(Some((
+                unavailable_capability,
+                "provider denied this granular step mode",
+            )));
+            let context = LiveDebuggerActionContext::from_authenticated_session(
+                &stopped_state,
+                &report,
+                Some(exact_live_address()),
+                Some(selected_thread()),
+            );
+
+            for &(candidate_kind, candidate_capability) in &step_matrix {
+                let availability =
+                    context.availability(LiveInstructionAction::Step(candidate_kind), &[0xCC]);
+                if candidate_capability == unavailable_capability {
+                    let reason = availability
+                        .disabled_reason()
+                        .expect("matching granular capability must fail closed");
+                    assert!(!availability.is_enabled(), "{unavailable_kind:?}");
+                    assert!(reason.contains(&format!("{unavailable_capability:?}")));
+                    assert!(reason.contains("provider denied this granular step mode"));
+                } else {
+                    assert!(availability.is_enabled(), "{candidate_kind:?}");
+                    assert_eq!(availability.disabled_reason(), None);
+                }
+            }
+
+            let mut missing_report = capability_report(None);
+            missing_report
+                .statuses
+                .retain(|status| status.capability != unavailable_capability);
+            let missing_context = LiveDebuggerActionContext::from_authenticated_session(
+                &stopped_state,
+                &missing_report,
+                Some(exact_live_address()),
+                Some(selected_thread()),
+            );
+            let expected_missing_reason = format!(
+                "Required capability {unavailable_capability:?} is missing from the live session capability report."
+            );
+            assert_eq!(
+                missing_context
+                    .availability(LiveInstructionAction::Step(unavailable_kind), &[0xCC])
+                    .disabled_reason(),
+                Some(expected_missing_reason.as_str())
+            );
+        }
+
+        let report = capability_report(Some((
+            DebugCapability::ExecutionControl,
+            "provider denied execution control",
+        )));
+        let context = LiveDebuggerActionContext::from_authenticated_session(
+            &stopped_state,
+            &report,
+            Some(exact_live_address()),
+            Some(selected_thread()),
+        );
+        for &(kind, _) in &step_matrix {
+            let availability = context.availability(LiveInstructionAction::Step(kind), &[0xCC]);
+            let reason = availability
+                .disabled_reason()
+                .expect("all step actions also require execution control");
+            assert!(!availability.is_enabled(), "{kind:?}");
+            assert!(reason.contains("ExecutionControl"));
+            assert!(reason.contains("provider denied execution control"));
         }
     }
 
