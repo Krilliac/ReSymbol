@@ -54,7 +54,8 @@ use crate::{
     worker::{
         MAX_OFFLINE_IMAGE_UI_READ_BYTES, OfflineImageReadAvailability, OfflineImageReadFailure,
         OfflineImageReadOutcome, OfflineImageReadSpan, OperationGate, OperationId,
-        OperationSequence, ServiceWorker, WorkerCommand, WorkerEvent, WorkerExportKind,
+        OperationSequence, ReviewSaveOutcome, ServiceWorker, WorkerCommand, WorkerEvent,
+        WorkerExportKind,
     },
 };
 
@@ -251,6 +252,12 @@ impl Default for Preferences {
             bottom_panel_open: true,
             recent_binaries: Vec::new(),
         }
+    }
+}
+
+impl Preferences {
+    fn normalize(&mut self) {
+        normalize_recent_binaries(&mut self.recent_binaries);
     }
 }
 
@@ -535,6 +542,14 @@ pub struct WorkbenchApp {
 
 impl WorkbenchApp {
     pub fn new(creation_context: &eframe::CreationContext<'_>) -> Self {
+        let startup_path = std::env::args_os().nth(1).map(PathBuf::from);
+        Self::new_with_startup(creation_context, startup_path)
+    }
+
+    fn new_with_startup(
+        creation_context: &eframe::CreationContext<'_>,
+        startup_path: Option<PathBuf>,
+    ) -> Self {
         #[cfg(feature = "screenshot")]
         if let Ok(value) = std::env::var("RESYMBOL_WORKBENCH_SCREENSHOT_ZOOM") {
             let zoom = value
@@ -546,7 +561,7 @@ impl WorkbenchApp {
             );
             creation_context.egui_ctx.set_zoom_factor(zoom);
         }
-        let preferences: Preferences = if cfg!(feature = "screenshot") {
+        let mut preferences: Preferences = if cfg!(feature = "screenshot") {
             Preferences::default()
         } else {
             creation_context
@@ -554,6 +569,7 @@ impl WorkbenchApp {
                 .and_then(|storage| eframe::get_value(storage, STORAGE_KEY))
                 .unwrap_or_default()
         };
+        preferences.normalize();
         preferences.theme.apply(&creation_context.egui_ctx);
         #[cfg(feature = "screenshot")]
         creation_context.egui_ctx.style_mut(|style| {
@@ -642,8 +658,6 @@ impl WorkbenchApp {
             ActivityLevel::Info,
             "Workbench ready in core-only safe review mode",
         );
-
-        let startup_path = std::env::args_os().nth(1).map(PathBuf::from);
 
         #[cfg(feature = "screenshot")]
         if let Ok(tab) = std::env::var("RESYMBOL_WORKBENCH_SCREENSHOT_TAB") {
@@ -1813,19 +1827,7 @@ impl WorkbenchApp {
                 Ok(Some(event)) => event,
                 Ok(None) => break,
                 Err(error) => {
-                    if !self.worker_disconnected {
-                        self.worker_disconnected = true;
-                        self.project_operation.invalidate();
-                        self.export_operation.invalidate();
-                        self.review_operation.invalidate();
-                        self.readiness_operation.invalidate();
-                        self.offline_read.clear();
-                        if let Some(previous) = self.pending_review_rollback.take() {
-                            self.review = Some(previous);
-                        }
-                        self.close_after_review_save = false;
-                        self.log(ActivityLevel::Error, error);
-                    }
+                    self.handle_worker_disconnect(error);
                     break;
                 }
             };
@@ -1842,25 +1844,7 @@ impl WorkbenchApp {
                         );
                         continue;
                     }
-                    match result {
-                        Ok(project) => {
-                            if let Some(path) = self.analysis_path.clone() {
-                                self.remember_recent_binary(path);
-                            }
-                            self.accept_project(project, ProjectAcceptance::NewProject);
-                        }
-                        Err(error) => {
-                            self.stage = if self.project.is_some() {
-                                WorkflowStage::Review
-                            } else {
-                                WorkflowStage::Open
-                            };
-                            self.log(
-                                ActivityLevel::Error,
-                                format!("Project open failed: {error}"),
-                            );
-                        }
-                    }
+                    self.finish_project_open(result);
                 }
                 WorkerEvent::SourceVerified { operation, result } => {
                     if !self.project_operation.finish(operation) {
@@ -1927,41 +1911,7 @@ impl WorkbenchApp {
                         continue;
                     }
                     match result {
-                        Ok(outcome) => {
-                            let current = self.review.as_mut().is_some_and(|review| {
-                                review.mark_saved(&outcome.ledger, outcome.path.clone())
-                            });
-                            let message = if current {
-                                format!("Saved review sidecar to {}", outcome.path.display())
-                            } else {
-                                format!(
-                                    "Saved an earlier review snapshot to {}; newer in-memory decisions remain unsaved",
-                                    outcome.path.display()
-                                )
-                            };
-                            self.review_destination = outcome.path.to_string_lossy().into_owned();
-                            self.review_result = Some(Ok(message.clone()));
-                            self.log(ActivityLevel::Success, message);
-                            if self.close_after_review_save {
-                                self.close_after_review_save = false;
-                                if current {
-                                    self.close_confirmation_open = false;
-                                    context.send_viewport_cmd(egui::ViewportCommand::Close);
-                                } else {
-                                    self.close_confirmation_open = true;
-                                }
-                            }
-                            if self.open_after_review_save {
-                                self.open_after_review_save = false;
-                                if current {
-                                    if let Some(path) = self.pending_binary_open.take() {
-                                        if let Err(error) = self.start_analysis(path) {
-                                            self.log(ActivityLevel::Error, error);
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        Ok(outcome) => self.finish_review_save(context, outcome),
                         Err(error) => {
                             let was_closing_after_save = self.close_after_review_save;
                             self.close_after_review_save = false;
@@ -2162,7 +2112,99 @@ impl WorkbenchApp {
         }
     }
 
+    fn handle_worker_disconnect(&mut self, error: String) {
+        if self.worker_disconnected {
+            return;
+        }
+        let project_operation_was_pending = self.project_operation.is_pending();
+        self.worker_disconnected = true;
+        self.project_operation.invalidate();
+        self.export_operation.invalidate();
+        self.review_operation.invalidate();
+        self.readiness_operation.invalidate();
+        self.offline_read.clear();
+        if let Some(previous) = self.pending_review_rollback.take() {
+            self.review = Some(previous);
+        }
+        if project_operation_was_pending {
+            self.restore_project_context_after_failed_open();
+        }
+        self.close_after_review_save = false;
+        self.log(ActivityLevel::Error, error);
+    }
+
+    fn finish_project_open(&mut self, result: Result<LoadedProject, String>) {
+        match result {
+            Ok(project) => self.accept_project(project, ProjectAcceptance::NewProject),
+            Err(error) => {
+                self.restore_project_context_after_failed_open();
+                self.log(
+                    ActivityLevel::Error,
+                    format!("Project open failed: {error}"),
+                );
+            }
+        }
+    }
+
+    fn restore_project_context_after_failed_open(&mut self) {
+        // `analysis_path` temporarily identifies the queued replacement so the
+        // chrome can display an [OPENING] label. A failed open or disconnected
+        // worker must restore the retained exact project and its visible tab,
+        // or return to a genuinely empty Open state.
+        self.analysis_path = self
+            .project
+            .as_ref()
+            .map(|project| project.identity.active_binary_path().to_path_buf());
+        self.stage = if self.project.is_some() {
+            self.main_tab.workflow_stage()
+        } else {
+            WorkflowStage::Open
+        };
+    }
+
+    fn finish_review_save(&mut self, context: &egui::Context, outcome: ReviewSaveOutcome) {
+        let current = self
+            .review
+            .as_mut()
+            .is_some_and(|review| review.mark_saved(&outcome.ledger, outcome.path.clone()));
+        let message = if current {
+            format!("Saved review sidecar to {}", outcome.path.display())
+        } else {
+            format!(
+                "Saved an earlier review snapshot to {}; newer in-memory decisions remain unsaved",
+                outcome.path.display()
+            )
+        };
+        self.review_destination = outcome.path.to_string_lossy().into_owned();
+        self.review_result = Some(Ok(message.clone()));
+        self.log(ActivityLevel::Success, message);
+        if self.close_after_review_save {
+            self.close_after_review_save = false;
+            if current {
+                self.close_confirmation_open = false;
+                context.send_viewport_cmd(egui::ViewportCommand::Close);
+            } else {
+                self.close_confirmation_open = true;
+            }
+        }
+        if self.open_after_review_save {
+            self.open_after_review_save = false;
+            if current {
+                if let Some(path) = self.pending_binary_open.take() {
+                    if let Err(error) = self.start_analysis(path) {
+                        self.log(ActivityLevel::Error, error);
+                    }
+                }
+            }
+        }
+    }
+
     fn accept_project(&mut self, project: LoadedProject, acceptance: ProjectAcceptance) {
+        let recent_path = if acceptance == ProjectAcceptance::NewProject {
+            self.analysis_path.clone()
+        } else {
+            None
+        };
         let preserve_context = acceptance == ProjectAcceptance::VerifiedSource;
         let reviews_still_bound = preserve_context
             && self.review.as_ref().is_some_and(|review| {
@@ -2264,6 +2306,9 @@ impl WorkbenchApp {
         }
         self.review_orphaned_decisions = updated_orphaned_decisions;
         self.project = Some(project);
+        if let Some(path) = recent_path {
+            self.remember_recent_binary(path);
+        }
         self.main_tab = if reviews_still_bound {
             previous_main_tab
         } else {
@@ -6722,12 +6767,30 @@ fn push_recent_binary(recent_binaries: &mut Vec<PathBuf>, path: PathBuf) {
     recent_binaries.truncate(MAX_RECENT_BINARIES);
 }
 
+fn normalize_recent_binaries(recent_binaries: &mut Vec<PathBuf>) {
+    let mut normalized = Vec::with_capacity(recent_binaries.len().min(MAX_RECENT_BINARIES));
+    for path in recent_binaries.drain(..) {
+        if normalized.contains(&path) {
+            continue;
+        }
+        normalized.push(path);
+        if normalized.len() == MAX_RECENT_BINARIES {
+            break;
+        }
+    }
+    *recent_binaries = normalized;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::{io::Write as _, path::Path};
 
     use resymbol_app::AppServices;
+    use resymbol_core::{
+        ClaimProducer, ClaimProvenance, Confidence, Evidence, EvidenceKind, SymbolAssertion,
+        SymbolClaim, SymbolSubject,
+    };
     use tempfile::NamedTempFile;
 
     const STRIPPED_FIXTURE: &[u8] =
@@ -6741,6 +6804,44 @@ mod tests {
             .expect("analyze PE");
         let project = LoadedProject::from_snapshot(snapshot).expect("loaded project");
         (source, project)
+    }
+
+    fn test_app() -> (egui::Context, WorkbenchApp) {
+        let context = egui::Context::default();
+        let creation_context = eframe::CreationContext::_new_kittest(context.clone());
+        let app = WorkbenchApp::new_with_startup(&creation_context, None);
+        (context, app)
+    }
+
+    fn review_subject(project: &LoadedProject, name: &str) -> ReviewSubject {
+        let row = project.functions.first().expect("projected function");
+        let claim = SymbolClaim::new(
+            SymbolSubject::Function {
+                binary: project.identity.sha256.clone(),
+                rva: row.rva,
+                size: None,
+            },
+            SymbolAssertion::Name {
+                name: name.to_owned(),
+            },
+            Confidence::new(0.75).expect("confidence"),
+            vec![
+                Evidence::new(
+                    EvidenceKind::new(EvidenceKind::MODEL_INFERENCE).expect("evidence kind"),
+                    "workbench state-transition fixture",
+                )
+                .expect("evidence"),
+            ],
+            ClaimProvenance {
+                producer: ClaimProducer::User {
+                    reviewer: Some("workbench-test".to_owned()),
+                },
+                method: "workbench.state-transition-fixture".to_owned(),
+                run_id: None,
+            },
+        )
+        .expect("name claim");
+        ReviewSubject::from_name_claim(&claim).expect("review subject")
     }
 
     #[test]
@@ -6788,6 +6889,192 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn persisted_recent_binaries_are_normalized_before_use() {
+        let persisted = serde_json::json!({
+            "recent_binaries": [
+                "binary-0.exe",
+                "binary-1.exe",
+                "binary-2.exe",
+                "binary-2.exe",
+                "binary-3.exe",
+                "binary-4.exe",
+                "binary-5.exe",
+                "binary-6.exe",
+                "binary-7.exe",
+                "binary-8.exe",
+                "binary-9.exe"
+            ]
+        });
+        let mut preferences: Preferences =
+            serde_json::from_value(persisted).expect("persisted preferences");
+
+        preferences.normalize();
+
+        assert_eq!(preferences.recent_binaries.len(), MAX_RECENT_BINARIES);
+        assert_eq!(
+            preferences.recent_binaries[0],
+            PathBuf::from("binary-0.exe")
+        );
+        assert_eq!(
+            preferences.recent_binaries[2],
+            PathBuf::from("binary-2.exe")
+        );
+        assert_eq!(
+            preferences.recent_binaries[7],
+            PathBuf::from("binary-7.exe")
+        );
+        assert_eq!(
+            preferences
+                .recent_binaries
+                .iter()
+                .filter(|path| path.as_path() == Path::new("binary-2.exe"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn failed_replacement_preserves_project_dirty_review_and_recents() {
+        let (_context, mut app) = test_app();
+        let (source, project) = loaded_project_with_source();
+        app.analysis_path = Some(source.path().to_path_buf());
+        app.finish_project_open(Ok(project));
+
+        let subject = review_subject(app.project.as_ref().expect("active project"), "candidate");
+        app.review
+            .as_mut()
+            .expect("bound review")
+            .apply_disposition(&subject, DecisionAction::Reject, "", "")
+            .expect("dirty review");
+        let prior_identity = app
+            .project
+            .as_ref()
+            .expect("active project")
+            .identity
+            .clone();
+        let prior_analysis_path = app.analysis_path.clone();
+        let prior_ledger = app.review.as_ref().expect("bound review").ledger().clone();
+        let prior_recents = app.preferences.recent_binaries.clone();
+
+        app.main_tab = MainTab::Exports;
+        app.analysis_path = Some(PathBuf::from("replacement-that-failed.exe"));
+        app.stage = WorkflowStage::Analyze;
+        app.finish_project_open(Err("deterministic replacement failure".to_owned()));
+
+        assert_eq!(
+            app.project.as_ref().expect("project retained").identity,
+            prior_identity
+        );
+        let retained_review = app.review.as_ref().expect("review retained");
+        assert!(retained_review.is_dirty());
+        assert_eq!(retained_review.ledger(), &prior_ledger);
+        assert_eq!(app.preferences.recent_binaries, prior_recents);
+        assert_eq!(app.analysis_path, prior_analysis_path);
+        assert_eq!(app.main_tab, MainTab::Exports);
+        assert_eq!(app.stage, WorkflowStage::Export);
+    }
+
+    #[test]
+    fn initial_open_failure_returns_to_a_genuinely_empty_open_state() {
+        let (_context, mut app) = test_app();
+        app.analysis_path = Some(PathBuf::from("initial-open-that-failed.exe"));
+        app.stage = WorkflowStage::Analyze;
+
+        app.finish_project_open(Err("deterministic initial failure".to_owned()));
+
+        assert!(app.project.is_none());
+        assert!(app.analysis_path.is_none());
+        assert_eq!(app.stage, WorkflowStage::Open);
+    }
+
+    #[test]
+    fn worker_disconnect_during_replacement_restores_retained_project_chrome() {
+        let (_context, mut app) = test_app();
+        let (source, project) = loaded_project_with_source();
+        app.analysis_path = Some(source.path().to_path_buf());
+        app.finish_project_open(Ok(project));
+        let prior_path = app.analysis_path.clone();
+        let operation = app.operation_sequence.issue();
+        app.project_operation.begin(operation);
+        app.main_tab = MainTab::Exports;
+        app.analysis_path = Some(PathBuf::from("replacement-interrupted.exe"));
+        app.stage = WorkflowStage::Analyze;
+
+        app.handle_worker_disconnect("deterministic worker disconnect".to_owned());
+
+        assert!(app.worker_disconnected);
+        assert!(!app.project_operation.is_pending());
+        assert_eq!(app.analysis_path, prior_path);
+        assert_eq!(app.main_tab, MainTab::Exports);
+        assert_eq!(app.stage, WorkflowStage::Export);
+    }
+
+    #[test]
+    fn only_successful_project_acceptance_adds_a_recent_binary() {
+        let (_context, mut app) = test_app();
+        app.analysis_path = Some(PathBuf::from("failed.exe"));
+
+        app.finish_project_open(Err("open failed".to_owned()));
+        assert!(app.preferences.recent_binaries.is_empty());
+
+        let (source, project) = loaded_project_with_source();
+        let requested_path = source.path().to_path_buf();
+        app.analysis_path = Some(requested_path.clone());
+        app.finish_project_open(Ok(project));
+
+        assert_eq!(app.preferences.recent_binaries.len(), 1);
+        assert_eq!(
+            app.preferences.recent_binaries[0],
+            std::fs::canonicalize(&requested_path).unwrap_or(requested_path)
+        );
+    }
+
+    #[test]
+    fn stale_review_snapshot_does_not_initiate_pending_binary_open() {
+        let (context, mut app) = test_app();
+        let (source, project) = loaded_project_with_source();
+        app.analysis_path = Some(source.path().to_path_buf());
+        app.finish_project_open(Ok(project));
+        let original_analysis_path = app.analysis_path.clone();
+        let original_identity = app
+            .project
+            .as_ref()
+            .expect("active project")
+            .identity
+            .clone();
+        let subject = review_subject(app.project.as_ref().expect("active project"), "candidate");
+        let review = app.review.as_mut().expect("bound review");
+        review
+            .apply_disposition(&subject, DecisionAction::AcceptPrimary, "", "")
+            .expect("first edit");
+        let saved_snapshot = review.ledger().clone();
+        review
+            .apply_disposition(&subject, DecisionAction::Reject, "", "")
+            .expect("newer edit");
+
+        let pending = PathBuf::from("pending-next-binary.exe");
+        app.pending_binary_open = Some(pending.clone());
+        app.open_after_review_save = true;
+        app.finish_review_save(
+            &context,
+            ReviewSaveOutcome {
+                ledger: saved_snapshot,
+                path: PathBuf::from("earlier.review.json"),
+            },
+        );
+
+        assert!(!app.open_after_review_save);
+        assert_eq!(app.pending_binary_open, Some(pending));
+        assert!(!app.project_operation.is_pending());
+        assert_eq!(app.analysis_path, original_analysis_path);
+        assert_eq!(
+            app.project.as_ref().expect("project retained").identity,
+            original_identity
+        );
+        assert!(app.review.as_ref().expect("review retained").is_dirty());
     }
 
     #[test]
