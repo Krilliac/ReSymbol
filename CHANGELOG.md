@@ -17,6 +17,10 @@ prereleases; breaking changes remain explicit.
   virtualization-firmware reporting, and Windows Hypervisor Platform presence. The probes load only
   system modules, never enable features or request elevation, and only remove requirements supported
   by positive evidence; they do not claim that a process-executing provider is ready.
+- Added `resymbol export --dry-run` for every export format. It preserves package validation,
+  target-loss assessment, exact-source PDB verification, and complete writer rendering while
+  creating neither the prospective destination nor a staging file; `--fail-on-loss` remains
+  enforceable in the same pre-publication flow.
 - Added a responsive, keyboard-first workbench navigation slice. The default 1440x900 review shell
   keeps all eight main views on one compact row and fits all six Function columns with both side
   panels open; the documented 1024x680 minimum uses an explicit all-view selector and a labeled
