@@ -662,6 +662,7 @@ pub enum LiveAccessError {
 #[derive(Debug)]
 struct ExactExecutable {
     file: File,
+    process_path: PathBuf,
     path: PathBuf,
     file_size: u64,
     size_of_image: u32,
@@ -698,7 +699,7 @@ fn observe_live_target(
     let start_key_before = process_start_key(process)?;
     validate_exact_executable(process, executable)?;
 
-    let module = main_module(selected_pid.get(), &executable.path)?;
+    let module = main_module(selected_pid.get(), &executable.process_path)?;
     if module.base != expected_image_base.get() {
         return Err(LiveAccessError::MainModuleBaseMismatch {
             expected: expected_image_base.get(),
@@ -810,6 +811,7 @@ fn open_exact_executable(
 
     Ok(ExactExecutable {
         file,
+        process_path: queried_path,
         path,
         file_size: before.len(),
         size_of_image,
@@ -821,8 +823,7 @@ fn validate_exact_executable(
     executable: &ExactExecutable,
 ) -> Result<(), LiveAccessError> {
     let queried_path = query_executable_path(process)?;
-    let current_path = canonical_executable_path(&queried_path)?;
-    if current_path != executable.path {
+    if queried_path != executable.process_path {
         return Err(LiveAccessError::ExecutablePathChanged);
     }
     let metadata = executable
@@ -1050,7 +1051,6 @@ fn main_module(process_id: u32, expected_path: &Path) -> Result<MainModule, Live
             return Err(LiveAccessError::ModuleProcessMismatch);
         }
         let module_path = module_entry_path(&entry)?;
-        let module_path = canonical_executable_path(&module_path)?;
         if module_path != expected_path {
             return Err(LiveAccessError::MainModulePathMismatch);
         }
