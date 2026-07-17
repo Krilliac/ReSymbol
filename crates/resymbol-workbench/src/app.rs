@@ -5866,6 +5866,10 @@ impl WorkbenchApp {
 
     #[cfg(feature = "screenshot")]
     fn show_screenshot_scenario_overlay(&mut self, context: &egui::Context) {
+        if self.screenshot_scenario == Some(ScreenshotScenario::DebuggerReadinessResult) {
+            self.show_screenshot_readiness_result_overlay(context);
+            return;
+        }
         if self.screenshot_scenario != Some(ScreenshotScenario::DisassemblyActions) {
             return;
         }
@@ -5892,6 +5896,47 @@ impl WorkbenchApp {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.set_min_width(popup_width);
                     self.show_instruction_action_menu(ui, &row, colors);
+                });
+            });
+    }
+
+    #[cfg(feature = "screenshot")]
+    fn show_screenshot_readiness_result_overlay(&self, context: &egui::Context) {
+        if self.readiness_operation.is_pending() {
+            return;
+        }
+        let outcome = self.readiness_outcome.as_ref().unwrap_or_else(|| {
+            let detail = self
+                .readiness_error
+                .as_deref()
+                .unwrap_or("probe completed without an outcome or error");
+            panic!(
+                "debugger-readiness-result scenario requires a typed readiness outcome: {detail}"
+            )
+        });
+        let colors = self.preferences.theme.semantic_colors();
+        let screen = context.screen_rect();
+        let popup_width = 920.0_f32.min(screen.width() - 32.0);
+        let position = egui::pos2(
+            (screen.center().x - popup_width / 2.0).max(screen.left() + 8.0),
+            screen.top() + 128.0,
+        );
+        egui::Area::new(egui::Id::new("screenshot_debugger_readiness_result"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(position)
+            .movable(false)
+            .show(context, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_width(popup_width);
+                    ui.label(RichText::new("Read-only readiness outcome").heading());
+                    ui.label(
+                        RichText::new(
+                            "This capture foregrounds the exact result bound to the selected provider and binary evidence.",
+                        )
+                        .color(colors.secondary_text),
+                    );
+                    ui.add_space(8.0);
+                    show_sandbox_readiness_outcome(ui, outcome, colors);
                 });
             });
     }
@@ -7303,13 +7348,7 @@ impl WorkbenchApp {
 
             ui.add_space(12.0);
             if let Some(outcome) = &self.readiness_outcome {
-                let response = show_sandbox_readiness_outcome(ui, outcome, colors);
-                #[cfg(feature = "screenshot")]
-                if self.screenshot_scenario
-                    == Some(ScreenshotScenario::DebuggerReadinessResult)
-                {
-                    response.scroll_to_me(Some(Align::Center));
-                }
+                show_sandbox_readiness_outcome(ui, outcome, colors);
             } else if !self.readiness_operation.is_pending() && self.readiness_error.is_none() {
                 ui.label(
                     RichText::new(
@@ -7623,7 +7662,7 @@ fn show_sandbox_readiness_outcome(
     ui: &mut egui::Ui,
     outcome: &DebuggerReadinessOutcome,
     colors: SemanticColors,
-) -> egui::Response {
+) {
     let report = outcome.report();
     let (status, status_color) = match report.readiness() {
         SandboxProviderReadiness::ReadyForProvisioningAttempt => {
@@ -7705,8 +7744,7 @@ fn show_sandbox_readiness_outcome(
                 .strong()
                 .color(colors.warning_conflict),
             );
-        })
-        .response
+        });
 }
 
 fn provider_selection_label(provider: &SandboxProviderSelection) -> String {
