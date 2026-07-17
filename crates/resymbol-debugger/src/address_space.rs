@@ -1,4 +1,4 @@
-use resymbol_analysis::{AnalysisError, BinaryAnalysis, PeAnalysis};
+use resymbol_analysis::{AnalysisError, BinaryAnalysis, ElfAnalysis, PeAnalysis};
 use resymbol_core::BinaryId;
 use serde::Serialize;
 use thiserror::Error;
@@ -91,6 +91,31 @@ pub struct FileBacking {
     pub size: u64,
 }
 
+/// Format-specific metadata for one validated static image layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "format", rename_all = "kebab-case")]
+pub enum StaticImageLayout {
+    Pe {
+        section_alignment: u32,
+        file_alignment: u32,
+    },
+    /// Sparse ELF `PT_LOAD` mappings. Virtual gaps are not materialized.
+    Elf,
+}
+
+impl StaticImageLayout {
+    #[must_use]
+    pub const fn pe_alignments(self) -> Option<(u32, u32)> {
+        match self {
+            Self::Pe {
+                section_alignment,
+                file_alignment,
+            } => Some((section_alignment, file_alignment)),
+            Self::Elf => None,
+        }
+    }
+}
+
 /// Why a range exists in the static PE image layout.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
@@ -104,6 +129,14 @@ pub enum StaticRegionKind {
         /// loader rounds the mapping to `SectionAlignment`. When
         /// `VirtualSize` is zero, PE loader-compatible modeling falls back to
         /// `SizeOfRawData`.
+        loaded_size: u64,
+    },
+    /// One sparse ELF `PT_LOAD` mapping. `loaded_size` is the exact
+    /// `p_memsz`; file backing, when present, is its `p_filesz` prefix.
+    LoadSegment {
+        program_header_index: u16,
+        flags: u32,
+        alignment: u32,
         loaded_size: u64,
     },
     /// An address interval inside `SizeOfImage` that is not claimed by the
@@ -137,8 +170,10 @@ impl StaticRegion {
 
     #[must_use]
     pub fn zero_fill_size(&self) -> u64 {
-        let StaticRegionKind::Section { loaded_size, .. } = &self.kind else {
-            return 0;
+        let loaded_size = match &self.kind {
+            StaticRegionKind::Section { loaded_size, .. }
+            | StaticRegionKind::LoadSegment { loaded_size, .. } => *loaded_size,
+            StaticRegionKind::Headers | StaticRegionKind::ImageGap => return 0,
         };
         loaded_size.saturating_sub(self.file_backing.map_or(0, |backing| backing.size))
     }
@@ -153,22 +188,24 @@ impl StaticRegion {
         let content_size = match &self.kind {
             StaticRegionKind::Headers => self.file_backing.map_or(0, |backing| backing.size),
             StaticRegionKind::Section { loaded_size, .. } => *loaded_size,
+            StaticRegionKind::LoadSegment { loaded_size, .. } => *loaded_size,
             StaticRegionKind::ImageGap => return 0,
         };
         self.range.size().saturating_sub(content_size)
     }
 }
 
-/// Validated, complete partition of one PE preferred image address space.
+/// Validated static image address space.
+///
+/// PE layouts retain their complete loader-rounded partition. ELF layouts
+/// retain only sorted `PT_LOAD` regions so even multi-gigabyte virtual gaps
+/// consume no region storage and remain unambiguously unmapped.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StaticAddressSpace {
     pub binary_id: BinaryId,
     pub preferred_image_base: u64,
     pub image_size: u64,
-    /// Exact in-memory section granularity declared by the PE optional header.
-    pub section_alignment: u32,
-    /// Exact on-disk section-data granularity declared by the PE optional header.
-    pub file_alignment: u32,
+    pub layout: StaticImageLayout,
     pub entry_point: Option<RelativeAddress>,
     regions: Vec<StaticRegion>,
 }
@@ -177,6 +214,7 @@ impl StaticAddressSpace {
     pub fn from_analysis(analysis: &BinaryAnalysis) -> Result<Self, StaticAddressSpaceError> {
         match analysis {
             BinaryAnalysis::Pe(pe) => Self::from_pe(pe),
+            BinaryAnalysis::Elf(elf) => Self::from_elf(elf),
             _ => Err(StaticAddressSpaceError::UnsupportedFormat),
         }
     }
@@ -184,6 +222,90 @@ impl StaticAddressSpace {
     pub fn from_pe(analysis: &PeAnalysis) -> Result<Self, StaticAddressSpaceError> {
         analysis.validate()?;
         Self::from_validated_pe(analysis)
+    }
+
+    pub fn from_elf(analysis: &ElfAnalysis) -> Result<Self, StaticAddressSpaceError> {
+        analysis.validate()?;
+
+        let image_size = analysis.image_size;
+        let image_base = analysis.identity.image_base;
+        image_base.checked_add(image_size).ok_or(
+            StaticAddressSpaceError::PreferredImageOverflow {
+                base: image_base,
+                image_size,
+            },
+        )?;
+
+        let mut regions = Vec::with_capacity(analysis.load_segments.len());
+        let mut cursor = 0_u64;
+        for segment in &analysis.load_segments {
+            let virtual_address = u64::from(segment.virtual_address);
+            let start = virtual_address.checked_sub(image_base).ok_or(
+                StaticAddressSpaceError::SegmentBelowImageBase {
+                    program_header_index: segment.program_header_index,
+                    virtual_address,
+                    image_base,
+                },
+            )?;
+            let size = u64::from(segment.memory_size);
+            let range = AddressRange::checked(start, size)?;
+            let end = range.end();
+            if start < cursor {
+                return Err(StaticAddressSpaceError::OverlappingRegion { start, cursor });
+            }
+            if end > image_size {
+                return Err(StaticAddressSpaceError::RegionOutsideImage {
+                    start,
+                    end,
+                    image_size,
+                });
+            }
+
+            let initialized_size = u64::from(segment.file_size);
+            let file_offset = u64::from(segment.file_offset);
+            let file_end = file_offset.checked_add(initialized_size).ok_or(
+                StaticAddressSpaceError::FileBackingOverflow {
+                    offset: file_offset,
+                    size: initialized_size,
+                },
+            )?;
+            if file_end > analysis.identity.size {
+                return Err(StaticAddressSpaceError::FileBackingOutsideBinary {
+                    offset: file_offset,
+                    size: initialized_size,
+                    binary_size: analysis.identity.size,
+                });
+            }
+            let file_backing = (initialized_size != 0).then_some(FileBacking {
+                offset: file_offset,
+                size: initialized_size,
+            });
+            regions.push(StaticRegion {
+                range,
+                kind: StaticRegionKind::LoadSegment {
+                    program_header_index: segment.program_header_index,
+                    flags: segment.flags,
+                    alignment: segment.alignment,
+                    loaded_size: size,
+                },
+                access: MemoryAccess {
+                    readable: segment.readable(),
+                    writable: segment.writable(),
+                    executable: segment.executable(),
+                },
+                file_backing,
+            });
+            cursor = end;
+        }
+
+        Ok(Self {
+            binary_id: analysis.identity.id.clone(),
+            preferred_image_base: image_base,
+            image_size,
+            layout: StaticImageLayout::Elf,
+            entry_point: Some(RelativeAddress::new(u64::from(analysis.entry_rva))),
+            regions,
+        })
     }
 
     pub(crate) fn from_validated_pe(
@@ -295,8 +417,10 @@ impl StaticAddressSpace {
             binary_id: analysis.identity.id.clone(),
             preferred_image_base: analysis.identity.image_base,
             image_size,
-            section_alignment: analysis.section_alignment,
-            file_alignment: analysis.file_alignment,
+            layout: StaticImageLayout::Pe {
+                section_alignment: analysis.section_alignment,
+                file_alignment: analysis.file_alignment,
+            },
             entry_point,
             regions,
         })
@@ -309,9 +433,12 @@ impl StaticAddressSpace {
 
     #[must_use]
     pub fn region_at(&self, address: RelativeAddress) -> Option<&StaticRegion> {
+        let index = self
+            .regions
+            .partition_point(|region| region.range.end() <= address.get());
         self.regions
-            .iter()
-            .find(|region| region.range.contains(address))
+            .get(index)
+            .filter(|region| region.range.contains(address))
     }
 
     #[must_use]
@@ -537,6 +664,22 @@ pub enum StaticAddressSpaceError {
     },
     #[error("section-table index {index} does not fit the portable model")]
     SectionIndexOverflow { index: usize },
+    #[error(
+        "ELF PT_LOAD program header {program_header_index} VA {virtual_address:#x} lies below image base {image_base:#x}"
+    )]
+    SegmentBelowImageBase {
+        program_header_index: u16,
+        virtual_address: u64,
+        image_base: u64,
+    },
+    #[error("static file backing {offset:#x}+{size:#x} overflows the file-offset domain")]
+    FileBackingOverflow { offset: u64, size: u64 },
+    #[error("static file backing {offset:#x}+{size:#x} exceeds binary size {binary_size:#x}")]
+    FileBackingOutsideBinary {
+        offset: u64,
+        size: u64,
+        binary_size: u64,
+    },
 }
 
 #[cfg(test)]
@@ -544,8 +687,8 @@ mod tests {
     use resymbol_analysis::{BinaryAnalysis, PeAnalysis, PeSection, analyze_bytes};
 
     use super::{
-        FileBacking, RelativeAddress, StaticAddressSpace, StaticAddressSpaceError, StaticRegion,
-        StaticRegionKind,
+        FileBacking, RelativeAddress, StaticAddressSpace, StaticAddressSpaceError,
+        StaticImageLayout, StaticRegion, StaticRegionKind,
     };
 
     const FIXTURE: &[u8] =
@@ -597,6 +740,72 @@ mod tests {
             section(".raw", 0x3000, 0, 0xe00, 0x200),
         ];
         pe
+    }
+
+    fn synthetic_sparse_elf() -> Vec<u8> {
+        const ELF_HEADER_SIZE: usize = 52;
+        const PROGRAM_HEADER_SIZE: usize = 32;
+        let mut bytes = vec![0_u8; 0x200];
+        bytes[..16].copy_from_slice(&[0x7f, b'E', b'L', b'F', 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        put_u16(&mut bytes, 16, 2);
+        put_u16(&mut bytes, 18, 8);
+        put_u32(&mut bytes, 20, 1);
+        put_u32(&mut bytes, 24, 0x1200_0040);
+        put_u32(&mut bytes, 28, ELF_HEADER_SIZE as u32);
+        put_u16(&mut bytes, 40, ELF_HEADER_SIZE as u16);
+        put_u16(&mut bytes, 42, PROGRAM_HEADER_SIZE as u16);
+        put_u16(&mut bytes, 44, 2);
+
+        put_program_header(
+            &mut bytes,
+            ELF_HEADER_SIZE,
+            0,
+            0x1200_0000,
+            0x100,
+            0x200,
+            5,
+            0x1000,
+        );
+        put_program_header(
+            &mut bytes,
+            ELF_HEADER_SIZE + PROGRAM_HEADER_SIZE,
+            0x180,
+            0xf000_0180,
+            4,
+            0x80,
+            6,
+            0x10,
+        );
+        bytes[0x180..0x184].copy_from_slice(&[0x12, 0x34, 0x56, 0x78]);
+        bytes
+    }
+
+    fn put_program_header(
+        bytes: &mut [u8],
+        offset: usize,
+        file_offset: u32,
+        virtual_address: u32,
+        file_size: u32,
+        memory_size: u32,
+        flags: u32,
+        alignment: u32,
+    ) {
+        put_u32(bytes, offset, 1);
+        put_u32(bytes, offset + 4, file_offset);
+        put_u32(bytes, offset + 8, virtual_address);
+        put_u32(bytes, offset + 12, virtual_address);
+        put_u32(bytes, offset + 16, file_size);
+        put_u32(bytes, offset + 20, memory_size);
+        put_u32(bytes, offset + 24, flags);
+        put_u32(bytes, offset + 28, alignment);
+    }
+
+    fn put_u16(bytes: &mut [u8], offset: usize, value: u16) {
+        bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }
 
     fn section_region<'a>(layout: &'a StaticAddressSpace, name: &str) -> &'a StaticRegion {
@@ -664,8 +873,13 @@ mod tests {
     fn distinguishes_loaded_content_zero_fill_and_loader_padding() {
         let layout =
             StaticAddressSpace::from_validated_pe(&synthetic_analysis()).expect("synthetic layout");
-        assert_eq!(layout.section_alignment, 0x1000);
-        assert_eq!(layout.file_alignment, 0x200);
+        assert_eq!(
+            layout.layout,
+            StaticImageLayout::Pe {
+                section_alignment: 0x1000,
+                file_alignment: 0x200,
+            }
+        );
 
         let headers = layout.regions().first().expect("headers");
         assert_eq!(headers.range.size(), 0x1000);
@@ -747,6 +961,44 @@ mod tests {
         );
         assert_eq!(tiny.mapped_padding_size(), 0x7f);
         assert_eq!(layout.regions().last().expect("gap").range.end(), 0x800);
+    }
+
+    #[test]
+    fn retains_sparse_elf_load_segments_without_materializing_large_gaps() {
+        let analysis = analyze_bytes(&synthetic_sparse_elf()).expect("synthetic sparse ELF");
+        let BinaryAnalysis::Elf(elf) = analysis else {
+            panic!("fixture must remain ELF")
+        };
+        let layout = StaticAddressSpace::from_elf(&elf).expect("sparse ELF layout");
+
+        assert_eq!(layout.layout, StaticImageLayout::Elf);
+        assert_eq!(layout.preferred_image_base, 0x1200_0000);
+        assert_eq!(layout.regions().len(), 2);
+        let first = &layout.regions()[0];
+        assert_eq!(first.range.start().get(), 0);
+        assert_eq!(first.range.size(), 0x200);
+        assert_eq!(first.zero_fill_size(), 0x100);
+        assert_eq!(first.mapped_padding_size(), 0);
+        assert!(first.access.readable && first.access.executable && !first.access.writable);
+        assert!(matches!(
+            first.kind,
+            StaticRegionKind::LoadSegment {
+                program_header_index: 0,
+                ..
+            }
+        ));
+
+        let second = &layout.regions()[1];
+        assert_eq!(second.range.start().get(), 0xde00_0180);
+        assert_eq!(second.range.size(), 0x80);
+        assert_eq!(second.file_backing.map(|backing| backing.size), Some(4));
+        assert_eq!(second.zero_fill_size(), 0x7c);
+        assert_eq!(layout.region_at(RelativeAddress::new(0x1000)), None);
+        assert_eq!(
+            layout.region_at(RelativeAddress::new(second.range.start().get())),
+            Some(second)
+        );
+        assert_eq!(layout.entry_point, Some(RelativeAddress::new(0x40)));
     }
 
     #[test]

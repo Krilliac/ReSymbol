@@ -11,7 +11,10 @@ CMake, Visual Studio, LLVM, DIA, or another compiler to run an official archive.
 
 ## Current scope
 
-The current analyzer accepts native Windows x86-64 PE32+ input. It safely extracts image and section
+The current analyzer accepts native Windows x86-64 PE32+ input. It also accepts ELF32
+little-endian `EM_MIPS` `ET_EXEC` input through a container-only path that retains checked headers,
+sparse non-empty `PT_LOAD` mappings, and zero base claims without decoding instructions; see
+[elf32-mips-container.md](elf32-mips-container.md). For PE, it safely extracts image and section
 metadata, conventional imports, modern RVA-form delay imports, exports, forwarded exports, x64
 exception-directory records, ordered TLS callback records, and load-config GuardCF function,
 address-taken IAT, long-jump, and EH-continuation records, plus checked security-cookie, GuardCF,
@@ -41,7 +44,8 @@ records, vftables, and executable virtual-slot targets. Recovered class/type nam
 and function-to-class relationships become evidence-bearing claims, and the result is written to a
 portable `.resym` package bound to the input's SHA-256 identity.
 
-On Windows x64, `resymbol-workbench.exe` opens a supported PE or current `.resym` package, runs the
+On Windows x64, `resymbol-workbench.exe` opens a supported PE, bounded ELF32 container, or current
+`.resym` package, runs the
 same core analysis away from the UI thread, and presents exact identity, evidence, durable
 exact-claim review, a bounded Reconstruction Graph, a static Address Space/protection assessment,
 bounded exact-RVA hex and x64 linear-disassembly previews from an exact verified source snapshot,
@@ -205,8 +209,10 @@ resymbol plugin list
 resymbol plugin doctor
 ```
 
-On Windows, start the desktop workbench with a supported PE path or launch it without a path and use
-the file picker:
+On Windows, start the desktop workbench with a supported PE or bounded ELF32 path, or launch it
+without a path and use the file picker. ELF projects provide a sparse `PT_LOAD` map and exact
+file-backed offline hex reads; x64 disassembly, static patching, protection analysis, MAP, and PDB
+remain PE-only:
 
 ```powershell
 .\resymbol-workbench.exe .\path\to\application.exe
@@ -278,7 +284,7 @@ Inspection validates the package first and emits no inspection data to stdout un
 file's exact size and SHA-256 match; failures report on stderr. Human output includes
 `source binary: <canonical-path>` and `identity gate: matched` after a successful check. JSON mode
 emits only the validated package JSON, with neither status line mixed into stdout. This works for
-supported package schemas 1 through 13 and only verifies identity: it does not rerun analysis, fill
+supported package schemas 1 through 14 and only verifies identity: it does not rerun analysis, fill
 in results absent from an older schema, or rewrite the package or binary.
 
 Both `analyze` and `inspect` report recovered direct-call, thunk, string, data-reference, GuardCF
@@ -359,7 +365,7 @@ Malformation and shared-budget exhaustion are hard errors, never partial delay-i
 Delay-IAT slots feed the existing `ImportIat` call/thunk target and outrank
 read-only function-pointer fallback; the richer inventory is not added to the neutral projection.
 
-New analyses write package schema 13. `inspect` and `export` can also open schemas 1 through 12.
+New analyses write package schema 14. `inspect` and `export` can also open schemas 1 through 13.
 Schema 1 is migrated into a validated current in-memory session and its base graph is rebuilt;
 schemas 2 through 8 use explicit compatibility paths. None rewrites the legacy package. Because
 `.resym` does not contain the original executable, compatibility loading cannot run missing
@@ -380,28 +386,28 @@ but omitted result families remain unavailable. Schemas 1 through 7 therefore re
 unavailable, schemas 1 through 8 report GuardCF unavailable, schemas 1 through 9 report modern
 Guard target inventories unavailable, schemas 1 through 10 report load-config security anchors
 unavailable, schemas 1 through 11 report XFG/CastGuard anchors unavailable, and schemas 1 through 12
-report the GuardMemcpy anchor unavailable. Analyze the exact original binary again to create schema 13
-with all current results. Relabeling a schema-4 pointer target beneath a
+report the GuardMemcpy anchor unavailable. Schema 13 retains all current PE recovery families but
+predates bounded ELF intake. Analyze the exact original binary again to create schema 14. Relabeling a schema-4 pointer target beneath a
 schema 2 or 3
 envelope is rejected, as is placing an RTTI base record with
 a missing or null `class_hierarchy_descriptor_rva` beneath any schema 1-through-4 envelope. A
 schema 1-through-5 envelope also cannot contain a deterministic base thunk source that depends on
 schema-6 transitive endpoint seeding. Schemas 1 through 6 also reject schema-7 TLS callback state
 and callback-only base thunk seeds. Schemas 1 through 7 reject the exact schema-8 base-analysis
-`delay_imports` inventory key and `directories.delay_imports` directory key. Schemas 8 through 13 always
+`delay_imports` inventory key and `directories.delay_imports` directory key. PE analyses in schemas 8 through 14 always
 serialize the delay-import inventory, even when empty, and reject a payload missing that marker.
 Schemas 1 through 8 reject schema-9 load-config/GuardCF fields,
-`directories.load_config`, and core `pe-guard-cf-function` claims. Schemas 9 through 13 always serialize the
+`directories.load_config`, and core `pe-guard-cf-function` claims. PE analyses in schemas 9 through 14 always serialize the
 `guard_cf_functions` inventory, even when empty, and reject a payload missing that marker.
-Schemas 1 through 9 reject schema-10 Guard target table-RVA and inventory fields. Schemas 10 through 13 always
+Schemas 1 through 9 reject schema-10 Guard target table-RVA and inventory fields. PE analyses in schemas 10 through 14 always
 serialize the address-taken IAT, long-jump, and EH-continuation inventory arrays, even when empty,
 and reject a payload missing any marker.
-Schemas 1 through 10 reject the schema-11 `load_config_security_anchors` object. Schemas 11 through 13
+Schemas 1 through 10 reject the schema-11 `load_config_security_anchors` object. PE analyses in schemas 11 through 14
 always serialize that object, even when empty, and reject a missing or non-object marker. Schemas 1
-through 11 reject schema-12 `load_config_xfg_anchors`; schemas 12 and 13 always serialize that
+through 11 reject schema-12 `load_config_xfg_anchors`; PE analyses in schemas 12 through 14 always serialize that
 object, even when empty, and reject a missing or non-object marker. Schemas 1 through 12 reject
-schema-13 `load_config_guard_memcpy_anchor`; schema 13 always serializes that object, even when
-empty, and rejects a missing or non-object marker.
+schema-13 `load_config_guard_memcpy_anchor`; PE analyses in schemas 13 and 14 always serialize that object, even when
+empty, and reject a missing or non-object marker.
 
 Export a package to a specific destination with `--output`:
 
@@ -440,8 +446,8 @@ Without `--output`, those formats write `application.symbols.json`, `application
 `application.map`, `application.pdb`, `application.ida.py`, and
 `ReSymbolImport_<first-12-binary-sha256>.java` beside the package, respectively. Markdown is a
 deterministic presentation report for human review, not a stable machine-interchange format; use
-JSON for integrations. New analyses write `.resym` package schema 13; export also accepts package
-schemas 1 through 12 through validated compatibility paths without rewriting them. The current
+JSON for integrations. New analyses write `.resym` package schema 14; export also accepts package
+schemas 1 through 13 through validated compatibility paths without rewriting them. The current
 neutral projection is independently schema 6, and MAP/PDB add no schema fields. Projection schema
 5 correlates exact or content-interior data-reference targets with retained strings, excluding NUL
 terminators and requiring UTF-16LE code-unit alignment; projection schema 6 adds explicit

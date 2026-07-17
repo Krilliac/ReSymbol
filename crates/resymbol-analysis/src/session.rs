@@ -152,10 +152,10 @@ impl<'de> Deserialize<'de> for PluginRunRecord {
 
 /// One exact binary analysis plus validated claims produced by plugin runs.
 ///
-/// Plugin claims remain outside `base_analysis`. This preserves the PE
-/// analysis invariant that its embedded graph is derived solely from exact PE
-/// metadata, while [`Self::combined_symbol_graph`] provides the append-only
-/// view used by later reconciliation and export stages.
+/// Plugin claims remain outside `base_analysis`. This preserves the base
+/// analysis invariant that its embedded graph is derived solely from exact
+/// parser evidence, while [`Self::combined_symbol_graph`] provides the
+/// append-only view used by later reconciliation and export stages.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct AnalysisSession {
     base_analysis: BinaryAnalysis,
@@ -374,6 +374,16 @@ pub enum SessionValidationError {
     },
     #[error("plugin claim {index} uses an unsupported subject kind")]
     UnsupportedSubject { index: usize },
+    #[error(
+        "plugin claim {index} uses an x86-64 recovery assertion that is unavailable for container-only ELF analysis"
+    )]
+    UnsupportedElfContainerAssertion { index: usize },
+    #[error("plugin claim {index} subject is not wholly contained in one ELF PT_LOAD mapping")]
+    ElfSubjectOutsideLoadSegment { index: usize },
+    #[error("plugin claim {index} function subject is not in an executable ELF PT_LOAD mapping")]
+    ElfFunctionNotExecutable { index: usize },
+    #[error("plugin claim {index} global subject is not in a readable ELF PT_LOAD mapping")]
+    ElfGlobalNotReadable { index: usize },
     #[error("plugin claim {index} has a function-boundary assertion on a non-function subject")]
     FunctionBoundaryRequiresFunction { index: usize },
     #[error("plugin claim {index} has a function-entry assertion on a non-function subject")]
@@ -754,7 +764,21 @@ fn validate_claim_section_policy(
     claim: &SymbolClaim,
     analysis: &BinaryAnalysis,
 ) -> Result<(), SessionValidationError> {
-    let BinaryAnalysis::Pe(analysis) = analysis;
+    let BinaryAnalysis::Pe(analysis) = analysis else {
+        let BinaryAnalysis::Elf(analysis) = analysis else {
+            unreachable!("all current binary-analysis variants are handled");
+        };
+        validate_elf_subject_mapping(index, claim, analysis)?;
+        return match claim.assertion() {
+            SymbolAssertion::DirectCall { .. }
+            | SymbolAssertion::ThunkTarget { .. }
+            | SymbolAssertion::StringLiteral { .. }
+            | SymbolAssertion::DataReference { .. } => {
+                Err(SessionValidationError::UnsupportedElfContainerAssertion { index })
+            }
+            _ => Ok(()),
+        };
+    };
     match claim.assertion() {
         SymbolAssertion::DirectCall {
             target: ControlFlowTarget::FunctionPointer { slot_rva, rva },
@@ -836,6 +860,43 @@ fn validate_claim_section_policy(
             }
         }
         _ => {}
+    }
+    Ok(())
+}
+
+fn validate_elf_subject_mapping(
+    index: usize,
+    claim: &SymbolClaim,
+    analysis: &crate::ElfAnalysis,
+) -> Result<(), SessionValidationError> {
+    let (rva, size, function) = match claim.subject() {
+        SymbolSubject::Function { rva, size, .. } => {
+            let effective_size = (*size).unwrap_or_else(|| match claim.assertion() {
+                SymbolAssertion::FunctionBoundary { size } => *size,
+                _ => 1,
+            });
+            (*rva, effective_size, true)
+        }
+        SymbolSubject::Global { rva, size, .. } => (*rva, size.unwrap_or(1), false),
+        SymbolSubject::Type { .. } => return Ok(()),
+        _ => return Err(SessionValidationError::UnsupportedSubject { index }),
+    };
+    let end = rva
+        .checked_add(size)
+        .ok_or(SessionValidationError::ElfSubjectOutsideLoadSegment { index })?;
+    let segment = analysis.load_segments.iter().find(|segment| {
+        let segment_start = u64::from(segment.virtual_address) - analysis.identity.image_base;
+        let segment_end = segment_start + u64::from(segment.memory_size);
+        rva >= segment_start && end <= segment_end
+    });
+    let Some(segment) = segment else {
+        return Err(SessionValidationError::ElfSubjectOutsideLoadSegment { index });
+    };
+    if function && !segment.executable() {
+        return Err(SessionValidationError::ElfFunctionNotExecutable { index });
+    }
+    if !function && !segment.readable() {
+        return Err(SessionValidationError::ElfGlobalNotReadable { index });
     }
     Ok(())
 }
@@ -934,6 +995,7 @@ fn import_iat_rvas(analysis: &BinaryAnalysis) -> BTreeSet<u64> {
             )
             .map(|entry| u64::from(entry.iat_rva))
             .collect(),
+        BinaryAnalysis::Elf(_) => BTreeSet::new(),
     }
 }
 

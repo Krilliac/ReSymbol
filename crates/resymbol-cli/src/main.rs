@@ -56,6 +56,7 @@ const GUARD_TARGET_TABLE_SCHEMA_VERSION: u32 = 10;
 const LOAD_CONFIG_SECURITY_ANCHOR_SCHEMA_VERSION: u32 = 11;
 const LOAD_CONFIG_XFG_ANCHOR_SCHEMA_VERSION: u32 = 12;
 const LOAD_CONFIG_GUARD_MEMCPY_ANCHOR_SCHEMA_VERSION: u32 = 13;
+const ELF_CONTAINER_SCHEMA_VERSION: u32 = 14;
 const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 
 #[derive(Debug, Parser)]
@@ -836,6 +837,9 @@ fn read_analysis_package(
     let legacy_inspection_source = (preserve_legacy_inspection_source
         && schema_version < CURRENT_SCHEMA_VERSION)
         .then(|| package.clone());
+    if schema_version < ELF_CONTAINER_SCHEMA_VERSION {
+        reject_pre_v14_elf_semantics(package.payload(), schema_version)?;
+    }
     if schema_version >= LOAD_CONFIG_GUARD_MEMCPY_ANCHOR_SCHEMA_VERSION {
         require_v13_load_config_guard_memcpy_anchor_marker(package.payload(), schema_version)?;
     } else {
@@ -893,7 +897,8 @@ fn read_analysis_package(
         10 => serde_json::from_value(payload).context("cannot decode schema-v10 analysis payload"),
         11 => serde_json::from_value(payload).context("cannot decode schema-v11 analysis payload"),
         12 => serde_json::from_value(payload).context("cannot decode schema-v12 analysis payload"),
-        13 => serde_json::from_value(payload).context("cannot decode current analysis payload"),
+        13 => serde_json::from_value(payload).context("cannot decode schema-v13 analysis payload"),
+        14 => serde_json::from_value(payload).context("cannot decode current analysis payload"),
         _ => bail!("unsupported analysis package schema {schema_version}"),
     })?;
     if (2..TRANSITIVE_THUNK_CHAIN_SCHEMA_VERSION).contains(&schema_version) {
@@ -919,15 +924,39 @@ fn read_analysis_package(
     })
 }
 
+fn reject_pre_v14_elf_semantics(payload: &Value, schema_version: u32) -> Result<()> {
+    debug_assert!((1..ELF_CONTAINER_SCHEMA_VERSION).contains(&schema_version));
+    if payload
+        .pointer("/base_analysis/format")
+        .and_then(Value::as_str)
+        == Some("elf")
+    {
+        bail!(
+            "package schema {schema_version} predates bounded ELF container intake; legacy envelopes cannot acquire an ELF payload by relabeling, so reanalyze the exact original binary"
+        );
+    }
+    Ok(())
+}
+
+fn pe_base_analysis_object(payload: &Value) -> Option<&Map<String, Value>> {
+    (payload
+        .pointer("/base_analysis/format")
+        .and_then(Value::as_str)
+        == Some("pe"))
+    .then(|| {
+        payload
+            .pointer("/base_analysis/analysis")
+            .and_then(Value::as_object)
+    })
+    .flatten()
+}
+
 fn require_v13_load_config_guard_memcpy_anchor_marker(
     payload: &Value,
     schema_version: u32,
 ) -> Result<()> {
     debug_assert!(schema_version >= LOAD_CONFIG_GUARD_MEMCPY_ANCHOR_SCHEMA_VERSION);
-    let Some(analysis) = payload
-        .pointer("/base_analysis/analysis")
-        .and_then(Value::as_object)
-    else {
+    let Some(analysis) = pe_base_analysis_object(payload) else {
         return Ok(());
     };
     if !analysis
@@ -962,10 +991,7 @@ fn reject_pre_v13_load_config_guard_memcpy_anchor_semantics(
 
 fn require_v12_load_config_xfg_anchor_marker(payload: &Value, schema_version: u32) -> Result<()> {
     debug_assert!(schema_version >= LOAD_CONFIG_XFG_ANCHOR_SCHEMA_VERSION);
-    let Some(analysis) = payload
-        .pointer("/base_analysis/analysis")
-        .and_then(Value::as_object)
-    else {
+    let Some(analysis) = pe_base_analysis_object(payload) else {
         return Ok(());
     };
     if !analysis
@@ -1003,10 +1029,7 @@ fn require_v11_load_config_security_anchor_marker(
     schema_version: u32,
 ) -> Result<()> {
     debug_assert!(schema_version >= LOAD_CONFIG_SECURITY_ANCHOR_SCHEMA_VERSION);
-    let Some(analysis) = payload
-        .pointer("/base_analysis/analysis")
-        .and_then(Value::as_object)
-    else {
+    let Some(analysis) = pe_base_analysis_object(payload) else {
         return Ok(());
     };
     if !analysis
@@ -1041,10 +1064,7 @@ fn reject_pre_v11_load_config_security_anchor_semantics(
 
 fn require_v10_guard_target_table_markers(payload: &Value, schema_version: u32) -> Result<()> {
     debug_assert!(schema_version >= GUARD_TARGET_TABLE_SCHEMA_VERSION);
-    let Some(analysis) = payload
-        .pointer("/base_analysis/analysis")
-        .and_then(Value::as_object)
-    else {
+    let Some(analysis) = pe_base_analysis_object(payload) else {
         return Ok(());
     };
     let missing = [
@@ -1092,10 +1112,7 @@ fn reject_pre_v10_guard_target_table_semantics(payload: &Value, schema_version: 
 
 fn require_v9_guard_cf_marker(payload: &Value, schema_version: u32) -> Result<()> {
     debug_assert!(schema_version >= GUARD_CF_SCHEMA_VERSION);
-    let Some(analysis) = payload
-        .pointer("/base_analysis/analysis")
-        .and_then(Value::as_object)
-    else {
+    let Some(analysis) = pe_base_analysis_object(payload) else {
         return Ok(());
     };
     if !analysis.contains_key("guard_cf_functions") {
@@ -1148,10 +1165,7 @@ fn reject_pre_v9_guard_cf_semantics(payload: &Value, schema_version: u32) -> Res
 
 fn require_v8_delay_import_marker(payload: &Value, schema_version: u32) -> Result<()> {
     debug_assert!(schema_version >= DELAY_IMPORT_SCHEMA_VERSION);
-    let Some(analysis) = payload
-        .pointer("/base_analysis/analysis")
-        .and_then(Value::as_object)
-    else {
+    let Some(analysis) = pe_base_analysis_object(payload) else {
         return Ok(());
     };
     if !analysis.contains_key("delay_imports") {
@@ -1630,6 +1644,16 @@ fn export(args: ExportArgs) -> Result<()> {
         .with_context(|| format!("cannot open package {}", package.display()))?;
     let package_data = read_analysis_package(&package_path, false)
         .with_context(|| format!("cannot read package {}", package_path.display()))?;
+    if matches!(
+        package_data.package.payload().base_analysis(),
+        BinaryAnalysis::Elf(_)
+    ) && matches!(format, ExportFormat::Map | ExportFormat::Pdb)
+    {
+        bail!(
+            "{} export is a PE/x86-64-only action and is unavailable for container-only ELF analysis",
+            format.label()
+        );
+    }
     let projection = ExportProjection::from_session(package_data.package.payload())
         .context("cannot build debugger export projection")?;
     let warning_occurrences = projection
@@ -3019,6 +3043,24 @@ fn print_analysis_summary(analysis: &BinaryAnalysis, availability: AnalysisFeatu
                 println!("MSVC RTTI scan: partial (a fixed discovery budget was reached)");
             }
         }
+        BinaryAnalysis::Elf(elf) => {
+            println!("format: ELF32 little-endian (EM_MIPS container only)");
+            println!(
+                "entry point: VA 0x{:x} / RVA 0x{:x}",
+                elf.entry_va, elf.entry_rva
+            );
+            println!("ELF flags: 0x{:08x}", elf.flags);
+            println!("program headers: {}", elf.program_headers.len());
+            println!(
+                "load segments: {} sparse mapping(s)",
+                elf.load_segments.len()
+            );
+            println!("section headers: {}", elf.section_headers.len());
+            println!(
+                "instruction recovery: unavailable (container intake does not classify or decode Emotion Engine instructions)"
+            );
+            println!("x86-64 preview, patch, MAP, PDB, and PE plugin hosts: unavailable");
+        }
         _ => println!("format: supported extension format"),
     }
 
@@ -3851,6 +3893,30 @@ mod tests {
 
     fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
         bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn elf32_container_fixture() -> Vec<u8> {
+        const HEADER_SIZE: usize = 52;
+        const PROGRAM_HEADER_SIZE: usize = 32;
+        let mut bytes = vec![0_u8; 0x100];
+        bytes[..16].copy_from_slice(&[0x7f, b'E', b'L', b'F', 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        put_u16(&mut bytes, 16, 2);
+        put_u16(&mut bytes, 18, 8);
+        put_u32(&mut bytes, 20, 1);
+        put_u32(&mut bytes, 24, 0x1200_0040);
+        put_u32(&mut bytes, 28, HEADER_SIZE as u32);
+        put_u16(&mut bytes, 40, HEADER_SIZE as u16);
+        put_u16(&mut bytes, 42, PROGRAM_HEADER_SIZE as u16);
+        put_u16(&mut bytes, 44, 1);
+        let program = HEADER_SIZE;
+        put_u32(&mut bytes, program, 1);
+        put_u32(&mut bytes, program + 8, 0x1200_0000);
+        put_u32(&mut bytes, program + 12, 0x1200_0000);
+        put_u32(&mut bytes, program + 16, 0x80);
+        put_u32(&mut bytes, program + 20, 0x100);
+        put_u32(&mut bytes, program + 24, 5);
+        put_u32(&mut bytes, program + 28, 0x1000);
+        bytes
     }
 
     fn put_c_string(bytes: &mut [u8], offset: usize, value: &str) {
@@ -5586,7 +5652,7 @@ entrypoint = "Plugin.dll"
 
         let package: ResymPackage<AnalysisSession> =
             read_file_bound(&output).expect("read bound package");
-        assert_eq!(CURRENT_SCHEMA_VERSION, 13);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 14);
         assert_eq!(package.schema_version(), CURRENT_SCHEMA_VERSION);
         assert_eq!(
             package.binary_sha256(),
@@ -6932,16 +6998,16 @@ entrypoint = "Plugin.dll"
     }
 
     #[test]
-    fn cli_rejects_schema_v14_before_decoding_the_analysis_payload() {
+    fn cli_rejects_schema_v15_before_decoding_the_analysis_payload() {
         let temp = tempfile::tempdir().expect("create temporary directory");
-        let path = temp.path().join("schema-v14.resym");
+        let path = temp.path().join("schema-v15.resym");
         let base_analysis = analyze_bytes(&pe_fixture()).expect("analyze PE fixture");
         let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
             .expect("create base-only session");
         let package = ResymPackage::from_bound_payload("0.1.0-future", session)
             .expect("create current package value");
         let mut value = serde_json::to_value(package).expect("serialize package value");
-        value["schema_version"] = serde_json::json!(14);
+        value["schema_version"] = serde_json::json!(15);
         value["payload"] = serde_json::json!("not an analysis session");
         fs::write(
             &path,
@@ -6950,28 +7016,118 @@ entrypoint = "Plugin.dll"
         .expect("write future package");
 
         let error = match read_analysis_package(&path, false) {
-            Ok(_) => panic!("schema 14 must be rejected"),
+            Ok(_) => panic!("schema 15 must be rejected"),
             Err(error) => error,
         };
         let diagnostic = format!("{error:#}");
-        assert!(diagnostic.contains("unsupported package schema 14"));
-        assert!(diagnostic.contains("schemas 1 through 13"));
+        assert!(diagnostic.contains("unsupported package schema 15"));
+        assert!(diagnostic.contains("schemas 1 through 14"));
         assert!(!diagnostic.contains("analysis payload"));
     }
 
     #[test]
-    fn schema_v13_requires_an_explicit_guard_memcpy_anchor_object_marker() {
+    fn pre_v14_packages_cannot_acquire_elf_container_semantics_by_relabeling() {
+        let elf_payload = serde_json::json!({
+            "base_analysis": {
+                "format": "elf",
+                "analysis": {}
+            },
+            "plugin_runs": [],
+            "plugin_claims": []
+        });
+        for schema_version in 1..ELF_CONTAINER_SCHEMA_VERSION {
+            let error = reject_pre_v14_elf_semantics(&elf_payload, schema_version)
+                .expect_err("ELF intake requires schema 14");
+            let diagnostic = error.to_string();
+            assert!(diagnostic.contains(&format!("package schema {schema_version}")));
+            assert!(diagnostic.contains("predates bounded ELF container intake"));
+            assert!(diagnostic.contains("relabeling"));
+        }
+
+        let pe_payload = serde_json::json!({
+            "base_analysis": {"format": "pe", "analysis": {}},
+            "plugin_runs": [],
+            "plugin_claims": []
+        });
+        reject_pre_v14_elf_semantics(&pe_payload, 13)
+            .expect("schema 13 PE analysis retains its historical meaning");
+    }
+
+    #[test]
+    fn elf_container_exports_neutral_targets_and_rejects_pe_only_targets() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let source_path = temp.path().join("synthetic.elf");
+        let source = elf32_container_fixture();
+        fs::write(&source_path, &source).expect("write synthetic ELF source");
+        let base_analysis = analyze_bytes(&source).expect("analyze synthetic ELF");
+        let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
+            .expect("create base-only ELF session");
+        let package = ResymPackage::from_bound_payload("0.1.0-elf-test", session)
+            .expect("create ELF package");
+        let package_path = temp.path().join("synthetic.resym");
+        fs::write(
+            &package_path,
+            serde_json::to_vec_pretty(&package).expect("serialize ELF package"),
+        )
+        .expect("write ELF package");
+
+        for (format, file_name) in [
+            (ExportFormat::Json, "synthetic.symbols.json"),
+            (ExportFormat::Markdown, "synthetic.symbols.md"),
+            (ExportFormat::IdaPython, "synthetic.ida.py"),
+            (ExportFormat::GhidraJava, "SyntheticElfImport.java"),
+        ] {
+            let output = temp.path().join(file_name);
+            export(ExportArgs {
+                package: package_path.clone(),
+                format,
+                output: Some(output.clone()),
+                binary: None,
+                fail_on_loss: false,
+                dry_run: false,
+            })
+            .expect("container-neutral ELF export succeeds");
+            assert!(
+                fs::metadata(&output).expect("export exists").len() > 0,
+                "{} output is non-empty",
+                format.label()
+            );
+        }
+
+        for (format, binary) in [
+            (ExportFormat::Map, None),
+            (ExportFormat::Pdb, Some(source_path.clone())),
+        ] {
+            let output = temp
+                .path()
+                .join(format!("unsupported-{}.out", format.label()));
+            let error = export(ExportArgs {
+                package: package_path.clone(),
+                format,
+                output: Some(output.clone()),
+                binary,
+                fail_on_loss: false,
+                dry_run: false,
+            })
+            .expect_err("PE-only target rejects ELF");
+            assert!(format!("{error:#}").contains("PE/x86-64-only"));
+            assert!(!output.exists(), "failed export must not create output");
+        }
+    }
+
+    #[test]
+    fn current_schema_requires_an_explicit_guard_memcpy_anchor_object_marker() {
         let temp = tempfile::tempdir().expect("create temporary directory");
         let base_analysis = analyze_bytes(&pe_fixture()).expect("analyze PE fixture");
         let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
             .expect("create base-only session");
-        let package = ResymPackage::from_bound_payload("0.1.0-schema13", session)
+        let package = ResymPackage::from_bound_payload("0.1.0-schema14", session)
             .expect("create current package value");
         let current = serde_json::to_value(package).expect("serialize current package value");
         let marker = current
             .pointer("/payload/base_analysis/analysis/load_config_guard_memcpy_anchor")
             .and_then(Value::as_object)
-            .expect("schema 13 serializes the GuardMemcpy-anchor object marker");
+            .expect("current schema serializes the GuardMemcpy-anchor object marker");
         assert!(
             marker.is_empty(),
             "the marker is an empty object when the anchor is absent"
@@ -6996,7 +7152,7 @@ entrypoint = "Plugin.dll"
                     analysis.remove("load_config_guard_memcpy_anchor");
                 }
             }
-            let path = temp.path().join(format!("schema-v13-{label}-marker.resym"));
+            let path = temp.path().join(format!("schema-v14-{label}-marker.resym"));
             fs::write(
                 &path,
                 serde_json::to_vec(&invalid).expect("encode invalid marker package"),
@@ -7004,11 +7160,11 @@ entrypoint = "Plugin.dll"
             .expect("write invalid marker package");
 
             let error = match read_analysis_package(&path, false) {
-                Ok(_) => panic!("schema 13 must reject a {label} GuardMemcpy-anchor marker"),
+                Ok(_) => panic!("schema 14 must reject a {label} GuardMemcpy-anchor marker"),
                 Err(error) => error,
             };
             let diagnostic = format!("{error:#}");
-            assert!(diagnostic.contains("package schema 13 requires an explicit"));
+            assert!(diagnostic.contains("package schema 14 requires an explicit"));
             assert!(diagnostic.contains("load_config_guard_memcpy_anchor object"));
             assert!(diagnostic.contains("cannot be migrated by changing only its envelope label"));
             assert!(!diagnostic.contains("schema-12"));
@@ -7157,15 +7313,15 @@ entrypoint = "Plugin.dll"
     }
 
     #[test]
-    fn schema_v13_still_requires_the_schema_v12_xfg_anchor_marker() {
+    fn current_schema_still_requires_the_schema_v12_xfg_anchor_marker() {
         let temp = tempfile::tempdir().expect("create temporary directory");
         let path = temp
             .path()
-            .join("schema-v13-without-xfg-anchor-marker.resym");
+            .join("schema-v14-without-xfg-anchor-marker.resym");
         let base_analysis = analyze_bytes(&pe_fixture()).expect("analyze PE fixture");
         let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
             .expect("create base-only session");
-        let package = ResymPackage::from_bound_payload("0.1.0-schema13", session)
+        let package = ResymPackage::from_bound_payload("0.1.0-schema14", session)
             .expect("create current package value");
         let mut value = serde_json::to_value(package).expect("serialize current package value");
         value
@@ -7180,11 +7336,11 @@ entrypoint = "Plugin.dll"
         .expect("write missing-marker package");
 
         let error = match read_analysis_package(&path, false) {
-            Ok(_) => panic!("schema 13 must retain the schema-12 XFG-anchor marker"),
+            Ok(_) => panic!("schema 14 must retain the schema-12 XFG-anchor marker"),
             Err(error) => error,
         };
         let diagnostic = format!("{error:#}");
-        assert!(diagnostic.contains("package schema 13 requires an explicit"));
+        assert!(diagnostic.contains("package schema 14 requires an explicit"));
         assert!(diagnostic.contains("load_config_xfg_anchors object"));
         assert!(!diagnostic.contains("load_config_guard_memcpy_anchor object"));
     }
@@ -7363,7 +7519,7 @@ entrypoint = "Plugin.dll"
     }
 
     #[test]
-    fn schema_v13_still_requires_the_schema_v11_security_anchor_marker() {
+    fn current_schema_still_requires_the_schema_v11_security_anchor_marker() {
         let temp = tempfile::tempdir().expect("create temporary directory");
         let path = temp
             .path()
@@ -7386,11 +7542,11 @@ entrypoint = "Plugin.dll"
         .expect("write missing-marker package");
 
         let error = match read_analysis_package(&path, false) {
-            Ok(_) => panic!("schema 13 must retain the schema-11 security-anchor marker"),
+            Ok(_) => panic!("schema 14 must retain the schema-11 security-anchor marker"),
             Err(error) => error,
         };
         let diagnostic = format!("{error:#}");
-        assert!(diagnostic.contains("package schema 13 requires an explicit"));
+        assert!(diagnostic.contains("package schema 14 requires an explicit"));
         assert!(diagnostic.contains("load_config_security_anchors object"));
         assert!(!diagnostic.contains("load_config_guard_memcpy_anchor object"));
         assert!(!diagnostic.contains("load_config_xfg_anchors object"));
@@ -7477,7 +7633,7 @@ entrypoint = "Plugin.dll"
     }
 
     #[test]
-    fn schemas_v10_through_v13_require_all_explicit_guard_target_inventory_markers() {
+    fn schemas_v10_through_v14_require_all_explicit_guard_target_inventory_markers() {
         let temp = tempfile::tempdir().expect("create temporary directory");
         let base_analysis = analyze_bytes(&pe_fixture()).expect("analyze PE fixture");
         let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
@@ -7485,7 +7641,7 @@ entrypoint = "Plugin.dll"
         let package = ResymPackage::from_bound_payload("0.1.0-schema10", session)
             .expect("create current package value");
         let current = serde_json::to_value(package).expect("serialize current package value");
-        for schema_version in [10, 11, 12, 13] {
+        for schema_version in [10, 11, 12, 13, 14] {
             let mut schema_value = current.clone();
             schema_value["schema_version"] = serde_json::json!(schema_version);
             if schema_version == 10 {
@@ -7628,7 +7784,7 @@ entrypoint = "Plugin.dll"
     }
 
     #[test]
-    fn schemas_v9_through_v13_require_an_explicit_guard_cf_inventory_marker() {
+    fn schemas_v9_through_v14_require_an_explicit_guard_cf_inventory_marker() {
         let temp = tempfile::tempdir().expect("create temporary directory");
         let base_analysis = analyze_bytes(&pe_fixture()).expect("analyze PE fixture");
         let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
@@ -7637,7 +7793,7 @@ entrypoint = "Plugin.dll"
             .expect("create current package value");
         let current = serde_json::to_value(package).expect("serialize current package value");
 
-        for schema_version in [9, 10, 11, 12, 13] {
+        for schema_version in [9, 10, 11, 12, 13, 14] {
             let mut value = current.clone();
             value["schema_version"] = serde_json::json!(schema_version);
             if schema_version == 9 {
@@ -8147,7 +8303,7 @@ entrypoint = "Plugin.dll"
     }
 
     #[test]
-    fn schemas_v8_through_v13_require_the_explicit_delay_import_inventory_marker() {
+    fn schemas_v8_through_v14_require_the_explicit_delay_import_inventory_marker() {
         let temp = tempfile::tempdir().expect("create temporary directory");
         let base_analysis = analyze_bytes(&pe_fixture()).expect("analyze PE fixture");
         let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
@@ -8155,7 +8311,7 @@ entrypoint = "Plugin.dll"
         let package = ResymPackage::from_bound_payload("0.1.0-schema10", session)
             .expect("create current package value");
         let current = serde_json::to_value(package).expect("serialize current package value");
-        for schema_version in [8, 9, 10, 11, 12, 13] {
+        for schema_version in [8, 9, 10, 11, 12, 13, 14] {
             let mut value = current.clone();
             value["schema_version"] = serde_json::json!(schema_version);
             if schema_version == 8 {

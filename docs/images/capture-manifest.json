@@ -1,5 +1,32 @@
 {
-    "schema_version":  1,
+    "schema_version":  2,
+    "capture_set":  "standard",
+    "requested_views":  [
+                            "open-empty",
+                            "overview",
+                            "functions",
+                            "graph",
+                            "address-space",
+                            "disassembly",
+                            "disassembly-actions",
+                            "binary-switch-confirmation",
+                            "debugger-sandbox",
+                            "debugger-readiness-result",
+                            "exports"
+                        ],
+    "expected_artifacts":  [
+                               "workbench-open-empty.png",
+                               "workbench-overview.png",
+                               "workbench-functions.png",
+                               "workbench-graph.png",
+                               "workbench-address-space.png",
+                               "workbench-disassembly.png",
+                               "workbench-disassembly-actions.png",
+                               "workbench-binary-switch-confirmation.png",
+                               "workbench-debugger-sandbox.png",
+                               "workbench-debugger-readiness-result.png",
+                               "workbench-exports.png"
+                           ],
     "fixture":  {
                     "file":  "milestone2-symbolized.exe",
                     "sha256":  "f7f221b4de7c6e4f6f2e4e227840ffa8ecc3d92a3553d8763755a3fafadc1a5e"
@@ -15,44 +42,92 @@
                  },
     "captures":  [
                      {
+                         "file":  "workbench-open-empty.png",
+                         "view":  "open-empty",
+                         "width":  1440,
+                         "height":  900,
+                         "bytes":  125913,
+                         "sha256":  "0d024d2df3d2cee337d83e92dd506eb038868d32a6e41140cf099368bb83d0cf"
+                     },
+                     {
                          "file":  "workbench-overview.png",
                          "view":  "overview",
                          "width":  1440,
                          "height":  900,
-                         "bytes":  244829,
-                         "sha256":  "9b01679639e379b36be76ee9b15daa9b2b000699f4c8614dd9611fef5d19e086"
+                         "bytes":  247482,
+                         "sha256":  "184d13fed645fa1d330f4178a1106aee59e6e69b10e7a7cecc1690c737cce719"
                      },
                      {
                          "file":  "workbench-functions.png",
                          "view":  "functions",
                          "width":  1440,
                          "height":  900,
-                         "bytes":  252544,
-                         "sha256":  "ba57a7faf9b850ef40d02f9652222eb0201b40030513fd2bb8774086cbc7f50d"
+                         "bytes":  303065,
+                         "sha256":  "f0d70c15b95860fc2b850ad661f9fc34759ba728df95cdbed804bb199e9c70e6"
                      },
                      {
                          "file":  "workbench-graph.png",
                          "view":  "graph",
                          "width":  1440,
                          "height":  900,
-                         "bytes":  257425,
-                         "sha256":  "feaffd00543dd5d91a707dff0677fc62af7116642761d0f747b08a79edf23152"
+                         "bytes":  258884,
+                         "sha256":  "9a1f1dc257b3b1769afe1333b3da868c227df6cbcb8569d57fd9ce7d56467f19"
                      },
                      {
                          "file":  "workbench-address-space.png",
                          "view":  "address-space",
                          "width":  1440,
                          "height":  900,
-                         "bytes":  254942,
-                         "sha256":  "a06eea7f7bf233cd58977b92bea3d058b60854ecadbaef8db55636420fe97d17"
+                         "bytes":  268251,
+                         "sha256":  "9e8a25eefd0c5d357de16b2165b3eab3ce4ad36c49b09d910e24e6a541c088f7"
+                     },
+                     {
+                         "file":  "workbench-disassembly.png",
+                         "view":  "disassembly",
+                         "width":  1440,
+                         "height":  900,
+                         "bytes":  287834,
+                         "sha256":  "2c28a048a50c10e0161ecaf04467a25e20447272eef2b5ed0c939db9b37b6016"
+                     },
+                     {
+                         "file":  "workbench-disassembly-actions.png",
+                         "view":  "disassembly-actions",
+                         "width":  1440,
+                         "height":  900,
+                         "bytes":  294027,
+                         "sha256":  "58f9500240ca9dd36067ee7e75a3c2544bfe5b3eb3366f9673ae0d408d569aae"
+                     },
+                     {
+                         "file":  "workbench-binary-switch-confirmation.png",
+                         "view":  "binary-switch-confirmation",
+                         "width":  1440,
+                         "height":  900,
+                         "bytes":  400083,
+                         "sha256":  "5dc8104a7088940af256021fbc4a6f19b7648159ea36c7117b4303307986e17c"
                      },
                      {
                          "file":  "workbench-debugger-sandbox.png",
                          "view":  "debugger-sandbox",
                          "width":  1440,
                          "height":  900,
-                         "bytes":  272340,
-                         "sha256":  "465f5f607263edc004484bd2048d2387f344544e49b8f2d870a9227c08c8b8f7"
+                         "bytes":  274915,
+                         "sha256":  "5b0ea1fd155036e7e0f3024bfb291cef21b7bb7a29172691ecd369832c3bd714"
+                     },
+                     {
+                         "file":  "workbench-debugger-readiness-result.png",
+                         "view":  "debugger-readiness-result",
+                         "width":  1440,
+                         "height":  900,
+                         "bytes":  269067,
+                         "sha256":  "ac79be56e8ad139ecc7cfb78f895f7f46b3067b2da3d63a8f661f18b55c61497"
+                     },
+                     {
+                         "file":  "workbench-exports.png",
+                         "view":  "exports",
+                         "width":  1440,
+                         "height":  900,
+                         "bytes":  259306,
+                         "sha256":  "4c7978ef1032cfd1371cd16e46f5f589eb296dc7b85282348cbed94d6f5fe4a7"
                      }
                  ]
 }

@@ -300,7 +300,9 @@ pub struct LoadedProject {
     pub snapshot: Arc<ProjectSnapshot>,
     pub identity: ProjectIdentity,
     pub projection: Arc<ExportProjection>,
-    pub static_address_space: StaticAddressSpace,
+    /// PE-only preferred-image layout. Container-only formats remain openable
+    /// while byte-dependent and PE-layout views stay explicitly unavailable.
+    pub static_address_space: Option<StaticAddressSpace>,
     pub protection_assessment: ProtectionAssessment,
     pub functions: Vec<FunctionRow>,
     function_details: Vec<FunctionDetail>,
@@ -339,7 +341,7 @@ impl LoadedProject {
                 found_size: projection.binary.file_size,
             });
         }
-        let static_address_space = StaticAddressSpace::from_analysis(base_analysis)?;
+        let static_address_space = Some(StaticAddressSpace::from_analysis(base_analysis)?);
         let protection_assessment = match (base_analysis, snapshot.verified_source_bytes()) {
             (BinaryAnalysis::Pe(analysis), Some(bytes)) => {
                 ProtectionAssessment::Available(scan_pe_protections(analysis, bytes)?)
@@ -786,6 +788,36 @@ mod tests {
         LoadedProject::from_snapshot(snapshot).expect("fixture model")
     }
 
+    fn synthetic_elf32_container() -> Vec<u8> {
+        const HEADER_SIZE: usize = 52;
+        const PROGRAM_HEADER_SIZE: usize = 32;
+        let mut bytes = vec![0_u8; 0x100];
+        bytes[..16].copy_from_slice(&[0x7f, b'E', b'L', b'F', 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let put_u16 = |bytes: &mut [u8], offset: usize, value: u16| {
+            bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+        };
+        let put_u32 = |bytes: &mut [u8], offset: usize, value: u32| {
+            bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        };
+        put_u16(&mut bytes, 16, 2);
+        put_u16(&mut bytes, 18, 8);
+        put_u32(&mut bytes, 20, 1);
+        put_u32(&mut bytes, 24, 0x1200_0040);
+        put_u32(&mut bytes, 28, HEADER_SIZE as u32);
+        put_u16(&mut bytes, 40, HEADER_SIZE as u16);
+        put_u16(&mut bytes, 42, PROGRAM_HEADER_SIZE as u16);
+        put_u16(&mut bytes, 44, 1);
+        let program = HEADER_SIZE;
+        put_u32(&mut bytes, program, 1);
+        put_u32(&mut bytes, program + 8, 0x1200_0000);
+        put_u32(&mut bytes, program + 12, 0x1200_0000);
+        put_u32(&mut bytes, program + 16, 0x80);
+        put_u32(&mut bytes, program + 20, 0x100);
+        put_u32(&mut bytes, program + 24, 5);
+        put_u32(&mut bytes, program + 28, 0x1000);
+        bytes
+    }
+
     fn producer() -> ProducerSource {
         ProducerSource::Core {
             component: "test".to_owned(),
@@ -897,7 +929,11 @@ mod tests {
             project.snapshot.package().binary_sha256()
         );
         assert_eq!(
-            project.static_address_space.binary_id,
+            project
+                .static_address_space
+                .as_ref()
+                .expect("PE fixture has a static address space")
+                .binary_id,
             project.identity.sha256
         );
         let ProtectionAssessment::Available(report) = &project.protection_assessment else {
@@ -930,6 +966,28 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn elf_container_opens_with_sparse_address_space_and_pe_only_scans_unavailable() {
+        let project = loaded_fixture(&synthetic_elf32_container());
+
+        assert!(matches!(project.identity.format, ExportBinaryFormat::Elf));
+        let address_space = project
+            .static_address_space
+            .as_ref()
+            .expect("ELF container has a sparse static address space");
+        assert_eq!(
+            address_space.layout,
+            resymbol_debugger::StaticImageLayout::Elf
+        );
+        assert_eq!(address_space.regions().len(), 1);
+        assert_eq!(address_space.regions()[0].zero_fill_size(), 0x80);
+        assert!(matches!(
+            project.protection_assessment,
+            ProtectionAssessment::UnsupportedFormat
+        ));
+        assert!(project.functions.is_empty());
     }
 
     #[test]
@@ -982,7 +1040,11 @@ mod tests {
             project.snapshot.origin_path()
         );
         assert_eq!(
-            project.static_address_space.binary_id,
+            project
+                .static_address_space
+                .as_ref()
+                .expect("PE package has a static address space")
+                .binary_id,
             project.identity.sha256
         );
 

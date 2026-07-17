@@ -1145,6 +1145,7 @@ impl ReviewLedger {
 
         let image_size = match session.base_analysis() {
             BinaryAnalysis::Pe(analysis) => u64::from(analysis.size_of_image),
+            BinaryAnalysis::Elf(analysis) => analysis.image_size,
             _ => return Err(ReviewError::UnsupportedAnalysisFormat),
         };
         ExportProjection::from_symbol_graph_with_name_selections(
