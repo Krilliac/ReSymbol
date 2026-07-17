@@ -15,6 +15,7 @@ use resymbol_analysis::{
 };
 use resymbol_app::{
     DecisionAction, ExportFormat, MAX_REVIEW_ANNOTATION_BYTES, MAX_REVIEWER_BYTES, ReviewSubject,
+    PublishedStaticPatch, StaticPatchEditRequest,
 };
 use resymbol_core::{
     BinaryIdentity, DiscoveredPlugin, PluginDiscoveryOptions, PluginDiscoveryReport,
@@ -545,6 +546,7 @@ pub struct WorkbenchApp {
     export_operation: OperationGate,
     review_operation: OperationGate,
     readiness_operation: OperationGate,
+    static_patch_operation: OperationGate,
     worker_disconnected: bool,
     analysis_path: Option<PathBuf>,
     function_filter: FunctionFilter,
@@ -590,6 +592,7 @@ pub struct WorkbenchApp {
     selected_disassembly_instruction: Option<usize>,
     disassembly_row_focus_target: Option<usize>,
     pending_static_patch_drafts: PendingStaticPatchDrafts,
+    static_patch_result: Option<Result<PublishedStaticPatch, String>>,
 }
 
 impl WorkbenchApp {
@@ -663,6 +666,7 @@ impl WorkbenchApp {
             export_operation: OperationGate::default(),
             review_operation: OperationGate::default(),
             readiness_operation: OperationGate::default(),
+            static_patch_operation: OperationGate::default(),
             worker_disconnected: false,
             analysis_path: None,
             function_filter: FunctionFilter::default(),
@@ -709,6 +713,7 @@ impl WorkbenchApp {
             selected_disassembly_instruction: None,
             disassembly_row_focus_target: None,
             pending_static_patch_drafts: PendingStaticPatchDrafts::default(),
+            static_patch_result: None,
         };
         app.log(
             ActivityLevel::Info,
@@ -2166,6 +2171,49 @@ impl WorkbenchApp {
                         ),
                     }
                 }
+                WorkerEvent::StaticPatchPublished { operation, result } => {
+                    if !self.static_patch_operation.finish(operation) {
+                        self.log(
+                            ActivityLevel::Warning,
+                            format!(
+                                "Ignored stale static patch result for operation {}",
+                                operation.get()
+                            ),
+                        );
+                        continue;
+                    }
+                    match result {
+                        Ok(outcome) => {
+                            let matches_current = self.project.as_ref().is_some_and(|project| {
+                                project.session().base_analysis().identity()
+                                    == outcome.source_identity()
+                            });
+                            if !matches_current {
+                                let error = "Static patch receipt did not match the current project identity"
+                                    .to_owned();
+                                self.static_patch_result = Some(Err(error.clone()));
+                                self.log(ActivityLevel::Error, error);
+                                continue;
+                            }
+                            let warning_count = outcome.warnings().len();
+                            let message = format!(
+                                "Created patched binary {} with SHA-256 {} and {warning_count} integrity warning(s)",
+                                outcome.path().display(),
+                                outcome.output_identity().id.as_str()
+                            );
+                            self.pending_static_patch_drafts.clear();
+                            self.static_patch_result = Some(Ok(outcome));
+                            self.log(ActivityLevel::Success, message);
+                        }
+                        Err(error) => {
+                            self.static_patch_result = Some(Err(error.clone()));
+                            self.log(
+                                ActivityLevel::Error,
+                                format!("Static patch publication failed: {error}"),
+                            );
+                        }
+                    }
+                }
             }
         }
     }
@@ -2180,6 +2228,8 @@ impl WorkbenchApp {
         self.export_operation.invalidate();
         self.review_operation.invalidate();
         self.readiness_operation.invalidate();
+        let static_patch_was_pending = self.static_patch_operation.is_pending();
+        self.static_patch_operation.invalidate();
         self.offline_read.clear();
         if let Some(previous) = self.pending_review_rollback.take() {
             self.review = Some(previous);
@@ -2188,6 +2238,12 @@ impl WorkbenchApp {
             self.restore_project_context_after_failed_open();
         }
         self.close_after_review_save = false;
+        if static_patch_was_pending {
+            self.static_patch_result = Some(Err(
+                "the application-service worker disconnected during static patch publication"
+                    .to_owned(),
+            ));
+        }
         self.log(ActivityLevel::Error, error);
     }
 
@@ -2328,6 +2384,7 @@ impl WorkbenchApp {
         self.export_operation.invalidate();
         self.review_operation.invalidate();
         self.readiness_operation.invalidate();
+        self.static_patch_operation.invalidate();
         self.offline_read.clear();
         self.pending_review_rollback = None;
         self.readiness_outcome = None;
@@ -2340,6 +2397,7 @@ impl WorkbenchApp {
             self.pending_static_patch_drafts.clear();
             self.selected_disassembly_instruction = None;
             self.disassembly_row_focus_target = None;
+            self.static_patch_result = None;
         }
         self.analysis_path = Some(project.identity.active_binary_path().to_path_buf());
         self.selected_projection_index = selected_rva
