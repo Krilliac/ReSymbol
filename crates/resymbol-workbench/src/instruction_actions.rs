@@ -6,15 +6,18 @@
 //! owned requests to the worker for checked plan construction and create-new
 //! publication.
 
+use resymbol_app::{
+    MAX_STATIC_PATCH_BYTES, MAX_STATIC_PATCH_BYTES_PER_EDIT, MAX_STATIC_PATCH_EDITS,
+    MAX_STATIC_PATCH_LABEL_BYTES, MAX_STATIC_PATCH_NOP_INSTRUCTION_BYTES, StaticPatchEditRequest,
+    StaticPatchKind,
+};
 use resymbol_debugger::{
     BreakpointKind, CapabilityAvailability, CapabilityReport, DebugCapability, MemoryAddress,
     SessionState, SessionStateKind, StepKind, StopToken, ThreadId,
 };
 use thiserror::Error;
 
-const MAX_X64_INSTRUCTION_BYTES: usize = 15;
-const MAX_PATCH_DRAFT_LABEL_BYTES: usize = 128;
-pub(crate) const MAX_PENDING_STATIC_PATCH_DRAFTS: usize = 128;
+pub(crate) const MAX_PENDING_STATIC_PATCH_DRAFTS: usize = MAX_STATIC_PATCH_EDITS;
 
 /// The application-service constructor used when a draft is published.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,10 +80,14 @@ impl StaticPatchDraft {
         if expected.is_empty() {
             return Err(StaticPatchDraftError::EmptyInstruction);
         }
-        if expected.len() > MAX_X64_INSTRUCTION_BYTES {
+        let maximum = match kind {
+            StaticPatchDraftKind::NopInstruction => MAX_STATIC_PATCH_NOP_INSTRUCTION_BYTES,
+            StaticPatchDraftKind::ReplaceBytes => MAX_STATIC_PATCH_BYTES_PER_EDIT,
+        };
+        if expected.len() > maximum {
             return Err(StaticPatchDraftError::InstructionTooLarge {
                 actual: expected.len(),
-                maximum: MAX_X64_INSTRUCTION_BYTES,
+                maximum,
             });
         }
         if expected.len() != replacement.len() {
@@ -98,7 +105,7 @@ impl StaticPatchDraft {
         let label = label.into();
         if label.trim() != label
             || label.is_empty()
-            || label.len() > MAX_PATCH_DRAFT_LABEL_BYTES
+            || label.len() > MAX_STATIC_PATCH_LABEL_BYTES
             || label.chars().any(char::is_control)
         {
             return Err(StaticPatchDraftError::InvalidLabel);
@@ -156,6 +163,31 @@ pub(crate) struct PendingStaticPatchDrafts {
 }
 
 impl PendingStaticPatchDrafts {
+    /// Build a complete replacement draft collection before any UI state changes.
+    pub(crate) fn from_requests(
+        requests: &[StaticPatchEditRequest],
+    ) -> Result<Self, StaticPatchDraftError> {
+        let mut pending = Self::default();
+        for request in requests {
+            let outcome = match request.kind() {
+                StaticPatchKind::NopInstruction => pending.queue_nop(
+                    u64::from(request.rva()),
+                    request.expected(),
+                    request.label(),
+                ),
+                StaticPatchKind::ReplaceBytes => pending.queue_replace(
+                    u64::from(request.rva()),
+                    request.expected(),
+                    request.replacement(),
+                    request.label(),
+                ),
+                _ => return Err(StaticPatchDraftError::UnsupportedPatchKind),
+            }?;
+            debug_assert!(matches!(outcome, PatchDraftQueueOutcome::Added));
+        }
+        Ok(pending)
+    }
+
     #[must_use]
     pub(crate) fn drafts(&self) -> &[StaticPatchDraft] {
         &self.drafts
@@ -206,6 +238,28 @@ impl PendingStaticPatchDrafts {
                 maximum: MAX_PENDING_STATIC_PATCH_DRAFTS,
             });
         }
+        let current_bytes = self
+            .drafts
+            .iter()
+            .try_fold(0usize, |total, existing| {
+                total.checked_add(existing.expected.len())
+            })
+            .ok_or(StaticPatchDraftError::AggregateBytesExceeded {
+                actual: usize::MAX,
+                maximum: MAX_STATIC_PATCH_BYTES,
+            })?;
+        let aggregate = current_bytes.checked_add(draft.expected.len()).ok_or(
+            StaticPatchDraftError::AggregateBytesExceeded {
+                actual: usize::MAX,
+                maximum: MAX_STATIC_PATCH_BYTES,
+            },
+        )?;
+        if aggregate > MAX_STATIC_PATCH_BYTES {
+            return Err(StaticPatchDraftError::AggregateBytesExceeded {
+                actual: aggregate,
+                maximum: MAX_STATIC_PATCH_BYTES,
+            });
+        }
         self.drafts.push(draft);
         self.drafts.sort_by_key(StaticPatchDraft::rva);
         Ok(PatchDraftQueueOutcome::Added)
@@ -232,7 +286,7 @@ pub(crate) enum PatchDraftQueueOutcome {
 pub(crate) enum StaticPatchDraftError {
     #[error("cannot queue a NOP edit for an empty instruction")]
     EmptyInstruction,
-    #[error("instruction is {actual} bytes; x86-64 instructions are limited to {maximum}")]
+    #[error("static edit is {actual} bytes; this edit kind is limited to {maximum}")]
     InstructionTooLarge { actual: usize, maximum: usize },
     #[error("instruction is already NOP-filled")]
     AlreadyNopFilled,
@@ -244,12 +298,16 @@ pub(crate) enum StaticPatchDraftError {
     UnchangedReplacement,
     #[error("instruction range overflows the RVA address space")]
     AddressOverflow,
-    #[error("patch draft label must be printable, nonempty, and at most 128 UTF-8 bytes")]
+    #[error("patch draft label must be printable, nonempty, and at most 256 UTF-8 bytes")]
     InvalidLabel,
     #[error("patch draft overlaps the existing edit at RVA 0x{existing_rva:016X}")]
     OverlappingDraft { existing_rva: u64 },
     #[error("pending static patch draft limit {maximum} reached")]
     DraftLimitReached { maximum: usize },
+    #[error("pending static patch drafts change {actual} bytes; the limit is {maximum}")]
+    AggregateBytesExceeded { actual: usize, maximum: usize },
+    #[error("the loaded patch set uses an unsupported future static edit kind")]
+    UnsupportedPatchKind,
 }
 
 /// Same-size edits available for canonical x86-64 conditional branches.
@@ -516,9 +574,9 @@ impl<'a> LiveDebuggerActionContext<'a> {
                     "The selected instruction has no exact bytes to compare and replace.",
                 );
             }
-            if instruction_bytes.len() > MAX_X64_INSTRUCTION_BYTES {
+            if instruction_bytes.len() > MAX_STATIC_PATCH_NOP_INSTRUCTION_BYTES {
                 return ActionAvailability::disabled(format!(
-                    "The selected byte span is {} bytes; one x64 instruction is at most {MAX_X64_INSTRUCTION_BYTES} bytes.",
+                    "The selected byte span is {} bytes; one x64 instruction is at most {MAX_STATIC_PATCH_NOP_INSTRUCTION_BYTES} bytes.",
                     instruction_bytes.len()
                 ));
             }
@@ -740,6 +798,31 @@ mod tests {
             StaticPatchDraft::nop_instruction(0, &[0xCC], " padded"),
             Err(StaticPatchDraftError::InvalidLabel)
         ));
+    }
+
+    #[test]
+    fn validated_patch_set_requests_build_a_complete_replacement_before_swap() {
+        let requests = vec![
+            StaticPatchEditRequest::replace_bytes(
+                0x2000,
+                vec![0x11; 32],
+                vec![0x22; 32],
+                "loaded general replacement",
+            )
+            .expect("valid general replacement"),
+            StaticPatchEditRequest::nop_instruction(0x1000, [0xcc], "loaded NOP")
+                .expect("valid NOP"),
+        ];
+
+        let drafts = PendingStaticPatchDrafts::from_requests(&requests)
+            .expect("validated requests fit the draft model");
+
+        assert_eq!(drafts.drafts().len(), 2);
+        assert_eq!(drafts.drafts()[0].rva(), 0x1000);
+        assert_eq!(drafts.drafts()[0].replacement(), &[0x90]);
+        assert_eq!(drafts.drafts()[1].rva(), 0x2000);
+        assert_eq!(drafts.drafts()[1].expected(), &[0x11; 32]);
+        assert_eq!(drafts.drafts()[1].replacement(), &[0x22; 32]);
     }
 
     #[test]

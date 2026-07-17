@@ -191,6 +191,19 @@ with the missing authority. Run to Cursor is explicitly a temporary software bre
 Continue. A future adapter must validate the current stop token and any required thread/address
 binding; the static preview never supplies live authority.
 
+Pending static drafts have worker-owned **Save Patch Set...** and **Load Patch Set...** controls.
+The required `.respatch.json` document is deterministic, strict schema v1 and limited to 16 MiB. It
+contains the complete source `BinaryIdentity` and RVA-ordered bounded edit requests only: kind, RVA,
+exact expected bytes, exact replacement bytes, and a bounded label. It cannot contain an
+authoritative file offset, assembly text, or an execution request. Saving is create-new/no-clobber.
+Loading denies unknown fields and unsupported schemas, requires the complete identity of the active
+source, reconstructs every edit through its public constructor, and builds a fresh checked plan so
+duplicate, overlapping, stale, unbacked, virtual-tail, or non-executable ranges fail closed. The UI
+does not mutate the current drafts until that whole operation succeeds; cancellation, worker
+failure, stale completion, wrong source, or any validation error preserves them. Successful results
+show the exact source identity and edit count. This portable static workflow remains independent of
+the disabled live debugger path and only feeds the separate create-new patched-binary publisher.
+
 Protection assessment shows bounded artifact evidence for entry-point placement and backing,
 TLS-before-entry behavior, anti-debug imports, common packer section names, high-entropy samples, and
 writable/executable sections. These are review cues, not malware verdicts. Offline opening keeps the
