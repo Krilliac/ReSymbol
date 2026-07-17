@@ -1,8 +1,9 @@
 # Workbench visual captures
 
-ReSymbol's deterministic capture workflow covers five review views for the checked-in symbolized
+ReSymbol's deterministic capture workflow covers six review views for the checked-in symbolized
 MSVC fixture: **Overview**, **Functions**, **Reconstruction Graph**, **Address Space**, and the
-non-executing **Debugger / Sandbox Readiness** surface. The capture path builds the workbench with
+selected-row **Disassembly** instruction-action surface, plus the non-executing
+**Debugger / Sandbox Readiness** surface. The capture path builds the workbench with
 its opt-in `screenshot` feature, disables persisted window state and animation, clears interactive
 pointer state, sets a fixed native viewport and UI zoom, waits for the workbench panels to settle,
 and then uses egui's next-frame screenshot event. The screenshot build disables eframe's normal
@@ -28,7 +29,7 @@ directory; they do not replace the default checked-in reference set.
 
 The default output directory is `docs/images`. Use `-OutputDirectory <path>` for disposable review
 artifacts or `-SkipBuild` after explicitly building
-`resymbol-workbench --features screenshot --bin resymbol-workbench`. Each run writes the five PNGs
+`resymbol-workbench --features screenshot --bin resymbol-workbench`. Each run writes the six PNGs
 and `capture-manifest.json`, which records dimensions, byte sizes, and SHA-256 hashes for the input
 fixture and outputs.
 
@@ -38,18 +39,18 @@ captures egui's returned native framebuffer without resizing it. This keeps both
 logical layout stable at supported desktop scales; any mismatch still fails loudly. Each view also
 has a bounded process timeout so a failed GUI startup cannot occupy a CI runner indefinitely.
 
-The five PNGs and `capture-manifest.json` under `docs/images` are the current checked-in,
+The six PNGs and `capture-manifest.json` under `docs/images` are the current checked-in,
 human-reviewed reference captures. They document the accepted appearance and make visual changes
 reviewable in source control, but they are not automated pixel-equivalence thresholds.
 
 When intentionally updating the references, run the script with its default output directory,
-inspect all five full-size images for layout, clipping, stale/duplicate-widget warnings, incorrect
+inspect all six full-size images for layout, clipping, stale/duplicate-widget warnings, incorrect
 state, and accidental hover styling, then review the manifest hashes and commit the manifest plus
 every PNG whose bytes changed. A manually replaced individual image or manifest-only edit is not a
 complete reference refresh; byte-identical regenerated images do not need new Git objects.
 
 The Windows visual-review workflow runs for relevant crate, fixture, capture-tool, and Rust
-dependency changes. It regenerates the same five standard views plus a separate focused Functions
+dependency changes. It regenerates the same six standard views plus a separate focused Functions
 view at 1024x680, validates PNG format, each scenario's exact dimensions, completeness, and manifest
 metadata, and uploads the files for three days with PNG recompression disabled. CI deliberately does
 not compare those pixels with `docs/images`, so a passing job proves capture integrity—not rendering

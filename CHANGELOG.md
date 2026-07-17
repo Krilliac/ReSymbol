@@ -60,6 +60,9 @@ prereleases; breaking changes remain explicit.
   before appending a NOP so the original target is preserved. Prefix-bearing, displacement-overflow,
   and non-Jcc encodings fail closed, and all edits still pass exact-source compare-before-write and
   create-new publication.
+- Added a deterministic visual-regression scenario for the disassembly preview with an exact row
+  selected, making the instruction-action affordance, bytes, flow category, and static/live
+  separation part of the standard GUI capture artifact set.
 - Added a refreshable exact-artifact policy catalog to the desktop workbench. Scans run on the
   bounded application-service worker and replace one owned snapshot, while the UI remains strictly
   non-executing. Every fingerprintable unpacked candidate with a valid manifest reports its exact

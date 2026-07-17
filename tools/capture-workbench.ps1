@@ -6,8 +6,8 @@ param(
     [int]$CaptureWidth = 1440,
     [ValidateRange(480, 2160)]
     [int]$CaptureHeight = 900,
-    [ValidateSet('overview', 'functions', 'functions-focused', 'graph', 'address-space', 'debugger-sandbox')]
-    [string[]]$CaptureTabs = @('overview', 'functions', 'graph', 'address-space', 'debugger-sandbox'),
+    [ValidateSet('overview', 'functions', 'functions-focused', 'graph', 'address-space', 'disassembly', 'debugger-sandbox')]
+    [string[]]$CaptureTabs = @('overview', 'functions', 'graph', 'address-space', 'disassembly', 'debugger-sandbox'),
     [switch]$SkipBuild,
     [ValidateRange(10, 600)]
     [int]$CaptureTimeoutSeconds = 90

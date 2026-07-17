@@ -750,7 +750,7 @@ impl WorkbenchApp {
                 "overview" => MainTab::Overview,
                 "functions" | "functions-focused" => MainTab::Functions,
                 "graph" => MainTab::Graph,
-                "address-space" | "memory-map" => MainTab::AddressSpace,
+                "address-space" | "memory-map" | "disassembly" => MainTab::AddressSpace,
                 "debugger-sandbox" | "readiness" => MainTab::DebuggerSandbox,
                 "exports" => {
                     app.stage = WorkflowStage::Export;
@@ -759,6 +759,24 @@ impl WorkbenchApp {
                 _ => panic!("unsupported screenshot tab {tab:?}"),
             };
             app.project = Some(project);
+            if tab == "disassembly" {
+                let entry_rva = app
+                    .project
+                    .as_ref()
+                    .and_then(|project| match project.session().base_analysis() {
+                        BinaryAnalysis::Pe(analysis) => Some(u64::from(analysis.entry_point_rva)),
+                        _ => None,
+                    })
+                    .filter(|rva| *rva != 0)
+                    .or_else(|| app.project.as_ref()?.functions.first().map(|row| row.rva))
+                    .expect("screenshot fixture needs a disassembly seed");
+                app.offline_read_rva_input = format!("0x{entry_rva:08X}");
+                app.offline_read_size = 128;
+                app.offline_byte_view = OfflineByteView::Disassembly;
+                app.selected_disassembly_instruction = Some(0);
+                app.queue_offline_image_read()
+                    .unwrap_or_else(|error| panic!("cannot queue disassembly capture: {error}"));
+            }
             if tab == "functions-focused" {
                 app.function_row_focus_target = app.selected_projection_index;
             }
@@ -2255,12 +2273,22 @@ impl WorkbenchApp {
                                 operation.get()
                             ),
                         ),
-                        OfflineReadEventDisposition::Available { byte_count } => self.log(
-                            ActivityLevel::Success,
-                            format!(
-                                "Read {byte_count} exact frozen source byte(s) through the offline host"
-                            ),
-                        ),
+                        OfflineReadEventDisposition::Available { byte_count } => {
+                            #[cfg(feature = "screenshot")]
+                            if std::env::var("RESYMBOL_WORKBENCH_SCREENSHOT_TAB")
+                                .is_ok_and(|tab| tab == "disassembly")
+                            {
+                                self.offline_byte_view = OfflineByteView::Disassembly;
+                                self.selected_disassembly_instruction = Some(0);
+                                self.disassembly_row_focus_target = Some(0);
+                            }
+                            self.log(
+                                ActivityLevel::Success,
+                                format!(
+                                    "Read {byte_count} exact frozen source byte(s) through the offline host"
+                                ),
+                            );
+                        }
                         OfflineReadEventDisposition::Unavailable { detail } => self.log(
                             ActivityLevel::Warning,
                             format!("Exact offline byte span is unavailable: {detail}"),
