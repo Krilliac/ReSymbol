@@ -126,8 +126,8 @@ impl AppServices {
         let expected_identity = analysis.identity();
         if &found_identity != expected_identity {
             return Err(StaticPatchSetError::SourceIdentityMismatch {
-                expected: expected_identity.clone(),
-                found: found_identity,
+                expected: Box::new(expected_identity.clone()),
+                found: Box::new(found_identity),
             });
         }
         if document.edits.len() > MAX_STATIC_PATCH_EDITS {
@@ -450,8 +450,8 @@ pub enum StaticPatchSetError {
     InvalidSourceIdentity(ClaimValidationError),
     #[error("patch set belongs to source {found:?}, not the current exact source {expected:?}")]
     SourceIdentityMismatch {
-        expected: BinaryIdentity,
-        found: BinaryIdentity,
+        expected: Box<BinaryIdentity>,
+        found: Box<BinaryIdentity>,
     },
     #[error("serialized NOP edit at RVA {rva:#x} does not contain its exact derived NOP bytes")]
     InvalidSerializedNopReplacement { rva: u32 },

@@ -351,8 +351,8 @@ impl StaticPatchPlan {
         }
         if source_layout.identity() != &self.source_identity {
             return Err(StaticPatchError::SourceIdentityMetadataMismatch {
-                expected: self.source_identity.clone(),
-                actual: source_layout.identity().clone(),
+                expected: Box::new(self.source_identity.clone()),
+                actual: Box::new(source_layout.identity().clone()),
             });
         }
 
@@ -1113,8 +1113,8 @@ pub enum StaticPatchError {
         "source byte-derived PE identity metadata does not match the static patch plan: expected {expected:?}, found {actual:?}"
     )]
     SourceIdentityMetadataMismatch {
-        expected: BinaryIdentity,
-        actual: BinaryIdentity,
+        expected: Box<BinaryIdentity>,
+        actual: Box<BinaryIdentity>,
     },
     #[error("the exact source PE layout is invalid: {0}")]
     InvalidSourceLayout(AnalysisError),
