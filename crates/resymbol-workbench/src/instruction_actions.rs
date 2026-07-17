@@ -728,8 +728,8 @@ mod tests {
                 Some(exact_live_address()),
                 Some(selected_thread()),
             );
-            let reason = context
-                .availability(action, &[0xCC])
+            let availability = context.availability(action, &[0xCC]);
+            let reason = availability
                 .disabled_reason()
                 .expect("required capability reason");
             assert!(reason.contains(&format!("{capability:?}")));
