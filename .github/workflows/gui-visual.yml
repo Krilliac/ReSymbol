@@ -153,6 +153,7 @@ jobs:
             "address-space",
             "disassembly",
             "disassembly-actions",
+            "exact-byte-editor",
             "binary-switch-confirmation",
             "debugger-sandbox",
             "debugger-readiness-result",

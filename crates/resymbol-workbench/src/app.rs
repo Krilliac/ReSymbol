@@ -163,6 +163,7 @@ enum ScreenshotScenario {
     AddressSpace,
     Disassembly,
     DisassemblyActions,
+    ExactByteEditor,
     BinarySwitchConfirmation,
     DebuggerSandbox,
     DebuggerReadinessResult,
@@ -181,6 +182,7 @@ impl ScreenshotScenario {
             "address-space" | "memory-map" => Some(Self::AddressSpace),
             "disassembly" => Some(Self::Disassembly),
             "disassembly-actions" => Some(Self::DisassemblyActions),
+            "exact-byte-editor" => Some(Self::ExactByteEditor),
             "binary-switch-confirmation" => Some(Self::BinarySwitchConfirmation),
             "debugger-sandbox" | "readiness" => Some(Self::DebuggerSandbox),
             "debugger-readiness-result" => Some(Self::DebuggerReadinessResult),
@@ -199,6 +201,7 @@ impl ScreenshotScenario {
             Self::AddressSpace => "address-space",
             Self::Disassembly => "disassembly",
             Self::DisassemblyActions => "disassembly-actions",
+            Self::ExactByteEditor => "exact-byte-editor",
             Self::BinarySwitchConfirmation => "binary-switch-confirmation",
             Self::DebuggerSandbox => "debugger-sandbox",
             Self::DebuggerReadinessResult => "debugger-readiness-result",
@@ -207,7 +210,10 @@ impl ScreenshotScenario {
     }
 
     const fn needs_offline_read(self) -> bool {
-        matches!(self, Self::Disassembly | Self::DisassemblyActions)
+        matches!(
+            self,
+            Self::Disassembly | Self::DisassemblyActions | Self::ExactByteEditor
+        )
     }
 
     const fn needs_readiness_result(self) -> bool {
@@ -873,7 +879,8 @@ impl WorkbenchApp {
                 ScreenshotScenario::Graph => MainTab::Graph,
                 ScreenshotScenario::AddressSpace
                 | ScreenshotScenario::Disassembly
-                | ScreenshotScenario::DisassemblyActions => MainTab::AddressSpace,
+                | ScreenshotScenario::DisassemblyActions
+                | ScreenshotScenario::ExactByteEditor => MainTab::AddressSpace,
                 ScreenshotScenario::DebuggerSandbox
                 | ScreenshotScenario::DebuggerReadinessResult => MainTab::DebuggerSandbox,
                 ScreenshotScenario::Exports => {
@@ -884,7 +891,10 @@ impl WorkbenchApp {
             };
             app.project = Some(project);
             if scenario.needs_offline_read() {
-                let (start_rva, read_size) = if scenario == ScreenshotScenario::DisassemblyActions {
+                let (start_rva, read_size) = if matches!(
+                    scenario,
+                    ScreenshotScenario::DisassemblyActions | ScreenshotScenario::ExactByteEditor
+                ) {
                     (
                         SCREENSHOT_CANONICAL_JCC_RVA,
                         SCREENSHOT_CANONICAL_JCC_READ_BYTES,
@@ -5942,7 +5952,7 @@ impl WorkbenchApp {
     }
 
     #[cfg(feature = "screenshot")]
-    fn screenshot_disassembly_action_row(&self) -> Option<LinearInstructionRow> {
+    fn screenshot_canonical_jcc_row(&self) -> Option<LinearInstructionRow> {
         let OfflineReadPresentation::Outcome(outcome) = self.offline_read.presentation.as_ref()?
         else {
             return None;
@@ -5966,13 +5976,34 @@ impl WorkbenchApp {
             self.show_screenshot_readiness_result_overlay(context);
             return;
         }
+        if self.screenshot_scenario == Some(ScreenshotScenario::ExactByteEditor) {
+            assert!(
+                self.pending_static_patch_drafts.drafts().is_empty(),
+                "exact-byte-editor capture must not queue a static patch draft"
+            );
+            assert!(
+                !self.publication_operation.is_pending() && self.static_patch_result.is_none(),
+                "exact-byte-editor capture must not begin or report publication"
+            );
+            if self.offline_read.is_pending() || self.static_exact_byte_edit.is_some() {
+                return;
+            }
+            let row = self.screenshot_canonical_jcc_row().unwrap_or_else(|| {
+                panic!(
+                    "exact-byte-editor scenario requires canonical Jcc bytes at fixture RVA 0x{SCREENSHOT_CANONICAL_JCC_RVA:08X}"
+                )
+            });
+            self.static_exact_byte_edit = Some(screenshot_exact_byte_edit(&row));
+            self.static_exact_byte_edit_error = None;
+            return;
+        }
         if self.screenshot_scenario != Some(ScreenshotScenario::DisassemblyActions) {
             return;
         }
         if self.offline_read.is_pending() {
             return;
         }
-        let row = self.screenshot_disassembly_action_row().unwrap_or_else(|| {
+        let row = self.screenshot_canonical_jcc_row().unwrap_or_else(|| {
             panic!(
                 "disassembly-actions scenario requires canonical Jcc bytes at fixture RVA 0x{SCREENSHOT_CANONICAL_JCC_RVA:08X}"
             )
@@ -8594,6 +8625,27 @@ fn exact_byte_replacement_preview(rva: u64, replacement: &[u8]) -> LinearDisasse
     disassemble_x64_linear(replacement, rva, limits)
 }
 
+#[cfg(any(test, feature = "screenshot"))]
+fn screenshot_exact_byte_edit(row: &LinearInstructionRow) -> StaticExactByteEdit {
+    assert_eq!(
+        row.rva(),
+        SCREENSHOT_CANONICAL_JCC_RVA,
+        "exact-byte editor capture must stay bound to the canonical fixture Jcc"
+    );
+    let replacement = ConditionalBranchPatch::InvertCondition
+        .replacement(row.bytes())
+        .expect("canonical screenshot Jcc has a same-length inversion");
+    let mut edit = StaticExactByteEdit::for_instruction(row.rva(), row.bytes(), row.text())
+        .expect("canonical screenshot Jcc is a bounded exact source instruction");
+    *edit.replacement_hex_mut() = canonical_hex_bytes(&replacement);
+    assert_eq!(
+        edit.validated_replacement(),
+        Ok(replacement),
+        "exact-byte editor capture replacement must enable the queue action"
+    );
+    edit
+}
+
 fn instruction_row_accessible_label(
     row: &LinearInstructionRow,
     index: usize,
@@ -9600,16 +9652,27 @@ mod tests {
             ScreenshotScenario::AddressSpace,
             ScreenshotScenario::Disassembly,
             ScreenshotScenario::DisassemblyActions,
+            ScreenshotScenario::ExactByteEditor,
             ScreenshotScenario::BinarySwitchConfirmation,
             ScreenshotScenario::DebuggerSandbox,
             ScreenshotScenario::DebuggerReadinessResult,
             ScreenshotScenario::Exports,
         ];
+        assert_eq!(scenarios.len(), 13);
+        assert_eq!(
+            scenarios
+                .iter()
+                .filter(|scenario| **scenario != ScreenshotScenario::FunctionsFocused)
+                .count(),
+            12,
+            "the standard contract excludes only the focused minimum-viewport scenario"
+        );
         for scenario in scenarios {
             assert_eq!(ScreenshotScenario::parse(scenario.name()), Some(scenario));
         }
         assert!(ScreenshotScenario::parse("unknown-scenario").is_none());
         assert!(ScreenshotScenario::DisassemblyActions.needs_offline_read());
+        assert!(ScreenshotScenario::ExactByteEditor.needs_offline_read());
         assert!(ScreenshotScenario::DebuggerReadinessResult.needs_readiness_result());
         assert!(!ScreenshotScenario::OpenEmpty.needs_offline_read());
     }
@@ -9653,6 +9716,26 @@ mod tests {
                 .replacement(row.bytes())
                 .is_some()
         );
+
+        let edit = screenshot_exact_byte_edit(row);
+        assert_eq!(edit.mode(), StaticExactByteEditMode::QueueNew);
+        assert_eq!(edit.rva(), SCREENSHOT_CANONICAL_JCC_RVA);
+        assert_eq!(edit.original(), &[0x74, 0x0A]);
+        assert_eq!(edit.original_instruction(), row.text());
+        let replacement = edit
+            .validated_replacement()
+            .expect("capture prefill enables the queue action");
+        assert_eq!(replacement, &[0x75, 0x0A]);
+        let replacement_preview = exact_byte_replacement_preview(edit.rva(), &replacement);
+        assert_eq!(replacement_preview.rows().len(), 1);
+        assert_eq!(
+            replacement_preview.rows()[0].bytes(),
+            replacement.as_slice()
+        );
+        assert!(matches!(
+            replacement_preview.stop_reason(),
+            LinearDisassemblyStopReason::EndOfInput
+        ));
     }
 
     #[test]
