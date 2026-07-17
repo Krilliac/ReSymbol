@@ -59,8 +59,14 @@ captured protection, verifies readback, and reports whether recovery restored
 bytes/cache/protection after any later failure. It rejects cross-region and cross-system-page writes
 rather than restoring a first page's protection over another. A pre-write race restores only
 protection and reports that ReSymbol made no byte-write attempt; it does not claim target-side bytes
-were stable. It does not stop threads or grant mutation authority: an authenticated provider must
-retain a current stopped-state token and keep the target stopped for the complete operation.
+were stable. Failure of the initial protection call is reported as `ChangeProtection`; protection is
+not claimed restored unless a fresh exact-binding query proves that the complete span still has the
+original observed protection. The crate can convert only its explicit `MutationFailed` errors into a
+validated protocol-1.6 `MemoryWriteFailure` using caller-supplied stop/address/size context. It bounds
+control-free diagnostic text at a UTF-8 boundary and returns no write evidence for other access
+errors. This conversion neither emits an event nor grants mutation authority: an authenticated
+provider must retain a current stopped-state token and keep the target stopped for the complete
+operation.
 
 The adapter compares Tool Help's reported main-module path with the retained file, requires the
 reported base to equal caller-supplied independent create-process debug-event evidence, rejects a

@@ -594,6 +594,9 @@ different region. Mutations are additionally restricted to one system page becau
 `VirtualProtectEx` reports only the first page's old protection for a multi-page span. Expected bytes
 are checked again after the protection change; a race abort restores only protection and records that
 ReSymbol made no byte-write attempt, without claiming a concurrent target left the bytes unchanged.
+Failure of the initial protection call is also classified as a pre-write `ChangeProtection` failure;
+because Windows returns no old-protection value on that path, recovery is considered proved only when
+a fresh exact-binding query confirms the one-page span still has the original observed protection.
 Post-protection failure returns explicit recovery evidence; success requires a cache flush,
 protection restoration, replacement readback, and final binding validation.
 
@@ -607,6 +610,12 @@ byte/cache/protection recovery instead requires the accepted fresh stop and a fo
 match the diagnostic exactly. This terminal evidence does not prove that detach, resume, or ordinary
 close is safe; no provider may advertise `LiveMemoryWrite` until it owns an explicit recovery,
 termination, or fail-closed teardown policy for that state.
+
+The Windows primitive exposes a narrow adapter from its local `MutationFailed` value to this protocol
+evidence. The provider must supply the exact command stop, address, and size; the adapter bounds and
+sanitizes diagnostic text without splitting UTF-8, maps every local stage/recovery value, and runs the
+protocol validator before returning evidence. Non-mutation access errors return no write-failure
+evidence. This is conversion plumbing only: it does not emit a host event or authorize a write.
 
 This adapter does not freeze the current executable path into an immutable loaded-image snapshot.
 The retained no-write/delete-sharing file handle, exact hash, and file/remote/module PE-header
