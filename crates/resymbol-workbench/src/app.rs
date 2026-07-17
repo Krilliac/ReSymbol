@@ -1065,7 +1065,16 @@ impl WorkbenchApp {
             .review
             .as_ref()
             .is_some_and(BoundReviewLedger::is_dirty);
-        if close_requires_confirmation(review_is_dirty, self.allow_dirty_close) {
+        #[cfg(feature = "screenshot")]
+        let screenshot_capture_completed =
+            self.screenshot_requested && self.screenshot_destination.is_none();
+        #[cfg(not(feature = "screenshot"))]
+        let screenshot_capture_completed = false;
+        // A deterministic capture closes only after its create-new PNG has been written. Do not
+        // re-open the dirty-review prompt while terminating that disposable automation process;
+        // the real modal and dirty ledger were still present in the captured frame.
+        let close_is_authorized = self.allow_dirty_close || screenshot_capture_completed;
+        if close_requires_confirmation(review_is_dirty, close_is_authorized) {
             if !self.close_confirmation_open {
                 self.log(
                     ActivityLevel::Warning,
