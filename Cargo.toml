@@ -11,6 +11,7 @@ members = [
     "crates/resymbol-plugin-api",
     "crates/resymbol-plugin-runtime",
     "crates/resymbol-plugin-state",
+    "crates/resymbol-windows-debug-host",
     "crates/resymbol-windows-live-access",
     "crates/resymbol-windows-process",
     "crates/resymbol-windows-readiness",

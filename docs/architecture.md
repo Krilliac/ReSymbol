@@ -624,10 +624,24 @@ from one allocation, after first matching its size to the retained file. A futur
 provider must supply that evidence (and retain the event's image-file handle when available) before
 authorizing reads or writes.
 
-No Windows debugger-host process, authenticated live transport, AppContainer or Hyper-V provider,
-guest agent, live launch/attach, breakpoint engine, register service, or provider-integrated
-process-memory service is implemented. The offline host and live-access primitive do not change that
-boundary: the current contracts and readiness UI are not a working malware sandbox or live debugger.
+`crates/resymbol-windows-debug-host` now builds the smallest phase-one live provider primitive on top
+of that read-only access boundary. One deliberately `!Send`/`!Sync` worker performs the exact
+preflight, attaches on its owning thread, immediately requests detach rather than target termination
+if that thread exits, and drains current-state events under both a finite total deadline and an event
+ceiling. It accepts only the exact create-process PID/base evidence, closes only create-process and
+load-DLL `hFile` values, retains the initial first-chance breakpoint, and exposes bounded exact
+main-image reads while that event remains pending. Its platform-aware capability report marks only
+`HostAttach` and `LiveMemoryRead` available on Windows. Explicit detach first continues any retained
+event and then attempts `DebugActiveProcessStop`, reporting kill-policy, continuation, and detach
+outcomes independently; destructor cleanup discards that evidence and is never cleanup proof.
+
+This is an in-process low-level API, not a Windows debugger-host helper process, authenticated live
+transport, or UI bridge. `attach_after_authorization` records a mandatory caller prerequisite but
+does not authenticate or enforce it; a future authenticated `SessionWorker` must consume exact
+host-risk authority before invoking it. No AppContainer or Hyper-V provider, guest agent, live
+launch, breakpoint engine, register service, stepping, writes, or sandbox provisioning is
+implemented. The offline host, low-level attach/read foundation, and readiness UI therefore remain
+far short of a working malware sandbox or end-user live debugger.
 [debugger-sandbox.md](debugger-sandbox.md) records the exact ownership, authorization, containment,
 cleanup, and verification gates that future live providers must satisfy.
 

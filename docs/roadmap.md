@@ -45,8 +45,12 @@ synthetic host supports only test/offline open-close mechanics and reports no pl
 The production in-process `OfflineImageDebugHost` owns only a retained identity-verified source
 snapshot; the Workbench exposes it as bounded exact-RVA reads on the application-service worker.
 The plaintext build-claim exchange detects protocol mismatch and replay but does not authenticate a
-peer or process. No live Windows host transport, AppContainer/Hyper-V provider, target execution,
-attach, breakpoint, register, or process-memory service is implemented.
+peer or process. A new same-thread Windows phase-one provider primitive can exact-preflight and
+attach to an explicitly selected existing process, retain its initial attach breakpoint, read a
+bounded exact main-image span while stopped, and explicitly continue/detach. It advertises only
+`HostAttach` and `LiveMemoryRead` on Windows. Its authorization-named entry point cannot authenticate
+or consume authority itself, and it has no helper transport, Workbench route, launch, breakpoint,
+register, step, write, AppContainer/Hyper-V, or sandbox service.
 
 This is a foundation, not the completed workbench or a working sandbox. GUI plugin execution,
 legacy-package migration, bulk review, docking, synchronized disassembly/pseudocode views, and an
@@ -345,8 +349,10 @@ discovery, broader indirect control flow and richer call-graph analysis, persist
 modeling, broader RTTI/ABI coverage, broader compiler fixtures,
 benchmarks, and continued malformed-input/resource-limit validation.
 The strictly non-executing offline image host and its bounded workbench byte reader are implemented.
-Process-executing debugger-hosted paths remain future work; neither the offline host nor the live
-contracts should be mistaken for a working live debugger or malware sandbox.
+The same-thread Windows phase-one attach/read primitive is also implemented and covered by an owned
+child fixture, but authenticated helper integration, UI control, execution control, and sandboxed
+process-hosting paths remain future work. Neither primitive should be mistaken for a working end-user
+live debugger or malware sandbox.
 
 ## Milestone 0: repository foundation
 

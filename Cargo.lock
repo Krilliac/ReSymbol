@@ -3094,6 +3094,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "resymbol-windows-debug-host"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "resymbol-core",
+ "resymbol-debugger",
+ "resymbol-windows-live-access",
+ "thiserror 2.0.18",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "resymbol-windows-live-access"
 version = "0.1.0-alpha.1"
 dependencies = [

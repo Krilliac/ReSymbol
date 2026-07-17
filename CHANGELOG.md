@@ -16,6 +16,20 @@ prereleases; breaking changes remain explicit.
   terminal `Failed` state. The host client rejects substituted, duplicate, contradictory,
   misordered, post-result, or success-labeled failure evidence. This is a provider contract, not a
   claim that live mutation ships or that an indeterminate target can safely be resumed or detached.
+- Added `resymbol-windows-debug-host`, a phase-one, same-thread Windows debug-attach foundation. Its
+  low-level entry point repeats the exact PID/start-key/binary/base preflight, calls
+  `DebugActiveProcess` and immediately requests detach-on-debug-thread-exit behavior, drains initial
+  events under one finite total deadline and event-count ceiling, validates the first
+  `CREATE_PROCESS_DEBUG_EVENT`, closes only the documented create-process/load-DLL file handles,
+  retains the first-chance attach breakpoint, and permits bounded exact main-image reads only while
+  that event remains pending. Explicit detach continues the retained event before attempting
+  `DebugActiveProcessStop`; kill-policy, continuation, and detach outcomes remain separate evidence,
+  while `Drop` is only unproved best-effort cleanup. A watchdog-bounded, parent-owned Windows child
+  fixture covers the real attach/read/detach path, with deterministic fake-backend tests covering
+  ordering, handle closure, deadlines, and cleanup faults. This is not an authenticated debugger-host
+  process or transport: the method name records that authorization must already have happened but
+  cannot prove it, and no Workbench bridge, launch, write, register, stepping, breakpoint engine, or
+  sandbox provisioning is exposed.
 - Added schema-14, container-only intake for ELF32 little-endian `EM_MIPS` executables. Checked
   header and table parsing retains sparse non-empty `PT_LOAD` mappings and a deterministic
   identity-only graph without decoding or executing instructions. A source-built synthetic fixture
