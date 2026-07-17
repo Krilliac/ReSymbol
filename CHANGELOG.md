@@ -340,13 +340,16 @@ prereleases; breaking changes remain explicit.
 
 ### Changed
 
-- Bumped the debugger wire and typed-command protocol to 1.4. Debug attaches now require one
-  correlated, validated `LiveTargetBinding` that matches the exact PID, trusted process-start key,
-  and main-module binary identity retained by the active open command. It carries the actual ASLR
-  image base and checked PE `SizeOfImage` range for safe static-RVA translation; zero, overflowing,
-  out-of-image, stale, duplicate, and replacement bindings fail closed, while terminal/failure
-  lifecycle state invalidates accepted evidence. Step Into, Step Over, and Step Out now have
-  independent complete-report capability statuses instead of inheriting one coarse execution bit.
+- Bumped the debugger wire and typed-command protocol to 1.4. Every successful host or sandbox
+  launch and every debug attach now requires one correlated, validated `LiveTargetBinding`. Host
+  launches bind the runtime main module to the exact requested binary; sandbox launches additionally
+  bind it to the exact attested PID, trusted process-start key, and binary identity; debug attaches
+  bind it to the exact process identity retained by the active open command. The binding carries the
+  actual ASLR image base and checked PE `SizeOfImage` range for safe static-RVA translation; missing,
+  pre-attestation, mismatched, replayed, zero, overflowing, out-of-image, duplicate, and replacement
+  bindings fail closed, while terminal/failure lifecycle state invalidates accepted evidence. Step
+  Into, Step Over, and Step Out now have independent complete-report capability statuses instead of
+  inheriting one coarse execution bit.
   Unsolicited stop/exit batches are staged and validated in full before reducer/cursor commit, so a
   later hostile frame cannot expose an accepted prefix. Legacy 1.3 and earlier peers are rejected.
   These are provider/client contracts only; no process-executing Windows provider is shipped.

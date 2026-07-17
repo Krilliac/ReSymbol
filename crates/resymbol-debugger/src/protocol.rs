@@ -177,7 +177,7 @@ pub struct ProcessIdentity {
 /// process instance.
 ///
 /// Providers must derive the process freshness key and actual image base from
-/// the same trusted process handle used for the attach. Static RVAs may be
+/// the same trusted process handle used for the launch or attach. Static RVAs may be
 /// translated only through this validated binding; a PID, preferred PE image
 /// base, or matching path is not sufficient evidence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -318,7 +318,7 @@ impl<'de> Deserialize<'de> for LiveTargetBinding {
 
 #[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
 pub enum LiveTargetBindingError {
-    #[error("main-module binary identity differs from the attached process identity")]
+    #[error("main-module binary identity differs from the live process identity")]
     MainModuleIdentityMismatch,
     #[error("live image base must be nonzero")]
     ZeroImageBase,
