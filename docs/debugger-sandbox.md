@@ -10,7 +10,8 @@ ReSymbol currently implements the non-executing foundation for debugger and sand
   anti-debug imports, common packer section names, high-entropy samples, and writable/executable
   sections;
 - backend-neutral target, capability, command, event, state-token, breakpoint, memory-read, and
-  compare-before-write memory-mutation contracts;
+  compare-before-write memory-mutation contracts, including an exact validated live-process/main-
+  module binding and separate Step Into, Step Over, and Step Out capability statuses;
 - a bounded control/raw-byte frame format, direction-checked plaintext build-claim correlation,
   exact wire/typed protocol version binding, strict typed command/event codec, cumulative
   response-allocation budget, and single-owner host-client seam;
@@ -203,6 +204,11 @@ tests:
    `AwaitingAttestation` leaves creation unknown and fails closed. An inherited-sandbox attach
    likewise binds its receipt to the exact process identity, provider, policy digest, and session
    retained from the provider-issued ownership lease. Helper loss never implies cleanup succeeded.
+9. A debug attach cannot complete without one correlated `LiveTargetBinding` for the exact retained
+   PID, trusted start key, and main-module `BinaryId`. The provider supplies the actual ASLR image
+   base and PE `SizeOfImage`; checked RVA translation rejects zero, overflowing, empty, and
+   out-of-image ranges. Duplicate or replacement evidence poisons the connection, and terminal or
+   failed lifecycle state invalidates the binding.
 
 The pure reducers and typed client now exercise these ordering and binding rules. The client
 independently replays each command through its reducer and accepts only command-specific state and
@@ -214,11 +220,12 @@ provider, not evidence that such a provider exists.
 
 The current seam is intentionally narrow:
 
-- debugger wire and typed-command protocol 1.3 carries the lease identifiers, provisioning epoch,
+- debugger wire and typed-command protocol 1.4 carries the lease identifiers, provisioning epoch,
   exact suspended-target process identity through state and attestation, exact failure operation
   context including the explicit target-creation outcome, and process-bound incomplete or complete
-  cleanup evidence. The wire supports exactly 1.3; a 1.2 Hello is rejected before negotiation
-  because it cannot represent the required process fields;
+  cleanup evidence, plus exact live-target binding evidence and granular step capability statuses.
+  The wire supports exactly 1.4; a 1.3 or earlier Hello is rejected before negotiation because it
+  cannot represent the complete current compatibility contract;
 - a four-byte length prefix is validated before allocating a bounded control buffer;
 - controller and host roles, directions, nonzero challenge nonce, expected plaintext build claims,
   offered protocol version, response kind, and independent frame sequences are correlated before
@@ -331,6 +338,10 @@ that separation rather than increasing the control allocation.
 After a transport or validation failure, the client disconnects and remains terminal. Callers may
 abandon the poisoned client-side session to recover its last observed state for diagnostics, but this
 does not produce a cleanup receipt, mark the session `Closed`, or permit channel reuse.
+Unsolicited stop/exit batches are decoded and validated in full before any reducer state, frame
+sequence, or event-sequence cursor is committed, so a valid prefix followed by a hostile frame is
+not exposed as accepted state. Empty batches, correlated events, typed-version mismatches,
+unsupported states/events, and poll transport failures all poison the connection.
 
 ## Local AppContainer boundary
 
@@ -397,8 +408,10 @@ The instruction action menu maintains three separate authority domains:
    or stopped-thread bindings required by the action. Live NOP requires `LiveMemoryWrite` and a
    `DebugCommand::WriteMemory` compare-before-write with the exact selected bytes and an equal-length
    `0x90` replacement. Run to Cursor requires both software-breakpoint and execution-control
-   capability and composes a temporary software breakpoint with Continue. Step Into/Over/Out,
-   Continue, and persistent software breakpoint creation stay on the same typed command path.
+   capability and composes a temporary software breakpoint with Continue. The protocol reports
+   Step Into/Over/Out through separate `StepInto`, `StepOver`, and `StepOut` statuses; wiring those
+   statuses into the still-disabled workbench action policy remains part of live-provider
+   integration. Continue and persistent software breakpoint creation stay on the typed command path.
 
 Protection findings are bounded artifact evidence. They are neither malware signatures nor an
 authorization to execute. Offline opening should keep those findings reviewable without training the
@@ -414,7 +427,7 @@ No process-executing provider should merge until the project has evidence for:
 - legal session transitions, cross-target and replayed lease rejection, stale generation/stop
   rejection, provisioning-epoch-bound attestation and cleanup, attestation-gated resume,
   compare-write conflicts, sequence overflow, and terminal cleanup behavior;
-- strict wire decoding, exact-1.3 Hello-first/once build-claim exchange including legacy-1.2
+- strict wire decoding, exact-1.4 Hello-first/once build-claim exchange including legacy-1.3
   rejection, role/build/version/nonce correlation, independent transport authentication, bounded
   allocation before payload reads, and crash recovery;
 - benign Windows probes showing allowed staged reads and scratch writes while profile sentinels,

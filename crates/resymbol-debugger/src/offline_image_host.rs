@@ -1125,6 +1125,9 @@ fn offline_capability_status(capability: DebugCapability) -> CapabilityStatus {
         DebugCapability::OfflineAnalysis => CapabilityAvailability::Available,
         DebugCapability::LiveMemoryWrite
         | DebugCapability::ExecutionControl
+        | DebugCapability::StepInto
+        | DebugCapability::StepOver
+        | DebugCapability::StepOut
         | DebugCapability::RegisterWrite
         | DebugCapability::SoftwareBreakpoints
         | DebugCapability::HardwareBreakpoints => CapabilityAvailability::Unavailable {
@@ -1587,6 +1590,9 @@ mod tests {
                 }
                 DebugCapability::LiveMemoryWrite
                 | DebugCapability::ExecutionControl
+                | DebugCapability::StepInto
+                | DebugCapability::StepOver
+                | DebugCapability::StepOut
                 | DebugCapability::RegisterWrite
                 | DebugCapability::SoftwareBreakpoints
                 | DebugCapability::HardwareBreakpoints => assert!(matches!(

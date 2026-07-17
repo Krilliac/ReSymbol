@@ -331,6 +331,16 @@ prereleases; breaking changes remain explicit.
 
 ### Changed
 
+- Bumped the debugger wire and typed-command protocol to 1.4. Debug attaches now require one
+  correlated, validated `LiveTargetBinding` that matches the exact PID, trusted process-start key,
+  and main-module binary identity retained by the active open command. It carries the actual ASLR
+  image base and checked PE `SizeOfImage` range for safe static-RVA translation; zero, overflowing,
+  out-of-image, stale, duplicate, and replacement bindings fail closed, while terminal/failure
+  lifecycle state invalidates accepted evidence. Step Into, Step Over, and Step Out now have
+  independent complete-report capability statuses instead of inheriting one coarse execution bit.
+  Unsolicited stop/exit batches are staged and validated in full before reducer/cursor commit, so a
+  later hostile frame cannot expose an accepted prefix. Legacy 1.3 and earlier peers are rejected.
+  These are provider/client contracts only; no process-executing Windows provider is shipped.
 - Bumped the debugger wire and typed-command protocol to 1.3. A sandboxed launch now carries the
   exact created PID, trusted process-start key, and executable identity through
   `AwaitingAttestation`, provider attestation, and cleanup. The reducer retains both the created
@@ -524,7 +534,7 @@ schema versions independently.
   attaches additionally bind provider, policy digest, and provisioning epoch. Attestation and
   cleanup receipts carry that fresh epoch, rejecting evidence replay from an otherwise identical
   earlier provisioning instance. These remain contracts for future providers, not shipped process
-  execution or containment. The debugger-host typed-command protocol is now 1.3, so legacy 1.2 and
+  execution or containment. The debugger-host typed-command protocol is now 1.4, so legacy 1.3 and
   older payload shapes fail typed validation before dispatch instead of being interpreted ambiguously.
 - The default WASM invocation accepts a component up to 64 MiB, enforces a 256 MiB linear-memory
   store limit, 100,000,000 fuel, a 2 MiB WebAssembly stack, one memory, two tables, 32 instances,

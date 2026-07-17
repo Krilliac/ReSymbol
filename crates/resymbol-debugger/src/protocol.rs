@@ -22,7 +22,7 @@ use crate::sandbox::{
 use resymbol_core::BinaryId;
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 3;
+pub const PROTOCOL_MINOR: u16 = 4;
 pub const MAX_LAUNCH_ARGUMENTS: usize = 128;
 pub const MAX_LAUNCH_ARGUMENT_BYTES: usize = 256 * 1024;
 pub const MAX_MEMORY_READ_BYTES: u32 = 1024 * 1024;
@@ -171,6 +171,173 @@ pub struct ProcessIdentity {
     pub process_id: ProcessId,
     pub start_key: ProcessStartKey,
     pub binary_id: BinaryId,
+}
+
+/// Exact identity and runtime image mapping for the main module of one live
+/// process instance.
+///
+/// Providers must derive the process freshness key and actual image base from
+/// the same trusted process handle used for the attach. Static RVAs may be
+/// translated only through this validated binding; a PID, preferred PE image
+/// base, or matching path is not sufficient evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveTargetBinding {
+    process: ProcessIdentity,
+    main_module_binary_id: BinaryId,
+    actual_image_base: MemoryAddress,
+    size_of_image: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LiveTargetBindingWire {
+    process: ProcessIdentity,
+    main_module_binary_id: BinaryId,
+    actual_image_base: MemoryAddress,
+    size_of_image: u32,
+}
+
+impl LiveTargetBinding {
+    pub fn new(
+        process: ProcessIdentity,
+        main_module_binary_id: BinaryId,
+        actual_image_base: MemoryAddress,
+        size_of_image: u32,
+    ) -> Result<Self, LiveTargetBindingError> {
+        if process.binary_id != main_module_binary_id {
+            return Err(LiveTargetBindingError::MainModuleIdentityMismatch);
+        }
+        if actual_image_base.get() == 0 {
+            return Err(LiveTargetBindingError::ZeroImageBase);
+        }
+        if size_of_image == 0 {
+            return Err(LiveTargetBindingError::EmptyImage);
+        }
+        actual_image_base
+            .get()
+            .checked_add(u64::from(size_of_image))
+            .ok_or(LiveTargetBindingError::ImageAddressOverflow {
+                base: actual_image_base.get(),
+                size_of_image,
+            })?;
+        Ok(Self {
+            process,
+            main_module_binary_id,
+            actual_image_base,
+            size_of_image,
+        })
+    }
+
+    #[must_use]
+    pub const fn process(&self) -> &ProcessIdentity {
+        &self.process
+    }
+
+    #[must_use]
+    pub const fn main_module_binary_id(&self) -> &BinaryId {
+        &self.main_module_binary_id
+    }
+
+    #[must_use]
+    pub const fn actual_image_base(&self) -> MemoryAddress {
+        self.actual_image_base
+    }
+
+    #[must_use]
+    pub const fn size_of_image(&self) -> u32 {
+        self.size_of_image
+    }
+
+    /// Returns the exclusive end of the validated runtime image range.
+    #[must_use]
+    pub fn image_end(&self) -> MemoryAddress {
+        MemoryAddress::new(
+            self.actual_image_base
+                .get()
+                .checked_add(u64::from(self.size_of_image))
+                .expect("LiveTargetBinding construction validates its image range"),
+        )
+    }
+
+    /// Translates one byte at a static RVA into the actual ASLR-adjusted VA.
+    pub fn address_for_rva(&self, rva: u64) -> Result<MemoryAddress, LiveTargetBindingError> {
+        self.address_for_rva_span(rva, 1)
+    }
+
+    /// Translates a nonempty static RVA span wholly contained in SizeOfImage.
+    pub fn address_for_rva_span(
+        &self,
+        rva: u64,
+        size: u64,
+    ) -> Result<MemoryAddress, LiveTargetBindingError> {
+        if size == 0 {
+            return Err(LiveTargetBindingError::EmptySpan);
+        }
+        if rva >= u64::from(self.size_of_image) {
+            return Err(LiveTargetBindingError::RvaOutOfImage {
+                rva,
+                size_of_image: self.size_of_image,
+            });
+        }
+        let span_end = rva
+            .checked_add(size)
+            .ok_or(LiveTargetBindingError::RvaSpanOverflow { rva, size })?;
+        if span_end > u64::from(self.size_of_image) {
+            return Err(LiveTargetBindingError::SpanOutOfImage {
+                rva,
+                size,
+                size_of_image: self.size_of_image,
+            });
+        }
+        let address = self.actual_image_base.get().checked_add(rva).ok_or(
+            LiveTargetBindingError::ImageAddressOverflow {
+                base: self.actual_image_base.get(),
+                size_of_image: self.size_of_image,
+            },
+        )?;
+        Ok(MemoryAddress::new(address))
+    }
+}
+
+impl<'de> Deserialize<'de> for LiveTargetBinding {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = LiveTargetBindingWire::deserialize(deserializer)?;
+        Self::new(
+            wire.process,
+            wire.main_module_binary_id,
+            wire.actual_image_base,
+            wire.size_of_image,
+        )
+        .map_err(D::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
+pub enum LiveTargetBindingError {
+    #[error("main-module binary identity differs from the attached process identity")]
+    MainModuleIdentityMismatch,
+    #[error("live image base must be nonzero")]
+    ZeroImageBase,
+    #[error("live SizeOfImage must be nonzero")]
+    EmptyImage,
+    #[error("live image base {base:#x} plus SizeOfImage {size_of_image:#x} overflows")]
+    ImageAddressOverflow { base: u64, size_of_image: u32 },
+    #[error("RVA span must be nonempty")]
+    EmptySpan,
+    #[error("RVA {rva:#x} is outside SizeOfImage {size_of_image:#x}")]
+    RvaOutOfImage { rva: u64, size_of_image: u32 },
+    #[error("RVA {rva:#x} plus span size {size:#x} overflows")]
+    RvaSpanOverflow { rva: u64, size: u64 },
+    #[error("RVA {rva:#x} plus span size {size:#x} exceeds SizeOfImage {size_of_image:#x}")]
+    SpanOutOfImage {
+        rva: u64,
+        size: u64,
+        size_of_image: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -344,6 +511,9 @@ define_debug_capabilities! {
     LiveMemoryRead,
     LiveMemoryWrite,
     ExecutionControl,
+    StepInto,
+    StepOver,
+    StepOut,
     RegisterRead,
     RegisterWrite,
     SoftwareBreakpoints,
@@ -1105,6 +1275,10 @@ impl CommandOutcome {
 pub enum DebugEvent {
     Capabilities(CapabilityReport),
     StateChanged(SessionState),
+    LiveTargetBound {
+        state: StateToken,
+        binding: LiveTargetBinding,
+    },
     MemoryRead {
         view: ReadViewToken,
         address: MemoryAddress,
@@ -1137,6 +1311,7 @@ impl DebugEvent {
     fn validate(&self) -> Result<(), ProtocolValidationError> {
         match self {
             Self::Capabilities(report) => report.validate(),
+            Self::LiveTargetBound { .. } => Ok(()),
             Self::StateChanged(SessionState::Failed { message, .. }) => validate_reason(message),
             Self::SandboxLifecycle(SandboxLifecycleEvent::Failed(failure)) => {
                 failure.validate_stage_kind()?;
@@ -1171,6 +1346,7 @@ impl DebugEvent {
     fn state_context(&self) -> Option<StateToken> {
         match self {
             Self::StateChanged(state) => Some(state.state_token()),
+            Self::LiveTargetBound { state, .. } => Some(*state),
             Self::MemoryRead { view, .. } => Some(view.state()),
             Self::MemoryWritten { stop, .. } | Self::BreakpointChanged { stop, .. } => {
                 Some(stop.state)
@@ -1548,6 +1724,172 @@ mod tests {
     }
 
     #[test]
+    fn live_target_binding_translates_only_valid_aslr_adjusted_image_spans() {
+        let binary_id = BinaryId::digest(b"live target binding image");
+        let binding = LiveTargetBinding::new(
+            process(binary_id.clone()),
+            binary_id,
+            MemoryAddress::new(0x0000_7ff7_4000_0000),
+            0x2_0000,
+        )
+        .expect("valid live target binding");
+
+        assert_eq!(
+            binding.address_for_rva(0x1234).expect("in-image RVA"),
+            MemoryAddress::new(0x0000_7ff7_4000_1234)
+        );
+        assert_eq!(
+            binding
+                .address_for_rva_span(0x1_ff00, 0x100)
+                .expect("span ending at SizeOfImage"),
+            MemoryAddress::new(0x0000_7ff7_4001_ff00)
+        );
+        assert_eq!(binding.image_end().get(), 0x0000_7ff7_4002_0000);
+        assert_eq!(
+            binding.address_for_rva(0x2_0000),
+            Err(LiveTargetBindingError::RvaOutOfImage {
+                rva: 0x2_0000,
+                size_of_image: 0x2_0000,
+            })
+        );
+        assert_eq!(
+            binding.address_for_rva_span(0x1_ffff, 2),
+            Err(LiveTargetBindingError::SpanOutOfImage {
+                rva: 0x1_ffff,
+                size: 2,
+                size_of_image: 0x2_0000,
+            })
+        );
+        assert_eq!(
+            binding.address_for_rva_span(1, u64::MAX),
+            Err(LiveTargetBindingError::RvaSpanOverflow {
+                rva: 1,
+                size: u64::MAX,
+            })
+        );
+        assert_eq!(
+            binding.address_for_rva_span(0, 0),
+            Err(LiveTargetBindingError::EmptySpan)
+        );
+    }
+
+    #[test]
+    fn live_target_binding_rejects_wrong_identity_empty_and_overflowing_images() {
+        let binary_id = BinaryId::digest(b"expected live image");
+        let identity = process(binary_id.clone());
+        assert_eq!(
+            LiveTargetBinding::new(
+                identity.clone(),
+                BinaryId::digest(b"wrong live image"),
+                MemoryAddress::new(0x1400_0000_0),
+                0x1000,
+            ),
+            Err(LiveTargetBindingError::MainModuleIdentityMismatch)
+        );
+        assert_eq!(
+            LiveTargetBinding::new(
+                identity.clone(),
+                binary_id.clone(),
+                MemoryAddress::new(0),
+                0x1000,
+            ),
+            Err(LiveTargetBindingError::ZeroImageBase)
+        );
+        assert_eq!(
+            LiveTargetBinding::new(
+                identity.clone(),
+                binary_id.clone(),
+                MemoryAddress::new(0x1400_0000_0),
+                0,
+            ),
+            Err(LiveTargetBindingError::EmptyImage)
+        );
+        assert_eq!(
+            LiveTargetBinding::new(
+                identity,
+                binary_id,
+                MemoryAddress::new(u64::MAX - 0xff),
+                0x100,
+            ),
+            Err(LiveTargetBindingError::ImageAddressOverflow {
+                base: u64::MAX - 0xff,
+                size_of_image: 0x100,
+            })
+        );
+    }
+
+    #[test]
+    fn live_target_binding_deserialization_and_event_context_are_strict() {
+        let binary_id = BinaryId::digest(b"strict live image");
+        let binding = LiveTargetBinding::new(
+            process(binary_id.clone()),
+            binary_id,
+            MemoryAddress::new(0x1800_0000_0),
+            0x5000,
+        )
+        .expect("valid binding");
+        let mut malformed = serde_json::to_value(&binding).expect("serialize binding");
+        malformed["main_module_binary_id"] =
+            serde_json::to_value(BinaryId::digest(b"substituted module")).expect("binary id");
+        assert!(serde_json::from_value::<LiveTargetBinding>(malformed).is_err());
+
+        let event = EventEnvelope {
+            version: ProtocolVersion::current(),
+            sequence: EventSequence::new(1).expect("event sequence"),
+            session_id: Some(session(1)),
+            state: Some(state(1, 3)),
+            caused_by: Some(CommandId::new(1).expect("command id")),
+            event: DebugEvent::LiveTargetBound {
+                state: state(1, 2),
+                binding,
+            },
+        };
+        assert_eq!(
+            event.validate(),
+            Err(ProtocolValidationError::StaleStateToken)
+        );
+        let mut wrong_session = event;
+        wrong_session.session_id = Some(session(2));
+        assert_eq!(
+            wrong_session.validate(),
+            Err(ProtocolValidationError::StaleSession)
+        );
+    }
+
+    #[test]
+    fn step_capability_report_is_complete_and_legacy_minor_is_rejected() {
+        assert_eq!(DebugCapability::ALL.len(), 17);
+        for capability in [
+            DebugCapability::StepInto,
+            DebugCapability::StepOver,
+            DebugCapability::StepOut,
+        ] {
+            assert!(DebugCapability::ALL.contains(&capability));
+        }
+        let report = CapabilityReport {
+            statuses: DebugCapability::ALL
+                .into_iter()
+                .map(|capability| CapabilityStatus {
+                    capability,
+                    availability: CapabilityAvailability::Available,
+                })
+                .collect(),
+        };
+        report.validate().expect("complete capability report");
+        assert_eq!(
+            ProtocolVersion {
+                major: PROTOCOL_MAJOR,
+                minor: 3,
+            }
+            .validate(),
+            Err(ProtocolValidationError::UnsupportedProtocolVersion {
+                major: PROTOCOL_MAJOR,
+                minor: 3,
+            })
+        );
+    }
+
+    #[test]
     fn stale_sessions_generations_and_stop_ids_are_rejected() {
         let current_stop = stop(1, 4, 20);
         let current = stopped_state(current_stop);
@@ -1759,6 +2101,9 @@ mod tests {
                 "live-memory-read",
                 "live-memory-write",
                 "execution-control",
+                "step-into",
+                "step-over",
+                "step-out",
                 "register-read",
                 "register-write",
                 "software-breakpoints",
