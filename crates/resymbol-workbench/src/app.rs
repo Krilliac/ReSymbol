@@ -4737,6 +4737,9 @@ impl WorkbenchApp {
     fn show_overview(&self, ui: &mut egui::Ui) {
         let project = self.project.as_ref().expect("checked by caller");
         let colors = self.preferences.theme.semantic_colors();
+        let active_binary_path = project.identity.active_binary_path();
+        let active_binary_path_hover =
+            active_binary_path_hover_text(&project.identity.active_binary_path_display());
         ScrollArea::vertical().show(ui, |ui| {
             ui.heading("Analysis overview");
             ui.label(
@@ -4744,11 +4747,12 @@ impl WorkbenchApp {
                     .color(colors.secondary_text),
             );
             ui.label(
-                RichText::new(project.identity.active_binary_path_display())
+                RichText::new(active_binary_path_text(active_binary_path))
                     .monospace()
                     .small()
                     .color(colors.secondary_text),
-            );
+            )
+            .on_hover_text(&active_binary_path_hover);
             ui.add_space(12.0);
 
             ui.columns(3, |columns| {
@@ -7245,7 +7249,10 @@ impl WorkbenchApp {
         let colors = self.preferences.theme.semantic_colors();
         let evidence = DebuggerReadinessEvidence::from_project(project);
         let binary_name = project.identity.display_name.clone();
-        let binary_path = project.identity.active_binary_path_display();
+        let binary_path = project.identity.active_binary_path();
+        let binary_path_text = active_binary_path_text(binary_path);
+        let binary_path_hover =
+            active_binary_path_hover_text(&project.identity.active_binary_path_display());
 
         ScrollArea::vertical().show(ui, |ui| {
             ui.heading("Debugger / Sandbox readiness");
@@ -7344,11 +7351,12 @@ impl WorkbenchApp {
                             .color(colors.exact_extracted),
                     );
                     ui.label(
-                        RichText::new(binary_path)
+                        RichText::new(&binary_path_text)
                             .small()
                             .monospace()
                             .color(colors.secondary_text),
-                    );
+                    )
+                    .on_hover_text(&binary_path_hover);
                 });
                 workbench_card(colors).show(&mut columns[1], |ui| {
                     ui.heading("Static protection evidence");
@@ -8312,6 +8320,14 @@ fn compact_path_text(path: &Path) -> String {
         .find(|component| !component.is_empty())
         .unwrap_or(trimmed)
         .to_owned()
+}
+
+fn active_binary_path_text(path: &Path) -> String {
+    compact_path_text(path)
+}
+
+fn active_binary_path_hover_text(human_readable_path: &str) -> String {
+    format!("Exact active binary path: {human_readable_path}")
 }
 
 fn offline_lifecycle_status(
@@ -9878,6 +9894,22 @@ mod tests {
         assert_eq!(
             human_readable_path(Path::new("/home/alice/artifact.resym")),
             "/home/alice/artifact.resym"
+        );
+    }
+
+    #[test]
+    fn overview_source_presentation_is_compact_and_retains_the_exact_human_path() {
+        let local = Path::new(r"\\?\C:\Users\alice\work\milestone2-symbolized.exe");
+        let runner = Path::new(r"\\?\D:\hostedtoolcache\runner\milestone2-symbolized.exe");
+
+        assert_eq!(active_binary_path_text(local), "milestone2-symbolized.exe");
+        assert_eq!(
+            active_binary_path_text(local),
+            active_binary_path_text(runner)
+        );
+        assert_eq!(
+            active_binary_path_hover_text(&human_readable_path(local)),
+            r"Exact active binary path: C:\Users\alice\work\milestone2-symbolized.exe"
         );
     }
 
