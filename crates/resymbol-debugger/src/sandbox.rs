@@ -1099,7 +1099,6 @@ impl SandboxFailure {
             } if binary_id == &expected.binary_id && helper_build == &expected.helper_build => {
                 match retained_target_creation {
                     Some(retained) if target_creation == retained => Ok(()),
-                    None if target_creation == &SandboxTargetCreationOutcome::NotCreated => Ok(()),
                     _ => Err(SandboxFailureValidationError::TargetCreationOutcome),
                 }
             }
@@ -1509,7 +1508,6 @@ impl SandboxMachine {
         self.target_creation.as_ref()
     }
 
-    #[must_use]
     pub(crate) fn failure_target_creation(
         &self,
     ) -> Result<&SandboxTargetCreationOutcome, SandboxMachineError> {
@@ -2287,32 +2285,37 @@ mod tests {
             SandboxFailureStage::Provisioning,
             SandboxFailureKind::HelperFailure,
         );
+        let retained = SandboxTargetCreationOutcome::NotCreated;
+        assert_eq!(
+            failure.validate_against_expected(&expected, None),
+            Err(SandboxFailureValidationError::TargetCreationOutcome)
+        );
         failure
-            .validate_against_expected(&expected, None)
+            .validate_against_expected(&expected, Some(&retained))
             .expect("exact failure binding");
 
         let mut changed = failure.clone();
         changed.session_id = SessionId::new(expected.session_id.get() + 1).expect("session");
         assert_eq!(
-            changed.validate_against_expected(&expected, None),
+            changed.validate_against_expected(&expected, Some(&retained)),
             Err(SandboxFailureValidationError::Session)
         );
         let mut changed = failure.clone();
         changed.provisioning_epoch = ProvisioningEpoch::new("f".repeat(64)).expect("epoch");
         assert_eq!(
-            changed.validate_against_expected(&expected, None),
+            changed.validate_against_expected(&expected, Some(&retained)),
             Err(SandboxFailureValidationError::ProvisioningEpoch)
         );
         let mut changed = failure.clone();
         changed.policy_digest = PolicyDigest::new("f".repeat(64)).expect("digest");
         assert_eq!(
-            changed.validate_against_expected(&expected, None),
+            changed.validate_against_expected(&expected, Some(&retained)),
             Err(SandboxFailureValidationError::PolicyDigest)
         );
         let mut changed = failure.clone();
         changed.provider = SandboxProviderSelection::HyperV;
         assert_eq!(
-            changed.validate_against_expected(&expected, None),
+            changed.validate_against_expected(&expected, Some(&retained)),
             Err(SandboxFailureValidationError::Provider)
         );
         let mut changed = failure.clone();
@@ -2321,7 +2324,7 @@ mod tests {
         };
         *binary_id = BinaryId::digest(b"another image");
         assert_eq!(
-            changed.validate_against_expected(&expected, None),
+            changed.validate_against_expected(&expected, Some(&retained)),
             Err(SandboxFailureValidationError::BinaryIdentity)
         );
         let mut changed = failure.clone();
@@ -2330,7 +2333,7 @@ mod tests {
         };
         *helper_build = HelperBuildId::new("another-helper").expect("helper");
         assert_eq!(
-            changed.validate_against_expected(&expected, None),
+            changed.validate_against_expected(&expected, Some(&retained)),
             Err(SandboxFailureValidationError::HelperBuild)
         );
         let mut changed = failure.clone();
@@ -2344,7 +2347,7 @@ mod tests {
             process: process_for(&expected),
         };
         assert_eq!(
-            changed.validate_against_expected(&expected, None),
+            changed.validate_against_expected(&expected, Some(&retained)),
             Err(SandboxFailureValidationError::TargetCreationOutcome)
         );
         let mut changed = failure;
@@ -2357,7 +2360,7 @@ mod tests {
             mode: AttachMode::Debug,
         };
         assert_eq!(
-            changed.validate_against_expected(&expected, None),
+            changed.validate_against_expected(&expected, Some(&retained)),
             Err(SandboxFailureValidationError::ContextKind)
         );
     }

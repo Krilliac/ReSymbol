@@ -68,8 +68,10 @@ rejects missing, mismatched, or replayed evidence before resume or release. Befo
 failure, a trusted host path must explicitly retain `NotCreated` or `Created` with that exact process
 identity; the binder rejects an unknown result. Processless cleanup is valid only after exact
 `NotCreated` evidence has been validated and retained; omission of a target state leaves the outcome
-unknown and fails closed. Attestation and cleanup evidence carry the same
-fresh epoch to reject replay across otherwise identical provisioning attempts. The wire accepts
+unknown and fails closed. A received failure event can only confirm the controller's already-retained
+outcome; it cannot establish `NotCreated` or mint processless-cleanup authority. Attestation and
+cleanup evidence carry the same fresh epoch to reject replay across otherwise identical provisioning
+attempts. The wire accepts
 exactly debugger protocol 1.3 and rejects 1.2 before negotiation because the older schema cannot
 represent these required fields. Raw expected-attestation and cleanup comparison helpers are
 crate-private; public acceptance always compares against reducer-retained identity. Identifier

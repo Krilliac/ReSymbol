@@ -4251,29 +4251,30 @@ mod tests {
     }
 
     #[test]
-    fn exact_discovery_failure_rejection_is_diagnostic_only() {
+    fn inbound_discovery_failure_cannot_mint_not_created_state() {
         let mut client = scripted_client(ScriptedAttack::FailedRejection);
         client
             .begin_session(session_id(), provisioning_epoch(), helper_build())
             .unwrap();
 
-        let receipt = client
-            .submit(DebugCommand::Open(sandbox_target()))
-            .expect("discovery failure is rollback-safe");
-        assert!(matches!(receipt.outcome, CommandOutcome::Rejected { .. }));
-        assert!(receipt.events.iter().any(|event| matches!(
-            &event.event,
-            DebugEvent::SandboxLifecycle(SandboxLifecycleEvent::Failed(failure))
-                if failure.stage == SandboxFailureStage::Discovery
-                    && failure.detail.as_str() == TEST_SANDBOX_FAILURE_DETAIL
-        )));
         assert_eq!(
-            client.session_state().map(SessionState::kind),
-            Some(SessionStateKind::Idle)
+            client.submit(DebugCommand::Open(sandbox_target())),
+            Err(DebugHostClientError::SessionMachine(
+                SessionMachineError::SandboxFailure(
+                    SandboxFailureValidationError::TargetCreationOutcome
+                )
+            ))
         );
+        assert_eq!(client.connection_state(), ClientConnectionState::Failed);
+        let session = client
+            .session
+            .as_ref()
+            .expect("session remains fail-closed");
+        assert_eq!(session.reducer.state().kind(), SessionStateKind::Opening);
+        assert_eq!(session.reducer.sandbox_target_creation_outcome(), None);
         assert_eq!(
-            client.connection_state(),
-            ClientConnectionState::SessionOpen
+            client.submit(DebugCommand::Open(sandbox_target())),
+            Err(DebugHostClientError::ConnectionFailed)
         );
     }
 
@@ -4298,13 +4299,14 @@ mod tests {
         extra_effect
             .begin_session(session_id(), provisioning_epoch(), helper_build())
             .unwrap();
-        assert!(matches!(
+        assert_eq!(
             extra_effect.submit(DebugCommand::Open(sandbox_target())),
-            Err(DebugHostClientError::UnexpectedCommandEvidence {
-                command_id,
-                evidence: "sandbox-failure-phase",
-            }) if command_id.get() == 1
-        ));
+            Err(DebugHostClientError::SessionMachine(
+                SessionMachineError::SandboxFailure(
+                    SandboxFailureValidationError::TargetCreationOutcome
+                )
+            ))
+        );
         assert_eq!(
             extra_effect.connection_state(),
             ClientConnectionState::Failed
@@ -4313,56 +4315,48 @@ mod tests {
             extra_effect.session_state().map(SessionState::kind),
             Some(SessionStateKind::Idle)
         );
+        let failed_session = extra_effect
+            .session
+            .as_ref()
+            .expect("failed connection retains speculative reducer evidence");
+        assert_eq!(
+            failed_session.reducer.state().kind(),
+            SessionStateKind::Opening
+        );
+        assert_eq!(
+            failed_session.reducer.sandbox_target_creation_outcome(),
+            None
+        );
     }
 
     #[test]
-    fn provisioning_failure_retains_cleanup_ownership_until_exact_close() {
+    fn remote_provisioning_failure_cannot_mint_processless_cleanup_ownership() {
         let mut client = scripted_client(ScriptedAttack::ProvisioningFailureThenCleanup);
         client
             .begin_session(session_id(), provisioning_epoch(), helper_build())
             .unwrap();
 
-        let receipt = client
-            .submit(DebugCommand::Open(sandbox_target()))
-            .expect("resource-owning failure is represented exactly");
-        assert!(matches!(receipt.outcome, CommandOutcome::Rejected { .. }));
         assert_eq!(
-            client.session_state().map(SessionState::kind),
-            Some(SessionStateKind::Failed)
+            client.submit(DebugCommand::Open(sandbox_target())),
+            Err(DebugHostClientError::SessionMachine(
+                SessionMachineError::SandboxFailure(
+                    SandboxFailureValidationError::TargetCreationOutcome
+                )
+            ))
         );
-        assert_eq!(
-            client.connection_state(),
-            ClientConnectionState::SessionOpen
-        );
+        assert_eq!(client.connection_state(), ClientConnectionState::Failed);
         let session = client
             .session
             .as_ref()
-            .expect("failed session remains owned");
+            .expect("failed connection retains its reducer evidence");
         assert!(session.reducer.expected_attestation().is_some());
-        assert_eq!(
-            session.reducer.sandbox_state(),
-            Some(SandboxLifecycleState::Cleanup)
-        );
+        assert_eq!(session.reducer.sandbox_target_creation_outcome(), None);
         assert!(!session.sandbox_cleanup_verified);
-
-        let failed = client.session_state().expect("failed state").state_token();
-        let close = client
-            .submit(DebugCommand::Close { state: failed })
-            .expect("cleanup-required failure can close with exact receipt");
-        assert_eq!(close.outcome, CommandOutcome::Succeeded);
+        let opening = client.session_state().expect("opening state").state_token();
         assert_eq!(
-            client.session_state().map(SessionState::kind),
-            Some(SessionStateKind::Closed)
+            client.submit(DebugCommand::Close { state: opening }),
+            Err(DebugHostClientError::ConnectionFailed)
         );
-        assert!(
-            client
-                .session
-                .as_ref()
-                .expect("closed session remains owned until release")
-                .sandbox_cleanup_verified
-        );
-        client.release_closed_session().expect("verified release");
-        assert_eq!(client.connection_state(), ClientConnectionState::Connected);
     }
 
     #[test]
@@ -4394,13 +4388,14 @@ mod tests {
         contradictory
             .begin_session(session_id(), provisioning_epoch(), helper_build())
             .unwrap();
-        assert!(matches!(
+        assert_eq!(
             contradictory.submit(DebugCommand::Open(sandbox_target())),
-            Err(DebugHostClientError::UnexpectedCommandEvidence {
-                evidence: "sandbox-rejection-diagnostic",
-                ..
-            })
-        ));
+            Err(DebugHostClientError::SessionMachine(
+                SessionMachineError::SandboxFailure(
+                    SandboxFailureValidationError::TargetCreationOutcome
+                )
+            ))
+        );
         assert_eq!(
             contradictory.connection_state(),
             ClientConnectionState::Failed
