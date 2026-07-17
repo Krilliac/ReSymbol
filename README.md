@@ -80,6 +80,16 @@ The current alpha implements and tests an end-to-end, deliberately narrow analys
   attest containment. The Address Space reader serves at most 256 bytes from the frozen exact source
   through the in-process offline host; it does not open a process or claim a live mapping. See
   [the debugger and sandbox architecture](docs/debugger-sandbox.md);
+- a UI-neutral, same-size static patch service for exact PE source snapshots. An immutable patch
+  plan is bound to the complete source `BinaryIdentity`; each labeled NOP-instruction or general
+  byte replacement resolves an executable, fully file-backed RVA to its exact file offset and
+  retains the expected original bytes. Plans are deterministically ordered and bounded, reject
+  duplicate, overlapping, unbacked, virtual-tail, non-executable, and out-of-image ranges, and
+  compare every expected span before producing a distinct patched image. Publication stages,
+  flushes, and synchronizes the complete image beside its destination before a create-new,
+  no-clobber publish. The source is never rewritten. A patched PE may no longer have a valid
+  Authenticode signature or PE checksum; ReSymbol reports both caveats and does not repair,
+  recompute, or re-sign either one;
 - a deterministic, debugger-neutral export projection plus `resymbol export`, which writes the
   projection as JSON, renders a bounded human-readable Markdown report, emits deterministic
   Microsoft-linker-style MAP text for compatible tools, creates an exact-RSDS public-symbol PDB
@@ -369,6 +379,14 @@ The workbench opens
 current `.resym` packages and creates new `.resym`, neutral JSON, Markdown, MAP, public-symbol PDB,
 IDA Python, or Ghidra Java artifacts. It does not execute plugins, migrate legacy packages, or
 overwrite an output or review-sidecar file.
+
+Static frontends build `StaticPatchEditRequest` values, freeze them with `StaticPatchPlan::new`,
+and publish through `AppServices::publish_static_patch_new`. The plan accepts only same-size edits
+in fully file-backed executable PE ranges and remains bound to the analysis SHA-256, size, format,
+architecture, and image base. Applying it rechecks the retained exact source identity and every
+expected byte before allocating and changing a separate output image. Publishing never overwrites
+the source or an existing destination. Patched outputs carry explicit warnings that Authenticode
+signature validity and the PE checksum may have been invalidated; neither is repaired or re-signed.
 
 The main review views stay on one responsive tab row at the default viewport and collapse into an
 explicit all-view selector at the documented minimum size. Use **Ctrl+Tab** or

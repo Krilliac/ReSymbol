@@ -8,6 +8,15 @@ prereleases; breaking changes remain explicit.
 
 ### Added
 
+- Added a UI-independent, same-size static PE patch subsystem. Immutable plans bind to the full
+  source binary identity and retain deterministic labeled NOP-instruction or general-byte edits
+  with exact RVA, derived file offset, expected bytes, and equal-length replacement bytes. Bounded
+  validation rejects empty, duplicate, overlapping, out-of-image, cross-section, non-executable,
+  unbacked, and virtual-tail edits before compare-before-write application creates a separate
+  deterministic output image. `AppServices` can stage, flush, synchronize, and create-new publish
+  that image without modifying the source or replacing an existing target; failed staging is
+  cleaned automatically. Every result explicitly warns that Authenticode signature validity and
+  the PE checksum may be invalidated, and ReSymbol does not repair, recompute, or re-sign them.
 - Added a responsive, keyboard-first workbench navigation slice. The default 1440x900 review shell
   keeps all eight main views on one compact row and fits all six Function columns with both side
   panels open; the documented 1024x680 minimum uses an explicit all-view selector and a labeled
@@ -428,6 +437,12 @@ schema versions independently.
 
 ### Safety and limits
 
+- Static patch plans retain at most 1,024 edits, 4 KiB per general edit, 15 bytes per x86
+  instruction-to-NOP edit, and 1 MiB of aggregate replacement bytes. They accept only equal-length
+  changes to one fully file-backed executable PE section,
+  verify the exact source size and SHA-256 before checking every expected byte, and mutate only a
+  newly allocated output image. Same-directory staged publication is no-clobber; it does not make
+  a patched executable trusted, signed, checksum-correct, safe to run, or semantically valid.
 - macOS executable-plugin containment now observes direct-child exit with a `kqueue` process filter,
   terminates the still-stable process group, and only then reaps the leader. XNU registration
   races resolve through an already-exited path that also kills the group before collecting status,
