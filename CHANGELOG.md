@@ -285,7 +285,7 @@ prereleases; breaking changes remain explicit.
   size rules. `resymbol export --fail-on-loss` rejects neutral-warning or target-loss occurrences
   before rendering and publication, while every successful export prints both totals.
 - Added optional `resymbol inspect PACKAGE --binary EXACT_ORIGINAL_BINARY` verification for package
-  schemas 1 through 10. Inspection validates the package first, then requires the supplied file's
+  schemas 1 through 13. Inspection validates the package first, then requires the supplied file's
   exact size and SHA-256 to match before any inspection output reaches stdout. Failures report on
   stderr. Human summaries add
   `source binary: <canonical-path>` and `identity gate: matched`; `--json` remains pure package JSON.
@@ -321,8 +321,8 @@ prereleases; breaking changes remain explicit.
   exact-length binary reader. Its 1 GiB default gate checks size before fallible allocation, probes
   one byte beyond the declared length, and hashes the same retained snapshot used for identity-bound
   PDB rendering.
-- Bumped the debugger wire and typed-command protocol to 1.2. Sandbox failures now bind the exact
-  session, provisioning epoch, policy digest, provider, and launch binary/helper or inherited
+- Protocol 1.3 retains and extends the exact sandbox-failure binding introduced in 1.2. Failures
+  bind the exact session, provisioning epoch, policy digest, provider, and launch binary/helper or inherited
   process/mode context. The controller validates an exact command-stage-kind-phase matrix before
   rollback or retaining failed ownership. Cleanup providers can additionally report a bounded
   `CleanupAttemptFailed` event with an exact incomplete receipt and advisory retryability; only a
@@ -337,7 +337,7 @@ prereleases; breaking changes remain explicit.
   and no longer quarantine the plugin artifact.
 - Raised the pinned Rust source-build toolchain and workspace MSRV to 1.86 for the Component Model
   host. Ordinary release users and users of the bundled WASM example still need no compiler.
-- New `.resym` analyses use package schema 11. Schema 4 introduced the `function-pointer`
+- New `.resym` analyses use package schema 13. Schema 4 introduced the `function-pointer`
   control-flow target, which persists both the read-only slot RVA and resolved function RVA and
   requires a paired same-site slot data reference for a direct call but not for a pointer thunk.
   Schema 5 preserves a legacy 24-byte RTTI base-class descriptor with a null
@@ -349,7 +349,9 @@ prereleases; breaking changes remain explicit.
   inventory. Schema 9 adds load-config size and GuardFlags state plus the ordered GFIDS inventory.
   Schema 10 adds the ordered Guard address-taken IAT, long-jump, and EH-continuation inventories.
   Schema 11 adds checked storage RVAs for the security cookie and the GuardCF check/dispatch
-  function-pointer slots. Its `load_config_security_anchors` object is serialized even when empty;
+  function-pointer slots. Schema 12 adds checked XFG and CastGuard storage anchors, and schema 13
+  adds the checked GuardMemcpy function-pointer-slot anchor. Their versioned objects are serialized
+  even when empty;
   each version-introducing inventory or object remains an explicit anti-relabel compatibility marker.
 - The debugger-neutral JSON projection now uses schema 6. Schema 4 added attributed string and
   data-reference arrays to schema 3's entry attribution and control-flow relationships; schema 5
@@ -386,7 +388,7 @@ schema versions independently.
 
 ### Compatibility
 
-- The CLI can inspect and export package schemas 1 through 10 through explicit, validated in-memory
+- The CLI can inspect and export package schemas 1 through 13 through explicit, validated in-memory
   compatibility paths. It revalidates persisted metadata, plugin runs and claims, binary binding,
   and rebuilds the deterministic base graph; it does not rewrite a legacy package. `inspect --json`
   preserves the validated original representation instead of mislabeling migrated content.
@@ -409,9 +411,10 @@ schema versions independently.
   security-cookie and GuardCF check/dispatch pointer-slot storage RVAs.
   Schemas 1 through 6 report TLS callback recovery unavailable, schemas 1 through 7 report
   delay-import recovery unavailable, and schemas 1 through 8 report GuardCF recovery unavailable;
-  schemas 1 through 9 report modern Guard target inventories unavailable, and schemas 1 through 10
-  report load-config security anchors unavailable. None can be synthesized
-  during loading. Reanalyze the exact original binary to create schema 11
+  schemas 1 through 9 report modern Guard target inventories unavailable, schemas 1 through 10
+  report load-config security anchors unavailable, schemas 1 through 11 report XFG/CastGuard
+  anchors unavailable, and schemas 1 through 12 report the GuardMemcpy anchor unavailable. None can
+  be synthesized during loading. Reanalyze the exact original binary to create schema 13
   with current recovery. The
   reader rejects schema 2 or 3 envelopes containing schema-4
   function-pointer targets in base relationships,
@@ -421,24 +424,28 @@ schema versions independently.
   source that depends on schema-6 transitive endpoint seeding, and rejects schema 1-through-6
   envelopes containing schema-7 TLS callback state or callback-only base thunk seeds. It also
   rejects schema 1-through-7 envelopes containing the exact schema-8 base-analysis `delay_imports`
-  inventory key or `directories.delay_imports` directory key. Schemas 8 through 11 require that
+  inventory key or `directories.delay_imports` directory key. Schemas 8 through 13 require that
   explicit inventory marker, even when empty. Changing only the envelope label is never migration.
   Schemas 1 through 8 also reject schema-9 load-config/GuardCF fields,
-  `directories.load_config`, and core `pe-guard-cf-function` claims. Schemas 9 through 11 require the explicit
-  `guard_cf_functions` inventory even when empty.
+  `directories.load_config`, and core `pe-guard-cf-function` claims. Schemas 9 through 13 require
+  the explicit `guard_cf_functions` inventory even when empty.
   Schemas 1 through 9 reject schema-10 Guard address-taken IAT, long-jump, and EH-continuation
-  table-RVA and inventory fields. Schemas 10 and 11 require all three inventory arrays even when empty.
+  table-RVA and inventory fields. Schemas 10 through 13 require all three inventory arrays even
+  when empty.
   Schemas 1 through 10 reject the exact schema-11 `load_config_security_anchors` base-analysis key;
-  schema 11 requires that value to be an object even when all anchors are absent.
-- Package schema 11 and neutral projection schema 6 are independent version domains. Generic
+  schemas 11 through 13 require that value to be an object even when all anchors are absent. Schemas
+  1 through 11 reject the schema-12 `load_config_xfg_anchors` key; schemas 12 and 13 require that
+  value to be an object even when all anchors are absent. Schemas 1 through 12 reject the schema-13
+  `load_config_guard_memcpy_anchor` key; schema 13 requires an object even when the anchor is absent.
+- Package schema 13 and neutral projection schema 6 are independent version domains. Generic
   package readers still require an explicit compatibility range and application-defined payload
   migration to accept an older schema.
 - Markdown export is presentation-only and does not change either version domain: new analyses
-  continue to use package schema 11 and the neutral projection continues to use schema 6.
+  continue to use package schema 13 and the neutral projection continues to use schema 6.
 - MAP export consumes the current validated session and neutral projection without adding fields to
-  package schema 11 or projection schema 6.
+  package schema 13 or projection schema 6.
 - PDB export consumes the same current session and projection plus a byte-backed inspection of the
-  exact original PE. It does not add fields to package schema 11 or projection schema 6.
+  exact original PE. It does not add fields to package schema 13 or projection schema 6.
 - The external plugin wire remains protocol 1.0. Dual-layout RTTI recovery changes deterministic
   base-analysis/package content but adds no plugin assertion or control-flow target shape.
   Transitive built-in thunk discovery likewise composes existing exact `thunk-target` claims and
@@ -454,6 +461,8 @@ schema versions independently.
   control-flow target shape, and leave those API, wire, and projection versions unchanged.
   Schema 11 load-config security anchors are likewise package-only additive `symbols.read` state;
   they add no claims or thunk seeds and leave those API, wire, and projection versions unchanged.
+  Schema 12 XFG/CastGuard anchors and schema 13 GuardMemcpy anchor follow the same package-only
+  boundary and likewise leave the plugin API, wire, and projection versions unchanged.
 - Managed-plugin execution adds no package-schema field: successful runs and validated claims use
   the existing `AnalysisSession` plugin ledger and claim representation.
 - WASM-plugin execution likewise adds no package-schema field. It uses the existing plugin ledger,
