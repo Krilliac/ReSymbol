@@ -1781,7 +1781,7 @@ mod tests {
             LiveTargetBinding::new(
                 identity.clone(),
                 BinaryId::digest(b"wrong live image"),
-                MemoryAddress::new(0x1400_0000_0),
+                MemoryAddress::new(0x0001_4000_0000),
                 0x1000,
             ),
             Err(LiveTargetBindingError::MainModuleIdentityMismatch)
@@ -1799,7 +1799,7 @@ mod tests {
             LiveTargetBinding::new(
                 identity.clone(),
                 binary_id.clone(),
-                MemoryAddress::new(0x1400_0000_0),
+                MemoryAddress::new(0x0001_4000_0000),
                 0,
             ),
             Err(LiveTargetBindingError::EmptyImage)
@@ -1824,7 +1824,7 @@ mod tests {
         let binding = LiveTargetBinding::new(
             process(binary_id.clone()),
             binary_id,
-            MemoryAddress::new(0x1800_0000_0),
+            MemoryAddress::new(0x0001_8000_0000),
             0x5000,
         )
         .expect("valid binding");
