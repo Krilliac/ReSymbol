@@ -13,8 +13,9 @@ use crate::authorization::{
 use crate::identity::{HostRiskLeaseId, ProvisioningEpoch, SandboxOwnershipLeaseId};
 use crate::protocol::{
     AttachMode, AttachScope, CommandEnvelope, CommandId, DebugCommand, DebugTargetRequest,
-    ProcessId, ProcessIdentity, ProtocolValidationError, RunId, RunToken, SessionId, SessionState,
-    SessionStateKind, StateGeneration, StateToken, StopId, StopReason, StopToken, ThreadId,
+    LiveTargetBinding, LiveTargetBindingError, MemoryAddress, ProcessId, ProcessIdentity,
+    ProtocolValidationError, RunId, RunToken, SessionId, SessionState, SessionStateKind,
+    StateGeneration, StateToken, StopId, StopReason, StopToken, ThreadId,
 };
 use crate::sandbox::{
     CleanupOutcome, DiagnosticText, ExpectedSandboxAttestation, HelperBuildId,
@@ -149,6 +150,80 @@ pub struct RemoteCommandCheckpoint {
     sandbox: Option<SandboxMachine>,
     inherited_sandbox: Option<SandboxOwnershipBinding>,
     post_accept: RemoteCommandPostAcceptState,
+}
+
+/// Host-local, one-use proof that the session reducer accepted one exact live
+/// memory write for one exact debug-attached process and module mapping.
+///
+/// This ticket is deliberately neither cloneable nor serializable. It is not a
+/// wire credential and has no public constructor. A host-local `SessionWorker`
+/// obtains it only from [`SessionMachine::begin_live_memory_write`] and moves it
+/// directly into the selected provider while retaining the separate
+/// [`RemoteCommandCheckpoint`] for commit or rejection.
+///
+/// ```compile_fail
+/// use resymbol_debugger::ValidatedLiveMemoryWrite;
+///
+/// fn require_clone<T: Clone>() {}
+/// require_clone::<ValidatedLiveMemoryWrite>();
+/// ```
+///
+/// ```compile_fail
+/// use resymbol_debugger::ValidatedLiveMemoryWrite;
+///
+/// fn require_serde<T: serde::Serialize + serde::de::DeserializeOwned>() {}
+/// require_serde::<ValidatedLiveMemoryWrite>();
+/// ```
+#[derive(Debug)]
+#[must_use = "validated live-memory writes must be dispatched or explicitly abandoned with their checkpoint"]
+pub struct ValidatedLiveMemoryWrite {
+    reducer_instance: Arc<ReducerInstanceBinding>,
+    command_id: CommandId,
+    stop: StopToken,
+    binding: LiveTargetBinding,
+    address: MemoryAddress,
+    expected: Vec<u8>,
+    replacement: Vec<u8>,
+}
+
+impl ValidatedLiveMemoryWrite {
+    #[must_use]
+    pub const fn command_id(&self) -> CommandId {
+        self.command_id
+    }
+
+    #[must_use]
+    pub const fn stop(&self) -> StopToken {
+        self.stop
+    }
+
+    #[must_use]
+    pub const fn binding(&self) -> &LiveTargetBinding {
+        &self.binding
+    }
+
+    #[must_use]
+    pub const fn address(&self) -> MemoryAddress {
+        self.address
+    }
+
+    #[must_use]
+    pub fn expected(&self) -> &[u8] {
+        &self.expected
+    }
+
+    #[must_use]
+    pub fn replacement(&self) -> &[u8] {
+        &self.replacement
+    }
+
+    /// Confirms that this ticket and checkpoint came from the same reducer
+    /// acceptance. This is correlation evidence, not a second authority.
+    #[must_use]
+    pub fn matches_checkpoint(&self, checkpoint: &RemoteCommandCheckpoint) -> bool {
+        self.command_id == checkpoint.command_id
+            && Arc::ptr_eq(&self.reducer_instance, &checkpoint.reducer_instance)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -427,6 +502,76 @@ impl SessionMachine {
             inherited_sandbox,
             post_accept: self.remote_command_post_accept_state(),
         })
+    }
+
+    /// Accepts one exact debug-attach memory-write command and returns its
+    /// reducer checkpoint plus a separate provider-consumable ticket.
+    ///
+    /// The command variant, accepted attach mode, and exact attached process
+    /// binding are checked before reducer state or command-ID watermarks can
+    /// change. Ordinary remote-command validation then proves the old
+    /// [`StopToken`] is the reducer's current stop and refreshes stopped state.
+    ///
+    /// `[host SessionWorker thread]`
+    pub fn begin_live_memory_write(
+        &mut self,
+        envelope: CommandEnvelope,
+        binding: LiveTargetBinding,
+    ) -> Result<(RemoteCommandCheckpoint, ValidatedLiveMemoryWrite), SessionMachineError> {
+        let (address, expected_len) = match &envelope.command {
+            DebugCommand::WriteMemory {
+                address, expected, ..
+            } => (*address, expected.len()),
+            _ => {
+                return Err(SessionMachineError::Protocol(
+                    ProtocolValidationError::NotMemoryWriteCommand,
+                ));
+            }
+        };
+        envelope.validate()?;
+        let attached_process_matches = match self.target.as_ref() {
+            Some(DebugTargetRequest::Attach(target)) if target.mode == AttachMode::Debug => {
+                let process = match &target.scope {
+                    AttachScope::Host { process, .. }
+                    | AttachScope::OwnedSandbox { process, .. } => process,
+                };
+                process == binding.process()
+            }
+            _ => return Err(SessionMachineError::LiveMemoryWriteRequiresDebugAttach),
+        };
+        if !attached_process_matches {
+            return Err(SessionMachineError::LiveMemoryWriteTargetMismatch);
+        }
+        binding
+            .rva_for_address_span(address, expected_len as u64)
+            .map_err(SessionMachineError::LiveMemoryWriteImageSpan)?;
+
+        let checkpoint = self.begin_remote_command(&envelope)?;
+        let CommandEnvelope {
+            command_id,
+            command,
+            ..
+        } = envelope;
+        let DebugCommand::WriteMemory {
+            stop,
+            address,
+            expected,
+            replacement,
+        } = command
+        else {
+            unreachable!("memory-write variant checked before reducer acceptance")
+        };
+        let ticket = ValidatedLiveMemoryWrite {
+            reducer_instance: Arc::clone(&checkpoint.reducer_instance),
+            command_id,
+            stop,
+            binding,
+            address,
+            expected,
+            replacement,
+        };
+        debug_assert!(ticket.matches_checkpoint(&checkpoint));
+        Ok((checkpoint, ticket))
     }
 
     /// Resolves a remote command whose response has been fully validated and
@@ -1249,6 +1394,12 @@ pub enum SessionMachineError {
     AttestationNotAccepted,
     #[error("execution is unavailable for this target mode")]
     ExecutionUnavailable,
+    #[error("live-memory writes require an accepted debug-mode attach target")]
+    LiveMemoryWriteRequiresDebugAttach,
+    #[error("live-memory write binding does not match the exact accepted attach process")]
+    LiveMemoryWriteTargetMismatch,
+    #[error("live-memory write span is outside the exact attached main image: {0}")]
+    LiveMemoryWriteImageSpan(#[source] LiveTargetBindingError),
     #[error("sandbox-owned execution cannot detach without cleanup")]
     SandboxDetachForbidden,
     #[error("sandbox close requires an exact cleanup receipt")]
@@ -1406,6 +1557,52 @@ mod tests {
             scope,
             mode: AttachMode::Debug,
         })
+    }
+
+    fn open_debug_attach_and_stop(
+        machine: &mut SessionMachine,
+        process: ProcessIdentity,
+    ) -> StopToken {
+        let risk_lease = host_risk_lease_id('d');
+        machine
+            .register_host_risk_lease(HostRiskLease::new_for_test(
+                risk_lease.clone(),
+                session_id(),
+                provisioning_epoch(),
+                HostRiskOperation::Attach {
+                    process: process.clone(),
+                    mode: AttachMode::Debug,
+                },
+            ))
+            .expect("register exact attach authority");
+        let initial = machine.state().state_token();
+        machine
+            .accept_command(&command(
+                1,
+                initial,
+                DebugCommand::Open(attach_target(AttachScope::Host {
+                    process,
+                    risk_lease,
+                })),
+            ))
+            .expect("accept exact debug attach");
+        machine
+            .mark_stopped(StopReason::Initial, ThreadId::new(7).expect("thread id"))
+            .expect("attach reaches stopped state");
+        let SessionState::Stopped { token, .. } = machine.state() else {
+            panic!("debug attach is stopped")
+        };
+        *token
+    }
+
+    fn live_binding(process: ProcessIdentity, image_base: u64) -> LiveTargetBinding {
+        LiveTargetBinding::new(
+            process.clone(),
+            process.binary_id,
+            MemoryAddress::new(image_base),
+            0x5000,
+        )
+        .expect("valid live target binding")
     }
 
     fn command(id: u64, expected_state: StateToken, command: DebugCommand) -> CommandEnvelope {
@@ -1697,6 +1894,169 @@ mod tests {
             )),
             Err(SessionMachineError::NonMonotonicCommandId { .. })
         ));
+    }
+
+    #[test]
+    fn live_memory_write_ticket_retains_exact_accepted_command_and_checkpoint_binding() {
+        let process = process_identity(44, 55, b"validated live write target");
+        let binding = live_binding(process.clone(), 0x1_4000_0000);
+        let mut machine = machine();
+        let stop = open_debug_attach_and_stop(&mut machine, process);
+        let address = binding
+            .address_for_rva_span(0x40, 4)
+            .expect("write span is in the main image");
+        let envelope = command(
+            2,
+            stop.state,
+            DebugCommand::WriteMemory {
+                stop,
+                address,
+                expected: b"old!".to_vec(),
+                replacement: b"new!".to_vec(),
+            },
+        );
+
+        let (checkpoint, ticket) = machine
+            .begin_live_memory_write(envelope, binding.clone())
+            .expect("exact stopped debug-attach write is accepted");
+
+        assert!(ticket.matches_checkpoint(&checkpoint));
+        assert_eq!(ticket.command_id(), CommandId::new(2).expect("command id"));
+        assert_eq!(ticket.stop(), stop);
+        assert_eq!(ticket.binding(), &binding);
+        assert_eq!(ticket.address(), address);
+        assert_eq!(ticket.expected(), b"old!");
+        assert_eq!(ticket.replacement(), b"new!");
+        let SessionState::Stopped {
+            token: refreshed, ..
+        } = machine.state()
+        else {
+            panic!("write acceptance retains stopped state")
+        };
+        assert_ne!(*refreshed, stop);
+        machine
+            .commit_remote_command(checkpoint, ticket.command_id())
+            .expect("exact checkpoint commits");
+    }
+
+    #[test]
+    fn live_memory_write_binding_mismatch_does_not_consume_command_or_change_state() {
+        let process = process_identity(44, 55, b"validated live write target");
+        let binding = live_binding(process.clone(), 0x1_4000_0000);
+        let wrong_process = process_identity(45, 56, b"other live write target");
+        let wrong_binding = live_binding(wrong_process, 0x1_5000_0000);
+        let mut machine = machine();
+        let stop = open_debug_attach_and_stop(&mut machine, process);
+        let state_before = machine.state().clone();
+        let address = binding
+            .address_for_rva_span(0x40, 4)
+            .expect("write span is in the main image");
+        let write = || {
+            command(
+                2,
+                stop.state,
+                DebugCommand::WriteMemory {
+                    stop,
+                    address,
+                    expected: b"old!".to_vec(),
+                    replacement: b"new!".to_vec(),
+                },
+            )
+        };
+
+        assert!(matches!(
+            machine.begin_live_memory_write(write(), wrong_binding),
+            Err(SessionMachineError::LiveMemoryWriteTargetMismatch)
+        ));
+        assert_eq!(machine.state(), &state_before);
+        assert_eq!(
+            machine.last_command_id(),
+            Some(CommandId::new(1).expect("open command id"))
+        );
+
+        let (checkpoint, ticket) = machine
+            .begin_live_memory_write(write(), binding)
+            .expect("same command id remains available after pre-accept rejection");
+        machine
+            .reject_remote_command(checkpoint, ticket.command_id())
+            .expect("undispatched ticket may restore visible state");
+    }
+
+    #[test]
+    fn live_memory_write_span_rejection_does_not_consume_command_or_change_state() {
+        let process = process_identity(44, 55, b"validated live write target");
+        let binding = live_binding(process.clone(), 0x1_4000_0000);
+        let mut machine = machine();
+        let stop = open_debug_attach_and_stop(&mut machine, process);
+        let state_before = machine.state().clone();
+        let address = MemoryAddress::new(
+            binding.actual_image_base().get() + u64::from(binding.size_of_image()) - 1,
+        );
+
+        let error = machine
+            .begin_live_memory_write(
+                command(
+                    2,
+                    stop.state,
+                    DebugCommand::WriteMemory {
+                        stop,
+                        address,
+                        expected: vec![0x74, 0x0a],
+                        replacement: vec![0x90, 0x90],
+                    },
+                ),
+                binding,
+            )
+            .expect_err("span crossing the exact image end is rejected before acceptance");
+
+        assert!(matches!(
+            error,
+            SessionMachineError::LiveMemoryWriteImageSpan(
+                LiveTargetBindingError::AddressSpanOutOfImage { .. }
+            )
+        ));
+        assert_eq!(machine.state(), &state_before);
+        assert_eq!(
+            machine.last_command_id(),
+            Some(CommandId::new(1).expect("open command id"))
+        );
+    }
+
+    #[test]
+    fn live_memory_write_ticket_does_not_match_an_identical_distinct_reducer_checkpoint() {
+        let process = process_identity(44, 55, b"validated live write target");
+        let binding = live_binding(process.clone(), 0x1_4000_0000);
+        let address = binding
+            .address_for_rva_span(0x40, 2)
+            .expect("write span is in the main image");
+        let mut first = machine();
+        let first_stop = open_debug_attach_and_stop(&mut first, process.clone());
+        let mut second = machine();
+        let second_stop = open_debug_attach_and_stop(&mut second, process);
+        let write = |stop: StopToken| {
+            command(
+                2,
+                stop.state,
+                DebugCommand::WriteMemory {
+                    stop,
+                    address,
+                    expected: vec![0x74, 0x0a],
+                    replacement: vec![0x90, 0x90],
+                },
+            )
+        };
+
+        let (first_checkpoint, first_ticket) = first
+            .begin_live_memory_write(write(first_stop), binding.clone())
+            .expect("first reducer accepts write");
+        let (second_checkpoint, second_ticket) = second
+            .begin_live_memory_write(write(second_stop), binding)
+            .expect("second reducer accepts identical write metadata");
+
+        assert!(first_ticket.matches_checkpoint(&first_checkpoint));
+        assert!(second_ticket.matches_checkpoint(&second_checkpoint));
+        assert!(!first_ticket.matches_checkpoint(&second_checkpoint));
+        assert!(!second_ticket.matches_checkpoint(&first_checkpoint));
     }
 
     #[test]

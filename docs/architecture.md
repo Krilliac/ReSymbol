@@ -664,11 +664,17 @@ ceiling. It accepts only the exact create-process PID/base evidence, closes only
 load-DLL `hFile` values, retains the initial first-chance breakpoint, and exposes bounded exact
 main-image reads and bounded, equal-length exact compare-before-write mutations while that event
 remains pending.
-The write requires exact retained `PendingStopEvidence` plus a logical `StopToken` already validated
-by an authenticated outer session; the low-level worker does not store or validate that token and
-carries it only into protocol failure evidence. Mutation rights are opened only for that one
-main-image-bounded transaction. Safe no-effect rejection or rollback-safe failure leaves the worker
-stopped; invalid evidence, target invalidation, or non-rollback-safe recovery enters
+The write requires exact retained `PendingStopEvidence` plus a move-only
+`ValidatedLiveMemoryWrite`. The host-local reducer mints that non-serialized ticket only after
+accepting the exact command for its current stopped token and after proving that the supplied
+`LiveTargetBinding` names the exact process from an accepted debug-mode attach and contains the full
+expected-byte span. The separate
+`RemoteCommandCheckpoint` remains with the session worker for commit or rejection. The Windows
+worker borrows that checkpoint, rejects unless it matches the ticket's reducer allocation and
+command ID, then consumes the ticket by value and independently compares its complete binding with
+the retained provider binding before opening mutation rights for that one main-image-bounded
+transaction. Safe no-effect rejection or rollback-safe failure leaves the worker stopped; invalid
+evidence, target invalidation, or non-rollback-safe recovery enters
 `CleanupRequired` with the operating-system event retained for explicit teardown. Its platform-aware
 capability report marks
 `HostAttach`, `LiveMemoryRead`, and `LiveMemoryWrite` available on Windows. Explicit detach first
@@ -679,7 +685,8 @@ never cleanup proof.
 This is an in-process low-level API, not a Windows debugger-host helper process, authenticated live
 transport, or UI bridge. `attach_after_authorization` records a mandatory caller prerequisite but
 does not authenticate or enforce it; a future authenticated `SessionWorker` must consume exact
-host-risk authority before invoking it. No AppContainer or Hyper-V provider, guest agent, live
+host-risk authority, validate the command with its host-local reducer, and present the exact retained
+checkpoint with ticket dispatch. No AppContainer or Hyper-V provider, guest agent, live
 launch, breakpoint engine, register service, execution stepping, Workbench live-memory bridge, or
 sandbox provisioning is implemented. The offline host, low-level attach/read/write foundation, and
 readiness UI therefore remain far short of a working malware sandbox or end-user live debugger.

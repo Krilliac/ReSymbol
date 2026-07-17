@@ -20,13 +20,13 @@ use std::{marker::PhantomData, rc::Rc};
 
 use resymbol_debugger::{
     CapabilityAvailability, CapabilityReport, CapabilityStatus, CapabilityUnavailableCode,
-    DebugCapability, LiveTargetBinding, LiveTargetBindingError, MemoryAddress, MemoryWriteFailure,
-    ProcessId, ThreadId,
+    CommandId, DebugCapability, LiveTargetBinding, LiveTargetBindingError, MemoryAddress,
+    MemoryWriteFailure, ProcessId, RemoteCommandCheckpoint, StopToken, ThreadId,
 };
 use thiserror::Error;
 
 #[cfg(any(windows, test))]
-use resymbol_debugger::{MAX_MEMORY_WRITE_BYTES, StopToken};
+use resymbol_debugger::{MAX_MEMORY_WRITE_BYTES, ValidatedLiveMemoryWrite};
 
 #[cfg(windows)]
 mod windows;
@@ -185,11 +185,13 @@ pub struct PendingStopEvidence {
 
 /// Exact low-level receipt for one stopped main-image mutation.
 ///
-/// This is correlated to the retained operating-system event and deliberately
-/// contains no logical stop token; this provider does not validate one.
+/// This is correlated to the retained operating-system event and echoes the
+/// command ID and old logical stop from the consumed reducer-validated ticket.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[must_use = "a successful stopped-memory mutation must be correlated and published"]
 pub struct DebugHostMemoryWriteReceipt {
+    command_id: CommandId,
+    stop: StopToken,
     pending_stop: PendingStopEvidence,
     binding: LiveTargetBinding,
     address: MemoryAddress,
@@ -198,6 +200,16 @@ pub struct DebugHostMemoryWriteReceipt {
 }
 
 impl DebugHostMemoryWriteReceipt {
+    #[must_use]
+    pub const fn command_id(&self) -> CommandId {
+        self.command_id
+    }
+
+    #[must_use]
+    pub const fn stop(&self) -> StopToken {
+        self.stop
+    }
+
     pub const fn pending_stop(&self) -> &PendingStopEvidence {
         &self.pending_stop
     }
@@ -230,6 +242,10 @@ pub enum DebugHostMemoryWriteError {
     NotStopped,
     #[error("the caller's operating-system stop evidence is not the worker's retained stop")]
     PendingStopMismatch,
+    #[error("the validated write ticket does not match the presented reducer checkpoint")]
+    CheckpointMismatch,
+    #[error("the validated write binding is not the worker's retained live target")]
+    TargetBindingMismatch,
     #[error("live memory write was safely rejected without a target-side effect: {detail}")]
     SafeNoEffectRejected { detail: String },
     #[error("live memory mutation failed with protocol evidence: {failure:?}")]
@@ -247,6 +263,24 @@ pub enum DebugHostMemoryWriteError {
         pending_stop: PendingStopEvidence,
         detail: String,
     },
+}
+
+impl DebugHostMemoryWriteError {
+    /// Whether an authenticated session worker may reject the exact remote
+    /// checkpoint and restore its pre-command visible state without hiding a
+    /// possible target-side effect.
+    #[must_use]
+    pub const fn permits_effect_free_checkpoint_rejection(&self) -> bool {
+        match self {
+            Self::NotStopped
+            | Self::PendingStopMismatch
+            | Self::CheckpointMismatch
+            | Self::TargetBindingMismatch
+            | Self::SafeNoEffectRejected { .. } => true,
+            Self::MemoryWriteFailed { failure, .. } => failure.recovery.is_rollback_safe(),
+            Self::InvalidEvidence { .. } | Self::TargetInvalidated { .. } => false,
+        }
+    }
 }
 
 impl PendingStopEvidence {
@@ -802,17 +836,19 @@ impl<B: DebugBackend> DebugHostWorker<B> {
 
     /// Writes only while the exact operating-system stop remains retained.
     ///
-    /// `validated_protocol_stop` is carried solely into protocol failure
-    /// evidence. This low-level worker neither stores nor validates it; the
-    /// authenticated outer session worker must do that before calling.
+    /// The move-only ticket proves host-local reducer acceptance. Its reducer
+    /// allocation and command ID must match the separately retained checkpoint.
+    /// This worker still revalidates its exact target binding and retained
+    /// operating-system stop before any provider write is attempted.
     fn write_stopped_main_image_after_protocol_validation(
         &mut self,
         expected_pending_stop: &PendingStopEvidence,
-        validated_protocol_stop: StopToken,
-        address: MemoryAddress,
-        expected_bytes: &[u8],
-        replacement: &[u8],
+        checkpoint: &RemoteCommandCheckpoint,
+        write: ValidatedLiveMemoryWrite,
     ) -> Result<DebugHostMemoryWriteReceipt, DebugHostMemoryWriteError> {
+        if !write.matches_checkpoint(checkpoint) {
+            return Err(DebugHostMemoryWriteError::CheckpointMismatch);
+        }
         let (binding, pending_stop) = match &self.state {
             WorkerState::Attached(AttachedState {
                 binding,
@@ -828,6 +864,14 @@ impl<B: DebugBackend> DebugHostWorker<B> {
         if &pending_stop != expected_pending_stop {
             return Err(DebugHostMemoryWriteError::PendingStopMismatch);
         }
+        if write.binding() != &binding {
+            return Err(DebugHostMemoryWriteError::TargetBindingMismatch);
+        }
+        let command_id = write.command_id();
+        let validated_protocol_stop = write.stop();
+        let address = write.address();
+        let expected_bytes = write.expected();
+        let replacement = write.replacement();
         let rejection = if expected_bytes.is_empty() {
             Some("live memory writes must replace at least one byte".to_owned())
         } else if expected_bytes.len() > MAX_MEMORY_WRITE_BYTES {
@@ -868,6 +912,8 @@ impl<B: DebugBackend> DebugHostWorker<B> {
                     && receipt.bytes_written == replacement.len() =>
             {
                 Ok(DebugHostMemoryWriteReceipt {
+                    command_id,
+                    stop: validated_protocol_stop,
                     pending_stop,
                     binding,
                     address,
@@ -1179,18 +1225,21 @@ mod tests {
 
     use resymbol_core::BinaryId;
     use resymbol_debugger::{
-        CapabilityAvailability, DebugCapability, LiveTargetBinding, MemoryAddress,
-        MemoryWriteFailure, MemoryWriteRecovery, MemoryWriteStage, ProcessId, ProcessIdentity,
-        ProcessStartKey, SessionId, StateGeneration, StateToken, StopId, StopToken,
+        AttachMode, AttachScope, AttachTarget, CapabilityAvailability, CommandEnvelope, CommandId,
+        DebugCapability, DebugCommand, DebugTargetRequest, HelperBuildId, HostRiskLeaseIssuer,
+        HostRiskOperation, LiveTargetBinding, MemoryAddress, MemoryWriteFailure,
+        MemoryWriteRecovery, MemoryWriteStage, ProcessId, ProcessIdentity, ProcessStartKey,
+        ProtocolVersion, ProvisioningEpoch, RemoteCommandCheckpoint, SessionId, SessionMachine,
+        SessionState, StopId, StopReason, StopToken, ThreadId, ValidatedLiveMemoryWrite,
     };
 
     use super::{
         BackendFailure, BackendWriteFailure, BackendWriteReceipt, CleanupStepOutcome,
         ContinueDisposition, DebugAttachLimits, DebugAttachLimitsError, DebugBackend,
         DebugEventKind, DebugEventRecord, DebugFileToken, DebugHostError,
-        DebugHostMemoryWriteError, DebugHostWorker, DebugHostWorkerState,
-        EXCEPTION_BREAKPOINT_CODE, MAX_INITIAL_DRAIN_TIMEOUT, PendingStopEvidence,
-        phase_one_capability_report_for_platform,
+        DebugHostMemoryWriteError, DebugHostMemoryWriteReceipt, DebugHostWorker,
+        DebugHostWorkerState, EXCEPTION_BREAKPOINT_CODE, MAX_INITIAL_DRAIN_TIMEOUT,
+        PendingStopEvidence, phase_one_capability_report_for_platform,
     };
 
     const PID: u32 = 41;
@@ -1412,13 +1461,127 @@ mod tests {
         .expect("valid deterministic binding")
     }
 
-    fn protocol_stop() -> StopToken {
-        StopToken {
-            state: StateToken {
-                session_id: SessionId::new(1).expect("nonzero test session"),
-                generation: StateGeneration::new(1).expect("nonzero test generation"),
+    struct ValidatedWriteTransaction {
+        machine: SessionMachine,
+        checkpoint: Option<RemoteCommandCheckpoint>,
+        ticket: Option<ValidatedLiveMemoryWrite>,
+    }
+
+    impl ValidatedWriteTransaction {
+        fn stop(&self) -> StopToken {
+            self.ticket.as_ref().expect("ticket available").stop()
+        }
+
+        fn command_id(&self) -> CommandId {
+            self.ticket.as_ref().expect("ticket available").command_id()
+        }
+
+        fn checkpoint(&self) -> &RemoteCommandCheckpoint {
+            self.checkpoint.as_ref().expect("checkpoint available")
+        }
+
+        fn take(&mut self) -> ValidatedLiveMemoryWrite {
+            self.ticket.take().expect("ticket is consumed once")
+        }
+
+        fn dispatch(
+            &mut self,
+            worker: &mut DebugHostWorker<FakeBackend>,
+            pending_stop: &PendingStopEvidence,
+        ) -> Result<DebugHostMemoryWriteReceipt, DebugHostMemoryWriteError> {
+            let write = self.take();
+            worker.write_stopped_main_image_after_protocol_validation(
+                pending_stop,
+                self.checkpoint(),
+                write,
+            )
+        }
+
+        fn reject(&mut self, command_id: CommandId) -> SessionState {
+            let checkpoint = self.checkpoint.take().expect("checkpoint is resolved once");
+            self.machine
+                .reject_remote_command(checkpoint, command_id)
+                .expect("effect-free error rejects exact checkpoint")
+                .clone()
+        }
+
+        fn state(&self) -> &SessionState {
+            self.machine.state()
+        }
+    }
+
+    fn validated_write(
+        binding: &LiveTargetBinding,
+        address: MemoryAddress,
+        expected: &[u8],
+        replacement: &[u8],
+    ) -> ValidatedWriteTransaction {
+        let session_id = SessionId::new(1).expect("nonzero test session");
+        let provisioning_epoch =
+            ProvisioningEpoch::new("a".repeat(64)).expect("test provisioning epoch");
+        let helper_build =
+            HelperBuildId::new("windows-debug-host-test").expect("test helper build");
+        let process = binding.process().clone();
+        let mut issuer = HostRiskLeaseIssuer::new().expect("host-risk issuer");
+        let (lease, _verifier) = issuer
+            .issue(
+                session_id,
+                provisioning_epoch.clone(),
+                HostRiskOperation::Attach {
+                    process: process.clone(),
+                    mode: AttachMode::Debug,
+                },
+            )
+            .expect("issue exact attach authority");
+        let risk_lease = lease.id().clone();
+        let mut machine = SessionMachine::new(session_id, provisioning_epoch, helper_build);
+        machine
+            .register_host_risk_lease(lease)
+            .expect("register exact attach authority");
+        let initial = machine.state().state_token();
+        machine
+            .accept_command(&CommandEnvelope {
+                version: ProtocolVersion::current(),
+                command_id: CommandId::new(1).expect("open command id"),
+                session_id: Some(session_id),
+                expected_state: Some(initial),
+                command: DebugCommand::Open(DebugTargetRequest::Attach(AttachTarget {
+                    scope: AttachScope::Host {
+                        process,
+                        risk_lease,
+                    },
+                    mode: AttachMode::Debug,
+                })),
+            })
+            .expect("accept exact debug attach");
+        machine
+            .mark_stopped(
+                StopReason::Initial,
+                ThreadId::new(STOP_THREAD_ID).expect("stopped thread id"),
+            )
+            .expect("debug attach reaches stopped state");
+        let SessionState::Stopped { token: stop, .. } = machine.state() else {
+            panic!("debug attach is stopped")
+        };
+        let envelope = CommandEnvelope {
+            version: ProtocolVersion::current(),
+            command_id: CommandId::new(2).expect("write command id"),
+            session_id: Some(session_id),
+            expected_state: Some(stop.state),
+            command: DebugCommand::WriteMemory {
+                stop: *stop,
+                address,
+                expected: expected.to_vec(),
+                replacement: replacement.to_vec(),
             },
-            stop_id: StopId::new(1).expect("nonzero test stop"),
+        };
+        let (checkpoint, ticket) = machine
+            .begin_live_memory_write(envelope, binding.clone())
+            .expect("mint exact validated write ticket");
+        ValidatedWriteTransaction {
+            machine,
+            checkpoint: Some(checkpoint),
+            ticket: Some(ticket),
         }
     }
 
@@ -1752,16 +1915,15 @@ mod tests {
             .expect("attach reaches initial breakpoint");
         let operations_before = worker.backend.operations.len();
         let address = MemoryAddress::new(IMAGE_BASE + 0x40);
-        let receipt = worker
-            .write_stopped_main_image_after_protocol_validation(
-                &pending_stop,
-                protocol_stop(),
-                address,
-                b"phas",
-                b"PHAS",
-            )
+        let mut transaction = validated_write(&binding, address, b"phas", b"PHAS");
+        let command_id = transaction.ticket.as_ref().expect("ticket").command_id();
+        let protocol_stop = transaction.stop();
+        let receipt = transaction
+            .dispatch(&mut worker, &pending_stop)
             .expect("exact stopped write succeeds");
 
+        assert_eq!(receipt.command_id(), command_id);
+        assert_eq!(receipt.stop(), protocol_stop);
         assert_eq!(receipt.pending_stop(), &pending_stop);
         assert_eq!(receipt.binding(), &binding);
         assert_eq!(receipt.address(), address);
@@ -1787,19 +1949,22 @@ mod tests {
         let pending_stop = worker
             .attach_after_authorization(&binding, DebugAttachLimits::default())
             .expect("attach reaches initial breakpoint");
-        let error = worker
-            .write_stopped_main_image_after_protocol_validation(
-                &pending_stop,
-                protocol_stop(),
-                MemoryAddress::new(IMAGE_BASE + 0x40),
-                b"nope",
-                b"NOPE",
-            )
+        let address = MemoryAddress::new(IMAGE_BASE + 0x40);
+        let mut transaction = validated_write(&binding, address, b"nope", b"NOPE");
+        let command_id = transaction.command_id();
+        let old_stop = transaction.stop();
+        let error = transaction
+            .dispatch(&mut worker, &pending_stop)
             .expect_err("compare mismatch rejects without mutation");
 
         assert!(matches!(
-            error,
+            &error,
             DebugHostMemoryWriteError::SafeNoEffectRejected { .. }
+        ));
+        assert!(error.permits_effect_free_checkpoint_rejection());
+        assert!(matches!(
+            transaction.reject(command_id),
+            SessionState::Stopped { token, .. } if token == old_stop
         ));
         assert_eq!(worker.state(), DebugHostWorkerState::Stopped);
         assert_eq!(worker.pending_stop(), Some(&pending_stop));
@@ -1818,15 +1983,11 @@ mod tests {
             thread_id: pending_stop.thread_id(),
             exception_address: MemoryAddress::new(pending_stop.exception_address().get() + 1),
         };
+        let address = MemoryAddress::new(IMAGE_BASE + 0x40);
+        let mut transaction = validated_write(&binding, address, b"phas", b"PHAS");
 
-        let error = worker
-            .write_stopped_main_image_after_protocol_validation(
-                &mismatched,
-                protocol_stop(),
-                MemoryAddress::new(IMAGE_BASE + 0x40),
-                b"phas",
-                b"PHAS",
-            )
+        let error = transaction
+            .dispatch(&mut worker, &mismatched)
             .expect_err("stale OS-stop evidence cannot authorize a write");
 
         assert!(matches!(
@@ -1838,6 +1999,72 @@ mod tests {
     }
 
     #[test]
+    fn mismatched_validated_target_binding_is_rejected_before_backend_write() {
+        let binding = test_binding();
+        let mut worker = attached_worker();
+        let pending_stop = worker
+            .attach_after_authorization(&binding, DebugAttachLimits::default())
+            .expect("attach reaches initial breakpoint");
+        let operations_before = worker.backend.operations.len();
+        let other_binary = BinaryId::digest(b"different validated target");
+        let other_binding = LiveTargetBinding::new(
+            ProcessIdentity {
+                process_id: ProcessId::new(PID + 1).expect("other PID"),
+                start_key: ProcessStartKey::new(78).expect("other start key"),
+                binary_id: other_binary.clone(),
+            },
+            other_binary,
+            MemoryAddress::new(IMAGE_BASE),
+            IMAGE_SIZE,
+        )
+        .expect("other exact binding");
+        let address = MemoryAddress::new(IMAGE_BASE + 0x40);
+        let mut transaction = validated_write(&other_binding, address, b"phas", b"PHAS");
+
+        let error = transaction
+            .dispatch(&mut worker, &pending_stop)
+            .expect_err("ticket for another target cannot authorize this worker");
+
+        assert!(matches!(
+            error,
+            DebugHostMemoryWriteError::TargetBindingMismatch
+        ));
+        assert_eq!(worker.backend.operations.len(), operations_before);
+        assert_eq!(worker.state(), DebugHostWorkerState::Stopped);
+        assert_eq!(worker.pending_stop(), Some(&pending_stop));
+    }
+
+    #[test]
+    fn checkpoint_from_identical_distinct_reducer_is_rejected_before_backend_write() {
+        let binding = test_binding();
+        let mut worker = attached_worker();
+        let pending_stop = worker
+            .attach_after_authorization(&binding, DebugAttachLimits::default())
+            .expect("attach reaches initial breakpoint");
+        let operations_before = worker.backend.operations.len();
+        let address = MemoryAddress::new(IMAGE_BASE + 0x40);
+        let mut ticket_transaction = validated_write(&binding, address, b"phas", b"PHAS");
+        let checkpoint_transaction = validated_write(&binding, address, b"phas", b"PHAS");
+        let write = ticket_transaction.take();
+
+        let error = worker
+            .write_stopped_main_image_after_protocol_validation(
+                &pending_stop,
+                checkpoint_transaction.checkpoint(),
+                write,
+            )
+            .expect_err("an identical command from another reducer allocation is not authority");
+
+        assert!(matches!(
+            error,
+            DebugHostMemoryWriteError::CheckpointMismatch
+        ));
+        assert_eq!(worker.backend.operations.len(), operations_before);
+        assert_eq!(worker.state(), DebugHostWorkerState::Stopped);
+        assert_eq!(worker.pending_stop(), Some(&pending_stop));
+    }
+
+    #[test]
     fn write_rejects_when_no_operating_system_stop_is_retained() {
         let mut worker = DebugHostWorker::new(FakeBackend::new([]));
         let pending_stop = PendingStopEvidence {
@@ -1845,14 +2072,11 @@ mod tests {
             thread_id: resymbol_debugger::ThreadId::new(STOP_THREAD_ID).expect("nonzero thread"),
             exception_address: MemoryAddress::new(IMAGE_BASE + 1),
         };
-        let error = worker
-            .write_stopped_main_image_after_protocol_validation(
-                &pending_stop,
-                protocol_stop(),
-                MemoryAddress::new(IMAGE_BASE + 0x40),
-                b"phas",
-                b"PHAS",
-            )
+        let binding = test_binding();
+        let address = MemoryAddress::new(IMAGE_BASE + 0x40);
+        let mut transaction = validated_write(&binding, address, b"phas", b"PHAS");
+        let error = transaction
+            .dispatch(&mut worker, &pending_stop)
             .expect_err("detached worker cannot write");
 
         assert!(matches!(error, DebugHostMemoryWriteError::NotStopped));
@@ -1862,12 +2086,14 @@ mod tests {
     #[test]
     fn indeterminate_write_failure_enters_cleanup_required_with_event_retained() {
         let binding = test_binding();
-        let protocol_stop = protocol_stop();
         let address = MemoryAddress::new(IMAGE_BASE + 0x40);
         let mut worker = attached_worker();
         let pending_stop = worker
             .attach_after_authorization(&binding, DebugAttachLimits::default())
             .expect("attach reaches initial breakpoint");
+        let mut transaction = validated_write(&binding, address, b"phas", b"PHAS");
+        let protocol_stop = transaction.stop();
+        let accepted_state = transaction.state().clone();
         worker.backend.write_failure =
             Some(BackendWriteFailure::MemoryWriteFailed(MemoryWriteFailure {
                 stop: protocol_stop,
@@ -1882,20 +2108,16 @@ mod tests {
                 detail: "injected indeterminate mutation".to_owned(),
             }));
 
-        let error = worker
-            .write_stopped_main_image_after_protocol_validation(
-                &pending_stop,
-                protocol_stop,
-                address,
-                b"phas",
-                b"PHAS",
-            )
+        let error = transaction
+            .dispatch(&mut worker, &pending_stop)
             .expect_err("indeterminate write cannot publish success");
 
         assert!(matches!(
-            error,
+            &error,
             DebugHostMemoryWriteError::MemoryWriteFailed { .. }
         ));
+        assert!(!error.permits_effect_free_checkpoint_rejection());
+        assert_eq!(transaction.state(), &accepted_state);
         assert_eq!(worker.state(), DebugHostWorkerState::CleanupRequired);
         assert!(worker.attached().pending.is_some());
         worker.detach().expect("cleanup ability remains retained");
@@ -1910,15 +2132,11 @@ mod tests {
             .attach_after_authorization(&binding, DebugAttachLimits::default())
             .expect("attach reaches initial breakpoint");
         worker.backend.corrupt_write_receipt = true;
+        let address = MemoryAddress::new(IMAGE_BASE + 0x40);
+        let mut transaction = validated_write(&binding, address, b"phas", b"PHAS");
 
-        let error = worker
-            .write_stopped_main_image_after_protocol_validation(
-                &pending_stop,
-                protocol_stop(),
-                MemoryAddress::new(IMAGE_BASE + 0x40),
-                b"phas",
-                b"PHAS",
-            )
+        let error = transaction
+            .dispatch(&mut worker, &pending_stop)
             .expect_err("uncorrelated success evidence cannot be published");
 
         assert!(matches!(
@@ -1939,21 +2157,20 @@ mod tests {
         worker.backend.write_failure = Some(BackendWriteFailure::InvalidEvidence {
             detail: "injected malformed protocol evidence".to_owned(),
         });
+        let address = MemoryAddress::new(IMAGE_BASE + 0x40);
+        let mut transaction = validated_write(&binding, address, b"phas", b"PHAS");
+        let accepted_state = transaction.state().clone();
 
-        let error = worker
-            .write_stopped_main_image_after_protocol_validation(
-                &pending_stop,
-                protocol_stop(),
-                MemoryAddress::new(IMAGE_BASE + 0x40),
-                b"phas",
-                b"PHAS",
-            )
+        let error = transaction
+            .dispatch(&mut worker, &pending_stop)
             .expect_err("invalid failure evidence cannot be published");
 
         assert!(matches!(
-            error,
+            &error,
             DebugHostMemoryWriteError::InvalidEvidence { .. }
         ));
+        assert!(!error.permits_effect_free_checkpoint_rejection());
+        assert_eq!(transaction.state(), &accepted_state);
         assert_eq!(worker.state(), DebugHostWorkerState::CleanupRequired);
         assert!(worker.attached().pending.is_some());
     }
@@ -1961,8 +2178,9 @@ mod tests {
     #[test]
     fn mismatched_memory_write_failure_evidence_fails_closed() {
         let binding = test_binding();
-        let protocol_stop = protocol_stop();
         let address = MemoryAddress::new(IMAGE_BASE + 0x40);
+        let seed_transaction = validated_write(&binding, address, b"phas", b"PHAS");
+        let protocol_stop = seed_transaction.stop();
         let mismatched_stop = StopToken {
             stop_id: StopId::new(protocol_stop.stop_id.get() + 1).expect("nonzero stop"),
             ..protocol_stop
@@ -2012,15 +2230,10 @@ mod tests {
                 .attach_after_authorization(&binding, DebugAttachLimits::default())
                 .expect("attach reaches initial breakpoint");
             worker.backend.write_failure = Some(BackendWriteFailure::MemoryWriteFailed(failure));
+            let mut transaction = validated_write(&binding, address, b"phas", b"PHAS");
 
-            let error = worker
-                .write_stopped_main_image_after_protocol_validation(
-                    &pending_stop,
-                    protocol_stop,
-                    address,
-                    b"phas",
-                    b"PHAS",
-                )
+            let error = transaction
+                .dispatch(&mut worker, &pending_stop)
                 .unwrap_err();
 
             assert!(
@@ -2047,15 +2260,11 @@ mod tests {
         worker.backend.write_failure = Some(BackendWriteFailure::TargetInvalidated {
             detail: "injected process identity drift".to_owned(),
         });
+        let address = MemoryAddress::new(IMAGE_BASE + 0x40);
+        let mut transaction = validated_write(&binding, address, b"phas", b"PHAS");
 
-        let error = worker
-            .write_stopped_main_image_after_protocol_validation(
-                &pending_stop,
-                protocol_stop(),
-                MemoryAddress::new(IMAGE_BASE + 0x40),
-                b"phas",
-                b"PHAS",
-            )
+        let error = transaction
+            .dispatch(&mut worker, &pending_stop)
             .expect_err("identity drift cannot preserve stopped authority");
 
         assert!(matches!(
@@ -2069,12 +2278,13 @@ mod tests {
     #[test]
     fn unrestored_protection_enters_cleanup_required_even_before_write() {
         let binding = test_binding();
-        let protocol_stop = protocol_stop();
         let address = MemoryAddress::new(IMAGE_BASE + 0x40);
         let mut worker = attached_worker();
         let pending_stop = worker
             .attach_after_authorization(&binding, DebugAttachLimits::default())
             .expect("attach reaches initial breakpoint");
+        let mut transaction = validated_write(&binding, address, b"phas", b"PHAS");
+        let protocol_stop = transaction.stop();
         worker.backend.write_failure =
             Some(BackendWriteFailure::MemoryWriteFailed(MemoryWriteFailure {
                 stop: protocol_stop,
@@ -2087,14 +2297,8 @@ mod tests {
                 detail: "injected unrestored protection".to_owned(),
             }));
 
-        let error = worker
-            .write_stopped_main_image_after_protocol_validation(
-                &pending_stop,
-                protocol_stop,
-                address,
-                b"phas",
-                b"PHAS",
-            )
+        let error = transaction
+            .dispatch(&mut worker, &pending_stop)
             .expect_err("unrestored protection is not rollback-safe");
 
         assert!(matches!(
@@ -2121,12 +2325,14 @@ mod tests {
         ];
         for (stage, recovery) in cases {
             let binding = test_binding();
-            let protocol_stop = protocol_stop();
             let address = MemoryAddress::new(IMAGE_BASE + 0x40);
             let mut worker = attached_worker();
             let pending_stop = worker
                 .attach_after_authorization(&binding, DebugAttachLimits::default())
                 .expect("attach reaches initial breakpoint");
+            let mut transaction = validated_write(&binding, address, b"phas", b"PHAS");
+            let protocol_stop = transaction.stop();
+            let command_id = transaction.command_id();
             worker.backend.write_failure =
                 Some(BackendWriteFailure::MemoryWriteFailed(MemoryWriteFailure {
                     stop: protocol_stop,
@@ -2137,19 +2343,18 @@ mod tests {
                     detail: "injected rollback-safe mutation failure".to_owned(),
                 }));
 
-            let error = worker
-                .write_stopped_main_image_after_protocol_validation(
-                    &pending_stop,
-                    protocol_stop,
-                    address,
-                    b"phas",
-                    b"PHAS",
-                )
+            let error = transaction
+                .dispatch(&mut worker, &pending_stop)
                 .expect_err("failure evidence remains a failure");
 
             assert!(matches!(
-                error,
+                &error,
                 DebugHostMemoryWriteError::MemoryWriteFailed { .. }
+            ));
+            assert!(error.permits_effect_free_checkpoint_rejection());
+            assert!(matches!(
+                transaction.reject(command_id),
+                SessionState::Stopped { token, .. } if token == protocol_stop
             ));
             assert_eq!(worker.state(), DebugHostWorkerState::Stopped);
             assert_eq!(worker.pending_stop(), Some(&pending_stop));

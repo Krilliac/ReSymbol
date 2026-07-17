@@ -11,8 +11,11 @@ use std::{
 
 use resymbol_core::BinaryId;
 use resymbol_debugger::{
-    MemoryAddress, ProcessId, ProcessStartKey, SessionId, StateGeneration, StateToken, StopId,
-    StopToken,
+    AttachMode, AttachScope, AttachTarget, CommandEnvelope, CommandId, DebugCommand,
+    DebugTargetRequest, HelperBuildId, HostRiskLeaseIssuer, HostRiskOperation, LiveTargetBinding,
+    MemoryAddress, ProcessId, ProcessStartKey, ProtocolVersion, ProvisioningEpoch,
+    RemoteCommandCheckpoint, SessionId, SessionMachine, SessionState, StopReason, ThreadId,
+    ValidatedLiveMemoryWrite,
 };
 use resymbol_windows_debug_host::{
     DebugAttachLimits, DebugHostWorkerState, WindowsDebugHostWorker,
@@ -146,41 +149,38 @@ fn owned_child_attach_stopped_read_continue_and_detach() {
         EXPECTED_BYTES
     );
     let write_address = MemoryAddress::new(read_address);
-    let protocol_stop = protocol_stop();
+    let mut session = ValidatedWriteSession::new(&binding, stop.thread_id());
+    let (checkpoint, write) = session.begin_write(write_address, EXPECTED_BYTES, PATCHED_BYTES);
+    let protocol_stop = write.stop();
     let receipt = worker
-        .write_stopped_main_image_after_protocol_validation(
-            &stop,
-            protocol_stop,
-            write_address,
-            EXPECTED_BYTES,
-            PATCHED_BYTES,
-        )
+        .write_stopped_main_image_after_protocol_validation(&stop, &checkpoint, write)
         .expect("write exact bytes under retained attach stop");
+    assert_eq!(receipt.stop(), protocol_stop);
     assert_eq!(receipt.pending_stop(), &stop);
     assert_eq!(receipt.binding(), &binding);
     assert_eq!(receipt.address(), write_address);
     assert_eq!(receipt.before(), EXPECTED_BYTES);
     assert_eq!(receipt.after(), PATCHED_BYTES);
+    session.commit(checkpoint, receipt.command_id());
     assert_eq!(
         worker
             .read_stopped_main_image(write_address, PATCHED_BYTES.len())
             .expect("read patched bytes under retained attach stop"),
         PATCHED_BYTES
     );
+    let (restore_checkpoint, restore) =
+        session.begin_write(write_address, PATCHED_BYTES, EXPECTED_BYTES);
+    let restore_stop = restore.stop();
     let restore_receipt = worker
-        .write_stopped_main_image_after_protocol_validation(
-            &stop,
-            protocol_stop,
-            write_address,
-            PATCHED_BYTES,
-            EXPECTED_BYTES,
-        )
+        .write_stopped_main_image_after_protocol_validation(&stop, &restore_checkpoint, restore)
         .expect("restore exact fixture bytes under retained attach stop");
+    assert_eq!(restore_receipt.stop(), restore_stop);
     assert_eq!(restore_receipt.pending_stop(), &stop);
     assert_eq!(restore_receipt.binding(), &binding);
     assert_eq!(restore_receipt.address(), write_address);
     assert_eq!(restore_receipt.before(), PATCHED_BYTES);
     assert_eq!(restore_receipt.after(), EXPECTED_BYTES);
+    session.commit(restore_checkpoint, restore_receipt.command_id());
     assert_eq!(
         worker
             .read_stopped_main_image(write_address, EXPECTED_BYTES.len())
@@ -200,12 +200,95 @@ fn parse_hex(field: Option<&str>, label: &str) -> u64 {
         .unwrap_or_else(|error| panic!("fixture {label} is hexadecimal: {error}"))
 }
 
-fn protocol_stop() -> StopToken {
-    StopToken {
-        state: StateToken {
-            session_id: SessionId::new(1).expect("nonzero test session"),
-            generation: StateGeneration::new(1).expect("nonzero test generation"),
-        },
-        stop_id: StopId::new(1).expect("nonzero test stop"),
+struct ValidatedWriteSession {
+    machine: SessionMachine,
+    binding: LiveTargetBinding,
+    next_command_id: u64,
+}
+
+impl ValidatedWriteSession {
+    fn new(binding: &LiveTargetBinding, stopped_thread: ThreadId) -> Self {
+        let session_id = SessionId::new(1).expect("nonzero test session");
+        let provisioning_epoch =
+            ProvisioningEpoch::new("a".repeat(64)).expect("test provisioning epoch");
+        let helper_build =
+            HelperBuildId::new("windows-debug-host-owned-child").expect("test helper build");
+        let process = binding.process().clone();
+        let mut issuer = HostRiskLeaseIssuer::new().expect("host-risk issuer");
+        let (lease, _verifier) = issuer
+            .issue(
+                session_id,
+                provisioning_epoch.clone(),
+                HostRiskOperation::Attach {
+                    process: process.clone(),
+                    mode: AttachMode::Debug,
+                },
+            )
+            .expect("issue exact attach authority");
+        let risk_lease = lease.id().clone();
+        let mut machine = SessionMachine::new(session_id, provisioning_epoch, helper_build);
+        machine
+            .register_host_risk_lease(lease)
+            .expect("register exact attach authority");
+        let initial = machine.state().state_token();
+        machine
+            .accept_command(&CommandEnvelope {
+                version: ProtocolVersion::current(),
+                command_id: CommandId::new(1).expect("open command id"),
+                session_id: Some(session_id),
+                expected_state: Some(initial),
+                command: DebugCommand::Open(DebugTargetRequest::Attach(AttachTarget {
+                    scope: AttachScope::Host {
+                        process,
+                        risk_lease,
+                    },
+                    mode: AttachMode::Debug,
+                })),
+            })
+            .expect("accept exact debug attach");
+        machine
+            .mark_stopped(StopReason::Initial, stopped_thread)
+            .expect("debug attach reaches stopped state");
+        Self {
+            machine,
+            binding: binding.clone(),
+            next_command_id: 2,
+        }
+    }
+
+    fn begin_write(
+        &mut self,
+        address: MemoryAddress,
+        expected: &[u8],
+        replacement: &[u8],
+    ) -> (RemoteCommandCheckpoint, ValidatedLiveMemoryWrite) {
+        let SessionState::Stopped { token: stop, .. } = self.machine.state() else {
+            panic!("validated write session is stopped")
+        };
+        let command_id = CommandId::new(self.next_command_id).expect("write command id");
+        let envelope = CommandEnvelope {
+            version: ProtocolVersion::current(),
+            command_id,
+            session_id: Some(stop.state.session_id),
+            expected_state: Some(stop.state),
+            command: DebugCommand::WriteMemory {
+                stop: *stop,
+                address,
+                expected: expected.to_vec(),
+                replacement: replacement.to_vec(),
+            },
+        };
+        let transaction = self
+            .machine
+            .begin_live_memory_write(envelope, self.binding.clone())
+            .expect("mint exact validated write ticket");
+        self.next_command_id += 1;
+        transaction
+    }
+
+    fn commit(&mut self, checkpoint: RemoteCommandCheckpoint, command_id: CommandId) {
+        self.machine
+            .commit_remote_command(checkpoint, command_id)
+            .expect("commit exact write checkpoint");
     }
 }
