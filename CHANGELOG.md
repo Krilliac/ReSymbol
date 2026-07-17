@@ -8,6 +8,14 @@ prereleases; breaking changes remain explicit.
 
 ### Added
 
+- Added a responsive, keyboard-first workbench navigation slice. The default 1440x900 review shell
+  keeps all eight main views on one compact row and fits all six Function columns with both side
+  panels open; the documented 1024x680 minimum uses an explicit all-view selector and a labeled
+  horizontal Function-table overflow instead of hiding controls, while compact identity/activity
+  chrome preserves a usable row viewport. Ctrl+Tab and Ctrl+Shift+Tab cycle views, Ctrl+F focuses
+  Function search, and stable Up/Down, Page Up/Page Down, Home, and End
+  navigation follows the active filter and sort with a distinct focus outline and accessible row
+  state. Visual CI also captures the focused minimum-viewport state.
 - Added durable exact-claim review to the desktop workbench. Function name proposals retain their
   complete-claim fingerprint and provenance, while Accept Primary, Keep as Alias, Reject, optional
   rationale annotations, undo, and redo update a binary-bound ledger. Strict sidecar load,
@@ -90,9 +98,13 @@ prereleases; breaking changes remain explicit.
   own descendants through POSIX process groups or Windows Job Objects and terminate the owned tree
   on direct-child completion, deadline, stdout/stderr capture failure, or runtime drop. This is not
   filesystem, network, or authority sandboxing. Windows creates each child atomically inside a
-  preconfigured kill-on-close Job, restricts inheritance to the exact standard-stream handles,
-  verifies membership before returning, and has no spawn-then-assign fallback. A hostile POSIX
-  plugin/helper or descendant can still deliberately leave its process group or session.
+  preconfigured Job, explicitly terminates the Job during normal cleanup, retains kill-on-close as
+  an abrupt-parent fallback when no out-of-scope process holds a duplicate, restricts inheritance
+  to the exact standard-stream handles, verifies membership before returning, and has no
+  spawn-then-assign fallback. An active same-account process with sufficient process/handle rights
+  can still manipulate ReSymbol or its handles; defending against that actor requires a separate OS
+  authority boundary. A hostile POSIX plugin/helper or descendant can still deliberately leave its
+  process group or session.
 - Added bounded modern MSVC x64 Rev1 RTTI and vftable discovery, including validated stored type
   names, base-class records, virtual-slot targets, vftable names, and attributed function-to-class
   relationships. Base-class arrays may mix the legacy 24-byte descriptor with the 28-byte
@@ -235,6 +247,11 @@ prereleases; breaking changes remain explicit.
   slice deliberately omits private symbols, compilands, source lines, locals, prototypes, function
   extents, and types; ordinary generation requires no Visual Studio, DIA, LLVM, or compiler
   installation.
+- Added typed, deterministic export-loss reporting for JSON, Markdown, MAP, PDB, IDAPython, and
+  Ghidra Java. Stable machine codes aggregate bounded occurrence counts without per-symbol detail;
+  MAP/PDB and debugger-script reports share their writers' exact selection, collision, and function
+  size rules. `resymbol export --fail-on-loss` rejects neutral-warning or target-loss occurrences
+  before rendering and publication, while every successful export prints both totals.
 - Added optional `resymbol inspect PACKAGE --binary EXACT_ORIGINAL_BINARY` verification for package
   schemas 1 through 10. Inspection validates the package first, then requires the supplied file's
   exact size and SHA-256 to match before any inspection output reaches stdout. Failures report on

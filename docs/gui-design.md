@@ -101,6 +101,19 @@ the exposed columns operates on stable indexes without reordering the canonical 
 Addresses, sizes, hashes, and disassembly-oriented data use a readable monospace face; controls and
 prose use the normal UI face.
 
+The implemented responsive policy keeps all eight main views on one compact button row with the
+default 1440x900 viewport and both side panels open. Wider work areas restore full labels; the
+documented 1024x680 minimum uses one explicit selector containing every view rather than wrapping or
+hiding tabs. At that minimum, the identity header and activity-panel default also compact so the
+review table retains a usable row viewport. All six Function columns fit at the default viewport.
+Narrower tables retain readable column minimums behind a labeled horizontal overflow instead of
+dropping confidence, provenance, or size. **Ctrl+Tab** and **Ctrl+Shift+Tab** cycle views,
+**Ctrl+F** focuses Function search, and
+**Up/Down**, **Page Up/Page Down**, **Home**, and **End** move the stable selection through the active
+filtered and sorted order. The focused row has an independent high-contrast outline and exposes one
+screen-reader label containing its position, name, RVA, status, confidence, source, size, and
+selection state.
+
 Table status distinguishes at least verified/extracted results, conflicts, inferred hypotheses,
 review decisions, and automatic fallback labels. Plugin origin is provenance, not an epistemic
 status, and remains visible in the source column or badge. Confidence never acts as a substitute
@@ -352,9 +365,11 @@ The workbench is not feature-complete until all themes support:
 Confidence meters always include a numeric value. Progress bars include stage text and outcome.
 Tooltips supplement visible labels; they do not contain the only explanation of a status.
 
-The existence of the initial alpha shell does not mark this checklist complete. Keyboard traversal,
-assistive-technology naming, contrast, scaling, reduced motion, and high-contrast behavior remain
-workbench-completion and pre-1.0 requirements for every theme and workflow.
+The first responsive interaction slice now covers main-view cycling, Function search focus, stable
+Function-row movement, explicit row focus, and Function-row assistive naming. The existence of that
+slice does not mark the checklist complete: keyboard traversal for the project tree, splitters,
+graph, review actions, exports, and dialogs; broader assistive-technology naming; scaling; reduced
+motion; and high-contrast behavior remain workbench-completion and pre-1.0 requirements.
 
 ## Current boundaries and deliberately deferred work
 

@@ -10,6 +10,16 @@ const MAX_REPORT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ROWS_PER_SECTION: usize = 1_024;
 const MAX_ROWS_PER_SECTION_LABEL: &str = "1,024";
 const MAX_CELL_SOURCE_BYTES: usize = 256;
+const MAX_SUMMARY_VALUES: usize = 3;
+const MAX_SUMMARY_SOURCE_BYTES: usize = 80;
+
+#[derive(Debug, Default)]
+pub(crate) struct MarkdownLossMetrics {
+    pub(crate) rows_omitted: usize,
+    pub(crate) candidates_omitted: usize,
+    pub(crate) text_truncations: usize,
+    pub(crate) attributions_omitted: usize,
+}
 const TRUNCATION_MARKER: &str = "… [truncated]";
 
 /// Failure to render a bounded GitHub-Flavored Markdown report.
@@ -504,14 +514,14 @@ fn summarize_texts(label: &str, values: &[AttributedText]) -> Option<String> {
         summary.push_str(label);
         summary.push_str(": ");
     }
-    for (index, value) in values.iter().take(3).enumerate() {
+    for (index, value) in values.iter().take(MAX_SUMMARY_VALUES).enumerate() {
         if index != 0 {
             summary.push_str(", ");
         }
-        summary.push_str(&truncate_source(&value.text, 80));
+        summary.push_str(&truncate_source(&value.text, MAX_SUMMARY_SOURCE_BYTES));
     }
-    if values.len() > 3 {
-        summary.push_str(&format!(" (+{} more)", values.len() - 3));
+    if values.len() > MAX_SUMMARY_VALUES {
+        summary.push_str(&format!(" (+{} more)", values.len() - MAX_SUMMARY_VALUES));
     }
     Some(summary)
 }
@@ -632,6 +642,159 @@ fn truncate_source(value: &str, maximum: usize) -> String {
     let mut truncated = value[..boundary].to_owned();
     truncated.push_str(TRUNCATION_MARKER);
     truncated
+}
+
+/// Measure only presentation details that the Markdown writer actually drops.
+///
+/// This shares the writer's private limits and formatting helpers so the
+/// public target-loss report cannot drift from the rendered report.
+pub(crate) fn markdown_loss_metrics(projection: &ExportProjection) -> MarkdownLossMetrics {
+    let mut metrics = MarkdownLossMetrics::default();
+    for value in [
+        binary_format(&projection.binary.format),
+        projection.binary.architecture.clone(),
+    ] {
+        count_cell_truncation(&mut metrics, &value);
+    }
+
+    metrics.rows_omitted = [
+        projection.functions.len(),
+        projection.globals.len(),
+        projection.types.len(),
+        projection.strings.len(),
+        projection.direct_calls.len(),
+        projection.data_references.len(),
+        projection.thunks.len(),
+        projection.warnings.len(),
+    ]
+    .into_iter()
+    .map(|count| count.saturating_sub(MAX_ROWS_PER_SECTION))
+    .sum();
+
+    for function in projection.functions.iter().take(MAX_ROWS_PER_SECTION) {
+        count_summary_losses(&mut metrics, &function.alternate_names);
+        count_summary_losses(&mut metrics, &function.prototypes);
+        count_summary_losses(&mut metrics, &function.class_memberships);
+
+        let attribution = function_attribution(function);
+        let details = [
+            summarize_texts("aliases", &function.alternate_names),
+            summarize_texts("prototypes", &function.prototypes),
+            summarize_texts("classes", &function.class_memberships),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("; ");
+        for value in [
+            function
+                .selected_name
+                .as_ref()
+                .map_or_else(String::new, display_name),
+            attribution.map_or_else(String::new, confidence),
+            attribution.map_or_else(String::new, provenance),
+            details,
+        ] {
+            count_cell_truncation(&mut metrics, &value);
+        }
+        let total_attributions = usize::from(function.entry_attribution.is_some())
+            + usize::from(function.size_attribution.is_some())
+            + usize::from(function.selected_name.is_some())
+            + function.alternate_names.len()
+            + function.prototypes.len()
+            + function.class_memberships.len();
+        metrics.attributions_omitted +=
+            total_attributions.saturating_sub(usize::from(attribution.is_some()));
+    }
+
+    for global in projection.globals.iter().take(MAX_ROWS_PER_SECTION) {
+        count_summary_losses(&mut metrics, &global.alternate_names);
+        let attribution = global
+            .selected_name
+            .as_ref()
+            .map(|name| &name.source.attribution)
+            .or(global.size_attribution.as_ref());
+        for value in [
+            global
+                .selected_name
+                .as_ref()
+                .map_or_else(String::new, display_name),
+            attribution.map_or_else(String::new, confidence),
+            attribution.map_or_else(String::new, provenance),
+            summarize_texts("", &global.alternate_names).unwrap_or_default(),
+        ] {
+            count_cell_truncation(&mut metrics, &value);
+        }
+        let total_attributions = usize::from(global.size_attribution.is_some())
+            + usize::from(global.selected_name.is_some())
+            + global.alternate_names.len();
+        metrics.attributions_omitted +=
+            total_attributions.saturating_sub(usize::from(attribution.is_some()));
+    }
+
+    for value in projection.types.iter().take(MAX_ROWS_PER_SECTION) {
+        count_summary_losses(&mut metrics, &value.definitions);
+        count_summary_losses(&mut metrics, &value.alternate_names);
+        let attribution = value
+            .selected_name
+            .as_ref()
+            .map(|name| &name.source.attribution)
+            .or_else(|| value.definitions.first().map(|item| &item.attribution));
+        for cell in [
+            value.key.clone(),
+            value
+                .selected_name
+                .as_ref()
+                .map_or_else(String::new, display_name),
+            attribution.map_or_else(String::new, confidence),
+            attribution.map_or_else(String::new, provenance),
+            summarize_texts("", &value.definitions).unwrap_or_default(),
+            summarize_texts("", &value.alternate_names).unwrap_or_default(),
+        ] {
+            count_cell_truncation(&mut metrics, &cell);
+        }
+        let total_attributions = usize::from(value.selected_name.is_some())
+            + value.definitions.len()
+            + value.alternate_names.len();
+        metrics.attributions_omitted +=
+            total_attributions.saturating_sub(usize::from(attribution.is_some()));
+    }
+
+    for string in projection.strings.iter().take(MAX_ROWS_PER_SECTION) {
+        count_cell_truncation(&mut metrics, &string.value);
+        count_cell_truncation(&mut metrics, &provenance(&string.attribution));
+    }
+    for call in projection.direct_calls.iter().take(MAX_ROWS_PER_SECTION) {
+        count_cell_truncation(&mut metrics, &control_flow_target(&call.target));
+        count_cell_truncation(&mut metrics, &provenance(&call.attribution));
+    }
+    for reference in projection.data_references.iter().take(MAX_ROWS_PER_SECTION) {
+        count_cell_truncation(&mut metrics, &provenance(&reference.attribution));
+    }
+    for thunk in projection.thunks.iter().take(MAX_ROWS_PER_SECTION) {
+        count_cell_truncation(&mut metrics, &control_flow_target(&thunk.target));
+        count_cell_truncation(&mut metrics, &provenance(&thunk.attribution));
+    }
+    for warning in projection.warnings.iter().take(MAX_ROWS_PER_SECTION) {
+        if let Some(value) = &warning.subject {
+            count_cell_truncation(&mut metrics, &subject(value));
+        }
+        count_cell_truncation(&mut metrics, &warning.message);
+    }
+    metrics
+}
+
+fn count_summary_losses(metrics: &mut MarkdownLossMetrics, values: &[AttributedText]) {
+    metrics.candidates_omitted += values.len().saturating_sub(MAX_SUMMARY_VALUES);
+    metrics.text_truncations += values
+        .iter()
+        .take(MAX_SUMMARY_VALUES)
+        .filter(|value| value.text.len() > MAX_SUMMARY_SOURCE_BYTES)
+        .count();
+}
+
+fn count_cell_truncation(metrics: &mut MarkdownLossMetrics, value: &str) {
+    metrics.text_truncations += usize::from(value.len() > MAX_CELL_SOURCE_BYTES);
 }
 
 #[cfg(test)]

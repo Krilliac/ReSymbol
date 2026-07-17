@@ -34,6 +34,10 @@ fn preserves_unicode_command_environment_cwd_and_pipes() {
             "with space",
             "quote\"inside",
             r"trailing\\",
+            "space trailing\\",
+            r#"space trailing\\\\"#,
+            r#"slashes\\\"quote"#,
+            r#"left""right"#,
             "Unicode-雪-λ",
         ])
         .current_dir(&current_directory)
@@ -91,7 +95,7 @@ fn immediate_grandchild_cannot_escape_kill_on_close_job() {
         );
         child
             .terminate_tree()
-            .expect("close kill-on-close Job handle");
+            .expect("explicitly terminate contained Job");
         markers.push(marker);
     }
     thread::sleep(Duration::from_millis(600));

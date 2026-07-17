@@ -313,9 +313,30 @@ fn validate_path(path: &Path) -> Result<(), ProtocolValidationError> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum DebugCapability {
+macro_rules! define_debug_capabilities {
+    ($($variant:ident),+ $(,)?) => {
+        #[derive(
+            Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+        )]
+        #[serde(rename_all = "kebab-case")]
+        pub enum DebugCapability {
+            $($variant,)+
+        }
+
+        impl DebugCapability {
+            /// Complete, stable protocol order for capability negotiation.
+            pub const ALL: [Self; define_debug_capabilities!(@count $($variant),+)] = [
+                $(Self::$variant,)+
+            ];
+        }
+    };
+    (@count $($variant:ident),+) => {
+        <[()]>::len(&[$(define_debug_capabilities!(@unit $variant)),+])
+    };
+    (@unit $variant:ident) => { () };
+}
+
+define_debug_capabilities! {
     OfflineAnalysis,
     DumpRead,
     SnapshotRead,
@@ -330,26 +351,6 @@ pub enum DebugCapability {
     SandboxedLaunch,
     HostLaunch,
     HostAttach,
-}
-
-impl DebugCapability {
-    /// Complete, stable protocol order for capability negotiation.
-    pub const ALL: [Self; 14] = [
-        Self::OfflineAnalysis,
-        Self::DumpRead,
-        Self::SnapshotRead,
-        Self::ObserveProcess,
-        Self::LiveMemoryRead,
-        Self::LiveMemoryWrite,
-        Self::ExecutionControl,
-        Self::RegisterRead,
-        Self::RegisterWrite,
-        Self::SoftwareBreakpoints,
-        Self::HardwareBreakpoints,
-        Self::SandboxedLaunch,
-        Self::HostLaunch,
-        Self::HostAttach,
-    ];
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1743,6 +1744,29 @@ mod tests {
             Err(ProtocolValidationError::DuplicateCapability {
                 capability: DebugCapability::LiveMemoryWrite,
             })
+        );
+    }
+
+    #[test]
+    fn capability_catalog_preserves_protocol_order_and_wire_names() {
+        assert_eq!(
+            serde_json::to_value(DebugCapability::ALL).expect("capability catalog serializes"),
+            serde_json::json!([
+                "offline-analysis",
+                "dump-read",
+                "snapshot-read",
+                "observe-process",
+                "live-memory-read",
+                "live-memory-write",
+                "execution-control",
+                "register-read",
+                "register-write",
+                "software-breakpoints",
+                "hardware-breakpoints",
+                "sandboxed-launch",
+                "host-launch",
+                "host-attach",
+            ])
         );
     }
 

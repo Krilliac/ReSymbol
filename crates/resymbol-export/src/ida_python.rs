@@ -2,7 +2,9 @@ use std::fmt::Write as _;
 
 use thiserror::Error;
 
-use crate::{ExportFunction, ExportProjection, ProjectionValidationError};
+#[cfg(test)]
+use crate::selection::non_overlapping_function_sizes as non_overlapping_sizes;
+use crate::{ExportProjection, ProjectionValidationError, selection::mutation_plan};
 
 /// Hard ceiling for a generated bridge script.
 ///
@@ -30,7 +32,7 @@ pub enum IdaPythonError {
 pub fn render_ida_python(projection: &ExportProjection) -> Result<String, IdaPythonError> {
     projection.validate()?;
 
-    let accepted_sizes = non_overlapping_sizes(&projection.functions);
+    let plan = mutation_plan(projection);
     let mut output = String::new();
     push_checked(
         &mut output,
@@ -52,40 +54,26 @@ import ida_ua\n\n",
     )?;
 
     push_checked(&mut output, "FUNCTIONS = (\n")?;
-    for (function, accepted_size) in projection.functions.iter().zip(&accepted_sizes) {
-        if !emits_function_record(function, *accepted_size) {
-            continue;
-        }
-        let size = accepted_size.map_or_else(|| "None".to_owned(), |value| format!("0x{value:x}"));
-        let name = function.selected_name.as_ref().map_or_else(
-            || "None".to_owned(),
-            |value| python_string_literal(&value.output_name),
-        );
+    for function in &plan.functions {
+        let size = function
+            .size
+            .map_or_else(|| "None".to_owned(), |value| format!("0x{value:x}"));
+        let name = function
+            .output_name
+            .map_or_else(|| "None".to_owned(), python_string_literal);
         push_checked(
             &mut output,
             &format!("    (0x{:x}, {size}, {name}),\n", function.rva),
         )?;
     }
     push_checked(&mut output, ")\n\nGLOBALS = (\n")?;
-    for global in &projection.globals {
-        let Some(name) = &global.selected_name else {
-            continue;
-        };
-        if projection
-            .functions
-            .binary_search_by_key(&global.rva, |function| function.rva)
-            .is_ok_and(|index| {
-                emits_function_record(&projection.functions[index], accepted_sizes[index])
-            })
-        {
-            continue;
-        }
+    for global in &plan.globals {
         push_checked(
             &mut output,
             &format!(
                 "    (0x{:x}, {}),\n",
                 global.rva,
-                python_string_literal(&name.output_name)
+                python_string_literal(global.output_name)
             ),
         )?;
     }
@@ -234,41 +222,6 @@ if __name__ == "__main__":
     Ok(output)
 }
 
-fn emits_function_record(function: &ExportFunction, accepted_size: Option<u64>) -> bool {
-    function.selected_name.is_some() || accepted_size.is_some()
-}
-
-fn non_overlapping_sizes(functions: &[ExportFunction]) -> Vec<Option<u64>> {
-    let mut accepted = functions.iter().map(|value| value.size).collect::<Vec<_>>();
-    let mut ranges = functions
-        .iter()
-        .enumerate()
-        .filter_map(|(index, value)| {
-            let size = value.size?;
-            let end = value.rva.checked_add(size)?;
-            Some((index, value.rva, end))
-        })
-        .collect::<Vec<_>>();
-    ranges.sort_by_key(|value| (value.1, value.2, value.0));
-
-    let mut cluster_start = 0;
-    while cluster_start < ranges.len() {
-        let mut cluster_end = ranges[cluster_start].2;
-        let mut next = cluster_start + 1;
-        while next < ranges.len() && ranges[next].1 < cluster_end {
-            cluster_end = cluster_end.max(ranges[next].2);
-            next += 1;
-        }
-        if next - cluster_start > 1 {
-            for value in &ranges[cluster_start..next] {
-                accepted[value.0] = None;
-            }
-        }
-        cluster_start = next;
-    }
-    accepted
-}
-
 fn python_string_literal(value: &str) -> String {
     let mut output = String::with_capacity(value.len().saturating_add(2));
     output.push('"');
@@ -317,8 +270,8 @@ mod tests {
     use super::*;
     use crate::{
         AttributedText, ExportAttribution, ExportBinary, ExportBinaryFormat,
-        ExportControlFlowTarget, ExportDirectCall, ExportGlobal, ExportName, ExportProducer,
-        ExportProvenance, ExportThunk,
+        ExportControlFlowTarget, ExportDirectCall, ExportFunction, ExportGlobal, ExportName,
+        ExportProducer, ExportProvenance, ExportThunk,
     };
 
     fn attribution() -> ExportAttribution {

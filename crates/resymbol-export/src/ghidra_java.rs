@@ -2,7 +2,7 @@ use std::fmt::Write as _;
 
 use thiserror::Error;
 
-use crate::{ExportFunction, ExportProjection, ProjectionValidationError};
+use crate::{ExportProjection, ProjectionValidationError, selection::mutation_plan};
 
 const MAX_SCRIPT_BYTES: usize = 32 * 1024 * 1024;
 const RECORDS_PER_METHOD: usize = 256;
@@ -335,48 +335,28 @@ import ghidra.program.model.symbol.SymbolTable;\n\n",
 }
 
 fn collect_records(projection: &ExportProjection) -> Vec<Record> {
-    let accepted_sizes = non_overlapping_sizes(&projection.functions);
+    let plan = mutation_plan(projection);
     let mut records = Vec::new();
-    for (function, size) in projection.functions.iter().zip(&accepted_sizes) {
-        if !emits_function_record(function, *size) {
-            continue;
-        }
-        let size = size.map_or_else(String::new, |value| format!("{value:x}"));
+    for function in &plan.functions {
+        let size = function
+            .size
+            .map_or_else(String::new, |value| format!("{value:x}"));
         let name = function
-            .selected_name
-            .as_ref()
-            .map_or_else(String::new, |value| {
-                base64_encode(value.output_name.as_bytes())
-            });
+            .output_name
+            .map_or_else(String::new, |value| base64_encode(value.as_bytes()));
         records.push(Record::Function(format!(
             "{:x},{size},{name}",
             function.rva
         )));
     }
-    for global in &projection.globals {
-        let Some(name) = &global.selected_name else {
-            continue;
-        };
-        if projection
-            .functions
-            .binary_search_by_key(&global.rva, |function| function.rva)
-            .is_ok_and(|index| {
-                emits_function_record(&projection.functions[index], accepted_sizes[index])
-            })
-        {
-            continue;
-        }
+    for global in &plan.globals {
         records.push(Record::Global(format!(
             "{:x},{}",
             global.rva,
-            base64_encode(name.output_name.as_bytes())
+            base64_encode(global.output_name.as_bytes())
         )));
     }
     records
-}
-
-fn emits_function_record(function: &ExportFunction, accepted_size: Option<u64>) -> bool {
-    function.selected_name.is_some() || accepted_size.is_some()
 }
 
 fn record_batch_data(records: &[Record]) -> String {
@@ -399,36 +379,6 @@ fn record_batch_data(records: &[Record]) -> String {
     }
     debug_assert!(data.is_ascii());
     data
-}
-
-fn non_overlapping_sizes(functions: &[ExportFunction]) -> Vec<Option<u64>> {
-    let mut accepted = functions.iter().map(|value| value.size).collect::<Vec<_>>();
-    let mut ranges = functions
-        .iter()
-        .enumerate()
-        .filter_map(|(index, value)| {
-            let size = value.size?;
-            Some((index, value.rva, value.rva.checked_add(size)?))
-        })
-        .collect::<Vec<_>>();
-    ranges.sort_by_key(|value| (value.1, value.2, value.0));
-
-    let mut cluster_start = 0;
-    while cluster_start < ranges.len() {
-        let mut cluster_end = ranges[cluster_start].2;
-        let mut next = cluster_start + 1;
-        while next < ranges.len() && ranges[next].1 < cluster_end {
-            cluster_end = cluster_end.max(ranges[next].2);
-            next += 1;
-        }
-        if next - cluster_start > 1 {
-            for value in &ranges[cluster_start..next] {
-                accepted[value.0] = None;
-            }
-        }
-        cluster_start = next;
-    }
-    accepted
 }
 
 /// Validate the conservative Java identifier subset accepted for Ghidra scripts.
@@ -603,8 +553,8 @@ mod tests {
     use super::*;
     use crate::{
         AttributedText, ExportAttribution, ExportBinary, ExportBinaryFormat,
-        ExportControlFlowTarget, ExportDirectCall, ExportGlobal, ExportName, ExportProducer,
-        ExportProvenance, ExportThunk,
+        ExportControlFlowTarget, ExportDirectCall, ExportFunction, ExportGlobal, ExportName,
+        ExportProducer, ExportProvenance, ExportThunk,
     };
 
     fn attribution() -> ExportAttribution {

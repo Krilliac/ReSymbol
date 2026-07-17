@@ -510,10 +510,14 @@ completes, a deadline expires, a stdout/stderr capture worker fails, or the runt
 This is a lifecycle boundary, not an authority boundary. Linux `waitid(WNOWAIT)` and a macOS kqueue
 `NOTE_EXIT` observer keep an exited group leader unreaped until the group is terminated, preventing
 process-group identifier reuse during normal cleanup. Windows creates the child atomically inside a
-preconfigured kill-on-close Job through a narrow `STARTUPINFOEX` native boundary, allows inheritance
-of only the exact standard-stream handles, verifies Job membership, and has no post-spawn assignment
-fallback. A hostile POSIX plugin/helper or descendant can deliberately leave its process group or
-session and escape later group termination.
+preconfigured Job through a narrow `STARTUPINFOEX` native boundary, explicitly terminates that Job
+during normal cleanup, retains kill-on-close as an abrupt-parent fallback when no out-of-scope
+process holds a duplicate, allows inheritance of only the exact standard-stream handles, verifies
+Job membership, and has no post-spawn assignment fallback. This does not defend against an active
+same-account process with sufficient process/handle rights: it can duplicate or remotely close
+ReSymbol's handles and terminate or tamper with the parent. That actor requires a separate OS
+authority boundary. A hostile POSIX plugin/helper or descendant can deliberately leave its process
+group or session and escape later group termination.
 
 Process separation contains ordinary crashes, not authority. External, native, and managed child
 code still has the ambient filesystem, network, credential, and process access of the account
@@ -585,6 +589,12 @@ closes the session, releases it, and disconnects before returning a result. The 
 result only when its operation, full identity, canonical verified source, span, and lifecycle receipt
 still match. It displays exact SHA-256 binary identity and read-only plugin health. Graphite, Light,
 IDA-inspired, and Classic Debugger are persisted theme presets; arbitrary docking is not implemented.
+The responsive shell keeps all main views on one compact row at the default viewport and uses one
+explicit all-view selector at the documented minimum. Its pure policy also compacts identity and
+activity chrome at minimum height so the central row viewport remains usable. Main-view cycling,
+Function-search focus, and stable filtered/sorted Function-row movement are reduced on the GUI event
+loop; the pure layout and navigation policy owns no widgets, worker resources, project data, or
+mutable selection state.
 
 The Reconstruction Graph is a read-only projection of retained analysis, not a second analyzer or a
 claim of complete call-graph recovery. It roots at the PE entry point when that point is available as

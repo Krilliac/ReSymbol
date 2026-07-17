@@ -578,10 +578,14 @@ closed.
 > directly. ReSymbol owns ordinary plugin/helper descendants through a POSIX process group or
 > Windows Job Object and terminates the tree when the direct child completes, a deadline or
 > stdout/stderr capture failure occurs, or the runtime drops. This is lifecycle containment, not
-> authority sandboxing. Windows creates the child atomically inside a preconfigured kill-on-close
-> Job, inherits only its exact standard-stream handles, verifies membership, and has no
-> spawn-then-assign fallback. A hostile POSIX plugin/helper or descendant can deliberately leave its
-> process group or session.
+> authority sandboxing. Windows creates the child atomically inside a preconfigured Job, explicitly
+> terminates that Job during normal cleanup, retains kill-on-close as an abrupt-parent fallback when
+> no out-of-scope process holds a duplicate, inherits only its exact standard-stream handles,
+> verifies membership, and has no spawn-then-assign fallback. This does not defend against an active
+> same-account process with sufficient process/handle rights: it can duplicate or remotely close
+> ReSymbol's handles and terminate or tamper with the parent. That actor requires a separate OS
+> authority boundary. A hostile POSIX plugin/helper or descendant can deliberately leave its process
+> group or session.
 
 > [!WARNING]
 > WASM components have no linked WASI filesystem, network, environment, clock, or process

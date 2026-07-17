@@ -284,7 +284,9 @@ Ghidra Java import scripts. Markdown is presentation-only rather than a stable i
 JSON remains the machine-consumable artifact. New analyses write package schema 13, while export also
 accepts package schemas 1 through 12 through validated compatibility paths. The neutral projection is
 independently schema 6; MAP and PDB add no schema fields, and no exporter rewrites its source
-package. Projection schema 5 correlates exact or valid content-interior data-reference targets with
+package. Every target now has a deterministic bounded aggregate loss report with stable codes;
+the CLI summarizes it separately from neutral projection warnings and `--fail-on-loss` rejects
+either loss domain before rendering or publication. Projection schema 5 correlates exact or valid content-interior data-reference targets with
 retained strings while excluding NUL terminators and misaligned UTF-16LE interiors; projection
 schema 6 preserves function-pointer slot and resolved-target RVAs. TLS callback endpoints reuse its
 existing function-entry and thunk shapes, so no TLS-specific projection field is added. Delay-load
@@ -400,11 +402,15 @@ eventually designed. A child process is a crash boundary, not an OS security san
 sandboxing remains separate work. The current runner owns ordinary descendants through POSIX
 process groups or Windows Job Objects and terminates the tree on direct-child completion, deadline,
 stdout/stderr capture failure, or runtime drop. This lifecycle containment does not restrict ambient
-authority. Windows creates the child atomically inside a preconfigured kill-on-close Job, allows
-inheritance of only its exact standard-stream handles, verifies Job membership, and has no
-spawn-then-assign fallback. A hostile POSIX plugin/helper or descendant can deliberately leave its
-process group or session. Linux and macOS otherwise observe direct-child exit without reaping and
-terminate the stable group before collecting the leader's status.
+authority. Windows creates the child atomically inside a preconfigured Job, explicitly terminates
+that Job during normal cleanup, retains kill-on-close as an abrupt-parent fallback when no
+out-of-scope process holds a duplicate, allows inheritance of only its exact standard-stream
+handles, verifies Job membership, and has no spawn-then-assign fallback. This does not defend
+against an active same-account process with sufficient process/handle rights: it can duplicate or
+remotely close ReSymbol's handles and terminate or tamper with the parent. That actor requires a
+separate OS authority boundary. A hostile POSIX plugin/helper or descendant can deliberately leave
+its process group or session. Linux and macOS otherwise observe direct-child exit without reaping
+and terminate the stable group before collecting the leader's status.
 
 ## Milestone 2: useful native-binary MVP
 
@@ -453,11 +459,12 @@ The MVP should be useful without AI, a network connection, Ghidra, or IDA.
 - MAP or simple public-symbol export (PE MAP implemented for selected named symbols)
 - Synthetic PDB export for validated public functions and globals (exact-RSDS public-symbol slice
   implemented)
-- Explicit lossy-export diagnostics
+- Explicit lossy-export diagnostics (implemented with bounded target reports and `--fail-on-loss`)
 
-The neutral projection already emits structured diagnostics for reductions such as unsupported
-assertions, name collisions, conflicting sizes, and overlapping ranges. Target-specific loss
-summaries and richer in-tool review remain part of this milestone. The first PE MAP writer is now a
+The neutral projection emits structured diagnostics for reductions such as unsupported assertions,
+name collisions, conflicting sizes, and overlapping ranges. Target-specific loss summaries are now
+implemented from the exact writer selection rules; richer in-tool review remains part of this
+milestone. The first PE MAP writer is now a
 separate `resymbol export` format, and the first synthetic PDB writer covers exact-RSDS public
 symbols. Richer MAP coverage, PDB private/type/line information, and interactive bridges remain
 planned.

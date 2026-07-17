@@ -8,6 +8,7 @@ mod model;
 mod readiness;
 mod review_state;
 mod theme;
+mod ui_policy;
 mod worker;
 
 pub use app::WorkbenchApp;
