@@ -27,10 +27,10 @@ provision any other resource. A readiness result means only that a caller may at
 the suspended target still needs the exact policy/provider/build attestation described below.
 
 The Windows debugger host process, pipe transport, AppContainer provider, Hyper-V provider, guest
-agent, live process attach, breakpoint engine, register access, live memory access, and instruction
-editing are not implemented. `SyntheticDebugHost` is available only to crate tests or the explicit
-`test-support` feature. It is not a security boundary or platform provider. The current types and UI
-must not be described as a working malware sandbox or live debugger.
+agent, live process attach, breakpoint engine, register access, live memory access, and live
+instruction editing are not implemented. `SyntheticDebugHost` is available only to crate tests or
+the explicit `test-support` feature. It is not a security boundary or platform provider. The current
+types and UI must not be described as a working malware sandbox or live debugger.
 
 ## Ownership and thread affinity
 
