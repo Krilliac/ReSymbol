@@ -84,13 +84,16 @@ The current alpha implements and tests an end-to-end, deliberately narrow analys
   [the debugger and sandbox architecture](docs/debugger-sandbox.md);
 - a UI-neutral, same-size static patch service for exact PE source snapshots. An immutable patch
   plan is bound to the complete source `BinaryIdentity`; each labeled NOP instruction must decode
-  as exactly one complete valid x64 instruction, while an explicit general byte replacement remains
-  available for arbitrary same-size edits. Each edit resolves an executable, fully file-backed RVA to its exact file offset and
-  retains the expected original bytes. Plans are deterministically ordered and bounded, reject
-  duplicate, overlapping, unbacked, virtual-tail, non-executable, and out-of-image ranges, and
-  compare every expected span before producing a distinct patched image. Publication stages,
-  flushes, and synchronizes the complete image beside its destination before a create-new,
-  no-clobber publish. The source is never rewritten. A patched PE may no longer have a valid
+  as exactly one complete valid x86-64 instruction, while an explicit general byte replacement
+  remains available for arbitrary same-size edits. Each edit provisionally resolves an executable,
+  fully file-backed RVA to a file offset and retains the expected original bytes. Plans are
+  deterministically ordered and bounded, reject duplicate, overlapping, unbacked, virtual-tail,
+  non-executable, and out-of-image ranges, and reparse the exact source's strict PE layout before
+  requiring every fresh mapping and expected span to match. Publication stages, flushes, and
+  file-synchronizes the complete image beside its destination before a create-new, no-clobber
+  publish. Unix also synchronizes the parent directory; the Windows path does not claim that the
+  new directory entry survives sudden power loss. The source is never rewritten. A patched PE may
+  no longer have a valid
   Authenticode signature or PE checksum; ReSymbol reports both caveats and does not repair,
   recompute, or re-sign either one;
 - a deterministic, debugger-neutral export projection plus `resymbol export`, which writes the
@@ -395,10 +398,17 @@ overwrite an output or review-sidecar file.
 Static frontends build `StaticPatchEditRequest` values, freeze them with `StaticPatchPlan::new`,
 and publish through `AppServices::publish_static_patch_new`. The plan accepts only same-size edits
 in fully file-backed executable PE ranges and remains bound to the analysis SHA-256, size, format,
-architecture, and image base. Applying it rechecks the retained exact source identity and every
-expected byte before allocating and changing a separate output image. Publishing never overwrites
-the source or an existing destination. Patched outputs carry explicit warnings that Authenticode
-signature validity and the PE checksum may have been invalidated; neither is repaired or re-signed.
+architecture, and image base. A NOP request's exact supplied span must decode as one complete valid
+x86-64 instruction; truncated encodings and spans with trailing instruction bytes are rejected.
+This local check does not infer boundaries outside the selected span. Applying reparses the retained
+exact bytes through the bounded header-only `inspect_pe_layout` path, requires its complete fresh
+identity and every executable/file-backed RVA mapping to match, and only then checks all expected
+bytes before allocating and changing one separate output buffer. Persisted package section records
+therefore cannot authorize a patch. Publishing never overwrites the source or an existing
+destination. Patched outputs carry explicit warnings that Authenticode signature validity and the
+PE checksum may have been invalidated; neither is repaired or re-signed. The staged file is synced;
+Unix additionally syncs its parent directory, while Windows publication makes no power-loss
+durability guarantee for the destination directory entry.
 
 The main review views stay on one responsive tab row at the default viewport and collapse into an
 explicit all-view selector at the documented minimum size. Use **Ctrl+Tab** or

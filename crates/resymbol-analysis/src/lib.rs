@@ -6,6 +6,7 @@
 
 mod code_recovery;
 mod error;
+mod instruction;
 mod linear_disassembly;
 mod msvc_rtti;
 mod pe;
@@ -14,13 +15,19 @@ mod string_recovery;
 mod types;
 
 pub use error::AnalysisError;
+pub use instruction::{
+    ExactX64InstructionError, MAX_X64_INSTRUCTION_BYTES, validate_exact_x64_instruction,
+};
 pub use linear_disassembly::{
     LinearDisassemblyError, LinearDisassemblyLimits, LinearDisassemblyPreview,
     LinearDisassemblyStopReason, LinearFlowControlCategory, LinearInstructionRow,
     LinearTruncationBoundary, MAX_LINEAR_DISASSEMBLY_BYTES, MAX_LINEAR_DISASSEMBLY_INSTRUCTIONS,
     disassemble_x64_linear,
 };
-pub use pe::{PeCodeViewInspection, PeCodeViewRsds, analyze_pe, inspect_pe_codeview};
+pub use pe::{
+    PeCodeViewInspection, PeCodeViewRsds, PeLayoutInspection, analyze_pe, inspect_pe_codeview,
+    inspect_pe_layout,
+};
 pub use session::{AnalysisSession, PluginRunRecord, PluginRunStatus, SessionValidationError};
 pub use types::{
     BinaryAnalysis, CoffHeader, DataDirectory, ImportTarget, MsvcRttiBaseClass, MsvcRttiVftable,
