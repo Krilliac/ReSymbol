@@ -8,6 +8,15 @@ prereleases; breaking changes remain explicit.
 
 ### Added
 
+- Added reproducible static patch-set documents and worker-owned **Save Patch Set...** / **Load
+  Patch Set...** controls. The required `.respatch.json` format is strict schema v1: it records the
+  complete source `BinaryIdentity` plus deterministically RVA-ordered, bounded NOP-instruction or
+  exact same-size byte-replacement requests, but no file offsets, assembly text, or executable
+  commands. Unknown fields and non-v1 schemas fail closed; bounded import reconstructs every public
+  request and a fresh plan, requires the exact current source identity, and rejects malformed,
+  stale, wrong-source, duplicate, overlapping, unbacked, or non-executable edits before replacing
+  drafts. Save is create-new/no-clobber, load preserves current drafts on every failure, and the UI
+  reports the exact source identity and edit count.
 - Added a bounded x64 linear-disassembly preview to the workbench Address Space reader. Hex and
   disassembly views share the same verified frozen-source bytes; independent byte and instruction
   limits, explicit stop reasons, and the visible "not CFG or function-boundary truth" disclaimer

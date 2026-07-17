@@ -6,6 +6,7 @@
 mod error;
 mod export;
 mod patch;
+mod patch_set;
 mod plugins;
 mod project;
 mod review;
@@ -17,6 +18,10 @@ pub use patch::{
     MAX_STATIC_PATCH_LABEL_BYTES, MAX_STATIC_PATCH_NOP_INSTRUCTION_BYTES, PatchedBinaryImage,
     PublishedStaticPatch, StaticPatchDurability, StaticPatchEdit, StaticPatchEditRequest,
     StaticPatchError, StaticPatchKind, StaticPatchPlan, StaticPatchWarning,
+};
+pub use patch_set::{
+    MAX_STATIC_PATCH_SET_FILE_BYTES, STATIC_PATCH_SET_SCHEMA_VERSION, STATIC_PATCH_SET_SUFFIX,
+    StaticPatchSetError, StaticPatchSetManifest,
 };
 pub use plugins::{PluginArtifactPolicyStatus, PluginCatalog, PluginCatalogEntry};
 pub use project::{AppServices, DEFAULT_MAX_BINARY_BYTES, ExactBinary, ProjectSnapshot};

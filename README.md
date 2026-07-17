@@ -104,6 +104,15 @@ The current alpha implements and tests an end-to-end, deliberately narrow analys
   may no longer have a valid
   Authenticode signature or PE checksum; ReSymbol reports both caveats and does not repair,
   recompute, or re-sign either one;
+- a strict, reproducible schema-v1 static patch-set format using the required
+  `.respatch.json` suffix. A patch set stores the complete source `BinaryIdentity` and a
+  deterministic RVA-ordered list of bounded NOP-instruction or exact same-size byte-replacement
+  requests; it stores no file offsets or assembly text and never executes anything. Unknown fields,
+  unsupported schemas, stale or wrong-source identities, malformed edits, and overlapping ranges
+  fail closed. Save is create-new/no-clobber and load is bounded to 16 MiB. The workbench performs
+  both operations on its application-service worker, keeps the current drafts if either operation
+  fails, and replaces them only after the complete imported document has passed constructor, plan,
+  source-identity, range, and overlap validation;
 - a deterministic, debugger-neutral export projection plus `resymbol export`, which writes the
   projection as JSON, renders a bounded human-readable Markdown report, emits deterministic
   Microsoft-linker-style MAP text for compatible tools, creates an exact-RSDS public-symbol PDB
@@ -420,6 +429,15 @@ receipt is returned. Unix additionally syncs its parent directory and reports po
 failure as a partial-success durability warning, while Windows reports file-only synchronization
 and makes no power-loss durability guarantee for the destination directory entry. Static patch and
 ordinary export jobs share one canonical, mutually exclusive workbench publication reservation.
+
+Patch drafts can also be saved with **Save Patch Set...** and restored with **Load Patch Set...**.
+`AppServices::save_static_patch_set_new` emits deterministic compact schema-v1 JSON to a new
+`.respatch.json` path without replacing an existing file; `AppServices::load_static_patch_set`
+caps input at 16 MiB, denies unknown fields, requires the complete current `BinaryIdentity`, and
+reconstructs every request and plan from its RVA and exact bytes. Serialized data never supplies a
+file offset or assembly command. A successful load atomically replaces the visible drafts; a stale,
+wrong-source, malformed, oversized, or overlapping document leaves them unchanged. The workbench
+shows the exact source identity and edit count for each successful save or load.
 
 The main review views stay on one responsive tab row at the default viewport and collapse into an
 explicit all-view selector at the documented minimum size. Use **Ctrl+Tab** or

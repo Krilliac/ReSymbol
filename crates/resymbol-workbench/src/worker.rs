@@ -12,7 +12,7 @@ use std::{
 
 use resymbol_app::{
     AppServices, ExportFormat, PluginCatalog, ProjectSnapshot, PublishedStaticPatch, ReviewLedger,
-    StaticPatchEditRequest, StaticPatchPlan,
+    StaticPatchEditRequest, StaticPatchPlan, StaticPatchSetManifest,
 };
 use resymbol_core::BinaryIdentity;
 use resymbol_debugger::{
@@ -114,6 +114,7 @@ impl OperationGate {
 pub enum PublicationKind {
     Export,
     StaticPatch,
+    PatchSet,
 }
 
 impl PublicationKind {
@@ -122,6 +123,7 @@ impl PublicationKind {
         match self {
             Self::Export => "export",
             Self::StaticPatch => "static patch",
+            Self::PatchSet => "patch-set save",
         }
     }
 }
@@ -310,6 +312,13 @@ impl WorkerExportKind {
 pub struct ExportOutcome {
     pub kind: WorkerExportKind,
     pub path: PathBuf,
+}
+
+/// Validated patch-set document completed by the application-service worker.
+#[derive(Debug)]
+pub struct PatchSetOutcome {
+    pub path: PathBuf,
+    pub manifest: StaticPatchSetManifest,
 }
 
 /// Exact ledger snapshot and destination completed by one save operation.
@@ -727,6 +736,19 @@ pub enum WorkerCommand {
         requests: Vec<StaticPatchEditRequest>,
         path: PathBuf,
     },
+    /// Validate and create-new save a portable static patch set.
+    SaveStaticPatchSet {
+        operation: OperationId,
+        project: Arc<ProjectSnapshot>,
+        requests: Vec<StaticPatchEditRequest>,
+        path: PathBuf,
+    },
+    /// Bounded-load and validate a portable static patch set.
+    LoadStaticPatchSet {
+        operation: OperationId,
+        project: Arc<ProjectSnapshot>,
+        path: PathBuf,
+    },
     Shutdown,
 }
 
@@ -771,6 +793,14 @@ pub enum WorkerEvent {
     StaticPatchPublished {
         operation: OperationId,
         result: Result<PublishedStaticPatch, String>,
+    },
+    StaticPatchSetSaved {
+        operation: OperationId,
+        result: Result<PatchSetOutcome, String>,
+    },
+    StaticPatchSetLoaded {
+        operation: OperationId,
+        result: Result<PatchSetOutcome, String>,
     },
 }
 
@@ -944,6 +974,29 @@ fn process_command(services: &AppServices, command: WorkerCommand) -> Option<Wor
             });
             WorkerEvent::StaticPatchPublished { operation, result }
         }
+        WorkerCommand::SaveStaticPatchSet {
+            operation,
+            project,
+            requests,
+            path,
+        } => WorkerEvent::StaticPatchSetSaved {
+            operation,
+            result: services
+                .save_static_patch_set_new(&project, requests, &path)
+                .map(|manifest| PatchSetOutcome { path, manifest })
+                .map_err(|error| error.to_string()),
+        },
+        WorkerCommand::LoadStaticPatchSet {
+            operation,
+            project,
+            path,
+        } => WorkerEvent::StaticPatchSetLoaded {
+            operation,
+            result: services
+                .load_static_patch_set(&project, &path)
+                .map(|manifest| PatchSetOutcome { path, manifest })
+                .map_err(|error| error.to_string()),
+        },
         WorkerCommand::Shutdown => return None,
     };
     Some(event)
@@ -1468,6 +1521,27 @@ entrypoint = "plugin.wasm"
             })
         ));
         assert!(gate.finish(patch, PublicationKind::StaticPatch));
+
+        let patch_set = sequence.issue();
+        let export = sequence.issue();
+        let patch_set_destination =
+            PublicationDestination::resolve(&directory.path().join("artifact.respatch.json"))
+                .expect("patch-set destination");
+        let same_destination = PublicationDestination::resolve(
+            &directory.path().join(".").join("artifact.respatch.json"),
+        )
+        .expect("same patch-set destination");
+        gate.begin(patch_set, PublicationKind::PatchSet, patch_set_destination)
+            .expect("reserve patch-set publication");
+        assert!(matches!(
+            gate.begin(export, PublicationKind::Export, same_destination),
+            Err(PublicationReservationError::DestinationReserved {
+                requested_kind: "export",
+                active_kind: "patch-set save",
+                ..
+            })
+        ));
+        assert!(gate.finish(patch_set, PublicationKind::PatchSet));
     }
 
     #[cfg(windows)]
@@ -1615,6 +1689,88 @@ entrypoint = "plugin.wasm"
                 operation,
                 result: Err(_),
             } if operation == second
+        ));
+    }
+
+    #[test]
+    fn worker_owns_strict_patch_set_save_and_load_with_operation_ids() {
+        let (_source, project) = project_snapshot_with_bytes(SYMBOLIZED_FIXTURE);
+        let directory = tempdir().expect("temporary patch-set directory");
+        let path = directory.path().join("worker.respatch.json");
+        let request = || {
+            StaticPatchEditRequest::nop_instruction(
+                THUNK_RVA,
+                THUNK_BYTES,
+                "Disable internal jump thunk",
+            )
+            .expect("valid exact instruction request")
+        };
+        let mut sequence = OperationSequence::default();
+        let save = sequence.issue();
+
+        let event = process_command(
+            &AppServices::default(),
+            WorkerCommand::SaveStaticPatchSet {
+                operation: save,
+                project: Arc::clone(&project),
+                requests: vec![request()],
+                path: path.clone(),
+            },
+        )
+        .expect("patch-set save event");
+        let WorkerEvent::StaticPatchSetSaved {
+            operation,
+            result: Ok(saved),
+        } = event
+        else {
+            panic!("unexpected patch-set save event")
+        };
+        assert_eq!(operation, save);
+        assert_eq!(saved.path, path);
+        assert_eq!(saved.manifest.edit_count(), 1);
+        assert_eq!(
+            saved.manifest.source_identity(),
+            project.session().base_analysis().identity()
+        );
+
+        let load = sequence.issue();
+        let event = process_command(
+            &AppServices::default(),
+            WorkerCommand::LoadStaticPatchSet {
+                operation: load,
+                project: Arc::clone(&project),
+                path: path.clone(),
+            },
+        )
+        .expect("patch-set load event");
+        let WorkerEvent::StaticPatchSetLoaded {
+            operation,
+            result: Ok(loaded),
+        } = event
+        else {
+            panic!("unexpected patch-set load event")
+        };
+        assert_eq!(operation, load);
+        assert_eq!(loaded.path, path);
+        assert_eq!(loaded.manifest, saved.manifest);
+
+        let duplicate = sequence.issue();
+        let event = process_command(
+            &AppServices::default(),
+            WorkerCommand::SaveStaticPatchSet {
+                operation: duplicate,
+                project,
+                requests: vec![request()],
+                path,
+            },
+        )
+        .expect("duplicate patch-set event");
+        assert!(matches!(
+            event,
+            WorkerEvent::StaticPatchSetSaved {
+                operation,
+                result: Err(_),
+            } if operation == duplicate
         ));
     }
 
