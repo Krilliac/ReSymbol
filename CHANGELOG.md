@@ -51,39 +51,53 @@ prereleases; breaking changes remain explicit.
   terminal `Failed` state. The host client rejects substituted, duplicate, contradictory,
   misordered, post-result, or success-labeled failure evidence. This is a provider contract, not a
   claim that live mutation ships or that an indeterminate target can safely be resumed or detached.
-- Added a non-cloneable, non-serialized `ValidatedLiveMemoryWrite` ticket for the future host-local
-  live `SessionWorker`. `SessionMachine::begin_live_memory_write` mints it only after an exact
+- Added a non-cloneable, non-serialized `ValidatedLiveMemoryWrite` ticket for the host-local live
+  session worker. `SessionMachine::begin_live_memory_write` mints it only after an exact
   `WriteMemory` command is accepted for the current stopped token, and only when the retained target
   is a debug-mode attach whose exact `ProcessIdentity` matches the supplied `LiveTargetBinding`.
   The exact expected-byte span must also lie inside that binding's main image before reducer state or
   command-ID watermarks change. The ticket owns the accepted command ID, old stop, full target
   binding, address, expected bytes, and replacement bytes; the separate move-only
-  `RemoteCommandCheckpoint` still controls reducer commit or rejection. The Windows provider now
-  requires that exact checkpoint alongside the consumed ticket and rejects a reducer-allocation or
-  command-ID mismatch before any backend access. This is an in-process authority boundary, not a
-  serialized credential, authenticated helper transport, or UI connection.
+  `RemoteCommandCheckpoint` still controls reducer commit or rejection. The crate-private Windows
+  provider requires that exact checkpoint alongside the consumed ticket and rejects a
+  reducer-allocation or command-ID mismatch before any backend access. The public
+  `WindowsSessionWorker` now owns the reducer, provider, binding, retained OS stop, and pending
+  checkpoint on the same thread. It accepts only `CommandEnvelope` values for stopped reads and
+  writes. Reads validate the complete image span before opening a checkpoint and return a must-use
+  receipt correlating the command, view, binding, provider stop, address, exact bytes, and committed
+  reducer state. Writes mint and consume the ticket internally. Both paths commit only fully
+  correlated success, reject safe failures only while the exact provider stop remains retained, and
+  freeze or poison contradictory or unsafe outcomes before explicit cleanup. Incomplete cleanup
+  remains retryable while the provider retains cleanup authority; if the provider is already
+  detached, its exact incomplete evidence is retained and returned forever rather than being
+  replaced by a false `Closed` result. `Closed` therefore proves provider/core cleanup only when the
+  cleanup receipt is complete and retains the last reducer snapshot unchanged. This remains an
+  in-process authority boundary, not a serialized credential, authenticated helper transport, or UI
+  connection.
 - Added `resymbol-windows-debug-host`, a phase-one, same-thread Windows debug-attach foundation. Its
-  low-level entry point repeats the exact PID/start-key/binary/base preflight, calls
+  crate-private low-level provider repeats the exact PID/start-key/binary/base preflight, calls
   `DebugActiveProcess` and immediately requests detach-on-debug-thread-exit behavior, drains initial
   events under one finite total deadline and event-count ceiling, validates the first
   `CREATE_PROCESS_DEBUG_EVENT`, closes only the documented create-process/load-DLL file handles,
   retains the first-chance attach breakpoint, and permits bounded exact main-image reads plus
   bounded, equal-length exact compare-before-write mutations only while that event remains pending.
-  The public write API consumes one `ValidatedLiveMemoryWrite` by value, borrows its exact matching
-  `RemoteCommandCheckpoint`, requires the caller's exact pending-stop evidence, revalidates the
+  The private mutation seam consumes one `ValidatedLiveMemoryWrite` by value, borrows its exact
+  matching `RemoteCommandCheckpoint`, requires the exact pending-stop evidence, revalidates the
   ticket's complete target binding against its retained worker binding, and carries the accepted old
-  stop into failure evidence. Windows now advertises
+  stop into failure evidence. `WindowsSessionWorker` is the only public live entry point. Windows
+  now advertises
   `LiveMemoryWrite` for this narrow primitive.
   Safe no-effect rejection and rollback-safe failure preserve the stopped state, while invalid
   evidence, target invalidation, or non-rollback-safe recovery enters `CleanupRequired` with the
   event retained for explicit teardown. Explicit detach continues the retained event before attempting
   `DebugActiveProcessStop`; kill-policy, continuation, and detach outcomes remain separate evidence,
   while `Drop` is only unproved best-effort cleanup. A watchdog-bounded, parent-owned Windows child
-  fixture covers the real attach/read/write/restore/detach path, with deterministic fake-backend tests
-  covering ordering, handle closure, deadlines, and cleanup faults. This is not an authenticated
-  debugger-host process or transport: the method names record prerequisites that must already have
-  happened but cannot prove them, and no Workbench live-memory bridge, launch, register, stepping,
-  breakpoint engine, or sandbox provisioning is exposed.
+  fixture covers the real authority-bound attach/read/write/restore/cleanup path, with deterministic
+  fake-backend tests
+  covering ordering, handle closure, deadlines, cleanup faults, authenticated orchestration,
+  checkpoint resolution, and terminal cleanup. This is not an authenticated debugger-host process
+  or transport, and no Workbench live-memory bridge, launch, register, stepping, breakpoint engine,
+  or sandbox provisioning is exposed.
 - Added schema-14, container-only intake for ELF32 little-endian `EM_MIPS` executables. Checked
   header and table parsing retains sparse non-empty `PT_LOAD` mappings and a deterministic
   identity-only graph without decoding or executing instructions. A source-built synthetic fixture

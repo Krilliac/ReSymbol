@@ -1,11 +1,11 @@
 //! Same-thread Windows debug-attach and stopped-memory foundation.
 //!
-//! This crate is a low-level provider boundary, not ReSymbol's authenticated
-//! live-helper transport and not a UI bridge. `WindowsDebugHostWorker` makes
-//! prior authorization explicit in its attach method name, but cannot prove
-//! that a caller consumed a move-only host-risk lease. The future authenticated
-//! `SessionWorker` must own this value, its `SessionMachine`, and the exact
-//! accepted command transaction on the same thread.
+//! This crate is a provider boundary, not ReSymbol's authenticated live-helper
+//! transport and not a UI bridge. Its low-level `WindowsDebugHostWorker` is
+//! crate-private because an attach method name cannot prove that a caller
+//! consumed a move-only host-risk lease. Public `WindowsSessionWorker` supplies
+//! the authority boundary: it owns the provider, its `SessionMachine`, and each
+//! exact accepted command transaction on the same thread.
 //!
 //! Phase one deliberately exposes only host attach plus stopped main-image
 //! reads and exact compare-before-write mutations. It has no continue, pause,
@@ -31,8 +31,15 @@ use resymbol_debugger::{MAX_MEMORY_WRITE_BYTES, ValidatedLiveMemoryWrite};
 #[cfg(windows)]
 mod windows;
 
+mod session_worker;
+
 #[cfg(windows)]
-pub use windows::WindowsDebugHostWorker;
+pub use windows::WindowsSessionWorker;
+
+pub use session_worker::{
+    DebugAttachReceipt, SessionWorkerCleanupReceipt, SessionWorkerError, SessionWorkerHealth,
+    SessionWorkerMemoryReadReceipt, SessionWorkerMemoryWriteReceipt,
+};
 
 /// Hard ceiling on the finite current-state event drain before attach fails
 /// closed and attempts to detach.
@@ -1239,7 +1246,8 @@ mod tests {
         DebugEventKind, DebugEventRecord, DebugFileToken, DebugHostError,
         DebugHostMemoryWriteError, DebugHostMemoryWriteReceipt, DebugHostWorker,
         DebugHostWorkerState, EXCEPTION_BREAKPOINT_CODE, MAX_INITIAL_DRAIN_TIMEOUT,
-        PendingStopEvidence, phase_one_capability_report_for_platform,
+        PendingStopEvidence, SessionWorkerError, SessionWorkerHealth,
+        phase_one_capability_report_for_platform, session_worker::SessionWorkerCore,
     };
 
     const PID: u32 = 41;
@@ -1618,8 +1626,8 @@ mod tests {
         }
     }
 
-    fn attached_worker() -> DebugHostWorker<FakeBackend> {
-        DebugHostWorker::new(FakeBackend::new([
+    fn attach_backend() -> FakeBackend {
+        FakeBackend::new([
             create_process(IMAGE_BASE, Some(CREATE_FILE)),
             DebugEventRecord {
                 process_id: PID,
@@ -1628,7 +1636,629 @@ mod tests {
             },
             load_dll(Some(DLL_FILE)),
             initial_breakpoint(),
-        ]))
+        ])
+    }
+
+    fn attached_worker() -> DebugHostWorker<FakeBackend> {
+        DebugHostWorker::new(attach_backend())
+    }
+
+    fn session_worker_fixture() -> (
+        SessionWorkerCore<FakeBackend>,
+        CommandEnvelope,
+        LiveTargetBinding,
+        SessionId,
+    ) {
+        let binding = test_binding();
+        let session_id = SessionId::new(91).expect("nonzero session id");
+        let provisioning_epoch =
+            ProvisioningEpoch::new("b".repeat(64)).expect("test provisioning epoch");
+        let helper_build =
+            HelperBuildId::new("windows-session-worker-test").expect("test helper build");
+        let mut issuer = HostRiskLeaseIssuer::new().expect("host-risk issuer");
+        let (lease, _verifier) = issuer
+            .issue(
+                session_id,
+                provisioning_epoch.clone(),
+                HostRiskOperation::Attach {
+                    process: binding.process().clone(),
+                    mode: AttachMode::Debug,
+                },
+            )
+            .expect("issue exact attach authority");
+        let risk_lease = lease.id().clone();
+        let machine = SessionMachine::new(session_id, provisioning_epoch, helper_build);
+        let mut worker = SessionWorkerCore::new(machine, attach_backend());
+        worker
+            .register_host_risk_lease(lease)
+            .expect("register exact attach authority");
+        let open = CommandEnvelope {
+            version: ProtocolVersion::current(),
+            command_id: CommandId::new(1).expect("open command id"),
+            session_id: Some(session_id),
+            expected_state: Some(worker.state().state_token()),
+            command: DebugCommand::Open(DebugTargetRequest::Attach(AttachTarget {
+                scope: AttachScope::Host {
+                    process: binding.process().clone(),
+                    risk_lease,
+                },
+                mode: AttachMode::Debug,
+            })),
+        };
+        (worker, open, binding, session_id)
+    }
+
+    fn session_write_envelope(
+        worker: &SessionWorkerCore<FakeBackend>,
+        session_id: SessionId,
+        address: MemoryAddress,
+        expected: &[u8],
+        replacement: &[u8],
+    ) -> CommandEnvelope {
+        let SessionState::Stopped { token, .. } = worker.state() else {
+            panic!("session worker must retain a stopped reducer");
+        };
+        CommandEnvelope {
+            version: ProtocolVersion::current(),
+            command_id: CommandId::new(2).expect("write command id"),
+            session_id: Some(session_id),
+            expected_state: Some(token.state),
+            command: DebugCommand::WriteMemory {
+                stop: *token,
+                address,
+                expected: expected.to_vec(),
+                replacement: replacement.to_vec(),
+            },
+        }
+    }
+
+    fn session_read_envelope(
+        worker: &SessionWorkerCore<FakeBackend>,
+        session_id: SessionId,
+        command_id: u64,
+        address: MemoryAddress,
+        size: u32,
+    ) -> CommandEnvelope {
+        let SessionState::Stopped { token, .. } = worker.state() else {
+            panic!("session worker must retain a stopped reducer");
+        };
+        CommandEnvelope {
+            version: ProtocolVersion::current(),
+            command_id: CommandId::new(command_id).expect("read command id"),
+            session_id: Some(session_id),
+            expected_state: Some(token.state),
+            command: DebugCommand::ReadMemory {
+                view: resymbol_debugger::ReadViewToken::Stopped { stop: *token },
+                address,
+                size,
+            },
+        }
+    }
+
+    #[test]
+    fn session_worker_pre_attach_failure_safely_rejects_without_attach_effect() {
+        let (mut worker, open, binding, _session_id) = session_worker_fixture();
+        let state_before = worker.state().clone();
+        worker.backend_for_test_mut().fail_operation = Some("preflight");
+
+        let error = worker
+            .open_debug_attach(open, binding, DebugAttachLimits::default())
+            .expect_err("pre-attach provider failure is effect free");
+
+        assert!(matches!(
+            error,
+            SessionWorkerError::DebugHost(DebugHostError::Provider {
+                operation: "preflight",
+                ..
+            })
+        ));
+        assert_eq!(worker.state(), &state_before);
+        assert_eq!(worker.health(), SessionWorkerHealth::Ready);
+        assert_eq!(worker.provider_state(), DebugHostWorkerState::Detached);
+        assert!(
+            !worker
+                .backend_for_test()
+                .operations
+                .iter()
+                .any(|operation| matches!(operation, Operation::Attach(_)))
+        );
+    }
+
+    #[test]
+    fn session_worker_incomplete_attach_cleanup_detached_is_sticky_and_poisoned() {
+        let (mut worker, open, binding, _session_id) = session_worker_fixture();
+        worker.backend_for_test_mut().fail_operation = Some("continue debug event");
+
+        let error = worker
+            .open_debug_attach(open, binding, DebugAttachLimits::default())
+            .expect_err("incomplete post-attach cleanup cannot be rejected");
+        let expected_evidence = match &error {
+            SessionWorkerError::DebugHost(DebugHostError::CleanupAfterFailure {
+                evidence, ..
+            }) => evidence.clone(),
+            other => panic!("expected incomplete attach cleanup, received {other:?}"),
+        };
+
+        assert!(!expected_evidence.complete());
+        assert!(matches!(worker.state(), SessionState::Failed { .. }));
+        assert_eq!(worker.health(), SessionWorkerHealth::Poisoned);
+        assert_eq!(worker.provider_state(), DebugHostWorkerState::Detached);
+
+        let first = worker.cleanup();
+        let second = worker.cleanup();
+        assert!(!first.complete());
+        assert!(!second.complete());
+        assert_eq!(first.evidence(), Some(&expected_evidence));
+        assert_eq!(second.evidence(), Some(&expected_evidence));
+        assert_eq!(first.health(), SessionWorkerHealth::Poisoned);
+        assert_eq!(second.health(), SessionWorkerHealth::Poisoned);
+        assert_eq!(worker.health(), SessionWorkerHealth::Poisoned);
+    }
+
+    #[test]
+    fn session_worker_cleanup_required_can_retry_to_closed() {
+        let (mut worker, open, binding, _session_id) = session_worker_fixture();
+        let attach = worker
+            .open_debug_attach(open, binding, DebugAttachLimits::default())
+            .expect("authenticated attach succeeds");
+        assert_eq!(attach.state(), worker.state());
+        worker.backend_for_test_mut().fail_detach = true;
+
+        let first = worker.cleanup();
+
+        assert!(!first.complete());
+        assert_eq!(first.health(), SessionWorkerHealth::CleanupRequired);
+        assert_eq!(
+            worker.provider_state(),
+            DebugHostWorkerState::CleanupRequired
+        );
+
+        worker.backend_for_test_mut().fail_detach = false;
+        let second = worker.cleanup();
+        assert!(second.complete());
+        assert_eq!(second.health(), SessionWorkerHealth::Closed);
+        assert_eq!(worker.health(), SessionWorkerHealth::Closed);
+        assert_eq!(worker.provider_state(), DebugHostWorkerState::Detached);
+    }
+
+    #[test]
+    fn session_worker_commits_correlated_attach_success() {
+        let (mut worker, open, binding, _session_id) = session_worker_fixture();
+
+        let receipt = worker
+            .open_debug_attach(open, binding.clone(), DebugAttachLimits::default())
+            .expect("authenticated attach succeeds");
+
+        assert_eq!(worker.health(), SessionWorkerHealth::Ready);
+        assert_eq!(worker.provider_state(), DebugHostWorkerState::Stopped);
+        assert_eq!(worker.binding(), Some(&binding));
+        assert_eq!(worker.pending_stop(), Some(receipt.pending_stop()));
+        assert!(matches!(receipt.state(), SessionState::Stopped { .. }));
+        assert_eq!(worker.state(), receipt.state());
+    }
+
+    #[test]
+    fn session_worker_commits_correlated_stopped_memory_read() {
+        let (mut worker, open, binding, session_id) = session_worker_fixture();
+        let attach = worker
+            .open_debug_attach(open, binding.clone(), DebugAttachLimits::default())
+            .expect("authenticated attach succeeds");
+        let pending_stop = attach.pending_stop().clone();
+        let address = MemoryAddress::new(IMAGE_BASE + 0x40);
+        let envelope = session_read_envelope(&worker, session_id, 2, address, 4);
+
+        let receipt = worker
+            .read_memory(envelope)
+            .expect("exact stopped read succeeds");
+
+        assert_eq!(receipt.command_id(), CommandId::new(2).expect("command id"));
+        assert_eq!(receipt.binding(), &binding);
+        assert_eq!(receipt.pending_stop(), &pending_stop);
+        assert_eq!(receipt.address(), address);
+        assert_eq!(receipt.bytes(), b"phas");
+        assert_eq!(receipt.state(), worker.state());
+        assert_eq!(worker.health(), SessionWorkerHealth::Ready);
+        assert_eq!(worker.provider_state(), DebugHostWorkerState::Stopped);
+    }
+
+    #[test]
+    fn session_worker_reducer_rejected_read_never_calls_provider() {
+        let (mut worker, open, binding, session_id) = session_worker_fixture();
+        let attach = worker
+            .open_debug_attach(open, binding, DebugAttachLimits::default())
+            .expect("authenticated attach succeeds");
+        assert_eq!(attach.state(), worker.state());
+        let operations_before = worker.backend_for_test().operations.len();
+        let envelope = session_read_envelope(
+            &worker,
+            session_id,
+            1,
+            MemoryAddress::new(IMAGE_BASE + 0x40),
+            4,
+        );
+
+        let error = worker
+            .read_memory(envelope)
+            .expect_err("non-monotonic read is reducer rejected");
+
+        assert!(matches!(error, SessionWorkerError::Reducer(_)));
+        assert_eq!(
+            worker.backend_for_test().operations.len(),
+            operations_before
+        );
+        assert_eq!(worker.health(), SessionWorkerHealth::Ready);
+        assert_eq!(worker.provider_state(), DebugHostWorkerState::Stopped);
+    }
+
+    #[test]
+    fn session_worker_read_contradiction_commits_failed_and_poisons() {
+        let (mut worker, open, binding, session_id) = session_worker_fixture();
+        let attach = worker
+            .open_debug_attach(open, binding, DebugAttachLimits::default())
+            .expect("authenticated attach succeeds");
+        assert_eq!(attach.state(), worker.state());
+        worker.set_post_dispatch_provider_state_for_test(DebugHostWorkerState::CleanupRequired);
+        let envelope = session_read_envelope(
+            &worker,
+            session_id,
+            2,
+            MemoryAddress::new(IMAGE_BASE + 0x40),
+            4,
+        );
+
+        let error = worker
+            .read_memory(envelope)
+            .expect_err("read without retained provider stop is contradictory");
+
+        assert!(matches!(
+            error,
+            SessionWorkerError::ContradictoryEvidence { .. }
+        ));
+        assert!(matches!(worker.state(), SessionState::Failed { .. }));
+        assert_eq!(worker.health(), SessionWorkerHealth::Poisoned);
+        assert_eq!(
+            worker.provider_state(),
+            DebugHostWorkerState::CleanupRequired
+        );
+    }
+
+    #[test]
+    fn session_worker_commits_fully_correlated_memory_write() {
+        let (mut worker, open, binding, session_id) = session_worker_fixture();
+        let attach_receipt = worker
+            .open_debug_attach(open, binding, DebugAttachLimits::default())
+            .expect("authenticated attach succeeds");
+        assert_eq!(attach_receipt.state(), worker.state());
+        let address = MemoryAddress::new(IMAGE_BASE + 0x40);
+        let envelope = session_write_envelope(&worker, session_id, address, b"phas", b"PHAS");
+
+        let receipt = worker
+            .write_memory(envelope)
+            .expect("exact stopped write succeeds");
+
+        assert_eq!(worker.health(), SessionWorkerHealth::Ready);
+        assert_eq!(receipt.provider().address(), address);
+        assert_eq!(receipt.provider().before(), b"phas");
+        assert_eq!(receipt.provider().after(), b"PHAS");
+        assert_eq!(worker.state(), receipt.state());
+    }
+
+    #[test]
+    fn session_worker_safe_write_rejection_restores_old_stop() {
+        let (mut worker, open, binding, session_id) = session_worker_fixture();
+        let attach_receipt = worker
+            .open_debug_attach(open, binding.clone(), DebugAttachLimits::default())
+            .expect("authenticated attach succeeds");
+        assert_eq!(attach_receipt.binding(), &binding);
+        let stopped_before = worker.state().clone();
+        let pending_before = worker.pending_stop().expect("retained OS stop").clone();
+        let envelope = session_write_envelope(
+            &worker,
+            session_id,
+            MemoryAddress::new(IMAGE_BASE + 0x40),
+            b"nope",
+            b"NOPE",
+        );
+
+        let error = worker
+            .write_memory(envelope)
+            .expect_err("compare mismatch rejects without effect");
+
+        assert!(matches!(
+            error,
+            SessionWorkerError::MemoryWrite(DebugHostMemoryWriteError::SafeNoEffectRejected { .. })
+        ));
+        assert_eq!(worker.state(), &stopped_before);
+        assert_eq!(worker.health(), SessionWorkerHealth::Ready);
+        assert_eq!(worker.provider_state(), DebugHostWorkerState::Stopped);
+        assert_eq!(worker.binding(), Some(&binding));
+        assert_eq!(worker.pending_stop(), Some(&pending_before));
+    }
+
+    #[test]
+    fn session_worker_rollback_safe_write_failure_restores_old_stop() {
+        let (mut worker, open, binding, session_id) = session_worker_fixture();
+        let attach = worker
+            .open_debug_attach(open, binding, DebugAttachLimits::default())
+            .expect("authenticated attach succeeds");
+        assert_eq!(attach.state(), worker.state());
+        let state_before = worker.state().clone();
+        let address = MemoryAddress::new(IMAGE_BASE + 0x40);
+        let SessionState::Stopped { token: stop, .. } = worker.state() else {
+            panic!("attach reaches stopped state");
+        };
+        let stop = *stop;
+        worker.backend_for_test_mut().write_failure =
+            Some(BackendWriteFailure::MemoryWriteFailed(MemoryWriteFailure {
+                stop,
+                address,
+                size: 4,
+                stage: MemoryWriteStage::VerifyReplacement,
+                recovery: MemoryWriteRecovery::Restored,
+                detail: "injected rollback-safe mutation".to_owned(),
+            }));
+        let envelope = session_write_envelope(&worker, session_id, address, b"phas", b"PHAS");
+
+        let error = worker
+            .write_memory(envelope)
+            .expect_err("rollback-safe provider failure remains a rejection");
+
+        assert!(matches!(
+            error,
+            SessionWorkerError::MemoryWrite(DebugHostMemoryWriteError::MemoryWriteFailed { .. })
+        ));
+        assert_eq!(worker.state(), &state_before);
+        assert_eq!(worker.health(), SessionWorkerHealth::Ready);
+        assert_eq!(worker.provider_state(), DebugHostWorkerState::Stopped);
+    }
+
+    #[test]
+    fn session_worker_success_with_lost_provider_stop_commits_failed_and_poisons() {
+        let (mut worker, open, binding, session_id) = session_worker_fixture();
+        let attach_receipt = worker
+            .open_debug_attach(open, binding, DebugAttachLimits::default())
+            .expect("authenticated attach succeeds");
+        assert_eq!(attach_receipt.state(), worker.state());
+        worker.set_post_dispatch_provider_state_for_test(DebugHostWorkerState::CleanupRequired);
+        let envelope = session_write_envelope(
+            &worker,
+            session_id,
+            MemoryAddress::new(IMAGE_BASE + 0x40),
+            b"phas",
+            b"PHAS",
+        );
+
+        let error = worker
+            .write_memory(envelope)
+            .expect_err("success without the exact retained provider stop is contradictory");
+
+        assert!(matches!(
+            error,
+            SessionWorkerError::ContradictoryEvidence { .. }
+        ));
+        assert!(matches!(worker.state(), SessionState::Failed { .. }));
+        assert_eq!(worker.health(), SessionWorkerHealth::Poisoned);
+        assert_eq!(
+            worker.provider_state(),
+            DebugHostWorkerState::CleanupRequired
+        );
+    }
+
+    #[test]
+    fn session_worker_safe_error_with_contradictory_provider_state_commits_failed() {
+        let (mut worker, open, binding, session_id) = session_worker_fixture();
+        let attach_receipt = worker
+            .open_debug_attach(open, binding, DebugAttachLimits::default())
+            .expect("authenticated attach succeeds");
+        assert_eq!(attach_receipt.state(), worker.state());
+        worker.set_post_dispatch_provider_state_for_test(DebugHostWorkerState::CleanupRequired);
+        let envelope = session_write_envelope(
+            &worker,
+            session_id,
+            MemoryAddress::new(IMAGE_BASE + 0x40),
+            b"nope",
+            b"NOPE",
+        );
+
+        let error = worker
+            .write_memory(envelope)
+            .expect_err("safe classification cannot override contradictory provider state");
+
+        assert!(matches!(
+            error,
+            SessionWorkerError::MemoryWrite(DebugHostMemoryWriteError::SafeNoEffectRejected { .. })
+        ));
+        assert!(matches!(worker.state(), SessionState::Failed { .. }));
+        assert_eq!(worker.health(), SessionWorkerHealth::Poisoned);
+        assert_eq!(
+            worker.provider_state(),
+            DebugHostWorkerState::CleanupRequired
+        );
+    }
+
+    #[test]
+    fn session_worker_unsafe_write_commits_failure_and_freezes() {
+        let (mut worker, open, binding, session_id) = session_worker_fixture();
+        let attach_receipt = worker
+            .open_debug_attach(open, binding, DebugAttachLimits::default())
+            .expect("authenticated attach succeeds");
+        assert_eq!(attach_receipt.state(), worker.state());
+        let address = MemoryAddress::new(IMAGE_BASE + 0x40);
+        let SessionState::Stopped { token: stop, .. } = worker.state() else {
+            panic!("attach reaches stopped state");
+        };
+        let stop = *stop;
+        worker.backend_for_test_mut().write_failure =
+            Some(BackendWriteFailure::MemoryWriteFailed(MemoryWriteFailure {
+                stop,
+                address,
+                size: 4,
+                stage: MemoryWriteStage::FlushReplacement,
+                recovery: MemoryWriteRecovery::Indeterminate {
+                    bytes_restored: false,
+                    instruction_cache_flushed: false,
+                    protection_restored: false,
+                },
+                detail: "injected indeterminate mutation".to_owned(),
+            }));
+        let envelope = session_write_envelope(&worker, session_id, address, b"phas", b"PHAS");
+
+        let error = worker
+            .write_memory(envelope)
+            .expect_err("indeterminate mutation freezes the session");
+
+        assert!(matches!(
+            error,
+            SessionWorkerError::MemoryWrite(DebugHostMemoryWriteError::MemoryWriteFailed { .. })
+        ));
+        assert_eq!(worker.health(), SessionWorkerHealth::CleanupRequired);
+        assert_eq!(
+            worker.provider_state(),
+            DebugHostWorkerState::CleanupRequired
+        );
+        assert!(matches!(worker.state(), SessionState::Failed { .. }));
+    }
+
+    #[test]
+    fn session_worker_target_invalidation_commits_failed_cleanup_required() {
+        let (mut worker, open, binding, session_id) = session_worker_fixture();
+        let attach = worker
+            .open_debug_attach(open, binding, DebugAttachLimits::default())
+            .expect("authenticated attach succeeds");
+        assert_eq!(attach.state(), worker.state());
+        let address = MemoryAddress::new(IMAGE_BASE + 0x40);
+        worker.backend_for_test_mut().write_failure =
+            Some(BackendWriteFailure::TargetInvalidated {
+                detail: "injected target invalidation".to_owned(),
+            });
+        let envelope = session_write_envelope(&worker, session_id, address, b"phas", b"PHAS");
+
+        let error = worker
+            .write_memory(envelope)
+            .expect_err("target invalidation freezes for cleanup");
+
+        assert!(matches!(
+            error,
+            SessionWorkerError::MemoryWrite(DebugHostMemoryWriteError::TargetInvalidated { .. })
+        ));
+        assert!(matches!(worker.state(), SessionState::Failed { .. }));
+        assert_eq!(worker.health(), SessionWorkerHealth::CleanupRequired);
+        assert_eq!(
+            worker.provider_state(),
+            DebugHostWorkerState::CleanupRequired
+        );
+    }
+
+    #[test]
+    fn session_worker_invalid_write_evidence_commits_failed_and_poisons() {
+        let (mut worker, open, binding, session_id) = session_worker_fixture();
+        let attach = worker
+            .open_debug_attach(open, binding, DebugAttachLimits::default())
+            .expect("authenticated attach succeeds");
+        assert_eq!(attach.state(), worker.state());
+        let address = MemoryAddress::new(IMAGE_BASE + 0x40);
+        worker.backend_for_test_mut().write_failure = Some(BackendWriteFailure::InvalidEvidence {
+            detail: "injected invalid provider evidence".to_owned(),
+        });
+        let envelope = session_write_envelope(&worker, session_id, address, b"phas", b"PHAS");
+
+        let error = worker
+            .write_memory(envelope)
+            .expect_err("invalid provider evidence poisons orchestration");
+
+        assert!(matches!(
+            error,
+            SessionWorkerError::MemoryWrite(DebugHostMemoryWriteError::InvalidEvidence { .. })
+        ));
+        assert!(matches!(worker.state(), SessionState::Failed { .. }));
+        assert_eq!(worker.health(), SessionWorkerHealth::Poisoned);
+        assert_eq!(
+            worker.provider_state(),
+            DebugHostWorkerState::CleanupRequired
+        );
+    }
+
+    #[test]
+    fn session_worker_unsafe_error_without_cleanup_state_commits_failed_and_poisons() {
+        let (mut worker, open, binding, session_id) = session_worker_fixture();
+        let attach_receipt = worker
+            .open_debug_attach(open, binding, DebugAttachLimits::default())
+            .expect("authenticated attach succeeds");
+        assert_eq!(attach_receipt.state(), worker.state());
+        let address = MemoryAddress::new(IMAGE_BASE + 0x40);
+        let SessionState::Stopped { token: stop, .. } = worker.state() else {
+            panic!("attach reaches stopped state");
+        };
+        let stop = *stop;
+        worker.backend_for_test_mut().write_failure =
+            Some(BackendWriteFailure::MemoryWriteFailed(MemoryWriteFailure {
+                stop,
+                address,
+                size: 4,
+                stage: MemoryWriteStage::FlushReplacement,
+                recovery: MemoryWriteRecovery::Indeterminate {
+                    bytes_restored: false,
+                    instruction_cache_flushed: false,
+                    protection_restored: false,
+                },
+                detail: "injected indeterminate mutation".to_owned(),
+            }));
+        worker.set_post_dispatch_provider_state_for_test(DebugHostWorkerState::Stopped);
+        let envelope = session_write_envelope(&worker, session_id, address, b"phas", b"PHAS");
+
+        let error = worker
+            .write_memory(envelope)
+            .expect_err("unsafe failure without cleanup-required state is contradictory");
+
+        assert!(matches!(
+            error,
+            SessionWorkerError::MemoryWrite(DebugHostMemoryWriteError::MemoryWriteFailed { .. })
+        ));
+        assert!(matches!(worker.state(), SessionState::Failed { .. }));
+        assert_eq!(worker.health(), SessionWorkerHealth::Poisoned);
+        assert_eq!(worker.provider_state(), DebugHostWorkerState::Stopped);
+    }
+
+    #[test]
+    fn session_worker_reducer_rejection_never_calls_provider_write() {
+        let (mut worker, open, binding, session_id) = session_worker_fixture();
+        let attach_receipt = worker
+            .open_debug_attach(open, binding, DebugAttachLimits::default())
+            .expect("authenticated attach succeeds");
+        assert_eq!(attach_receipt.state(), worker.state());
+        let operations_before = worker.backend_for_test().operations.len();
+        let outside_image = MemoryAddress::new(IMAGE_BASE + u64::from(IMAGE_SIZE));
+        let envelope = session_write_envelope(&worker, session_id, outside_image, b"phas", b"PHAS");
+
+        let error = worker
+            .write_memory(envelope)
+            .expect_err("reducer rejects an out-of-image write");
+
+        assert!(matches!(error, SessionWorkerError::Reducer(_)));
+        assert_eq!(
+            worker.backend_for_test().operations.len(),
+            operations_before
+        );
+        assert_eq!(worker.health(), SessionWorkerHealth::Ready);
+        assert_eq!(worker.provider_state(), DebugHostWorkerState::Stopped);
+    }
+
+    #[test]
+    fn session_worker_cleanup_is_terminal_closed() {
+        let (mut worker, open, binding, _session_id) = session_worker_fixture();
+        let attach_receipt = worker
+            .open_debug_attach(open, binding, DebugAttachLimits::default())
+            .expect("authenticated attach succeeds");
+        assert_eq!(attach_receipt.state(), worker.state());
+
+        let receipt = worker.cleanup();
+
+        assert!(receipt.complete());
+        assert_eq!(receipt.health(), SessionWorkerHealth::Closed);
+        assert_eq!(worker.health(), SessionWorkerHealth::Closed);
+        assert_eq!(worker.provider_state(), DebugHostWorkerState::Detached);
+        assert_eq!(worker.binding(), None);
+        assert_eq!(worker.pending_stop(), None);
     }
 
     #[test]

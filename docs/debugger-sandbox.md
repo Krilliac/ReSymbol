@@ -83,7 +83,7 @@ total deadline plus a count ceiling. It requires the first event to be the exact
 handles, conservatively passes unexpected exceptions as not handled, and retains the first-chance
 attach breakpoint. While that event remains pending it permits exact bounded reads and bounded,
 equal-length, changed exact compare-before-write mutations wholly inside the validated main image.
-Each write requires the caller's exact `PendingStopEvidence` and consumes a move-only,
+Internally, each write requires exact `PendingStopEvidence` and consumes a move-only,
 non-serialized `ValidatedLiveMemoryWrite`. A host-local `SessionMachine` mints that ticket only after
 accepting the exact command for its current stopped token and matching the ticket's target process
 to an accepted debug-mode attach, with the expected-byte span inside that exact main image. The
@@ -99,13 +99,24 @@ explicit teardown. Detach first continues the retained breakpoint and then attem
 `DebugActiveProcessStop` even if continuation fails; kill-policy, continuation, and detach outcomes
 are reported separately. Drop performs only best-effort cleanup and cannot be used as detach proof.
 
-This low-level method is named `attach_after_authorization` to make its prerequisite explicit, but a
-name and `LiveTargetBinding` are not authority. The crate neither authenticates a transport nor
-verifies or consumes a move-only host-risk lease. Only a future authenticated, host-local
-`SessionWorker` may place attach and ticket minting behind the command reducer and exact one-use
-authorization flow. The
-current Workbench never invokes it; live-memory GUI wiring and Step Into/Over/Out controls remain
-unimplemented.
+The low-level `attach_after_authorization` method records only a caller prerequisite: its name and a
+`LiveTargetBinding` are not authority, so `WindowsDebugHostWorker` is crate-private and not
+re-exported. The public Windows `WindowsSessionWorker` is the host-local ownership boundary. On one
+thread it owns the `SessionMachine`, provider, exact live binding, retained operating-system stop,
+and pending remote checkpoint; it consumes the move-only host-risk lease before attach and accepts
+only `CommandEnvelope` values for stopped reads and writes. A read validates the complete image span
+before starting its reducer checkpoint and returns a must-use receipt binding the command, stopped
+view, target, provider stop, address, exact bytes, and committed reducer state. Write tickets and all
+checkpoints remain private. Success commits only after exact provider correlation. Safe rejection can
+restore the old logical stop only while the provider still proves the exact retained stopped state;
+contradictory or unsafe outcomes commit `Failed` and freeze or poison the worker before cleanup.
+Reducer state, worker health, and provider state are separate axes. `Closed` health proves complete
+provider/core cleanup but retains the last reducer snapshot; it does not synthesize a controller
+`SessionState::Closed` or close receipt. Incomplete cleanup is retryable while the provider remains
+`CleanupRequired`. If the provider becomes detached without complete evidence, that exact evidence is
+sticky, health remains `Poisoned`, and later cleanup calls cannot report a false close.
+The crate still does not authenticate a transport, and the current Workbench never invokes this
+surface; live-memory GUI wiring and Step Into/Over/Out controls remain unimplemented.
 
 ## Ownership and thread affinity
 

@@ -656,7 +656,7 @@ provider must supply that evidence (and retain the event's image-file handle whe
 authorizing reads or writes.
 
 `crates/resymbol-windows-debug-host` now builds the smallest phase-one live provider primitive on top
-of that access boundary while keeping its long-lived handle read-only. One deliberately
+of that access boundary while keeping its long-lived handle read-only. One deliberately private,
 `!Send`/`!Sync` worker performs the exact
 preflight, attaches on its owning thread, immediately requests detach rather than target termination
 if that thread exits, and drains current-state events under both a finite total deadline and an event
@@ -664,13 +664,13 @@ ceiling. It accepts only the exact create-process PID/base evidence, closes only
 load-DLL `hFile` values, retains the initial first-chance breakpoint, and exposes bounded exact
 main-image reads and bounded, equal-length exact compare-before-write mutations while that event
 remains pending.
-The write requires exact retained `PendingStopEvidence` plus a move-only
+Internally, a write requires exact retained `PendingStopEvidence` plus a move-only
 `ValidatedLiveMemoryWrite`. The host-local reducer mints that non-serialized ticket only after
 accepting the exact command for its current stopped token and after proving that the supplied
 `LiveTargetBinding` names the exact process from an accepted debug-mode attach and contains the full
 expected-byte span. The separate
-`RemoteCommandCheckpoint` remains with the session worker for commit or rejection. The Windows
-worker borrows that checkpoint, rejects unless it matches the ticket's reducer allocation and
+`RemoteCommandCheckpoint` remains with the session worker for commit or rejection. The private
+Windows provider borrows that checkpoint, rejects unless it matches the ticket's reducer allocation and
 command ID, then consumes the ticket by value and independently compares its complete binding with
 the retained provider binding before opening mutation rights for that one main-image-bounded
 transaction. Safe no-effect rejection or rollback-safe failure leaves the worker stopped; invalid
@@ -682,11 +682,22 @@ continues any retained event and then attempts `DebugActiveProcessStop`, reporti
 continuation, and detach outcomes independently; destructor cleanup discards that evidence and is
 never cleanup proof.
 
-This is an in-process low-level API, not a Windows debugger-host helper process, authenticated live
-transport, or UI bridge. `attach_after_authorization` records a mandatory caller prerequisite but
-does not authenticate or enforce it; a future authenticated `SessionWorker` must consume exact
-host-risk authority, validate the command with its host-local reducer, and present the exact retained
-checkpoint with ticket dispatch. No AppContainer or Hyper-V provider, guest agent, live
+The low-level `WindowsDebugHostWorker` is a crate-private provider seam; the public
+`WindowsSessionWorker` is the only live orchestration boundary. It owns the `SessionMachine`,
+consumes the exact move-only host-risk lease, retains the binding and OS stop, and keeps every remote
+checkpoint and one-use write ticket private. It accepts only stopped read and write command
+envelopes. A read validates the complete image span before opening its checkpoint and returns a
+must-use receipt that binds the command, read view, target, provider stop, address, exact bytes, and
+committed reducer state. Read and write success are committed only after full
+command/stop/binding/address/result correlation. Safe rejection may restore the old stop only while
+the provider still proves the exact retained stopped state; unsafe or contradictory evidence commits
+a terminal reducer failure and freezes or poisons the worker until cleanup. Provider state, reducer
+state, and worker health are independent axes: `Closed` health proves complete provider/core cleanup
+but retains the last reducer snapshot unchanged. Incomplete cleanup remains retryable while the
+provider retains cleanup authority. Once detached with incomplete evidence, the worker retains and
+returns that exact evidence forever and never reports a synthetic successful close. This is still not
+a Windows debugger-host helper process,
+authenticated transport, or UI bridge. No AppContainer or Hyper-V provider, guest agent, live
 launch, breakpoint engine, register service, execution stepping, Workbench live-memory bridge, or
 sandbox provisioning is implemented. The offline host, low-level attach/read/write foundation, and
 readiness UI therefore remain far short of a working malware sandbox or end-user live debugger.

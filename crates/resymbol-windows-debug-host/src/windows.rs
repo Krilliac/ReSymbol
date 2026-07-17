@@ -7,7 +7,8 @@ use std::{
 };
 
 use resymbol_debugger::{
-    LiveTargetBinding, MemoryAddress, ProcessId, RemoteCommandCheckpoint, StopToken,
+    CommandEnvelope, HelperBuildId, HostRiskLease, LiveTargetBinding, MemoryAddress, ProcessId,
+    ProvisioningEpoch, RemoteCommandCheckpoint, SessionId, SessionMachine, SessionState, StopToken,
     ValidatedLiveMemoryWrite,
 };
 use resymbol_windows_live_access::{
@@ -26,9 +27,12 @@ use windows_sys::Win32::{
 
 use crate::{
     BackendFailure, BackendWriteFailure, BackendWriteReceipt, ContinueDisposition,
-    DebugAttachLimits, DebugBackend, DebugEventKind, DebugEventRecord, DebugFileToken,
-    DebugHostError, DebugHostMemoryWriteError, DebugHostMemoryWriteReceipt, DebugHostWorker,
-    DebugHostWorkerState, PendingStopEvidence, phase_one_capability_report,
+    DebugAttachLimits, DebugAttachReceipt, DebugBackend, DebugEventKind, DebugEventRecord,
+    DebugFileToken, DebugHostError, DebugHostMemoryWriteError, DebugHostMemoryWriteReceipt,
+    DebugHostWorker, DebugHostWorkerState, PendingStopEvidence, SessionWorkerCleanupReceipt,
+    SessionWorkerError, SessionWorkerHealth, SessionWorkerMemoryReadReceipt,
+    SessionWorkerMemoryWriteReceipt, phase_one_capability_report,
+    session_worker::SessionWorkerCore,
 };
 
 /// Single-thread owner of one phase-one Windows debug attachment.
@@ -36,13 +40,15 @@ use crate::{
 /// The value is intentionally neither `Send` nor `Sync`. Construct, attach,
 /// read, and detach it on the same dedicated session-worker thread.
 #[derive(Debug)]
-pub struct WindowsDebugHostWorker {
+#[allow(dead_code)]
+pub(crate) struct WindowsDebugHostWorker {
     inner: DebugHostWorker<WindowsDebugBackend>,
 }
 
+#[allow(dead_code)]
 impl WindowsDebugHostWorker {
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             inner: DebugHostWorker::new(WindowsDebugBackend::new()),
         }
@@ -51,22 +57,22 @@ impl WindowsDebugHostWorker {
     /// Returns the static provider surface. The future authenticated helper
     /// transport remains responsible for deciding whether it may publish it.
     #[must_use]
-    pub fn capabilities() -> resymbol_debugger::CapabilityReport {
+    pub(crate) fn capabilities() -> resymbol_debugger::CapabilityReport {
         phase_one_capability_report()
     }
 
     #[must_use]
-    pub fn state(&self) -> DebugHostWorkerState {
+    pub(crate) fn state(&self) -> DebugHostWorkerState {
         self.inner.state()
     }
 
     #[must_use]
-    pub fn binding(&self) -> Option<&LiveTargetBinding> {
+    pub(crate) fn binding(&self) -> Option<&LiveTargetBinding> {
         self.inner.binding()
     }
 
     #[must_use]
-    pub fn pending_stop(&self) -> Option<&PendingStopEvidence> {
+    pub(crate) fn pending_stop(&self) -> Option<&PendingStopEvidence> {
         self.inner.pending_stop()
     }
 
@@ -77,7 +83,7 @@ impl WindowsDebugHostWorker {
     /// process, a transport, or a serialized lease identifier. Passing a
     /// `LiveTargetBinding` proves identity and mapping equality only. Do not
     /// call it directly from UI or untrusted command-dispatch code.
-    pub fn attach_after_authorization(
+    pub(crate) fn attach_after_authorization(
         &mut self,
         expected: &LiveTargetBinding,
         limits: DebugAttachLimits,
@@ -87,7 +93,7 @@ impl WindowsDebugHostWorker {
 
     /// Reads a bounded span from the exact preflight main image while the
     /// initial attach breakpoint remains pending.
-    pub fn read_stopped_main_image(
+    pub(crate) fn read_stopped_main_image(
         &mut self,
         address: MemoryAddress,
         size: usize,
@@ -102,7 +108,7 @@ impl WindowsDebugHostWorker {
     /// command ID. This worker also checks the ticket's exact target binding
     /// and the caller's retained operating-system stop before opening mutation
     /// rights.
-    pub fn write_stopped_main_image_after_protocol_validation(
+    pub(crate) fn write_stopped_main_image_after_protocol_validation(
         &mut self,
         expected_pending_stop: &PendingStopEvidence,
         checkpoint: &RemoteCommandCheckpoint,
@@ -121,7 +127,7 @@ impl WindowsDebugHostWorker {
     /// reports kill-policy, event-continuation, and detach outcomes
     /// independently. Invoke this explicitly: the worker's `Drop` cleanup is
     /// best effort and discards evidence, so it is never proof of detachment.
-    pub fn detach(&mut self) -> Result<(), DebugHostError> {
+    pub(crate) fn detach(&mut self) -> Result<(), DebugHostError> {
         self.inner.detach()
     }
 }
@@ -129,6 +135,139 @@ impl WindowsDebugHostWorker {
 impl Default for WindowsDebugHostWorker {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Authenticated same-thread owner of a Windows debug session.
+///
+/// Unlike [WindowsDebugHostWorker], this facade never accepts a pre-minted
+/// write ticket or reducer checkpoint. It owns the session reducer, consumes
+/// exact host-risk leases, and correlates every provider outcome before making
+/// the resulting state visible.
+///
+/// Its observable axes have separate meanings: `state()` is the logical
+/// reducer snapshot, `health()` gates further orchestration, and
+/// `provider_state()` reports low-level OS attachment cleanup. Callers must not
+/// infer one axis from another. In particular, `Closed` health means explicit
+/// provider/core cleanup completed while `state()` remains the last reducer
+/// snapshot; `CleanupRequired` and `Poisoned` accept only `cleanup()`.
+///
+/// ```compile_fail
+/// use resymbol_windows_debug_host::WindowsSessionWorker;
+///
+/// fn require_send<T: Send>() {}
+/// require_send::<WindowsSessionWorker>();
+/// ```
+///
+/// ```compile_fail
+/// use resymbol_windows_debug_host::WindowsSessionWorker;
+///
+/// fn require_sync<T: Sync>() {}
+/// require_sync::<WindowsSessionWorker>();
+/// ```
+///
+/// The unauthenticated low-level provider is intentionally not public:
+///
+/// ```compile_fail
+/// use resymbol_windows_debug_host::WindowsDebugHostWorker;
+/// ```
+#[derive(Debug)]
+pub struct WindowsSessionWorker {
+    inner: SessionWorkerCore<WindowsDebugBackend>,
+    attach_limits: DebugAttachLimits,
+}
+
+impl WindowsSessionWorker {
+    #[must_use]
+    pub fn new(
+        session_id: SessionId,
+        provisioning_epoch: ProvisioningEpoch,
+        helper_build: HelperBuildId,
+        attach_limits: DebugAttachLimits,
+    ) -> Self {
+        Self {
+            inner: SessionWorkerCore::new(
+                SessionMachine::new(session_id, provisioning_epoch, helper_build),
+                WindowsDebugBackend::new(),
+            ),
+            attach_limits,
+        }
+    }
+
+    #[must_use]
+    pub fn capabilities() -> resymbol_debugger::CapabilityReport {
+        phase_one_capability_report()
+    }
+
+    #[must_use]
+    pub const fn state(&self) -> &SessionState {
+        self.inner.state()
+    }
+
+    #[must_use]
+    pub const fn health(&self) -> SessionWorkerHealth {
+        self.inner.health()
+    }
+
+    #[must_use]
+    pub fn provider_state(&self) -> DebugHostWorkerState {
+        self.inner.provider_state()
+    }
+
+    #[must_use]
+    pub fn binding(&self) -> Option<&LiveTargetBinding> {
+        self.inner.binding()
+    }
+
+    #[must_use]
+    pub fn pending_stop(&self) -> Option<&PendingStopEvidence> {
+        self.inner.pending_stop()
+    }
+
+    /// Registers one move-only host approval directly in the owned reducer.
+    pub fn register_host_risk_lease(
+        &mut self,
+        lease: HostRiskLease,
+    ) -> Result<(), SessionWorkerError> {
+        self.inner.register_host_risk_lease(lease)
+    }
+
+    /// Accepts, authorizes, and executes one exact host debug-attach command.
+    pub fn open_debug_attach(
+        &mut self,
+        envelope: CommandEnvelope,
+        binding: LiveTargetBinding,
+    ) -> Result<DebugAttachReceipt, SessionWorkerError> {
+        self.inner
+            .open_debug_attach(envelope, binding, self.attach_limits)
+    }
+
+    /// Validates and executes one stopped-memory read from its envelope.
+    pub fn read_memory(
+        &mut self,
+        envelope: CommandEnvelope,
+    ) -> Result<SessionWorkerMemoryReadReceipt, SessionWorkerError> {
+        self.inner.read_memory(envelope)
+    }
+
+    /// Validates and executes one stopped-memory command from its envelope.
+    pub fn write_memory(
+        &mut self,
+        envelope: CommandEnvelope,
+    ) -> Result<SessionWorkerMemoryWriteReceipt, SessionWorkerError> {
+        self.inner.write_memory(envelope)
+    }
+
+    /// Attempts explicit provider cleanup.
+    ///
+    /// This owner becomes terminally `Closed` only when the returned receipt's
+    /// `complete()` is true. Incomplete cleanup remains retryable when the
+    /// provider is still attached, or sticky and `Poisoned` when detach already
+    /// made missing cleanup evidence unrecoverable. Completion does not
+    /// synthesize a logical `SessionState::Closed` or a controller close
+    /// receipt; the receipt exposes the last reducer snapshot.
+    pub fn cleanup(&mut self) -> SessionWorkerCleanupReceipt {
+        self.inner.cleanup()
     }
 }
 
