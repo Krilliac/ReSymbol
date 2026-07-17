@@ -150,9 +150,31 @@ pub enum ClientConnectionState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandReceipt {
-    pub command_id: CommandId,
-    pub outcome: CommandOutcome,
-    pub events: Vec<EventEnvelope>,
+    pub(crate) command_id: CommandId,
+    pub(crate) outcome: CommandOutcome,
+    pub(crate) events: Vec<EventEnvelope>,
+}
+
+impl CommandReceipt {
+    #[must_use]
+    pub const fn command_id(&self) -> CommandId {
+        self.command_id
+    }
+
+    #[must_use]
+    pub const fn outcome(&self) -> &CommandOutcome {
+        &self.outcome
+    }
+
+    #[must_use]
+    pub fn events(&self) -> &[EventEnvelope] {
+        &self.events
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (CommandId, CommandOutcome, Vec<EventEnvelope>) {
+        (self.command_id, self.outcome, self.events)
+    }
 }
 
 /// One connection and at most one active session.
@@ -4828,6 +4850,82 @@ mod tests {
                 thread_id: ThreadId::new(9).expect("initial thread"),
             },
         )
+    }
+
+    #[test]
+    fn successful_memory_write_returns_exact_public_receipt_evidence() {
+        let (mut client, stop) = prime_stopped_scripted_exchange_client();
+        let command_id = CommandId::new(2).expect("write command id");
+        let command = memory_write_command(stop);
+        let (refreshed_stop, refreshed_state) = refreshed_write_state(stop);
+        let (address, expected, replacement) = match &command {
+            DebugCommand::WriteMemory {
+                address,
+                expected,
+                replacement,
+                ..
+            } => (*address, expected.clone(), replacement.clone()),
+            _ => unreachable!("memory_write_command always returns a write"),
+        };
+        client.transport.scripted.push_back(vec![
+            correlated_event_frame(
+                2,
+                1,
+                command_id,
+                stop.state,
+                DebugEvent::MemoryWritten {
+                    stop,
+                    address,
+                    before: expected.clone(),
+                    after: replacement.clone(),
+                },
+            ),
+            correlated_event_frame(
+                3,
+                2,
+                command_id,
+                refreshed_stop.state,
+                DebugEvent::StateChanged(refreshed_state.clone()),
+            ),
+            correlated_event_frame(
+                4,
+                3,
+                command_id,
+                refreshed_stop.state,
+                DebugEvent::CommandResult {
+                    command_id,
+                    outcome: CommandOutcome::Succeeded,
+                },
+            ),
+        ]);
+
+        let receipt = client.submit(command).expect("verified memory write");
+        assert_eq!(receipt.command_id, command_id);
+        assert_eq!(receipt.outcome, CommandOutcome::Succeeded);
+        assert_eq!(receipt.events.len(), 3);
+        assert!(matches!(
+            &receipt.events[0].event,
+            DebugEvent::MemoryWritten {
+                stop: actual_stop,
+                address: actual_address,
+                before,
+                after,
+            } if *actual_stop == stop
+                && *actual_address == address
+                && before == &expected
+                && after == &replacement
+        ));
+        assert!(
+            receipt
+                .events
+                .iter()
+                .all(|event| event.caused_by == Some(command_id))
+        );
+        assert!(matches!(
+            &receipt.events[1].event,
+            DebugEvent::StateChanged(actual) if actual == &refreshed_state
+        ));
+        assert_eq!(client.session_state(), Some(&refreshed_state));
     }
 
     #[test]

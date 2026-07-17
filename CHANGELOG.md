@@ -8,6 +8,20 @@ prereleases; breaking changes remain explicit.
 
 ### Added
 
+- Added a backend-neutral `LivePatchHistory` reducer for future authenticated live-memory UI
+  integration. It is bound to one immutable session and exact process-instance/image mapping,
+  reserves a maximum of 256 entries and 1 MiB of before/after bytes before dispatch, and emits only
+  compare-before-write commands. Reserved operations expose their command only through a single-use
+  dispatch transition and may be cancelled only while dispatch is proven not to have begun. Exact
+  successful host-client receipts, including the refreshed stopped token, push a forward write or
+  pop the strict-LIFO undo stack; a safe no-effect/restored rejection leaves history unchanged. Undo
+  always uses the caller's current stop token. Unknown transport outcomes, indeterminate write
+  recovery, context drift after dispatch, and contradictory receipt evidence permanently freeze the
+  reducer for inspection with bounded pending evidence. There is no silent eviction, redo, process
+  access, authority, provider wiring, or Workbench connection in this pure planner.
+- Sealed `CommandReceipt` construction inside `resymbol-debugger` while retaining read-only
+  accessors and a consuming parts API, so downstream controller code cannot fabricate host-validated
+  evidence.
 - Added a static-only exact-byte editor to every bounded x64 disassembly row. **Edit Exact Bytes...**
   queues the existing same-size `ReplaceBytes` request, while **Edit Queued Patch...** transactionally
   replaces the draft bound to that exact RVA and immutable source instruction. The modal accepts only

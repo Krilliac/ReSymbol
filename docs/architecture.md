@@ -617,6 +617,28 @@ sanitizes diagnostic text without splitting UTF-8, maps every local stage/recove
 protocol validator before returning evidence. Non-mutation access errors return no write-failure
 evidence. This is conversion plumbing only: it does not emit a host event or authorize a write.
 
+`resymbol-debugger::LivePatchHistory` is the pure controller-side boundary for eventual live patch
+undo. One instance is permanently bound to one `SessionId` and exact `LiveTargetBinding`, including
+the process freshness key, so a replacement process with the same binary hash is still a different
+target. It reserves entry and aggregate before/after-byte capacity before yielding a forward
+operation. A reservation exposes its exact `WriteMemory` command only through a single-use
+reserved-to-dispatched transition. It may be cancelled only before that transition; afterward it
+must resolve an exact receipt or freeze as transport-unknown. Only the public host client's exact
+`MemoryWritten`, refreshed `Stopped`, and
+successful command-result receipt pushes that write or pops the strict-LIFO undo stack; each entry
+retains both its source and resulting stop. Undo constructs a new compare-before-write command from
+the current stop, with the prior replacement as `expected` and prior original bytes as `replacement`.
+Safe no-effect or fully restored rejection clears only the pending operation. Indeterminate recovery,
+transport uncertainty, post-dispatch context drift, or mismatched evidence freezes the reducer for
+inspection while retaining bounded pending evidence. The fixed bounds are 256 committed entries and
+1 MiB across retained before/after bytes, with no eviction and no redo. This reducer performs no I/O,
+does not issue authority, and is not a substitute for the authenticated worker that must dispatch its
+commands.
+
+`CommandReceipt` construction is sealed inside `resymbol-debugger`; downstream callers receive
+read-only accessors or consume a receipt into its parts, but cannot construct purportedly validated
+evidence.
+
 This adapter does not freeze the current executable path into an immutable loaded-image snapshot.
 The retained no-write/delete-sharing file handle, exact hash, and file/remote/module PE-header
 corroboration close ordinary path races, but an already-authorized same-account actor that can
