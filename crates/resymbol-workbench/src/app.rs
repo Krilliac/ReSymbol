@@ -9,16 +9,18 @@ use std::{fs::OpenOptions, io::BufWriter};
 
 use eframe::egui::{self, Align, Key, Layout, RichText, ScrollArea, Sense, TextEdit};
 use egui_extras::{Column, TableBuilder};
-use resymbol_analysis::BinaryAnalysis;
+use resymbol_analysis::{
+    BinaryAnalysis, LinearDisassemblyLimits, LinearDisassemblyPreview, LinearInstructionRow,
+    disassemble_x64_linear,
+};
 use resymbol_app::{
-    DecisionAction, ExportFormat, MAX_REVIEW_ANNOTATION_BYTES, MAX_REVIEWER_BYTES, ReviewSubject,
+    DecisionAction, ExportFormat, MAX_REVIEW_ANNOTATION_BYTES, MAX_REVIEWER_BYTES,
+    PluginArtifactPolicyStatus, PluginCatalog, PluginCatalogEntry, PublishedStaticPatch,
+    ReviewSubject, StaticPatchEditRequest,
 };
-use resymbol_core::{
-    BinaryIdentity, DiscoveredPlugin, PluginDiscoveryOptions, PluginDiscoveryReport,
-    discover_plugins, plugin_api::PluginHealthState,
-};
+use resymbol_core::BinaryIdentity;
 use resymbol_debugger::{
-    IsolationBoundary, MemoryAccess, ProtectionSeverity, SandboxGuarantee,
+    IsolationBoundary, MemoryAccess, ProtectionSeverity, RelativeAddress, SandboxGuarantee,
     SandboxProviderReadiness, SandboxProviderReadinessReason, SandboxProviderRequirement,
     SandboxProviderSelection, StaticRegionKind,
 };
@@ -35,6 +37,11 @@ use crate::{
         GRAPH_MAX_DEPTH, GRAPH_MAX_EDGES, GRAPH_MAX_NODES, GraphEdge, GraphEdgeKind,
         GraphEdgeOrigin, GraphImportKind, GraphNode, GraphNodeId, GraphNodeKind, GraphRootKind,
         ReconstructionGraph, ReconstructionGraphView, ReconstructionGraphViewNode,
+    },
+    instruction_actions::{
+        InstructionSelectionMove, LiveDebuggerActionContext, LiveDebuggerProtocolRoute,
+        LiveInstructionAction, MAX_PENDING_STATIC_PATCH_DRAFTS, PatchDraftQueueOutcome,
+        PendingStaticPatchDrafts, navigate_instruction_selection,
     },
     model::{
         FunctionFilter, FunctionRow, FunctionSort, FunctionSortKey, FunctionStatus, LoadedProject,
@@ -65,6 +72,7 @@ const MAX_ACTIVITY_MESSAGE_BYTES: usize = 512;
 const MAX_RECENT_BINARIES: usize = 8;
 const OFFLINE_READ_SIZES: [u32; 5] = [16, 32, 64, 128, MAX_OFFLINE_IMAGE_UI_READ_BYTES];
 const OFFLINE_HEX_ROW_BYTES: usize = 16;
+const OFFLINE_DISASSEMBLY_INSTRUCTION_LIMIT: usize = 64;
 const FUNCTION_KEYBOARD_PAGE_ROWS: usize = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -515,6 +523,13 @@ enum OfflineReadDisplay<'a> {
     Unavailable { code: &'static str, detail: &'a str },
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum OfflineByteView {
+    #[default]
+    Hex,
+    Disassembly,
+}
+
 /// Native ReSymbol evidence-review workbench.
 pub struct WorkbenchApp {
     preferences: Preferences,
@@ -528,7 +543,9 @@ pub struct WorkbenchApp {
     project_operation: OperationGate,
     export_operation: OperationGate,
     review_operation: OperationGate,
+    plugin_operation: OperationGate,
     readiness_operation: OperationGate,
+    static_patch_operation: OperationGate,
     worker_disconnected: bool,
     analysis_path: Option<PathBuf>,
     function_filter: FunctionFilter,
@@ -542,7 +559,7 @@ pub struct WorkbenchApp {
     reconstruction_graph: Option<ReconstructionGraph>,
     activity: Vec<ActivityEntry>,
     console_host: ConsoleHost,
-    plugin_report: Result<PluginDiscoveryReport, String>,
+    plugin_catalog: Option<Result<PluginCatalog, String>>,
     export_kind: ExportKind,
     export_destination: String,
     export_result: Option<Result<String, String>>,
@@ -570,6 +587,11 @@ pub struct WorkbenchApp {
     offline_read: OfflineReadUiState,
     offline_read_rva_input: String,
     offline_read_size: u32,
+    offline_byte_view: OfflineByteView,
+    selected_disassembly_instruction: Option<usize>,
+    disassembly_row_focus_target: Option<usize>,
+    pending_static_patch_drafts: PendingStaticPatchDrafts,
+    static_patch_result: Option<Result<PublishedStaticPatch, String>>,
 }
 
 impl WorkbenchApp {
@@ -623,13 +645,6 @@ impl WorkbenchApp {
             );
         }
 
-        let plugin_options = PluginDiscoveryOptions {
-            safe_mode: true,
-            ..PluginDiscoveryOptions::default()
-        };
-        let plugin_report = discover_plugins("plugins", &plugin_options)
-            .map_err(|error| bounded_message(format!("cannot inspect plugin directory: {error}")));
-
         let mut app = Self {
             preferences,
             stage: WorkflowStage::Open,
@@ -642,7 +657,9 @@ impl WorkbenchApp {
             project_operation: OperationGate::default(),
             export_operation: OperationGate::default(),
             review_operation: OperationGate::default(),
+            plugin_operation: OperationGate::default(),
             readiness_operation: OperationGate::default(),
+            static_patch_operation: OperationGate::default(),
             worker_disconnected: false,
             analysis_path: None,
             function_filter: FunctionFilter::default(),
@@ -656,7 +673,7 @@ impl WorkbenchApp {
             reconstruction_graph: None,
             activity: Vec::new(),
             console_host: ConsoleHost::new(),
-            plugin_report,
+            plugin_catalog: None,
             export_kind: ExportKind::Package,
             export_destination: String::new(),
             export_result: None,
@@ -685,10 +702,15 @@ impl WorkbenchApp {
             offline_read: OfflineReadUiState::default(),
             offline_read_rva_input: "0x00000000".to_owned(),
             offline_read_size: 64,
+            offline_byte_view: OfflineByteView::default(),
+            selected_disassembly_instruction: None,
+            disassembly_row_focus_target: None,
+            pending_static_patch_drafts: PendingStaticPatchDrafts::default(),
+            static_patch_result: None,
         };
         app.log(
             ActivityLevel::Info,
-            "Workbench ready in core-only safe review mode",
+            "Workbench ready in core-only non-executing review mode",
         );
 
         #[cfg(feature = "screenshot")]
@@ -749,6 +771,7 @@ impl WorkbenchApp {
                 ActivityLevel::Success,
                 format!("Loaded {} for visual regression capture", path.display()),
             );
+            app.begin_initial_plugin_catalog_refresh();
             return app;
         }
 
@@ -757,6 +780,7 @@ impl WorkbenchApp {
                 app.log(ActivityLevel::Error, error);
             }
         }
+        app.begin_initial_plugin_catalog_refresh();
         app
     }
 
@@ -830,6 +854,13 @@ impl WorkbenchApp {
     }
 
     fn request_close(&mut self, context: &egui::Context) -> bool {
+        if self.static_patch_operation.is_pending() {
+            self.log(
+                ActivityLevel::Warning,
+                "Close paused until the worker-owned static patch publication finishes",
+            );
+            return false;
+        }
         // A close request supersedes an in-progress project-switch prompt. Keeping both
         // continuations alive could otherwise let one review save trigger two actions.
         self.pending_binary_open = None;
@@ -890,7 +921,8 @@ impl WorkbenchApp {
 
         let review_busy = self.project_operation.is_pending()
             || self.review_operation.is_pending()
-            || self.export_operation.is_pending();
+            || self.export_operation.is_pending()
+            || self.static_patch_operation.is_pending();
         let response = egui::Modal::new(egui::Id::new("dirty_review_close_confirmation")).show(
             context,
             |ui| {
@@ -926,7 +958,13 @@ impl WorkbenchApp {
                     {
                         action = Some(CloseDialogAction::SaveNew);
                     }
-                    if ui.button("Discard and Close").clicked() {
+                    if ui
+                        .add_enabled(
+                            !self.static_patch_operation.is_pending(),
+                            egui::Button::new("Discard and Close"),
+                        )
+                        .clicked()
+                    {
                         action = Some(CloseDialogAction::DiscardAndClose);
                     }
                     if ui.button("Cancel").clicked() {
@@ -1001,7 +1039,8 @@ impl WorkbenchApp {
             || self.review_operation.is_pending()
             || self.export_operation.is_pending()
             || self.readiness_operation.is_pending()
-            || self.offline_read.is_pending();
+            || self.offline_read.is_pending()
+            || self.static_patch_operation.is_pending();
         let response = egui::Modal::new(egui::Id::new("dirty_review_binary_switch_confirmation"))
             .show(context, |ui| {
                 ui.set_min_width(470.0);
@@ -1388,6 +1427,13 @@ impl WorkbenchApp {
             );
             return;
         }
+        if self.static_patch_operation.is_pending() {
+            self.log(
+                ActivityLevel::Warning,
+                "Wait for static patch publication before opening another binary",
+            );
+            return;
+        }
         if self
             .review
             .as_ref()
@@ -1434,6 +1480,11 @@ impl WorkbenchApp {
             return Err(
                 "wait for the debugger sandbox readiness probe before replacing the project"
                     .to_owned(),
+            );
+        }
+        if self.static_patch_operation.is_pending() {
+            return Err(
+                "wait for static patch publication before replacing the project".to_owned(),
             );
         }
         if self
@@ -1490,6 +1541,48 @@ impl WorkbenchApp {
                 choice.label()
             ),
         );
+    }
+
+    fn queue_plugin_catalog_refresh(&mut self) -> Result<String, String> {
+        if self.plugin_operation.is_pending() {
+            return Err("a plugin catalog refresh is already running".to_owned());
+        }
+        if self.worker_disconnected {
+            return Err("the application-service worker is unavailable".to_owned());
+        }
+        let operation = self.operation_sequence.issue();
+        self.service_worker
+            .submit(WorkerCommand::RefreshPluginCatalog {
+                operation,
+                root: PathBuf::from("plugins"),
+            })?;
+        self.plugin_operation.begin(operation);
+        let message =
+            "Queued read-only plugin policy refresh; no plugin will be executed".to_owned();
+        self.log(ActivityLevel::Info, &message);
+        Ok(message)
+    }
+
+    fn begin_initial_plugin_catalog_refresh(&mut self) {
+        if let Err(error) = self.queue_plugin_catalog_refresh() {
+            self.plugin_catalog = Some(Err(error.clone()));
+            self.log(
+                ActivityLevel::Error,
+                format!("Plugin catalog refresh failed: {error}"),
+            );
+        }
+    }
+
+    fn accept_plugin_catalog(
+        &mut self,
+        operation: OperationId,
+        result: Result<PluginCatalog, String>,
+    ) -> bool {
+        if !self.plugin_operation.finish(operation) {
+            return false;
+        }
+        self.plugin_catalog = Some(result);
+        true
     }
 
     fn queue_sandbox_readiness_probe(&mut self) -> Result<String, String> {
@@ -1566,6 +1659,8 @@ impl WorkbenchApp {
                 rva: span.rva(),
                 size: span.size(),
             })?;
+        self.selected_disassembly_instruction = None;
+        self.disassembly_row_focus_target = None;
         self.offline_read
             .begin(operation, OfflineReadRequestBinding { source, span });
         let message = format!(
@@ -1628,6 +1723,9 @@ impl WorkbenchApp {
         }
         if self.review_operation.is_pending() {
             return Err("wait for the current review save or load first".to_owned());
+        }
+        if self.static_patch_operation.is_pending() {
+            return Err("wait for static patch publication first".to_owned());
         }
         let project = self
             .project
@@ -2058,6 +2156,35 @@ impl WorkbenchApp {
                         }
                     }
                 }
+                WorkerEvent::PluginCatalogRefreshed { operation, result } => {
+                    let message = match &result {
+                        Ok(catalog) => format!(
+                            "Plugin policy catalog refreshed: {} candidate(s), {} pass exact-artifact policy; execution is not implied",
+                            catalog.entries().len(),
+                            catalog.artifact_policy_allowed_count()
+                        ),
+                        Err(error) => format!("Plugin policy catalog refresh failed: {error}"),
+                    };
+                    let success = result.is_ok();
+                    if !self.accept_plugin_catalog(operation, result) {
+                        self.log(
+                            ActivityLevel::Warning,
+                            format!(
+                                "Ignored stale plugin catalog result for operation {}",
+                                operation.get()
+                            ),
+                        );
+                        continue;
+                    }
+                    self.log(
+                        if success {
+                            ActivityLevel::Success
+                        } else {
+                            ActivityLevel::Error
+                        },
+                        message,
+                    );
+                }
                 WorkerEvent::SandboxProviderProbed { operation, result } => {
                     if !self.readiness_operation.finish(operation) {
                         self.log(
@@ -2140,6 +2267,52 @@ impl WorkbenchApp {
                         ),
                     }
                 }
+                WorkerEvent::StaticPatchPublished { operation, result } => {
+                    if !self.static_patch_operation.finish(operation) {
+                        self.log(
+                            ActivityLevel::Warning,
+                            format!(
+                                "Ignored stale static patch result for operation {}",
+                                operation.get()
+                            ),
+                        );
+                        continue;
+                    }
+                    match result {
+                        Ok(outcome) => {
+                            let matches_current = self.project.as_ref().is_some_and(|project| {
+                                project.session().base_analysis().identity()
+                                    == outcome.source_identity()
+                            });
+                            if !matches_current {
+                                let error = "Static patch receipt did not match the current project identity"
+                                    .to_owned();
+                                self.static_patch_result = Some(Err(error.clone()));
+                                self.console_reply(false, &error);
+                                self.log(ActivityLevel::Error, error);
+                                continue;
+                            }
+                            let warning_count = outcome.warnings().len();
+                            let message = format!(
+                                "Created patched binary {} with SHA-256 {} and {warning_count} integrity warning(s)",
+                                outcome.path().display(),
+                                outcome.output_identity().id.as_str()
+                            );
+                            self.pending_static_patch_drafts.clear();
+                            self.static_patch_result = Some(Ok(outcome));
+                            self.console_reply(true, &message);
+                            self.log(ActivityLevel::Success, message);
+                        }
+                        Err(error) => {
+                            self.static_patch_result = Some(Err(error.clone()));
+                            self.console_reply(false, &error);
+                            self.log(
+                                ActivityLevel::Error,
+                                format!("Static patch publication failed: {error}"),
+                            );
+                        }
+                    }
+                }
             }
         }
     }
@@ -2153,7 +2326,10 @@ impl WorkbenchApp {
         self.project_operation.invalidate();
         self.export_operation.invalidate();
         self.review_operation.invalidate();
+        self.plugin_operation.invalidate();
         self.readiness_operation.invalidate();
+        let static_patch_was_pending = self.static_patch_operation.is_pending();
+        self.static_patch_operation.invalidate();
         self.offline_read.clear();
         if let Some(previous) = self.pending_review_rollback.take() {
             self.review = Some(previous);
@@ -2162,6 +2338,12 @@ impl WorkbenchApp {
             self.restore_project_context_after_failed_open();
         }
         self.close_after_review_save = false;
+        if static_patch_was_pending {
+            self.static_patch_result = Some(Err(
+                "the application-service worker disconnected during static patch publication"
+                    .to_owned(),
+            ));
+        }
         self.log(ActivityLevel::Error, error);
     }
 
@@ -2302,6 +2484,7 @@ impl WorkbenchApp {
         self.export_operation.invalidate();
         self.review_operation.invalidate();
         self.readiness_operation.invalidate();
+        self.static_patch_operation.invalidate();
         self.offline_read.clear();
         self.pending_review_rollback = None;
         self.readiness_outcome = None;
@@ -2310,6 +2493,12 @@ impl WorkbenchApp {
             .to_string_lossy()
             .into_owned();
         self.export_result = None;
+        if acceptance == ProjectAcceptance::NewProject {
+            self.pending_static_patch_drafts.clear();
+            self.selected_disassembly_instruction = None;
+            self.disassembly_row_focus_target = None;
+            self.static_patch_result = None;
+        }
         self.analysis_path = Some(project.identity.active_binary_path().to_path_buf());
         self.selected_projection_index = selected_rva
             .and_then(|rva| {
@@ -2673,6 +2862,7 @@ impl WorkbenchApp {
             && !self.review_operation.is_pending()
             && !self.readiness_operation.is_pending()
             && !self.offline_read.is_pending()
+            && !self.static_patch_operation.is_pending()
             && self.pending_binary_open.is_none();
         let recent_binaries = self.preferences.recent_binaries.clone();
         let mut choose_binary_requested = false;
@@ -2721,63 +2911,69 @@ impl WorkbenchApp {
                             .inner_margin(egui::Margin::symmetric(10, 5))
                             .corner_radius(4)
                             .show(ui, |ui| {
-                                if chrome.compact_header {
-                                    ui.set_max_width(280.0);
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(&project.identity.display_name).strong(),
+                                // A Frame inherits its parent's horizontal layout. Keep the
+                                // identity lines in an explicit vertical child so their widths
+                                // do not add together and collide with the trailing controls.
+                                ui.vertical(|ui| {
+                                    if chrome.compact_header {
+                                        ui.set_max_width(280.0);
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(&project.identity.display_name)
+                                                    .strong(),
+                                            )
+                                            .truncate(),
                                         )
-                                        .truncate(),
-                                    )
-                                    .on_hover_text(&project.identity.display_name);
-                                } else {
-                                    ui.label(
-                                        RichText::new(&project.identity.display_name).strong(),
-                                    );
-                                }
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        RichText::new(if chrome.compact_header {
-                                            "[EXACT] Identity bound"
-                                        } else {
-                                            "[EXACT] Exact identity"
-                                        })
-                                            .color(colors.exact_extracted),
-                                    )
-                                    .on_hover_text(format!(
-                                        "SHA-256 {}",
-                                        project.identity.sha256.as_str()
-                                    ));
-                                    if !chrome.compact_header {
+                                        .on_hover_text(&project.identity.display_name);
+                                    } else {
                                         ui.label(
-                                            RichText::new(short_hash(
-                                                project.identity.sha256.as_str(),
-                                            ))
-                                            .monospace()
-                                            .small()
-                                            .color(colors.secondary_text),
+                                            RichText::new(&project.identity.display_name).strong(),
+                                        );
+                                    }
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            RichText::new(if chrome.compact_header {
+                                                "[EXACT] Identity bound"
+                                            } else {
+                                                "[EXACT] Exact identity"
+                                            })
+                                            .color(colors.exact_extracted),
                                         )
                                         .on_hover_text(format!(
                                             "SHA-256 {}",
                                             project.identity.sha256.as_str()
                                         ));
+                                        if !chrome.compact_header {
+                                            ui.label(
+                                                RichText::new(short_hash(
+                                                    project.identity.sha256.as_str(),
+                                                ))
+                                                .monospace()
+                                                .small()
+                                                .color(colors.secondary_text),
+                                            )
+                                            .on_hover_text(format!(
+                                                "SHA-256 {}",
+                                                project.identity.sha256.as_str()
+                                            ));
+                                        }
+                                    });
+                                    if self.project_operation.is_pending() {
+                                        if let Some(path) = &self.analysis_path {
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "[OPENING] {}",
+                                                    path.file_name()
+                                                        .and_then(|name| name.to_str())
+                                                        .unwrap_or("selected binary")
+                                                ))
+                                                .small()
+                                                .color(colors.inferred),
+                                            )
+                                            .on_hover_text(path.display().to_string());
+                                        }
                                     }
                                 });
-                                if self.project_operation.is_pending() {
-                                    if let Some(path) = &self.analysis_path {
-                                        ui.label(
-                                            RichText::new(format!(
-                                                "[OPENING] {}",
-                                                path.file_name()
-                                                    .and_then(|name| name.to_str())
-                                                    .unwrap_or("selected binary")
-                                            ))
-                                            .small()
-                                            .color(colors.inferred),
-                                        )
-                                        .on_hover_text(path.display().to_string());
-                                    }
-                                }
                             });
                     } else if let Some(path) = &self.analysis_path {
                         ui.label(path.display().to_string());
@@ -3037,7 +3233,7 @@ impl WorkbenchApp {
                             "Schema {}",
                             project.snapshot.package().schema_version()
                         ));
-                        ui.label("Core-only safe review mode");
+                        ui.label("Core-only non-executing review mode");
                     });
                     if ui
                         .selectable_label(
@@ -3099,7 +3295,7 @@ impl WorkbenchApp {
                 }
 
                 ui.separator();
-                ui.collapsing("Plugins (read-only safe mode)", |ui| {
+                ui.collapsing("Plugins (read-only policy catalog)", |ui| {
                     self.show_plugin_list(ui);
                 });
                 ui.separator();
@@ -3137,17 +3333,44 @@ impl WorkbenchApp {
             });
     }
 
-    fn show_plugin_list(&self, ui: &mut egui::Ui) {
-        match &self.plugin_report {
-            Ok(report) if report.plugins.is_empty() => {
+    fn show_plugin_list(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let can_refresh = !self.plugin_operation.is_pending() && !self.worker_disconnected;
+            if ui
+                .add_enabled(can_refresh, egui::Button::new("Refresh"))
+                .on_hover_text(
+                    "Re-scan plugin artifacts and exact-fingerprint policy off the UI thread",
+                )
+                .clicked()
+            {
+                if let Err(error) = self.queue_plugin_catalog_refresh() {
+                    self.log(
+                        ActivityLevel::Error,
+                        format!("Plugin catalog refresh failed: {error}"),
+                    );
+                }
+            }
+            if self.plugin_operation.is_pending() {
+                ui.label(RichText::new("Scanning...").weak());
+            }
+        });
+        ui.small(
+            "Discovery health includes manifest, API, entrypoint, duplicate-ID, and declared plugin-dependency checks. Runtime, capability selection, host/helper, granted-permission, target, and launch-time gates are not evaluated. The workbench never executes plugins.",
+        );
+        match &self.plugin_catalog {
+            None => {
+                ui.label("[--] Plugin catalog has not completed yet");
+            }
+            Some(Ok(report)) if report.entries().is_empty() => {
                 ui.label("[--] No plugins discovered");
             }
-            Ok(report) => {
-                for plugin in &report.plugins {
+            Some(Ok(report)) => {
+                ui.small(format!("Root: {}", report.root().display()));
+                for plugin in report.entries() {
                     show_plugin(ui, plugin, self.preferences.theme.semantic_colors());
                 }
             }
-            Err(error) => {
+            Some(Err(error)) => {
                 ui.colored_label(
                     self.preferences
                         .theme
@@ -4304,6 +4527,7 @@ impl WorkbenchApp {
 
     fn show_address_space(&mut self, ui: &mut egui::Ui) {
         let colors = self.preferences.theme.semantic_colors();
+        self.handle_address_space_shortcuts(ui);
 
         ui.heading("Static address space");
         ui.horizontal_wrapped(|ui| {
@@ -4591,6 +4815,22 @@ impl WorkbenchApp {
                         ui.spinner();
                     }
                 });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("Preview").strong());
+                    ui.selectable_value(&mut self.offline_byte_view, OfflineByteView::Hex, "Hex")
+                        .on_hover_text("Show exact verified bytes (keyboard: H)");
+                    ui.selectable_value(
+                        &mut self.offline_byte_view,
+                        OfflineByteView::Disassembly,
+                        "Disassembly",
+                    )
+                    .on_hover_text("Show bounded x64 linear preview (keyboard: D)");
+                    ui.label(
+                        RichText::new("H/D switch view; arrow keys select instructions")
+                            .small()
+                            .color(colors.secondary_text),
+                    );
+                });
 
                 if let Some(presentation) = presentation {
                     ui.add_space(7.0);
@@ -4632,30 +4872,23 @@ impl WorkbenchApp {
                                             .small()
                                             .color(colors.secondary_text),
                                     );
-                                    ScrollArea::both()
-                                        .id_salt("offline_hex_rows_scroll")
-                                        .auto_shrink([false, true])
-                                        .max_height(124.0)
-                                        .show(ui, |ui| {
-                                            egui::Grid::new("offline_hex_rows")
-                                                .num_columns(3)
-                                                .spacing([12.0, 2.0])
-                                                .striped(true)
-                                                .show(ui, |ui| {
-                                                    for row in format_offline_hex_rows(
-                                                        outcome.span().rva(),
-                                                        bytes,
-                                                    ) {
-                                                        ui.monospace(format!(
-                                                            "0x{:016X}",
-                                                            row.rva
-                                                        ));
-                                                        ui.monospace(row.hex);
-                                                        ui.monospace(format!("|{}|", row.ascii));
-                                                        ui.end_row();
-                                                    }
-                                                });
-                                        });
+                                    match self.offline_byte_view {
+                                        OfflineByteView::Hex => {
+                                            self.show_offline_hex_preview(
+                                                ui,
+                                                outcome.span().rva(),
+                                                bytes,
+                                            );
+                                        }
+                                        OfflineByteView::Disassembly => {
+                                            self.show_linear_disassembly_preview(
+                                                ui,
+                                                outcome.span().rva(),
+                                                bytes,
+                                                colors,
+                                            );
+                                        }
+                                    }
                                 }
                                 OfflineImageReadAvailability::Unavailable(unavailable) => {
                                     ui.colored_label(
@@ -4685,6 +4918,8 @@ impl WorkbenchApp {
                 }
             });
 
+        self.show_pending_static_patch_drafts(ui, colors);
+
         if queue_requested {
             if let Err(error) = self.queue_offline_image_read() {
                 let error = bounded_message(error);
@@ -4693,6 +4928,759 @@ impl WorkbenchApp {
                     ActivityLevel::Error,
                     format!("Cannot queue offline image read: {error}"),
                 );
+            }
+        }
+    }
+
+    fn handle_address_space_shortcuts(&mut self, ui: &egui::Ui) {
+        if ui.ctx().wants_keyboard_input() {
+            return;
+        }
+        let (show_hex, show_disassembly) = ui.ctx().input(|input| {
+            let plain = !input.modifiers.command
+                && !input.modifiers.ctrl
+                && !input.modifiers.alt
+                && !input.modifiers.shift;
+            (
+                plain && input.key_pressed(Key::H),
+                plain && input.key_pressed(Key::D),
+            )
+        });
+        if show_hex {
+            self.offline_byte_view = OfflineByteView::Hex;
+        } else if show_disassembly {
+            self.offline_byte_view = OfflineByteView::Disassembly;
+        }
+    }
+
+    fn show_offline_hex_preview(&self, ui: &mut egui::Ui, start_rva: u64, bytes: &[u8]) {
+        ScrollArea::both()
+            .id_salt("offline_hex_rows_scroll")
+            .auto_shrink([false, true])
+            .max_height(124.0)
+            .show(ui, |ui| {
+                egui::Grid::new("offline_hex_rows")
+                    .num_columns(3)
+                    .spacing([12.0, 2.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        for row in format_offline_hex_rows(start_rva, bytes) {
+                            ui.monospace(format!("0x{:016X}", row.rva));
+                            ui.monospace(row.hex);
+                            ui.monospace(format!("|{}|", row.ascii));
+                            ui.end_row();
+                        }
+                    });
+            });
+    }
+
+    fn show_linear_disassembly_preview(
+        &mut self,
+        ui: &mut egui::Ui,
+        start_rva: u64,
+        bytes: &[u8],
+        colors: SemanticColors,
+    ) {
+        let limits = match LinearDisassemblyLimits::new(
+            bytes.len().max(1),
+            OFFLINE_DISASSEMBLY_INSTRUCTION_LIMIT,
+        ) {
+            Ok(limits) => limits,
+            Err(error) => {
+                ui.colored_label(
+                    colors.destructive_quarantined,
+                    format!("[FAILED CLOSED] Cannot construct linear preview: {error}"),
+                );
+                return;
+            }
+        };
+        let preview = disassemble_x64_linear(bytes, start_rva, limits);
+        if self
+            .selected_disassembly_instruction
+            .is_some_and(|index| index >= preview.rows().len())
+        {
+            self.selected_disassembly_instruction = None;
+            self.disassembly_row_focus_target = None;
+        }
+        self.apply_disassembly_keyboard_navigation(ui, &preview);
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new(LinearDisassemblyPreview::DISCLAIMER)
+                    .strong()
+                    .color(colors.warning_conflict),
+            );
+            ui.label(
+                RichText::new(format!(
+                    "{} instruction(s), {} byte(s) considered; {}",
+                    preview.rows().len(),
+                    preview.considered_bytes(),
+                    preview.stop_reason().label()
+                ))
+                .small()
+                .color(colors.secondary_text),
+            );
+        });
+
+        let selected_index = self
+            .selected_disassembly_instruction
+            .filter(|index| *index < preview.rows().len());
+        let focus_target = self.disassembly_row_focus_target;
+        ScrollArea::both()
+            .id_salt("offline_linear_disassembly_scroll")
+            .auto_shrink([false, true])
+            .max_height(180.0)
+            .show(ui, |ui| {
+                ui.set_min_width(760.0);
+                egui::Grid::new("offline_linear_disassembly_rows")
+                    .num_columns(5)
+                    .spacing([12.0, 3.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.strong("RVA");
+                        ui.strong("Bytes");
+                        ui.strong("Instruction");
+                        ui.strong("Flow");
+                        ui.strong("Len");
+                        ui.end_row();
+                        for (index, row) in preview.rows().iter().enumerate() {
+                            let selected = selected_index == Some(index);
+                            let accessible =
+                                instruction_row_accessible_label(row, index, preview.rows().len());
+                            let rva_response = ui
+                                .add(
+                                    egui::Label::new(
+                                        RichText::new(format!("0x{:016X}", row.rva())).monospace(),
+                                    )
+                                    .sense(Sense::click()),
+                                )
+                                .on_hover_text(&accessible);
+                            self.bind_instruction_row_context(&rva_response, index, row, colors);
+                            let bytes_response = ui
+                                .add(
+                                    egui::Label::new(
+                                        RichText::new(format_instruction_bytes(row.bytes()))
+                                            .monospace(),
+                                    )
+                                    .sense(Sense::click()),
+                                )
+                                .on_hover_text(&accessible);
+                            self.bind_instruction_row_context(&bytes_response, index, row, colors);
+                            let response = ui
+                                .selectable_label(selected, RichText::new(row.text()).monospace())
+                                .on_hover_text(&accessible);
+                            response.widget_info(|| {
+                                egui::WidgetInfo::selected(
+                                    egui::WidgetType::SelectableLabel,
+                                    true,
+                                    selected,
+                                    &accessible,
+                                )
+                            });
+                            if focus_target == Some(index) {
+                                response.request_focus();
+                                response.scroll_to_me(Some(Align::Center));
+                            }
+                            self.bind_instruction_row_context(&response, index, row, colors);
+                            let flow_response = ui
+                                .add(
+                                    egui::Label::new(
+                                        RichText::new(row.flow_control().label()).monospace(),
+                                    )
+                                    .sense(Sense::click()),
+                                )
+                                .on_hover_text(&accessible);
+                            self.bind_instruction_row_context(&flow_response, index, row, colors);
+                            let length_response = ui
+                                .add(
+                                    egui::Label::new(
+                                        RichText::new(row.length().to_string()).monospace(),
+                                    )
+                                    .sense(Sense::click()),
+                                )
+                                .on_hover_text(&accessible);
+                            self.bind_instruction_row_context(&length_response, index, row, colors);
+                            ui.end_row();
+                        }
+                    });
+            });
+        if focus_target.is_some() {
+            self.disassembly_row_focus_target = None;
+        }
+
+        if let Some(index) = self
+            .selected_disassembly_instruction
+            .filter(|index| *index < preview.rows().len())
+        {
+            ui.horizontal_wrapped(|ui| {
+                ui.menu_button("Selected instruction actions...", |ui| {
+                    self.show_instruction_action_menu(ui, &preview.rows()[index], colors);
+                });
+                ui.label(
+                    RichText::new(
+                        "Keyboard: arrows/Home/End select, Ctrl+C copies RVA, Ctrl+Shift+C copies bytes, Alt+N queues a static NOP draft",
+                    )
+                    .small()
+                    .color(colors.secondary_text),
+                );
+            });
+        }
+    }
+
+    fn bind_instruction_row_context(
+        &mut self,
+        response: &egui::Response,
+        index: usize,
+        row: &LinearInstructionRow,
+        colors: SemanticColors,
+    ) {
+        if response.clicked() || response.secondary_clicked() {
+            self.selected_disassembly_instruction = Some(index);
+        }
+        response.context_menu(|ui| {
+            self.show_instruction_action_menu(ui, row, colors);
+        });
+    }
+
+    fn apply_disassembly_keyboard_navigation(
+        &mut self,
+        ui: &egui::Ui,
+        preview: &LinearDisassemblyPreview,
+    ) {
+        if ui.ctx().wants_keyboard_input() {
+            return;
+        }
+        let (movement, copy_rva, copy_bytes, queue_nop) = ui.ctx().input(|input| {
+            let movement = if input.modifiers.command
+                || input.modifiers.ctrl
+                || input.modifiers.alt
+                || input.modifiers.shift
+            {
+                None
+            } else if input.key_pressed(Key::ArrowUp) {
+                Some(InstructionSelectionMove::Previous)
+            } else if input.key_pressed(Key::ArrowDown) {
+                Some(InstructionSelectionMove::Next)
+            } else if input.key_pressed(Key::Home) {
+                Some(InstructionSelectionMove::First)
+            } else if input.key_pressed(Key::End) {
+                Some(InstructionSelectionMove::Last)
+            } else {
+                None
+            };
+            let command = input.modifiers.command || input.modifiers.ctrl;
+            (
+                movement,
+                command && !input.modifiers.shift && input.key_pressed(Key::C),
+                command && input.modifiers.shift && input.key_pressed(Key::C),
+                input.modifiers.alt && input.key_pressed(Key::N),
+            )
+        });
+        if let Some(movement) = movement {
+            let selected = navigate_instruction_selection(
+                self.selected_disassembly_instruction,
+                preview.rows().len(),
+                movement,
+            );
+            self.selected_disassembly_instruction = selected;
+            self.disassembly_row_focus_target = selected;
+        }
+        let Some(row) = self
+            .selected_disassembly_instruction
+            .and_then(|index| preview.rows().get(index))
+        else {
+            return;
+        };
+        if copy_rva {
+            ui.ctx().copy_text(format!("0x{:016X}", row.rva()));
+        }
+        if copy_bytes {
+            ui.ctx().copy_text(format_instruction_bytes(row.bytes()));
+        }
+        if queue_nop {
+            self.queue_static_nop_draft(row);
+        }
+    }
+
+    fn show_instruction_action_menu(
+        &mut self,
+        ui: &mut egui::Ui,
+        row: &LinearInstructionRow,
+        colors: SemanticColors,
+    ) {
+        ui.label(RichText::new(row.text()).monospace().strong());
+        if ui.button("Copy RVA").clicked() {
+            ui.ctx().copy_text(format!("0x{:016X}", row.rva()));
+            ui.close();
+        }
+        let preferred_address = self.preferred_static_address(row.rva());
+        let copy_address = ui
+            .add_enabled(
+                preferred_address.is_some(),
+                egui::Button::new("Copy Preferred Address"),
+            )
+            .on_disabled_hover_text(
+                "The RVA is outside the preferred static image or overflows its preferred base.",
+            );
+        if copy_address.clicked() {
+            ui.ctx().copy_text(format!(
+                "0x{:016X}",
+                preferred_address.expect("enabled preferred address")
+            ));
+            ui.close();
+        }
+        if ui.button("Copy Bytes").clicked() {
+            ui.ctx().copy_text(format_instruction_bytes(row.bytes()));
+            ui.close();
+        }
+        if ui.button("Copy Instruction").clicked() {
+            ui.ctx().copy_text(row.text().to_owned());
+            ui.close();
+        }
+
+        let target = row.direct_target_rva();
+        let target_readable =
+            target.is_some_and(|target| self.static_rva_has_readable_file_backing(target));
+        let follow = ui
+            .add_enabled(target_readable, egui::Button::new("Follow Direct Target"))
+            .on_disabled_hover_text(match target {
+                None => "No typed direct branch/call target is present; indirect targets are never guessed.",
+                Some(_) => "The direct target is outside readable exact file backing in the verified static image.",
+            });
+        if follow.clicked() {
+            self.follow_static_target(target.expect("enabled direct target"));
+            ui.close();
+        }
+        ui.separator();
+        let already_nop_filled = row.bytes().iter().all(|byte| *byte == 0x90);
+        let static_nop_disabled_reason = self.static_nop_patchability(row).err();
+        let queue_static_nop = ui
+            .add_enabled(
+                static_nop_disabled_reason.is_none(),
+                egui::Button::new("Queue NOP for Patched Binary"),
+            )
+            .on_disabled_hover_text(
+                static_nop_disabled_reason.unwrap_or("The static NOP draft is unavailable."),
+            );
+        if queue_static_nop.clicked() {
+            self.queue_static_nop_draft(row);
+            ui.close();
+        }
+        ui.label(
+            RichText::new("Draft only; no file or live memory is modified")
+                .small()
+                .color(colors.secondary_text),
+        );
+        ui.separator();
+        ui.label(RichText::new("Live debugger").strong());
+        let live = LiveDebuggerActionContext::disconnected();
+        if let Some(reason) = live
+            .availability(LiveInstructionAction::Continue, row.bytes())
+            .disabled_reason()
+        {
+            ui.label(
+                RichText::new(format!("Live actions disabled: {reason}"))
+                    .small()
+                    .color(colors.secondary_text),
+            );
+        }
+        if already_nop_filled {
+            ui.label(
+                RichText::new("Live NOP disabled: The selected instruction is already NOP-filled.")
+                    .small()
+                    .color(colors.secondary_text),
+            );
+        }
+        for action in LiveInstructionAction::ALL {
+            let availability = live.availability(action, row.bytes());
+            let route = protocol_route_text(&action.protocol_route_preview(row.bytes()));
+            let button = ui
+                .add_enabled(availability.is_enabled(), egui::Button::new(action.label()))
+                .on_disabled_hover_text(format!(
+                    "{} Typed route: {route}",
+                    availability
+                        .disabled_reason()
+                        .unwrap_or("Action is unavailable.")
+                ));
+            if button.clicked() {
+                // This branch is unreachable while the UI has no authenticated
+                // typed client adapter. Keep the failure visible if the policy
+                // model and adapter wiring ever diverge.
+                self.log(
+                    ActivityLevel::Error,
+                    format!(
+                        "Live action {} has no authenticated workbench client adapter",
+                        action.label()
+                    ),
+                );
+            }
+        }
+    }
+
+    fn static_rva_has_readable_file_backing(&self, rva: u64) -> bool {
+        let address = RelativeAddress::new(rva);
+        self.project
+            .as_ref()
+            .and_then(|project| project.static_address_space.region_at(address))
+            .is_some_and(|region| {
+                region.access.readable && region.file_offset_at(address).is_some()
+            })
+    }
+
+    fn static_nop_patchability(&self, row: &LinearInstructionRow) -> Result<(), &'static str> {
+        if self.static_patch_operation.is_pending() {
+            return Err("A static patch publication is already running.");
+        }
+        if row.bytes().is_empty() {
+            return Err("The selected instruction has no exact source bytes.");
+        }
+        if row.bytes().iter().all(|byte| *byte == 0x90) {
+            return Err("The selected instruction is already NOP-filled.");
+        }
+        let project = self.project.as_ref().ok_or("No static project is open.")?;
+        if !project.snapshot.has_verified_source() {
+            return Err("The exact source binary must be verified before queuing a static edit.");
+        }
+        let start = RelativeAddress::new(row.rva());
+        let last_rva = row
+            .rva()
+            .checked_add(row.bytes().len() as u64 - 1)
+            .ok_or("The selected instruction range overflows the RVA address space.")?;
+        let last = RelativeAddress::new(last_rva);
+        let region = project
+            .static_address_space
+            .region_at(start)
+            .ok_or("The selected instruction is outside the preferred static image.")?;
+        if !region.access.executable || !matches!(&region.kind, StaticRegionKind::Section { .. }) {
+            return Err("Static NOP edits are limited to executable PE sections.");
+        }
+        if region.file_offset_at(start).is_none() || region.file_offset_at(last).is_none() {
+            return Err(
+                "The complete instruction is not in one exact file-backed executable region.",
+            );
+        }
+        Ok(())
+    }
+
+    fn preferred_static_address(&self, rva: u64) -> Option<u64> {
+        self.project
+            .as_ref()?
+            .static_address_space
+            .preferred_virtual_address(RelativeAddress::new(rva))
+    }
+
+    fn follow_static_target(&mut self, target_rva: u64) {
+        if !self.static_rva_has_readable_file_backing(target_rva) {
+            self.log(
+                ActivityLevel::Warning,
+                format!(
+                    "Cannot follow RVA 0x{target_rva:016X}: target is not in readable exact file backing"
+                ),
+            );
+            return;
+        }
+        self.offline_read_rva_input = format!("0x{target_rva:016X}");
+        self.selected_disassembly_instruction = None;
+        self.disassembly_row_focus_target = None;
+        if let Err(error) = self.queue_offline_image_read() {
+            self.log(
+                ActivityLevel::Error,
+                format!("Cannot follow direct target: {error}"),
+            );
+        }
+    }
+
+    fn queue_static_nop_draft(&mut self, row: &LinearInstructionRow) {
+        if let Err(reason) = self.static_nop_patchability(row) {
+            self.log(
+                ActivityLevel::Error,
+                format!("Cannot queue static NOP draft: {reason}"),
+            );
+            return;
+        }
+        let label = format!("NOP {} at RVA 0x{:016X}", row.text(), row.rva());
+        match self
+            .pending_static_patch_drafts
+            .queue_nop(row.rva(), row.bytes(), label)
+        {
+            Ok(PatchDraftQueueOutcome::Added) => {
+                self.static_patch_result = None;
+                self.log(
+                    ActivityLevel::Success,
+                    format!(
+                        "Queued unpublished static NOP draft for RVA 0x{:016X}; no file or process was modified",
+                        row.rva()
+                    ),
+                );
+            }
+            Ok(PatchDraftQueueOutcome::AlreadyQueued) => self.log(
+                ActivityLevel::Info,
+                format!(
+                    "Static NOP draft for RVA 0x{:016X} is already queued",
+                    row.rva()
+                ),
+            ),
+            Err(error) => self.log(
+                ActivityLevel::Error,
+                format!("Cannot queue static NOP draft: {error}"),
+            ),
+        }
+    }
+
+    fn choose_static_patch_destination(&self) -> Option<PathBuf> {
+        let default = self.project.as_ref().and_then(default_static_patch_path)?;
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Create a new patched binary")
+            .add_filter(PE_CONTAINER_FILTER.label, PE_CONTAINER_FILTER.extensions)
+            .add_filter(ALL_FILES_FILTER.label, ALL_FILES_FILTER.extensions);
+        if let Some(parent) = default
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            dialog = dialog.set_directory(parent);
+        }
+        if let Some(name) = default.file_name().and_then(|name| name.to_str()) {
+            dialog = dialog.set_file_name(name);
+        }
+        dialog.save_file()
+    }
+
+    fn build_static_patch_requests(&self) -> Result<Vec<StaticPatchEditRequest>, String> {
+        let drafts = self.pending_static_patch_drafts.drafts();
+        if drafts.is_empty() {
+            return Err("queue at least one static edit before publishing".to_owned());
+        }
+        let mut requests = Vec::with_capacity(drafts.len());
+        for draft in drafts {
+            let rva = u32::try_from(draft.rva()).map_err(|_| {
+                format!(
+                    "static patch draft RVA 0x{:016X} exceeds the PE RVA range",
+                    draft.rva()
+                )
+            })?;
+            let request = StaticPatchEditRequest::nop_instruction(
+                rva,
+                draft.expected().to_vec(),
+                draft.label().to_owned(),
+            )
+            .map_err(|error| format!("static patch draft at RVA 0x{rva:08X}: {error}"))?;
+            requests.push(request);
+        }
+        Ok(requests)
+    }
+
+    fn queue_static_patch_publication(&mut self, path: PathBuf) -> Result<String, String> {
+        if path.file_name().is_none() {
+            return Err("choose a destination that names a new patched binary".to_owned());
+        }
+        if path.exists() {
+            return Err(format!(
+                "choose a new path; existing patched destination {} will not be replaced",
+                path.display()
+            ));
+        }
+        if self.worker_disconnected {
+            return Err("the application-service worker is unavailable".to_owned());
+        }
+        if self.static_patch_operation.is_pending() {
+            return Err("a static patch publication is already running".to_owned());
+        }
+        if self.project_operation.is_pending() {
+            return Err(
+                "wait for the current project or source operation before publishing a patch"
+                    .to_owned(),
+            );
+        }
+        let requests = self.build_static_patch_requests()?;
+        let (project, project_name, source_path) = {
+            let project = self
+                .project
+                .as_ref()
+                .ok_or_else(|| "open a project before publishing a static patch".to_owned())?;
+            let source_path = project.snapshot.verified_source_path().ok_or_else(|| {
+                "the exact source binary must be verified before publishing a static patch"
+                    .to_owned()
+            })?;
+            (
+                Arc::clone(&project.snapshot),
+                project.identity.display_name.clone(),
+                source_path.to_path_buf(),
+            )
+        };
+        if path == source_path {
+            return Err(
+                "the patched destination must differ from the verified source path".to_owned(),
+            );
+        }
+        let edit_count = requests.len();
+        let operation = self.operation_sequence.issue();
+        self.service_worker
+            .submit(WorkerCommand::PublishStaticPatch {
+                operation,
+                project,
+                requests,
+                path: path.clone(),
+            })?;
+        self.static_patch_operation.begin(operation);
+        self.static_patch_result = None;
+        let message = format!(
+            "Queued {edit_count} exact static edit(s) for create-new publication to {} from {project_name}",
+            path.display()
+        );
+        self.log(ActivityLevel::Info, &message);
+        Ok(message)
+    }
+
+    fn show_pending_static_patch_drafts(&mut self, ui: &mut egui::Ui, colors: SemanticColors) {
+        ui.add_space(6.0);
+        let mut remove_rva = None;
+        let mut clear_all = false;
+        let mut publish_requested = false;
+        let publication_pending = self.static_patch_operation.is_pending();
+        let exact_source_ready = self
+            .project
+            .as_ref()
+            .is_some_and(|project| project.snapshot.has_verified_source());
+        egui::Frame::new()
+            .fill(colors.raised)
+            .stroke(egui::Stroke::new(1.0, colors.border))
+            .inner_margin(egui::Margin::same(8))
+            .corner_radius(4)
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("Pending static patch drafts").strong());
+                    ui.label(format!(
+                        "{} / {}",
+                        self.pending_static_patch_drafts.drafts().len(),
+                        MAX_PENDING_STATIC_PATCH_DRAFTS
+                    ));
+                    ui.label(
+                        RichText::new(
+                            "Unpublished only; a checked publisher must verify exact source bytes and create a new binary.",
+                        )
+                        .color(colors.secondary_text),
+                    );
+                    if ui
+                        .add_enabled(
+                            !publication_pending
+                                && !self.pending_static_patch_drafts.drafts().is_empty(),
+                            egui::Button::new("Clear drafts"),
+                        )
+                        .clicked()
+                    {
+                        clear_all = true;
+                    }
+                });
+                if self.pending_static_patch_drafts.drafts().is_empty() {
+                    ui.label(
+                        RichText::new("No pending static edits")
+                            .small()
+                            .color(colors.secondary_text),
+                    );
+                } else {
+                    for draft in self.pending_static_patch_drafts.drafts() {
+                        let (expected, replacement) = draft.source_check_and_replacement();
+                        ui.horizontal_wrapped(|ui| {
+                            ui.monospace(format!("0x{:016X}", draft.rva()));
+                            ui.monospace(format_instruction_bytes(expected));
+                            ui.label("->");
+                            ui.monospace(format_instruction_bytes(&replacement));
+                            ui.label(draft.label());
+                            if ui
+                                .add_enabled(
+                                    !publication_pending,
+                                    egui::Button::new("Remove").small(),
+                                )
+                                .clicked()
+                            {
+                                remove_rva = Some(draft.rva());
+                            }
+                        });
+                    }
+                }
+                ui.separator();
+                let can_publish = !publication_pending
+                    && !self.worker_disconnected
+                    && !self.project_operation.is_pending()
+                    && exact_source_ready
+                    && !self.pending_static_patch_drafts.drafts().is_empty();
+                let publish_label = if publication_pending {
+                    "Publishing patched binary..."
+                } else {
+                    "Create New Patched Binary..."
+                };
+                let publish = ui
+                    .add_enabled(can_publish, egui::Button::new(publish_label))
+                    .on_disabled_hover_text(if publication_pending {
+                        "A worker-owned create-new publication is already running."
+                    } else if !exact_source_ready {
+                        "Verify the exact source binary before publishing static edits."
+                    } else if self.pending_static_patch_drafts.drafts().is_empty() {
+                        "Queue at least one exact instruction edit first."
+                    } else {
+                        "The application-service worker is unavailable or busy with the project."
+                    });
+                publish_requested = publish.clicked();
+                if publication_pending {
+                    ui.spinner();
+                }
+                ui.label(
+                    RichText::new(
+                        "Publication revalidates the exact source identity and expected bytes on the service worker, then creates a new file without replacing source or destination.",
+                    )
+                    .small()
+                    .color(colors.secondary_text),
+                );
+                if let Some(result) = &self.static_patch_result {
+                    ui.separator();
+                    match result {
+                        Ok(outcome) => {
+                            ui.colored_label(
+                                colors.healthy,
+                                format!("[CREATED] {}", outcome.path().display()),
+                            );
+                            ui.label(
+                                RichText::new(format!(
+                                    "Output SHA-256 {}",
+                                    outcome.output_identity().id.as_str()
+                                ))
+                                .monospace()
+                                .small()
+                                .color(colors.exact_extracted),
+                            );
+                            for warning in outcome.warnings() {
+                                ui.colored_label(
+                                    colors.warning_conflict,
+                                    format!("[INTEGRITY WARNING] {warning}"),
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            ui.colored_label(
+                                colors.destructive_quarantined,
+                                format!("[PUBLICATION FAILED] {error}"),
+                            );
+                        }
+                    }
+                }
+            });
+        if let Some(rva) = remove_rva {
+            let _ = self.pending_static_patch_drafts.remove(rva);
+            self.static_patch_result = None;
+        }
+        if clear_all {
+            self.pending_static_patch_drafts.clear();
+            self.static_patch_result = None;
+        }
+        if publish_requested {
+            if let Some(path) = self.choose_static_patch_destination() {
+                if let Err(error) = self.queue_static_patch_publication(path) {
+                    self.static_patch_result = Some(Err(error.clone()));
+                    self.log(
+                        ActivityLevel::Error,
+                        format!("Static patch publication failed: {error}"),
+                    );
+                }
             }
         }
     }
@@ -5644,6 +6632,7 @@ impl eframe::App for WorkbenchApp {
                 || self.review_operation.is_pending()
                 || self.readiness_operation.is_pending()
                 || self.offline_read.is_pending()
+                || self.static_patch_operation.is_pending()
                 || self.console_host.is_enabled())
         {
             context.request_repaint_after(std::time::Duration::from_millis(100));
@@ -5888,29 +6877,76 @@ fn write_screenshot_new(path: &Path, image: &egui::ColorImage) -> Result<(), Str
         .map_err(|error| format!("PNG finish failed: {error}"))
 }
 
-fn show_plugin(ui: &mut egui::Ui, plugin: &DiscoveredPlugin, colors: SemanticColors) {
-    let (prefix, color) = match plugin.health.state {
-        PluginHealthState::Discovered | PluginHealthState::Enabled => ("OK", colors.healthy),
-        PluginHealthState::Disabled => ("OFF", colors.fallback),
-        PluginHealthState::Incompatible => ("INCOMPATIBLE", colors.warning_conflict),
-        PluginHealthState::Quarantined | PluginHealthState::DevelopmentError => {
-            ("QUARANTINED", colors.destructive_quarantined)
+fn show_plugin(ui: &mut egui::Ui, plugin: &PluginCatalogEntry, colors: SemanticColors) {
+    let color = match plugin.artifact_policy {
+        PluginArtifactPolicyStatus::Sandboxed | PluginArtifactPolicyStatus::Trusted => {
+            colors.healthy
         }
-        _ => ("STATE", colors.fallback),
+        PluginArtifactPolicyStatus::ApprovalRequired => colors.warning_conflict,
+        PluginArtifactPolicyStatus::Disabled => colors.fallback,
+        PluginArtifactPolicyStatus::Quarantined | PluginArtifactPolicyStatus::CorruptState => {
+            colors.destructive_quarantined
+        }
+        PluginArtifactPolicyStatus::Unavailable => colors.warning_conflict,
     };
-    let name = plugin.manifest.as_ref().map_or_else(
-        || plugin.path.display().to_string(),
-        |manifest| manifest.name.clone(),
-    );
+    let name = plugin
+        .name
+        .as_ref()
+        .map_or_else(|| plugin.path.display().to_string(), |name| name.clone());
     ui.collapsing(
-        RichText::new(format!("[{prefix}] {name}")).color(color),
+        RichText::new(format!("[{}] {name}", plugin.artifact_policy.badge_label())).color(color),
         |ui| {
-            ui.label(format!("State: {:?}", plugin.health.state));
-            ui.label(format!("Path: {}", plugin.path.display()));
-            for diagnostic in &plugin.health.diagnostics {
-                ui.label(format!("{:?}: {}", diagnostic.severity, diagnostic.message));
+            ui.label(format!("Source: {}", plugin.source));
+            if let Some(id) = &plugin.id {
+                ui.label(format!("ID: {id}"));
             }
-            if plugin.health.diagnostics.is_empty() {
+            if let Some(version) = &plugin.version {
+                ui.label(format!("Version: {version}"));
+            }
+            if let Some(description) = &plugin.description {
+                ui.label(description);
+            }
+            ui.label(format!("Discovery health: {}", plugin.health));
+            ui.label(format!(
+                "Discovery loadable: {}",
+                if plugin.loadable { "yes" } else { "no" }
+            ));
+            ui.label(format!(
+                "Exact-artifact policy: {}",
+                if plugin.artifact_policy.allows_by_artifact_policy() {
+                    "passes"
+                } else {
+                    "blocked"
+                }
+            ));
+            ui.label("Full CLI execution eligibility: not evaluated");
+            ui.label("Workbench execution: not supported");
+            if let Some(runtime) = &plugin.runtime {
+                ui.label(format!("Runtime: {runtime}"));
+            }
+            if !plugin.capabilities.is_empty() {
+                ui.label(format!(
+                    "Declared capabilities: {}",
+                    plugin.capabilities.join(", ")
+                ));
+            }
+            if !plugin.permissions.is_empty() {
+                ui.label(format!(
+                    "Requested permissions: {}",
+                    plugin.permissions.join(", ")
+                ));
+            }
+            ui.label(format!("Path: {}", plugin.path.display()));
+            if let Some(fingerprint) = &plugin.artifact_fingerprint {
+                ui.label("Exact artifact SHA-256:");
+                ui.monospace(fingerprint);
+            } else {
+                ui.label("Exact artifact SHA-256: unavailable");
+            }
+            for diagnostic in &plugin.diagnostics {
+                ui.label(diagnostic);
+            }
+            if plugin.diagnostics.is_empty() {
                 ui.label("No diagnostics");
             }
         },
@@ -6105,6 +7141,65 @@ fn format_offline_hex_rows(start_rva: u64, bytes: &[u8]) -> Vec<OfflineHexRow> {
                 .collect(),
         })
         .collect()
+}
+
+fn format_instruction_bytes(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn instruction_row_accessible_label(
+    row: &LinearInstructionRow,
+    index: usize,
+    row_count: usize,
+) -> String {
+    let direct_target = row.direct_target_rva().map_or_else(
+        || "no direct target".to_owned(),
+        |target| format!("direct target RVA 0x{target:016X}"),
+    );
+    format!(
+        "Linear disassembly instruction {} of {}: RVA 0x{:016X}; bytes {}; {}; flow {}; {}; length {}",
+        index + 1,
+        row_count,
+        row.rva(),
+        format_instruction_bytes(row.bytes()),
+        row.text(),
+        row.flow_control().label(),
+        direct_target,
+        row.length()
+    )
+}
+
+fn protocol_route_text(route: &LiveDebuggerProtocolRoute) -> String {
+    match route {
+        LiveDebuggerProtocolRoute::WriteMemoryCompareBeforeWrite {
+            expected,
+            replacement,
+        } => format!(
+            "DebugCommand::WriteMemory compare-before-write ({} exact expected byte(s), {} replacement byte(s))",
+            expected.len(),
+            replacement.len()
+        ),
+        LiveDebuggerProtocolRoute::SetBreakpoint {
+            kind,
+            temporary,
+            continue_after_set,
+        } => format!(
+            "DebugCommand::SetBreakpoint ({kind:?}, temporary={temporary}){}",
+            if *continue_after_set {
+                " then DebugCommand::Continue"
+            } else {
+                ""
+            }
+        ),
+        LiveDebuggerProtocolRoute::Step { kind } => {
+            format!("DebugCommand::Step {{ kind: {kind:?} }}")
+        }
+        LiveDebuggerProtocolRoute::Continue => "DebugCommand::Continue".to_owned(),
+    }
 }
 
 fn offline_read_banner(display: OfflineReadDisplay<'_>, rva: u64) -> String {
@@ -6774,6 +7869,27 @@ fn default_export_path(project: &LoadedProject, kind: ExportKind) -> PathBuf {
     path
 }
 
+fn default_static_patch_path(project: &LoadedProject) -> Option<PathBuf> {
+    let source = project.snapshot.verified_source_path()?;
+    let digest = project.identity.sha256.as_str();
+    let stem = source
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .map_or_else(|| format!("resymbol_{}", &digest[..12]), ToOwned::to_owned);
+    let file_name = source
+        .extension()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .map_or_else(
+            || format!("{stem}-patched"),
+            |extension| format!("{stem}-patched.{extension}"),
+        );
+    let mut path = source.to_path_buf();
+    path.set_file_name(file_name);
+    Some(path)
+}
+
 fn default_review_path(project: &LoadedProject) -> PathBuf {
     let digest = project.identity.sha256.as_str();
     let stem = project
@@ -6984,6 +8100,60 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn plugin_catalog_accepts_only_current_refresh_across_project_acceptance() {
+        let (_context, mut app) = test_app();
+        let temporary = tempfile::tempdir().expect("temporary plugin root");
+        let catalog = resymbol_app::AppServices::default()
+            .inspect_plugin_catalog(temporary.path())
+            .expect("empty plugin catalog");
+        app.plugin_operation.invalidate();
+        app.plugin_catalog = None;
+        let stale = app.operation_sequence.issue();
+        let current = app.operation_sequence.issue();
+        app.plugin_operation.begin(current);
+
+        let (source, project) = loaded_project_with_source();
+        app.analysis_path = Some(source.path().to_path_buf());
+        app.accept_project(project, ProjectAcceptance::NewProject);
+        assert!(
+            app.plugin_operation.is_pending(),
+            "project-independent catalog refresh remains current"
+        );
+
+        assert!(!app.accept_plugin_catalog(stale, Ok(catalog.clone())));
+        assert!(app.plugin_catalog.is_none());
+        assert!(app.plugin_operation.is_pending());
+
+        assert!(app.accept_plugin_catalog(current, Ok(catalog)));
+        assert!(!app.plugin_operation.is_pending());
+        let accepted = app
+            .plugin_catalog
+            .as_ref()
+            .expect("accepted snapshot")
+            .as_ref()
+            .expect("successful snapshot");
+        assert_eq!(accepted.root(), temporary.path());
+    }
+
+    #[test]
+    fn plugin_policy_badges_are_explicit_and_unambiguous() {
+        for (eligibility, badge) in [
+            (PluginArtifactPolicyStatus::Sandboxed, "SANDBOXED"),
+            (PluginArtifactPolicyStatus::Trusted, "TRUSTED"),
+            (
+                PluginArtifactPolicyStatus::ApprovalRequired,
+                "APPROVAL REQUIRED",
+            ),
+            (PluginArtifactPolicyStatus::Disabled, "DISABLED"),
+            (PluginArtifactPolicyStatus::Quarantined, "QUARANTINED"),
+            (PluginArtifactPolicyStatus::CorruptState, "CORRUPT STATE"),
+            (PluginArtifactPolicyStatus::Unavailable, "UNAVAILABLE"),
+        ] {
+            assert_eq!(eligibility.badge_label(), badge);
+        }
     }
 
     #[test]
@@ -7425,5 +8595,170 @@ mod tests {
         assert!(parse_hex_rva("-1").is_err());
         assert!(parse_hex_rva("0x10000000000000000").is_err());
         assert!(parse_hex_rva("0x12_G4").is_err());
+    }
+
+    #[test]
+    fn instruction_presentation_retains_exact_bytes_and_accessible_context() {
+        let limits = LinearDisassemblyLimits::new(16, 4).expect("limits");
+        let preview = disassemble_x64_linear(&[0x90, 0xC3], 0x1000, limits);
+        let row = preview.rows().first().expect("instruction row");
+
+        assert_eq!(format_instruction_bytes(row.bytes()), "90");
+        assert_eq!(
+            instruction_row_accessible_label(row, 0, preview.rows().len()),
+            "Linear disassembly instruction 1 of 2: RVA 0x0000000000001000; bytes 90; nop; flow sequential; no direct target; length 1"
+        );
+    }
+
+    #[test]
+    fn live_route_text_keeps_run_to_cursor_and_nop_composition_explicit() {
+        let run_to = LiveInstructionAction::RunToCursor.protocol_route_preview(&[0x90]);
+        let live_nop =
+            LiveInstructionAction::NopLiveMemory.protocol_route_preview(&[0x48, 0x89, 0xD8]);
+
+        assert_eq!(
+            protocol_route_text(&run_to),
+            "DebugCommand::SetBreakpoint (Software, temporary=true) then DebugCommand::Continue"
+        );
+        assert_eq!(
+            protocol_route_text(&live_nop),
+            "DebugCommand::WriteMemory compare-before-write (3 exact expected byte(s), 3 replacement byte(s))"
+        );
+    }
+
+    #[test]
+    fn direct_target_navigation_requires_readable_exact_file_backing() {
+        let (_source, project) = loaded_project_with_source();
+        let readable_backed = project
+            .static_address_space
+            .regions()
+            .iter()
+            .find_map(|region| {
+                (region.access.readable
+                    && region.file_backing.is_some_and(|backing| backing.size > 0))
+                .then(|| region.range.start().get())
+            })
+            .expect("readable file-backed fixture address");
+        let readable_unbacked = project
+            .static_address_space
+            .regions()
+            .iter()
+            .find_map(|region| {
+                let first_unbacked = region
+                    .range
+                    .start()
+                    .get()
+                    .checked_add(region.file_backing.map_or(0, |backing| backing.size))?;
+                (region.access.readable && first_unbacked < region.range.end())
+                    .then_some(first_unbacked)
+            })
+            .expect("readable zero-fill or mapped-padding fixture address");
+        let preferred_address = project.static_address_space.preferred_image_base + readable_backed;
+        let (_context, mut app) = test_app();
+        app.project = Some(project);
+
+        assert!(app.static_rva_has_readable_file_backing(readable_backed));
+        assert!(!app.static_rva_has_readable_file_backing(readable_unbacked));
+        assert_eq!(
+            app.preferred_static_address(readable_backed),
+            Some(preferred_address)
+        );
+    }
+
+    #[test]
+    fn static_nop_ui_gate_requires_an_exact_file_backed_executable_section() {
+        let (_source, project) = loaded_project_with_source();
+        let executable_backed = project
+            .static_address_space
+            .regions()
+            .iter()
+            .find(|region| {
+                region.access.executable
+                    && matches!(&region.kind, StaticRegionKind::Section { .. })
+                    && region.file_backing.is_some_and(|backing| backing.size > 0)
+            })
+            .expect("file-backed executable fixture region")
+            .range
+            .start()
+            .get();
+        let non_executable_backed = project
+            .static_address_space
+            .regions()
+            .iter()
+            .find(|region| {
+                !region.access.executable
+                    && region.file_backing.is_some_and(|backing| backing.size > 0)
+            })
+            .expect("file-backed non-executable fixture region")
+            .range
+            .start()
+            .get();
+        let executable = disassemble_x64_linear(
+            &[0xCC],
+            executable_backed,
+            LinearDisassemblyLimits::new(1, 1).expect("limits"),
+        );
+        let non_executable = disassemble_x64_linear(
+            &[0xCC],
+            non_executable_backed,
+            LinearDisassemblyLimits::new(1, 1).expect("limits"),
+        );
+        let already_nop = disassemble_x64_linear(
+            &[0x90],
+            executable_backed,
+            LinearDisassemblyLimits::new(1, 1).expect("limits"),
+        );
+        let (_context, mut app) = test_app();
+        app.project = Some(project);
+
+        assert!(app.static_nop_patchability(&executable.rows()[0]).is_ok());
+        assert_eq!(
+            app.static_nop_patchability(&non_executable.rows()[0]),
+            Err("Static NOP edits are limited to executable PE sections.")
+        );
+        assert_eq!(
+            app.static_nop_patchability(&already_nop.rows()[0]),
+            Err("The selected instruction is already NOP-filled.")
+        );
+    }
+
+    #[test]
+    fn patched_binary_suggestion_uses_the_verified_source_path() {
+        let directory = tempfile::tempdir().expect("temporary source directory");
+        let source = directory.path().join("application.exe");
+        std::fs::write(&source, STRIPPED_FIXTURE).expect("write exact source fixture");
+        let snapshot = AppServices::default()
+            .analyze_binary(&source)
+            .expect("analyze exact source fixture");
+        let project = LoadedProject::from_snapshot(snapshot).expect("loaded project");
+
+        assert_eq!(
+            default_static_patch_path(&project),
+            Some(directory.path().join("application-patched.exe"))
+        );
+    }
+
+    #[test]
+    fn patch_request_conversion_revalidates_the_exact_instruction_boundary() {
+        let (_context, mut app) = test_app();
+        app.pending_static_patch_drafts
+            .queue_nop(0x1000, &[0xCC, 0xC3], "two instructions")
+            .expect("shape-valid bounded draft");
+        assert!(
+            app.build_static_patch_requests()
+                .expect_err("multi-instruction NOP must fail")
+                .contains("exactly one complete valid x64 instruction")
+        );
+
+        app.pending_static_patch_drafts.clear();
+        app.pending_static_patch_drafts
+            .queue_nop(0x1000, &[0xCC], "one instruction")
+            .expect("shape-valid exact instruction draft");
+        assert_eq!(
+            app.build_static_patch_requests()
+                .expect("single instruction request")
+                .len(),
+            1
+        );
     }
 }

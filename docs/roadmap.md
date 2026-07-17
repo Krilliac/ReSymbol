@@ -49,9 +49,10 @@ peer or process. No live Windows host transport, AppContainer/Hyper-V provider, 
 attach, breakpoint, register, or process-memory service is implemented.
 
 This is a foundation, not the completed workbench or a working sandbox. GUI plugin execution,
-legacy-package migration, bulk review, docking, disassembly views, and an interactive debugger
-bridge remain planned. A portable Windows archive is the initial GUI packaging target; broader
-desktop packaging remains future validation.
+legacy-package migration, bulk review, docking, synchronized disassembly/pseudocode views, and an
+interactive debugger bridge remain planned. Address Space now includes a bounded non-executing x64
+linear preview, but it is not CFG or function-boundary truth. A portable Windows archive is the
+initial GUI packaging target; broader desktop packaging remains future validation.
 
 The CLI writes package schema 13 and can inspect or export schemas 1 through 12 through explicit
 compatibility paths. Schema 1 is migrated in memory by revalidating persisted metadata and
@@ -486,11 +487,12 @@ Semantic inference remains optional and never converts a hypothesis into an extr
 - Desktop workbench GUI for project navigation, evidence review, claim comparison, plugin health,
   bounded retained-relationship graphing, and export preview (initial Windows-first core-only shell,
   synchronized Reconstruction Graph, static Address Space/protection assessment, bounded exact-RVA
-  reads from verified source snapshots, non-executing debugger/sandbox readiness, evidence inspector,
-  current-package opening, six create-new exports, and transaction-safe exact-claim review with
-  versioned sidecars, dirty-close protection, and undo/redo implemented; bulk review, plugin
-  execution, docking/disassembly, editable or exhaustive graphing, live debugger bridges, and the
-  remaining [approved design](gui-design.md) are planned)
+  reads plus bounded x64 linear preview from verified source snapshots, non-executing
+  debugger/sandbox readiness, evidence inspector, current-package opening, six create-new exports,
+  and transaction-safe exact-claim review with versioned sidecars, dirty-close protection, and
+  undo/redo implemented; bulk review, plugin execution, docking/synchronized disassembly and
+  pseudocode, editable or exhaustive graphing, live debugger bridges, and the remaining
+  [approved design](gui-design.md) are planned)
 - Signed or verifiable plugin packages and registry metadata
 - Hash-addressed community symbol packs without bundled application binaries
 - Mergeable annotations and review decisions

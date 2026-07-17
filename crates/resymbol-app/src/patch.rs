@@ -2,13 +2,16 @@
 
 use std::{
     collections::TryReserveError,
-    fmt,
+    fmt, fs,
     io::{self, Write as _},
     path::{Path, PathBuf},
     sync::Arc,
 };
 
-use resymbol_analysis::{AnalysisError, BinaryAnalysis, PeSection};
+use resymbol_analysis::{
+    AnalysisError, BinaryAnalysis, LinearDisassemblyLimits, LinearDisassemblyStopReason, PeSection,
+    disassemble_x64_linear,
+};
 use resymbol_core::{BinaryFormat, BinaryId, BinaryIdentity, ClaimValidationError};
 use thiserror::Error;
 
@@ -511,8 +514,49 @@ impl AppServices {
         plan: &StaticPatchPlan,
         output: impl AsRef<Path>,
     ) -> Result<PublishedStaticPatch, StaticPatchError> {
+        let output = output.as_ref();
+        if project
+            .verified_source_path()
+            .is_some_and(|source| paths_refer_to_same_location(source, output))
+        {
+            return Err(StaticPatchError::OutputMatchesSource {
+                path: output.to_path_buf(),
+            });
+        }
         let image = self.apply_static_patch(project, plan)?;
-        publish_image_new(&image, output.as_ref())
+        publish_image_new(&image, output)
+    }
+}
+
+fn paths_refer_to_same_location(source: &Path, output: &Path) -> bool {
+    if source == output {
+        return true;
+    }
+    let normalize = |path: &Path| -> Option<PathBuf> {
+        if let Ok(canonical) = fs::canonicalize(path) {
+            return Some(canonical);
+        }
+        let file_name = path.file_name()?;
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::canonicalize(parent)
+            .ok()
+            .map(|canonical| canonical.join(file_name))
+    };
+    let (Some(source), Some(output)) = (normalize(source), normalize(output)) else {
+        return false;
+    };
+    #[cfg(windows)]
+    {
+        let source = source.to_string_lossy();
+        let output = output.to_string_lossy();
+        source.eq_ignore_ascii_case(output.as_ref())
+    }
+    #[cfg(not(windows))]
+    {
+        source == output
     }
 }
 
@@ -562,7 +606,34 @@ fn validate_request_shape(
     {
         return Err(StaticPatchError::InvalidNopReplacement { rva });
     }
+    if matches!(kind, StaticPatchKind::NopInstruction) {
+        validate_exact_nop_instruction(rva, expected)?;
+    }
     Ok(())
+}
+
+fn validate_exact_nop_instruction(rva: u32, expected: &[u8]) -> Result<(), StaticPatchError> {
+    let limits = LinearDisassemblyLimits::new(expected.len(), 2)
+        .expect("validated NOP edits fit the linear-disassembly hard limits");
+    let preview = disassemble_x64_linear(expected, u64::from(rva), limits);
+    let exact_single_instruction = preview.rows().len() == 1
+        && preview.rows()[0].bytes() == expected
+        && matches!(
+            preview.stop_reason(),
+            LinearDisassemblyStopReason::EndOfInput
+        );
+    if exact_single_instruction {
+        return Ok(());
+    }
+    let detail = if preview.rows().len() > 1 {
+        format!(
+            "decoded {} complete instructions instead of one",
+            preview.rows().len()
+        )
+    } else {
+        preview.stop_reason().label()
+    };
+    Err(StaticPatchError::InvalidNopInstructionEncoding { rva, detail })
 }
 
 fn validate_edit_size(size: usize) -> Result<(), StaticPatchError> {
@@ -831,6 +902,10 @@ pub enum StaticPatchError {
     },
     #[error("NOP edit at RVA {rva:#x} contains a non-NOP replacement byte")]
     InvalidNopReplacement { rva: u32 },
+    #[error(
+        "NOP edit at RVA {rva:#x} must contain exactly one complete valid x64 instruction: {detail}"
+    )]
+    InvalidNopInstructionEncoding { rva: u32, detail: String },
     #[error("the source binary identity is invalid: {0}")]
     InvalidSourceIdentity(ClaimValidationError),
     #[error("the analysis model is invalid: {0}")]
@@ -916,6 +991,8 @@ pub enum StaticPatchError {
     ExactSourceRequired,
     #[error("patched binary output path `{path}` does not name a file")]
     InvalidOutputPath { path: PathBuf },
+    #[error("patched binary output path `{path}` is the verified source path")]
+    OutputMatchesSource { path: PathBuf },
     #[error("refusing to overwrite existing patched binary `{path}`")]
     TargetAlreadyExists { path: PathBuf },
     #[error("cannot {operation} `{path}`: {source}")]
@@ -1010,5 +1087,32 @@ mod tests {
                 maximum: MAX_STATIC_PATCH_NOP_INSTRUCTION_BYTES,
             })
         ));
+        for invalid in [&[0xe9, 0x00][..], &[0xff, 0xf8][..], &[0xcc, 0xc3][..]] {
+            assert!(matches!(
+                StaticPatchEditRequest::nop_instruction(
+                    0x1000,
+                    invalid,
+                    "not one complete instruction"
+                ),
+                Err(StaticPatchError::InvalidNopInstructionEncoding { rva: 0x1000, .. })
+            ));
+        }
+        assert!(
+            StaticPatchEditRequest::nop_instruction(
+                0x1000,
+                [0xe9, 0x00, 0x00, 0x00, 0x00],
+                "one complete jump"
+            )
+            .is_ok()
+        );
+        assert!(
+            StaticPatchEditRequest::replace_bytes(
+                0x1000,
+                [0xcc, 0xc3],
+                [0x90, 0x90],
+                "general multi-instruction escape hatch"
+            )
+            .is_ok()
+        );
     }
 }

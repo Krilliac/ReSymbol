@@ -9,7 +9,10 @@ use std::{
     thread::{self, JoinHandle},
 };
 
-use resymbol_app::{AppServices, ExportFormat, ProjectSnapshot, ReviewLedger};
+use resymbol_app::{
+    AppServices, ExportFormat, PluginCatalog, ProjectSnapshot, PublishedStaticPatch, ReviewLedger,
+    StaticPatchEditRequest, StaticPatchPlan,
+};
 use resymbol_core::BinaryIdentity;
 use resymbol_debugger::{
     CapabilityAvailability, ClientConnectionState, CommandOutcome, DebugCapability, DebugCommand,
@@ -519,6 +522,11 @@ pub enum WorkerCommand {
         project: Arc<ProjectSnapshot>,
         path: PathBuf,
     },
+    /// Refresh the presentation-only plugin catalog without loading or executing plugins.
+    RefreshPluginCatalog {
+        operation: OperationId,
+        root: PathBuf,
+    },
     ProbeSandboxProvider {
         operation: OperationId,
         evidence: DebuggerReadinessEvidence,
@@ -530,6 +538,13 @@ pub enum WorkerCommand {
         project: Arc<ProjectSnapshot>,
         rva: u64,
         size: u32,
+    },
+    /// Validate and create-new publish exact static edits away from the UI thread.
+    PublishStaticPatch {
+        operation: OperationId,
+        project: Arc<ProjectSnapshot>,
+        requests: Vec<StaticPatchEditRequest>,
+        path: PathBuf,
     },
     Shutdown,
 }
@@ -560,6 +575,10 @@ pub enum WorkerEvent {
         operation: OperationId,
         result: Result<ReviewLoadOutcome, String>,
     },
+    PluginCatalogRefreshed {
+        operation: OperationId,
+        result: Result<PluginCatalog, String>,
+    },
     SandboxProviderProbed {
         operation: OperationId,
         result: Result<DebuggerReadinessOutcome, String>,
@@ -567,6 +586,10 @@ pub enum WorkerEvent {
     OfflineImageRead {
         operation: OperationId,
         result: Result<OfflineImageReadOutcome, OfflineImageReadFailure>,
+    },
+    StaticPatchPublished {
+        operation: OperationId,
+        result: Result<PublishedStaticPatch, String>,
     },
 }
 
@@ -697,6 +720,14 @@ fn process_command(services: &AppServices, command: WorkerCommand) -> Option<Wor
                     })
                 }),
         },
+        WorkerCommand::RefreshPluginCatalog { operation, root } => {
+            WorkerEvent::PluginCatalogRefreshed {
+                operation,
+                result: services
+                    .inspect_plugin_catalog(root)
+                    .map_err(|error| error.to_string()),
+            }
+        }
         WorkerCommand::ProbeSandboxProvider {
             operation,
             evidence,
@@ -713,6 +744,25 @@ fn process_command(services: &AppServices, command: WorkerCommand) -> Option<Wor
             operation,
             result: read_offline_image(project, rva, size),
         },
+        WorkerCommand::PublishStaticPatch {
+            operation,
+            project,
+            requests,
+            path,
+        } => {
+            let result = StaticPatchPlan::new(
+                project.session().base_analysis().identity(),
+                project.session().base_analysis(),
+                requests,
+            )
+            .map_err(|error| error.to_string())
+            .and_then(|plan| {
+                services
+                    .publish_static_patch_new(&project, &plan, &path)
+                    .map_err(|error| error.to_string())
+            });
+            WorkerEvent::StaticPatchPublished { operation, result }
+        }
         WorkerCommand::Shutdown => return None,
     };
     Some(event)
@@ -1028,6 +1078,7 @@ fn apply_reviews(
 mod tests {
     use std::{fs, io::Write as _};
 
+    use resymbol_app::PluginArtifactPolicyStatus;
     use resymbol_core::{BinaryFormat, BinaryId, BinaryIdentity};
     use resymbol_debugger::{
         DiagnosticText, ProviderProbeObservation, SandboxProviderProbeRequest,
@@ -1038,6 +1089,11 @@ mod tests {
 
     const STRIPPED_FIXTURE: &[u8] =
         include_bytes!("../../../fixtures/pe-x64-msvc/artifacts/milestone2-stripped.exe");
+    const SYMBOLIZED_FIXTURE: &[u8] =
+        include_bytes!("../../../fixtures/pe-x64-msvc/artifacts/milestone2-symbolized.exe");
+    const THUNK_RVA: u32 = 0x1184;
+    const THUNK_FILE_OFFSET: usize = 0x584;
+    const THUNK_BYTES: [u8; 5] = [0xe9, 0x03, 0x00, 0x00, 0x00];
 
     fn project_snapshot() -> Arc<ProjectSnapshot> {
         let (_source, snapshot) = project_snapshot_with_source();
@@ -1055,6 +1111,56 @@ mod tests {
             .analyze_binary(source.path())
             .expect("analyze worker fixture");
         (source, snapshot)
+    }
+
+    #[test]
+    fn plugin_catalog_refresh_runs_as_a_non_executing_worker_workflow() {
+        let temporary = tempdir().expect("temporary plugin root");
+        let plugin = temporary.path().join("worker-wasm");
+        fs::create_dir(&plugin).expect("create plugin directory");
+        fs::write(plugin.join("plugin.wasm"), b"not executable wasm").expect("write entrypoint");
+        fs::write(
+            plugin.join("plugin.toml"),
+            r#"manifest_version = 1
+id = "community.resymbol.worker-wasm"
+name = "Worker WASM"
+version = "1.0.0"
+api = "^0.1"
+capabilities = ["analyzer.binary"]
+permissions = ["binary.read", "claims.submit"]
+
+[runtime]
+kind = "wasm"
+entrypoint = "plugin.wasm"
+"#,
+        )
+        .expect("write plugin manifest");
+        let operation = OperationSequence::default().issue();
+
+        let event = process_command(
+            &AppServices::default(),
+            WorkerCommand::RefreshPluginCatalog {
+                operation,
+                root: temporary.path().to_path_buf(),
+            },
+        )
+        .expect("plugin catalog event");
+        let WorkerEvent::PluginCatalogRefreshed {
+            operation: actual,
+            result,
+        } = event
+        else {
+            panic!("unexpected worker event")
+        };
+        assert_eq!(actual, operation);
+        let catalog = result.expect("worker catalog refresh");
+        assert_eq!(catalog.entries().len(), 1);
+        assert_eq!(
+            catalog.entries()[0].artifact_policy,
+            PluginArtifactPolicyStatus::Sandboxed
+        );
+        let entrypoint = fs::read(plugin.join("plugin.wasm")).expect("entrypoint unchanged");
+        assert_eq!(entrypoint.as_slice(), b"not executable wasm");
     }
 
     fn offline_read(
@@ -1176,6 +1282,78 @@ mod tests {
         assert!(matches!(
             event,
             WorkerEvent::ReviewSaved {
+                operation,
+                result: Err(_),
+            } if operation == second
+        ));
+    }
+
+    #[test]
+    fn worker_owns_checked_create_new_static_patch_publication() {
+        let (source, project) = project_snapshot_with_bytes(SYMBOLIZED_FIXTURE);
+        let directory = tempdir().expect("temporary patch directory");
+        let path = directory.path().join("patched.exe");
+        let request = || {
+            StaticPatchEditRequest::nop_instruction(
+                THUNK_RVA,
+                THUNK_BYTES,
+                "Disable internal jump thunk",
+            )
+            .expect("valid exact instruction request")
+        };
+        let mut sequence = OperationSequence::default();
+        let first = sequence.issue();
+
+        let event = process_command(
+            &AppServices::default(),
+            WorkerCommand::PublishStaticPatch {
+                operation: first,
+                project: Arc::clone(&project),
+                requests: vec![request()],
+                path: path.clone(),
+            },
+        )
+        .expect("static patch event");
+        match event {
+            WorkerEvent::StaticPatchPublished {
+                operation,
+                result: Ok(outcome),
+            } => {
+                assert_eq!(operation, first);
+                assert_eq!(outcome.path(), path);
+                assert_eq!(
+                    outcome.source_identity(),
+                    project.session().base_analysis().identity()
+                );
+                assert_ne!(outcome.output_identity(), outcome.source_identity());
+                assert_eq!(outcome.warnings().len(), 2);
+            }
+            _ => panic!("unexpected worker event"),
+        }
+        let patched = fs::read(&path).expect("read patched output");
+        assert_eq!(
+            &patched[THUNK_FILE_OFFSET..THUNK_FILE_OFFSET + THUNK_BYTES.len()],
+            &[0x90; THUNK_BYTES.len()]
+        );
+        assert_eq!(
+            fs::read(source.path()).expect("read unchanged source"),
+            SYMBOLIZED_FIXTURE
+        );
+
+        let second = sequence.issue();
+        let event = process_command(
+            &AppServices::default(),
+            WorkerCommand::PublishStaticPatch {
+                operation: second,
+                project,
+                requests: vec![request()],
+                path,
+            },
+        )
+        .expect("second static patch event");
+        assert!(matches!(
+            event,
+            WorkerEvent::StaticPatchPublished {
                 operation,
                 result: Err(_),
             } if operation == second

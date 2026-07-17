@@ -23,6 +23,20 @@ artifact may run automatically during later analyses. Changing any fingerprinted
 file invalidates trust and requires a new decision. A plugin is never compiled, deleted, or
 rewritten automatically when it fails.
 
+The desktop workbench presents the exact-artifact trust, disablement, and quarantine policy without
+executing plugins.
+Its refresh action runs discovery, complete-directory fingerprinting, and host-state evaluation on
+the application-service worker, then atomically replaces the visible catalog snapshot. Each entry
+with a valid unpacked manifest and fingerprint shows the full exact SHA-256 and one explicit badge:
+`SANDBOXED`, `TRUSTED`, `APPROVAL REQUIRED`, `DISABLED`, `QUARANTINED`, `CORRUPT STATE`, or
+`UNAVAILABLE`. These badges combine discovery health (including manifest validity, API
+compatibility, entrypoint safety, duplicate IDs, and declared plugin-dependency resolution) with
+exact-artifact policy. They do not evaluate runtime support, capability selection, host/helper
+availability, granted permissions, target compatibility, or launch-time revalidation, and they do
+not imply that GUI plugin execution is implemented. The workbench has no trust, reset, enable, or
+execute control. Package candidates, unidentified directories, and fingerprint failures show an
+unavailable fingerprint and remain policy-blocked.
+
 An intended portable layout is:
 
 ```text

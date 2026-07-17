@@ -44,23 +44,25 @@ portable `.resym` package bound to the input's SHA-256 identity.
 On Windows x64, `resymbol-workbench.exe` opens a supported PE or current `.resym` package, runs the
 same core analysis away from the UI thread, and presents exact identity, evidence, durable
 exact-claim review, a bounded Reconstruction Graph, a static Address Space/protection assessment,
-bounded exact-RVA bytes from an exact verified source snapshot, read-only debugger/sandbox provider
-readiness, and discovered plugin health. The graph roots at the
+bounded exact-RVA hex and x64 linear-disassembly previews from an exact verified source snapshot,
+read-only debugger/sandbox provider readiness, and discovered plugin health. The graph roots at the
 PE entry point or a clearly labeled deterministic lowest-RVA navigation fallback, synchronizes
 function selection with the inspector, and draws only retained direct-call, thunk, and import
 relationships. Its visible bounded state makes large binary truncation explicit instead of
 suggesting complete call-graph recovery. Address Space is a preferred-image model rather than a live
 process map. Its reader serves at most 256 canonical file-backed bytes through the in-process offline
-host and rejects unbacked or crossing spans; readiness is only a non-mutating provisioning preflight.
-Neither surface executes the input or proves containment. Plugin health is read-only and the GUI does
+host and rejects unbacked or crossing spans. The capped linear view reports why it stopped and is not
+CFG or function-boundary truth; readiness is only a non-mutating provisioning preflight. Neither
+surface executes the input or proves containment. Plugin health is read-only and the GUI does
 not execute plugins or migrate
-legacy packages. It creates new `.resym`, neutral JSON, Markdown, MAP, public-symbol PDB, IDA Python,
-and Ghidra Java artifacts, stores review decisions in a separate binary-bound create-new sidecar,
+legacy packages. It creates new patched PE binaries, `.resym`, neutral JSON, Markdown, MAP,
+public-symbol PDB, IDA Python, and Ghidra Java artifacts, stores review decisions in a separate binary-bound create-new sidecar,
 and refuses to replace an existing destination. Its companion console is off by default; enable
 **View -> Companion console** to spawn live logs and typed workbench controls, then clear the same
 checkbox to close only that console session.
 
-This is not yet a general disassembler or a full symbol-recovery pipeline. It does not infer names
+The bounded Address Space preview is not a general disassembler or a full symbol-recovery pipeline.
+It does not infer names
 erased by compilation, reconstruct general C++ layouts, recover register-indirect control flow, or
 name virtual functions merely because their targets appear in a vftable. RTTI support deliberately
 accepts both MSVC x64 Rev1 base-class descriptor layouts: the legacy 24-byte form without `pCHD`
@@ -221,12 +223,16 @@ assessment, and read-only debugger/sandbox readiness. The graph's root and synch
 controls let you move between the entry point or deterministic lowest-RVA fallback and individual
 functions; only retained direct-call, thunk, and import edges are drawn. A **BOUNDED** cue identifies
 large views that exceed the rendering budget. With verified source bytes, Address Space can preview
-an exact 16/32/64/128/256-byte file-backed RVA span through the in-process offline host. The static
-and readiness views do not execute the input, create a sandbox, or prove containment. The workbench
+an exact 16/32/64/128/256-byte file-backed RVA span through the in-process offline host as hex or a
+capped x64 linear decode. The preview is not CFG or function-boundary truth. **Create New Patched
+Binary** accepts queued NOP drafts only when each is one complete x64 instruction, then worker-owned
+publication verifies exact source identity/bytes and creates a separate no-clobber binary; live actions remain disabled without an
+authenticated provider and current capabilities/tokens. The static and readiness views do not
+execute the input, create a sandbox, or prove containment. The workbench
 opens current `.resym` packages, can
 verify them against an exact source binary, saves review history to a separate create-new sidecar,
-and publishes create-new `.resym`, neutral JSON, Markdown, MAP, public-symbol PDB, IDA Python, or
-Ghidra Java artifacts. It never overwrites an existing destination. Plugin execution and legacy
+and publishes create-new patched PE binaries, `.resym`, neutral JSON, Markdown, MAP, public-symbol
+PDB, IDA Python, or Ghidra Java artifacts. It never overwrites an existing destination. Plugin execution and legacy
 package migration remain CLI workflows; live launch, attach, and memory mutation are not
 implemented.
 

@@ -5,8 +5,15 @@ use std::{
     sync::Arc,
 };
 
-use resymbol_app::{AppError, AppServices, DEFAULT_MAX_BINARY_BYTES, ExportFormat, ReviewLedger};
+use resymbol_app::{
+    AppError, AppServices, DEFAULT_MAX_BINARY_BYTES, ExportFormat, PluginArtifactPolicyStatus,
+    ReviewLedger,
+};
+use resymbol_core::plugin_api::PluginId;
 use resymbol_package::{CURRENT_SCHEMA_VERSION, PackageError};
+use resymbol_plugin_state::{
+    ArtifactStateKey, FingerprintLimits, PluginStateStore, fingerprint_plugin_directory,
+};
 use tempfile::TempDir;
 
 const EXACT_RSDS_PE: &[u8] =
@@ -155,7 +162,7 @@ fn all_six_exports_prepare_and_publish_without_clobbering() {
 }
 
 #[test]
-fn plugin_catalog_is_deterministic_and_safe_mode_never_loads() {
+fn plugin_catalog_is_deterministic_and_safe_mode_never_passes_artifact_policy() {
     let temp = TempDir::new().expect("create temp directory");
     let plugin = temp.path().join("sample-plugin");
     fs::create_dir(&plugin).expect("create plugin directory");
@@ -183,6 +190,7 @@ entrypoint = "plugin.wasm"
         .discover_plugins(temp.path(), false)
         .expect("discover normal plugin catalog");
     assert_eq!(normal.loadable_count(), 1);
+    assert_eq!(normal.artifact_policy_allowed_count(), 1);
     assert_eq!(normal.entries().len(), 1);
     let entry = &normal.entries()[0];
     assert_eq!(entry.id.as_deref(), Some("community.resymbol.sample"));
@@ -190,18 +198,200 @@ entrypoint = "plugin.wasm"
     assert_eq!(entry.runtime.as_deref(), Some("wasm"));
     assert_eq!(entry.health, "enabled");
     assert!(entry.loadable);
+    assert_eq!(entry.artifact_policy, PluginArtifactPolicyStatus::Sandboxed);
+    assert_eq!(
+        entry.artifact_fingerprint.as_ref().map(String::len),
+        Some(64)
+    );
+    assert!(entry.artifact_policy.allows_by_artifact_policy());
 
     let safe = services
         .discover_plugins(temp.path(), true)
         .expect("discover safe-mode plugin catalog");
     assert!(safe.safe_mode());
     assert_eq!(safe.loadable_count(), 0);
+    assert_eq!(safe.artifact_policy_allowed_count(), 0);
     assert_eq!(safe.entries()[0].health, "disabled");
+    assert_eq!(
+        safe.entries()[0].artifact_policy,
+        PluginArtifactPolicyStatus::Disabled
+    );
     assert!(
         safe.entries()[0]
             .diagnostics
             .iter()
             .any(|message| message.contains("safe-mode"))
+    );
+}
+
+#[test]
+fn process_catalog_policy_is_bound_to_the_exact_artifact() {
+    let temp = TempDir::new().expect("create temp directory");
+    let plugin = temp.path().join("process-plugin");
+    fs::create_dir(&plugin).expect("create process plugin directory");
+    let executable = plugin.join("plugin.exe");
+    fs::write(&executable, b"first exact process artifact").expect("write process entrypoint");
+    fs::write(
+        plugin.join("plugin.toml"),
+        r#"manifest_version = 1
+id = "community.resymbol.process-policy"
+name = "Process policy fixture"
+version = "1.0.0"
+api = "^0.1"
+capabilities = ["analyzer.binary"]
+permissions = ["binary.read", "claims.submit"]
+
+[runtime]
+kind = "external-process"
+entrypoint = "plugin.exe"
+args = ["--stdio"]
+"#,
+    )
+    .expect("write process manifest");
+
+    let services = AppServices::default();
+    let initial = services
+        .inspect_plugin_catalog(temp.path())
+        .expect("inspect initial process policy");
+    let initial_entry = &initial.entries()[0];
+    assert_eq!(initial.loadable_count(), 1);
+    assert_eq!(initial.artifact_policy_allowed_count(), 0);
+    assert_eq!(
+        initial_entry.artifact_policy,
+        PluginArtifactPolicyStatus::ApprovalRequired
+    );
+    assert!(initial_entry.loadable);
+    assert!(!initial_entry.artifact_policy.allows_by_artifact_policy());
+    let initial_fingerprint = fingerprint_plugin_directory(&plugin, FingerprintLimits::default())
+        .expect("fingerprint initial process artifact")
+        .fingerprint;
+    let initial_fingerprint_hex = initial_fingerprint.to_hex();
+    assert_eq!(
+        initial_entry.artifact_fingerprint.as_deref(),
+        Some(initial_fingerprint_hex.as_str())
+    );
+
+    let plugin_id = PluginId::new("community.resymbol.process-policy").expect("plugin id");
+    let store = PluginStateStore::new(temp.path());
+    store
+        .trust(&ArtifactStateKey::new(
+            plugin_id.clone(),
+            initial_fingerprint,
+        ))
+        .expect("trust exact initial artifact");
+    let trusted = services
+        .inspect_plugin_catalog(temp.path())
+        .expect("inspect trusted process policy");
+    assert_eq!(
+        trusted.entries()[0].artifact_policy,
+        PluginArtifactPolicyStatus::Trusted
+    );
+    assert_eq!(trusted.loadable_count(), 1);
+    assert_eq!(trusted.artifact_policy_allowed_count(), 1);
+    assert!(
+        trusted.entries()[0]
+            .artifact_policy
+            .allows_by_artifact_policy()
+    );
+
+    fs::write(&executable, b"mutated process artifact").expect("mutate process entrypoint");
+    let changed = services
+        .inspect_plugin_catalog(temp.path())
+        .expect("inspect changed process policy");
+    assert_eq!(
+        changed.entries()[0].artifact_policy,
+        PluginArtifactPolicyStatus::ApprovalRequired
+    );
+    assert_eq!(changed.artifact_policy_allowed_count(), 0);
+    assert!(
+        !changed.entries()[0]
+            .artifact_policy
+            .allows_by_artifact_policy()
+    );
+    assert_ne!(
+        changed.entries()[0].artifact_fingerprint,
+        initial.entries()[0].artifact_fingerprint
+    );
+
+    let changed_fingerprint = fingerprint_plugin_directory(&plugin, FingerprintLimits::default())
+        .expect("fingerprint changed process artifact")
+        .fingerprint;
+    let changed_key = ArtifactStateKey::new(plugin_id, changed_fingerprint);
+    store
+        .quarantine(&changed_key, "deterministic policy test quarantine")
+        .expect("quarantine exact changed artifact");
+    let quarantined = services
+        .inspect_plugin_catalog(temp.path())
+        .expect("inspect quarantined process policy");
+    assert_eq!(
+        quarantined.entries()[0].artifact_policy,
+        PluginArtifactPolicyStatus::Quarantined
+    );
+    assert_eq!(quarantined.artifact_policy_allowed_count(), 0);
+    assert!(
+        !quarantined.entries()[0]
+            .artifact_policy
+            .allows_by_artifact_policy()
+    );
+}
+
+#[test]
+fn corrupt_exact_process_state_fails_catalog_policy_closed() {
+    let temp = TempDir::new().expect("create temp directory");
+    let plugin = temp.path().join("corrupt-state-plugin");
+    fs::create_dir(&plugin).expect("create process plugin directory");
+    fs::write(plugin.join("plugin.exe"), b"process artifact").expect("write entrypoint");
+    fs::write(
+        plugin.join("plugin.toml"),
+        r#"manifest_version = 1
+id = "community.resymbol.corrupt-state"
+name = "Corrupt state fixture"
+version = "1.0.0"
+api = "^0.1"
+capabilities = ["analyzer.binary"]
+permissions = ["binary.read", "claims.submit"]
+
+[runtime]
+kind = "external-process"
+entrypoint = "plugin.exe"
+"#,
+    )
+    .expect("write process manifest");
+
+    let fingerprint = fingerprint_plugin_directory(&plugin, FingerprintLimits::default())
+        .expect("fingerprint process artifact")
+        .fingerprint;
+    let key = ArtifactStateKey::new(
+        PluginId::new("community.resymbol.corrupt-state").expect("plugin id"),
+        fingerprint,
+    );
+    let store = PluginStateStore::new(temp.path());
+    store.trust(&key).expect("create exact trust record");
+    let record = fs::read_dir(store.state_root().join("v1").join("trust"))
+        .expect("read trust directory")
+        .map(|entry| entry.expect("read trust entry").path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(&format!("-{fingerprint}.json")))
+        })
+        .expect("exact trust record");
+    fs::write(record, b"{").expect("corrupt exact trust record");
+
+    let catalog = AppServices::default()
+        .inspect_plugin_catalog(temp.path())
+        .expect("catalog scan survives corrupt plugin state");
+    let entry = &catalog.entries()[0];
+    assert_eq!(
+        entry.artifact_policy,
+        PluginArtifactPolicyStatus::CorruptState
+    );
+    assert!(!entry.artifact_policy.allows_by_artifact_policy());
+    assert!(
+        entry
+            .diagnostics
+            .iter()
+            .any(|message| message.contains("failed closed"))
     );
 }
 
