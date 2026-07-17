@@ -39,6 +39,44 @@ use crate::protocol::{
     EventSequence,
 };
 pub const MAX_PENDING_COMMANDS: usize = 1;
+/// Longest single wait a transport may perform for unsolicited host events.
+///
+/// Callers can pump repeatedly, but one poll remains bounded so a connection
+/// owner can service shutdown and outbound command queues between waits.
+pub const MAX_HOST_POLL_WAIT_MILLIS: u32 = 1_000;
+
+/// Validated wait supplied to [`HostFrameExchange::poll_inbound`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct HostPollWait(u32);
+
+impl HostPollWait {
+    pub fn from_millis(milliseconds: u32) -> Result<Self, HostPollWaitError> {
+        if milliseconds > MAX_HOST_POLL_WAIT_MILLIS {
+            Err(HostPollWaitError::TooLong {
+                actual: milliseconds,
+                maximum: MAX_HOST_POLL_WAIT_MILLIS,
+            })
+        } else {
+            Ok(Self(milliseconds))
+        }
+    }
+
+    #[must_use]
+    pub const fn immediate() -> Self {
+        Self(0)
+    }
+
+    #[must_use]
+    pub const fn as_millis(self) -> u32 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
+pub enum HostPollWaitError {
+    #[error("host event poll wait {actual} ms exceeds the {maximum} ms maximum")]
+    TooLong { actual: u32, maximum: u32 },
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlShutdownReason {
@@ -64,6 +102,22 @@ pub trait HostFrameExchange {
         request: HostFrame,
         limits: HostResponseLimits,
     ) -> Result<HostResponseBatch, HostTransportError>;
+
+    /// Receives one nonempty, peer-declared batch of unsolicited event frames.
+    ///
+    /// The default preserves compatibility for request/response-only hosts by
+    /// reporting that no batch arrived. A live transport must apply `limits`
+    /// before allocating exactly as [`Self::exchange`] does. `Ok(None)` means
+    /// the bounded wait elapsed; it is not a disconnect or an empty batch.
+    /// Poll batches and exchange responses share one inbound frame/event
+    /// sequence and must be surfaced in the exact order assigned by the host.
+    fn poll_inbound(
+        &mut self,
+        _wait: HostPollWait,
+        _limits: HostResponseLimits,
+    ) -> Result<Option<HostResponseBatch>, HostTransportError> {
+        Ok(None)
+    }
 
     /// Releases host-side bookkeeping only after the client independently
     /// verified a terminal session and, when required, exact cleanup evidence.
@@ -458,6 +512,50 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
         self.accept_response_batch(&envelope, checkpoint, required_command_state, responses)
     }
 
+    /// Pumps one bounded batch of unsolicited state observations.
+    ///
+    /// This path never completes or implies success for an outbound command.
+    /// Only `caused_by = None` stopped and exited observations for the exact
+    /// active session are accepted, and each observation is independently
+    /// replayed through the controller's reducer before it becomes verified
+    /// state. `Ok(Vec::new())` means the bounded transport wait elapsed.
+    ///
+    /// `[connection owner thread; potentially blocking for at most wait]`
+    pub fn pump_inbound(
+        &mut self,
+        wait: HostPollWait,
+    ) -> Result<Vec<EventEnvelope>, DebugHostClientError> {
+        self.require_session_open()?;
+        let responses = match self
+            .transport
+            .poll_inbound(wait, DEFAULT_HOST_RESPONSE_LIMITS)
+        {
+            Ok(Some(responses)) => responses,
+            Ok(None) => return Ok(Vec::new()),
+            Err(error) => {
+                self.connection_state = if error.is_disconnected() {
+                    ClientConnectionState::Disconnected
+                } else {
+                    ClientConnectionState::Failed
+                };
+                self.abort_transport(ControlShutdownReason::TransportFailure);
+                return Err(error.into());
+            }
+        };
+
+        let mut session = self
+            .session
+            .take()
+            .ok_or(DebugHostClientError::SessionNotOwned)?;
+        let result = self.accept_unsolicited_batch(&mut session, responses);
+        self.session = Some(session);
+        if result.is_err() {
+            self.connection_state = ClientConnectionState::Failed;
+            self.abort_transport(ControlShutdownReason::ProtocolFailure);
+        }
+        result
+    }
+
     /// Releases only a terminal, reducer-confirmed session. This does not send
     /// a target operation and cannot turn an unclean session into a clean one.
     ///
@@ -563,6 +661,73 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
             self.abort_transport(ControlShutdownReason::ProtocolFailure);
         }
         result
+    }
+
+    fn accept_unsolicited_batch(
+        &mut self,
+        session: &mut ClientSession,
+        responses: HostResponseBatch,
+    ) -> Result<Vec<EventEnvelope>, DebugHostClientError> {
+        responses.validate(DEFAULT_HOST_RESPONSE_LIMITS)?;
+        if responses.is_empty() {
+            return Err(DebugHostClientError::EmptyUnsolicitedEventBatch);
+        }
+        let mut events = Vec::with_capacity(responses.len());
+        for frame in responses.into_frames() {
+            self.require_negotiated_frame_version(&frame)?;
+            if frame.header().sequence.get() != self.next_inbound_frame_sequence {
+                return Err(DebugHostClientError::UnexpectedFrameSequence {
+                    expected: self.next_inbound_frame_sequence,
+                    actual: frame.header().sequence.get(),
+                });
+            }
+            self.next_inbound_frame_sequence = self
+                .next_inbound_frame_sequence
+                .checked_add(1)
+                .ok_or(DebugHostClientError::FrameSequenceOverflow)?;
+            let event = decode_event_frame(&frame)?;
+            if event.version != self.typed_version {
+                return Err(DebugHostClientError::UnexpectedTypedProtocolVersion {
+                    expected: self.typed_version,
+                    actual: event.version,
+                });
+            }
+            self.event_cursor.observe(event.sequence)?;
+            if let Some(command_id) = event.caused_by {
+                return Err(DebugHostClientError::UnsolicitedEventCarriedCorrelation {
+                    command_id,
+                });
+            }
+            let session_id = session.reducer.session_id();
+            if event.session_id != Some(session_id) {
+                return Err(DebugHostClientError::UnexpectedEventSession {
+                    expected: session_id,
+                    actual: event.session_id,
+                });
+            }
+            let next = match &event.event {
+                DebugEvent::StateChanged(
+                    next @ (SessionState::Stopped { .. } | SessionState::Exited { .. }),
+                ) => next,
+                DebugEvent::StateChanged(next) => {
+                    return Err(DebugHostClientError::UnexpectedUnsolicitedState {
+                        state: next.kind(),
+                    });
+                }
+                _ => return Err(DebugHostClientError::UnexpectedUnsolicitedEvent),
+            };
+            if event.state != Some(next.state_token()) {
+                return Err(DebugHostClientError::UnexpectedEventState {
+                    expected: next.state_token(),
+                    actual: event.state,
+                });
+            }
+            session.verified_state.validate_successor(next)?;
+            apply_state_event(&mut session.reducer, next, None)?;
+            session.verified_state = next.clone();
+            events.push(event);
+        }
+        Ok(events)
     }
 
     fn accept_capability_batch(
@@ -1776,6 +1941,14 @@ pub enum DebugHostClientError {
         expected: CommandId,
         actual: Option<CommandId>,
     },
+    #[error("unsolicited host event carried command correlation {command_id:?}")]
+    UnsolicitedEventCarriedCorrelation { command_id: CommandId },
+    #[error("transport returned an empty unsolicited event batch instead of a poll timeout")]
+    EmptyUnsolicitedEventBatch,
+    #[error("unsolicited host event carried unsupported session state {state:?}")]
+    UnexpectedUnsolicitedState { state: SessionStateKind },
+    #[error("unsolicited host batch carried a non-state event")]
+    UnexpectedUnsolicitedEvent,
     #[error("expected event session {expected:?}, received {actual:?}")]
     UnexpectedEventSession {
         expected: SessionId,
@@ -2264,7 +2437,7 @@ fn synthetic_command_supported(command: &DebugCommand) -> bool {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeSet, VecDeque};
     use std::path::PathBuf;
     use std::rc::Rc;
 
@@ -2322,6 +2495,121 @@ mod tests {
         DebugHostClient::connect(host, [0x6d; 16], "controller/build-7", "host/build-4").unwrap()
     }
 
+    fn async_process() -> ProcessIdentity {
+        ProcessIdentity {
+            process_id: ProcessId::new(4_242).expect("process id"),
+            start_key: ProcessStartKey::new(7_777).expect("process start key"),
+            binary_id: BinaryId::digest(b"async host-client fixture"),
+        }
+    }
+
+    fn async_state_frame(
+        frame_sequence: u64,
+        event_sequence: u64,
+        state: SessionState,
+        caused_by: Option<CommandId>,
+    ) -> HostFrame {
+        let envelope = EventEnvelope {
+            version: ProtocolVersion::current(),
+            sequence: EventSequence::new(event_sequence).expect("event sequence"),
+            session_id: Some(state.state_token().session_id),
+            state: Some(state.state_token()),
+            caused_by,
+            event: DebugEvent::StateChanged(state),
+        };
+        encode_event_frame(
+            FrameSequence::new(frame_sequence).expect("frame sequence"),
+            &envelope,
+        )
+        .expect("async event frame")
+    }
+
+    fn running_async_client(inbound: Vec<Vec<HostFrame>>) -> DebugHostClient<AsyncQueueHost> {
+        let mut client = DebugHostClient::connect(
+            AsyncQueueHost::new(inbound),
+            [0x6d; 16],
+            "controller/build-7",
+            "host/build-4",
+        )
+        .expect("connect async test host");
+        client
+            .begin_session(session_id(), provisioning_epoch(), helper_build())
+            .expect("begin async test session");
+
+        let process = async_process();
+        let risk_id = HostRiskLeaseId::new("a".repeat(64)).expect("host-risk id");
+        let operation = HostRiskOperation::Attach {
+            process: process.clone(),
+            mode: AttachMode::Debug,
+        };
+        client
+            .register_host_risk_verifier(HostRiskVerifier::new(
+                risk_id.clone(),
+                session_id(),
+                provisioning_epoch(),
+                operation,
+            ))
+            .expect("register controller verifier");
+
+        // Prime only the controller's pure reducer. The synthetic transport
+        // still performs no process operation and makes no live-host claim.
+        let idle = client
+            .session_state()
+            .expect("idle session state")
+            .state_token();
+        let open = CommandEnvelope {
+            version: ProtocolVersion::current(),
+            command_id: CommandId::new(1).expect("open command id"),
+            session_id: Some(session_id()),
+            expected_state: Some(idle),
+            command: DebugCommand::Open(DebugTargetRequest::Attach(AttachTarget {
+                scope: AttachScope::Host {
+                    process,
+                    risk_lease: risk_id,
+                },
+                mode: AttachMode::Debug,
+            })),
+        };
+        let session = client.session.as_mut().expect("client session");
+        session
+            .reducer
+            .accept_command(&open)
+            .expect("accept synthetic attach");
+        let stopped = session
+            .reducer
+            .mark_stopped(
+                StopReason::Initial,
+                ThreadId::new(9).expect("initial thread id"),
+            )
+            .expect("mark initial stop")
+            .clone();
+        let SessionState::Stopped { token, .. } = stopped else {
+            panic!("attach did not produce a stopped state");
+        };
+        let continue_command = CommandEnvelope {
+            version: ProtocolVersion::current(),
+            command_id: CommandId::new(2).expect("continue command id"),
+            session_id: Some(session_id()),
+            expected_state: Some(token.state),
+            command: DebugCommand::Continue { stop: token },
+        };
+        let running = session
+            .reducer
+            .accept_command(&continue_command)
+            .expect("accept synthetic continue")
+            .clone();
+        assert_eq!(running.kind(), SessionStateKind::Running);
+        session.verified_state = running;
+        client
+    }
+
+    fn next_async_state_token() -> StateToken {
+        StateToken {
+            session_id: session_id(),
+            generation: StateGeneration::new(5).expect("next state generation"),
+        }
+    }
+
     #[derive(Debug, Clone, Copy)]
     enum ResponseMutation {
         FrameGap,
@@ -2341,6 +2629,20 @@ mod tests {
     struct OverBudgetHost {
         inner: SyntheticDebugHost,
         exchanges: usize,
+    }
+
+    struct AsyncQueueHost {
+        inner: SyntheticDebugHost,
+        inbound: VecDeque<Vec<HostFrame>>,
+    }
+
+    impl AsyncQueueHost {
+        fn new(inbound: Vec<Vec<HostFrame>>) -> Self {
+            Self {
+                inner: host(),
+                inbound: inbound.into(),
+            }
+        }
     }
 
     impl OverBudgetHost {
@@ -2522,6 +2824,45 @@ mod tests {
             )
             .unwrap();
             HostResponseBatch::try_from_frames(frames, permissive).map_err(HostTransportError::from)
+        }
+
+        fn release_session(&mut self, session_id: SessionId) -> Result<(), HostTransportError> {
+            self.inner.release_session(session_id)
+        }
+
+        fn shutdown_control(
+            &mut self,
+            reason: ControlShutdownReason,
+        ) -> Result<(), HostTransportError> {
+            self.inner.shutdown_control(reason)
+        }
+
+        fn abort_control(&mut self, reason: ControlShutdownReason) {
+            self.inner.abort_control(reason);
+        }
+    }
+
+    impl HostFrameExchange for AsyncQueueHost {
+        fn exchange(
+            &mut self,
+            request: HostFrame,
+            limits: HostResponseLimits,
+        ) -> Result<HostResponseBatch, HostTransportError> {
+            self.inner.exchange(request, limits)
+        }
+
+        fn poll_inbound(
+            &mut self,
+            _wait: HostPollWait,
+            limits: HostResponseLimits,
+        ) -> Result<Option<HostResponseBatch>, HostTransportError> {
+            let frames = self.inbound.pop_front();
+            frames
+                .map(|frames| {
+                    HostResponseBatch::try_from_frames(frames, limits)
+                        .map_err(HostTransportError::from)
+                })
+                .transpose()
         }
 
         fn release_session(&mut self, session_id: SessionId) -> Result<(), HostTransportError> {
@@ -5117,5 +5458,193 @@ mod tests {
             Err(DebugHostClientError::UnexpectedEventState { .. })
         ));
         assert_eq!(stale.connection_state(), ClientConnectionState::Failed);
+    }
+
+    #[test]
+    fn async_pump_accepts_exact_uncorrelated_stop_observation() {
+        let stopped = SessionState::Stopped {
+            token: StopToken {
+                state: next_async_state_token(),
+                stop_id: StopId::new(2).expect("second stop id"),
+            },
+            reason: StopReason::UserPause,
+            thread_id: ThreadId::new(10).expect("stopped thread id"),
+        };
+        let frame = async_state_frame(2, 1, stopped.clone(), None);
+        let mut client = running_async_client(vec![vec![frame]]);
+
+        let events = client
+            .pump_inbound(HostPollWait::immediate())
+            .expect("accept async stop");
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0].event,
+            DebugEvent::StateChanged(state) if state == &stopped
+        ));
+        assert_eq!(client.session_state(), Some(&stopped));
+        assert_eq!(
+            client.connection_state(),
+            ClientConnectionState::SessionOpen
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(&event.event, DebugEvent::CommandResult { .. }))
+        );
+    }
+
+    #[test]
+    fn async_pump_accepts_exact_uncorrelated_exit_observation() {
+        let exited = SessionState::Exited {
+            token: next_async_state_token(),
+            exit_code: 0x55,
+        };
+        let frame = async_state_frame(2, 1, exited.clone(), None);
+        let mut client = running_async_client(vec![vec![frame]]);
+
+        let events = client
+            .pump_inbound(HostPollWait::from_millis(25).expect("bounded poll wait"))
+            .expect("accept async exit");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(client.session_state(), Some(&exited));
+        assert!(matches!(
+            &events[0].event,
+            DebugEvent::StateChanged(SessionState::Exited {
+                exit_code: 0x55,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn async_pump_rejects_frame_and_event_sequence_gaps_and_poisons_connection() {
+        let exited = SessionState::Exited {
+            token: next_async_state_token(),
+            exit_code: 1,
+        };
+        let frame_gap = async_state_frame(3, 1, exited.clone(), None);
+        let mut frame_gap_client = running_async_client(vec![vec![frame_gap]]);
+        assert_eq!(
+            frame_gap_client.pump_inbound(HostPollWait::immediate()),
+            Err(DebugHostClientError::UnexpectedFrameSequence {
+                expected: 2,
+                actual: 3,
+            })
+        );
+        assert_eq!(
+            frame_gap_client.connection_state(),
+            ClientConnectionState::Failed
+        );
+        assert_eq!(
+            frame_gap_client.session_state().map(SessionState::kind),
+            Some(SessionStateKind::Running)
+        );
+
+        let event_gap = async_state_frame(2, 2, exited, None);
+        let mut event_gap_client = running_async_client(vec![vec![event_gap]]);
+
+        assert!(matches!(
+            event_gap_client.pump_inbound(HostPollWait::immediate()),
+            Err(DebugHostClientError::Protocol(
+                ProtocolValidationError::UnexpectedEventSequence {
+                    expected: 1,
+                    actual: 2
+                }
+            ))
+        ));
+        assert_eq!(
+            event_gap_client.connection_state(),
+            ClientConnectionState::Failed
+        );
+        assert_eq!(
+            event_gap_client.session_state().map(SessionState::kind),
+            Some(SessionStateKind::Running)
+        );
+    }
+
+    #[test]
+    fn async_pump_rejects_wrong_session_without_advancing_verified_state() {
+        let wrong_session = SessionId::new(99).expect("wrong session id");
+        let exited = SessionState::Exited {
+            token: StateToken {
+                session_id: wrong_session,
+                generation: StateGeneration::new(5).expect("next state generation"),
+            },
+            exit_code: 1,
+        };
+        let frame = async_state_frame(2, 1, exited, None);
+        let mut client = running_async_client(vec![vec![frame]]);
+
+        assert!(matches!(
+            client.pump_inbound(HostPollWait::immediate()),
+            Err(DebugHostClientError::UnexpectedEventSession {
+                expected,
+                actual: Some(actual)
+            }) if expected == session_id() && actual == wrong_session
+        ));
+        assert_eq!(client.connection_state(), ClientConnectionState::Failed);
+        assert_eq!(
+            client.session_state().map(SessionState::kind),
+            Some(SessionStateKind::Running)
+        );
+    }
+
+    #[test]
+    fn async_pump_rejects_command_correlated_frame() {
+        let stopped = SessionState::Stopped {
+            token: StopToken {
+                state: next_async_state_token(),
+                stop_id: StopId::new(2).expect("second stop id"),
+            },
+            reason: StopReason::UserPause,
+            thread_id: ThreadId::new(10).expect("stopped thread id"),
+        };
+        let correlation = CommandId::new(77).expect("command correlation");
+        let frame = async_state_frame(2, 1, stopped, Some(correlation));
+        let mut client = running_async_client(vec![vec![frame]]);
+
+        assert_eq!(
+            client.pump_inbound(HostPollWait::immediate()),
+            Err(DebugHostClientError::UnsolicitedEventCarriedCorrelation {
+                command_id: correlation
+            })
+        );
+        assert_eq!(client.connection_state(), ClientConnectionState::Failed);
+    }
+
+    #[test]
+    fn request_response_hosts_default_to_bounded_empty_poll_without_affecting_submit() {
+        assert_eq!(
+            HostPollWait::from_millis(MAX_HOST_POLL_WAIT_MILLIS + 1),
+            Err(HostPollWaitError::TooLong {
+                actual: MAX_HOST_POLL_WAIT_MILLIS + 1,
+                maximum: MAX_HOST_POLL_WAIT_MILLIS,
+            })
+        );
+        let mut client = client(host());
+        client
+            .begin_session(session_id(), provisioning_epoch(), helper_build())
+            .expect("begin offline session");
+        let open = client
+            .submit(DebugCommand::Open(DebugTargetRequest::Offline(
+                OfflineTarget {
+                    path: PathBuf::from("sample.exe"),
+                },
+            )))
+            .expect("open through compatibility exchange path");
+        assert_eq!(open.outcome, CommandOutcome::Succeeded);
+        assert!(
+            client
+                .pump_inbound(HostPollWait::immediate())
+                .expect("default poll timeout")
+                .is_empty()
+        );
+        let state = client.session_state().expect("offline state").state_token();
+        let close = client
+            .submit(DebugCommand::Close { state })
+            .expect("close after empty poll");
+        assert_eq!(close.outcome, CommandOutcome::Succeeded);
     }
 }
