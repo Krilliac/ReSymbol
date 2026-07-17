@@ -478,6 +478,7 @@ fn default_root(
 ) -> Option<GraphRoot> {
     let entry_point_rva = match project.session().base_analysis() {
         BinaryAnalysis::Pe(pe) => u64::from(pe.entry_point_rva),
+        BinaryAnalysis::Elf(elf) => u64::from(elf.entry_rva),
         _ => 0,
     };
     default_root_for_entry(entry_point_rva, nodes)

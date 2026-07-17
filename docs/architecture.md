@@ -12,7 +12,9 @@ symbol graph, modern
 MSVC x64 Rev1 RTTI/vftable
 discovery, canonical JSON `.resym` packages, plugin
 discovery/contracts, a no-WASI WebAssembly Component Model host, and trusted external-process,
-native C/C++, and managed/.NET analysis runtimes. It also includes a validated, debugger-neutral
+native C/C++, and managed/.NET analysis runtimes. A separate container-only ELF32 little-endian
+`EM_MIPS` path retains checked headers and sparse `PT_LOAD` mappings without instruction decoding.
+It also includes a validated, debugger-neutral
 export projection, deterministic Microsoft-linker-style MAP output, an exact-RSDS public-symbol PDB
 writer, and conservative standalone import-script generators
 for IDA and Ghidra. A first Windows-first workbench slice now provides background core analysis,
@@ -703,7 +705,7 @@ A plugin declares a supported API range. Unsupported plugins are marked incompat
 loaded optimistically. Schema migrations are explicit and must preserve provenance. Before 1.0,
 breaking changes are expected, but they still require version bumps and release notes.
 
-The current CLI writes analysis-package schema 13 and can inspect or export schemas 1 through 12
+The current CLI writes analysis-package schema 14 and can inspect or export schemas 1 through 13
 through explicit compatibility paths. It migrates schema 1 into a validated current session,
 rebuilds the base graph from persisted legacy metadata, and never rewrites the source package.
 Schema 2 already records direct calls and thunks but predates recovered strings and data references;
@@ -724,7 +726,8 @@ as unavailable in schemas 1 through 8, and the Guard address-taken IAT, long-jum
 EH-continuation inventories as unavailable in schemas 1 through 9, and load-config security
 anchors as unavailable in schemas 1 through 10, XFG/CastGuard anchors as unavailable in schemas
 1 through 11, and the GuardMemcpy anchor as unavailable in schemas 1 through 12, then reanalyzing
-the exact original binary into schema 13.
+the exact original binary into schema 14. Schema 13 retains the complete PE recovery shape but
+predates bounded ELF container intake.
 Schemas 2 and 3 are also semantically gated against relabeled schema-4 `function-pointer` targets.
 All schemas 1 through 4 are semantically gated against relabeled schema-5 base-class records whose
 `class_hierarchy_descriptor_rva` is missing or null. Schemas 1 through 5 reject a deterministic
@@ -732,27 +735,32 @@ base thunk source that is valid only under schema-6 transitive endpoint seeding.
 Schemas 1 through 6 reject schema-7 TLS fields, core `pe-tls-callback` claims, and callback-only
 base thunk seeds rather than accepting a relabeled package.
 Schemas 1 through 7 likewise reject the exact schema-8 base-analysis `delay_imports` inventory key
-and `directories.delay_imports` directory key. Schemas 8 through 13 always serialize the delay-import
-inventory, including an empty array, and reject a payload missing that marker so relabeling alone
-cannot upgrade a legacy package.
+and `directories.delay_imports` directory key. PE analyses in schemas 8 through 14 always serialize
+the delay-import inventory, including an empty array, and reject a payload missing that marker so
+relabeling alone cannot upgrade a legacy package.
 Schemas 1 through 8 reject schema-9 `load_config_size`, `guard_flags`,
 `guard_cf_function_table_rva`, and `guard_cf_functions` fields, the `directories.load_config` key,
-and core `pe-guard-cf-function` claims. Schemas 9 through 13 always serialize the GuardCF inventory,
-including an empty array, and reject a payload missing that marker.
-Schemas 1 through 9 reject schema-10 Guard target table-RVA and inventory fields. Schemas 10 through 13
-always serialize the address-taken IAT, long-jump, and EH-continuation inventory arrays, including
-empty arrays, and reject a payload missing any marker.
-Schemas 1 through 10 reject the schema-11 `load_config_security_anchors` object. Schemas 11 through 13
-always serialize that object, including `{}` when every anchor is absent, and reject missing or
-non-object markers. Schemas 1 through 11 reject schema-12 `load_config_xfg_anchors`; schemas 12 and
-13 always serialize that object, including `{}` when all four anchors are absent, and reject a
-missing or non-object marker. Schemas 1 through 12 reject schema-13
-`load_config_guard_memcpy_anchor`; schema 13 always serializes that object, including `{}` when the
-anchor is absent, and rejects a missing or non-object marker.
+and core `pe-guard-cf-function` claims. PE analyses in schemas 9 through 14 always serialize the
+GuardCF inventory, including an empty array, and reject a payload missing that marker.
+Schemas 1 through 9 reject schema-10 Guard target table-RVA and inventory fields. PE analyses in
+schemas 10 through 14 always serialize the address-taken IAT, long-jump, and EH-continuation
+inventory arrays, including empty arrays, and reject a payload missing any marker.
+Schemas 1 through 10 reject the schema-11 `load_config_security_anchors` object. PE analyses in
+schemas 11 through 14 always serialize that object, including `{}` when every anchor is absent, and
+reject missing or non-object markers. Schemas 1 through 11 reject schema-12
+`load_config_xfg_anchors`; PE analyses in schemas 12 through 14 always serialize that object,
+including `{}` when all four anchors are absent, and reject a missing or non-object marker. Schemas
+1 through 12 reject schema-13 `load_config_guard_memcpy_anchor`; PE analyses in schemas 13 and 14
+always serialize that object, including `{}` when the anchor is absent, and reject a missing or
+non-object marker.
+Schema 14 retains every schema-13 marker for PE analyses and adds a separate validated `elf`
+analysis variant. The ELF variant stores checked ELF32 little-endian `EM_MIPS` headers and sparse
+non-empty `PT_LOAD` mappings, but no decoded instructions or base symbol claims; see
+[elf32-mips-container.md](elf32-mips-container.md).
 The independently versioned debugger-neutral projection is schema 6; its string-reference
 correlation and exact per-hop thunk relationships are derived from already validated claims and
-therefore do not require a projection-schema change or legacy package rewrite. Package schema 13 and
-neutral projection schema 6 remain independent compatibility domains. Package schema 13 also leaves
+therefore do not require a projection-schema change or legacy package rewrite. Package schema 14 and
+neutral projection schema 6 remain independent compatibility domains. Package schema 14 also leaves
 the plugin API and external wire protocol 1.0 unchanged. Plugins with `symbols.read` can observe the
 TLS, delay-import, load-config/GuardCF, modern Guard target, and all three load-config anchor families
 in detached base-analysis JSON; plugins without

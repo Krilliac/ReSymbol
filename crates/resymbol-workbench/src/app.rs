@@ -24,7 +24,7 @@ use resymbol_debugger::{
     SandboxProviderReadiness, SandboxProviderReadinessReason, SandboxProviderRequirement,
     SandboxProviderSelection, StaticRegionKind,
 };
-use resymbol_export::{ExportControlFlowTarget, ExportProducer};
+use resymbol_export::{ExportBinaryFormat, ExportControlFlowTarget, ExportProducer};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -93,21 +93,26 @@ const PE_CONTAINER_FILTER: BinaryPickerFilterSpec = BinaryPickerFilterSpec {
     label: "PE containers",
     extensions: &["exe", "dll", "sys", "cpl", "ocx", "scr", "efi"],
 };
+const ELF_CONTAINER_FILTER: BinaryPickerFilterSpec = BinaryPickerFilterSpec {
+    label: "ELF containers",
+    extensions: &["elf", "axf"],
+};
 const RESYMBOL_PACKAGE_FILTER: BinaryPickerFilterSpec = BinaryPickerFilterSpec {
     label: "ReSymbol packages",
     extensions: &["resym"],
 };
 const ALL_FILES_FILTER: BinaryPickerFilterSpec = BinaryPickerFilterSpec {
-    label: "All files (including extensionless PE)",
+    label: "All files (including extensionless containers)",
     extensions: &["*"],
 };
 const OPEN_BINARY_OR_PACKAGE_FILTERS: &[BinaryPickerFilterSpec] = &[
     PE_CONTAINER_FILTER,
+    ELF_CONTAINER_FILTER,
     RESYMBOL_PACKAGE_FILTER,
     ALL_FILES_FILTER,
 ];
 const VERIFY_EXACT_BINARY_FILTERS: &[BinaryPickerFilterSpec] =
-    &[PE_CONTAINER_FILTER, ALL_FILES_FILTER];
+    &[PE_CONTAINER_FILTER, ELF_CONTAINER_FILTER, ALL_FILES_FILTER];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkflowStage {
@@ -272,6 +277,15 @@ impl ExportKind {
             Self::IdaPython => WorkerExportKind::Service(ExportFormat::IdaPython),
             Self::GhidraJava => WorkerExportKind::Service(ExportFormat::GhidraJava),
         }
+    }
+
+    const fn requires_pe(self) -> bool {
+        matches!(self, Self::Map | Self::Pdb)
+    }
+
+    fn unavailable_reason(self, format: &ExportBinaryFormat) -> Option<&'static str> {
+        (self.requires_pe() && !matches!(format, ExportBinaryFormat::Pe))
+            .then_some("Microsoft MAP and PDB exports are available only for PE/x86-64 projects.")
     }
 }
 
@@ -1720,6 +1734,9 @@ impl WorkbenchApp {
                 .project
                 .as_ref()
                 .ok_or_else(|| "open a binary or package before exporting".to_owned())?;
+            if let Some(reason) = kind.unavailable_reason(&project.identity.format) {
+                return Err(reason.to_owned());
+            }
             if kind == ExportKind::Pdb && !project.snapshot.has_verified_source() {
                 return Err(
                     "PDB export requires the exact source binary; package-only projects must verify it first"
@@ -2828,7 +2845,7 @@ impl WorkbenchApp {
 
     fn choose_binary(&mut self, _context: &egui::Context) {
         let mut dialog = binary_picker_dialog(
-            "Open a PE32+ x86-64 container or current ReSymbol package",
+            "Open a supported binary container or current ReSymbol package",
             BinaryPickerPurpose::OpenBinaryOrPackage,
         );
         if let Some(directory) = self
@@ -3068,7 +3085,7 @@ impl WorkbenchApp {
                                 "Drop exactly one binary"
                             });
                             ui.label(
-                                "PE32+ .exe/.dll/.sys/.cpl/.ocx/.scr/.efi or extensionless files, plus current .resym packages, are supported.",
+                                "PE32+ .exe/.dll/.sys/.cpl/.ocx/.scr/.efi, ELF32 .elf/.axf, extensionless containers, and current .resym packages are supported.",
                             );
                             ui.small(
                                 "The active project remains intact unless the replacement opens successfully.",
@@ -3493,11 +3510,16 @@ impl WorkbenchApp {
                         self.stage = WorkflowStage::Review;
                     }
                     if ui
-                        .selectable_label(
-                            self.main_tab == MainTab::AddressSpace,
-                            format!(
-                                "Address space ({})",
-                                project.static_address_space.regions().len()
+                        .add_enabled(
+                            project.static_address_space.is_some(),
+                            egui::Button::selectable(
+                                self.main_tab == MainTab::AddressSpace,
+                                project.static_address_space.as_ref().map_or_else(
+                                    || "Address space (unavailable)".to_owned(),
+                                    |address_space| {
+                                        format!("Address space ({})", address_space.regions().len())
+                                    },
+                                ),
                             ),
                         )
                         .clicked()
@@ -4508,7 +4530,7 @@ impl WorkbenchApp {
 
         if verify_source {
             let Some(path) = binary_picker_dialog(
-                "Verify the exact original PE for this package",
+                "Verify the exact original binary for this package",
                 BinaryPickerPurpose::VerifyExactBinary,
             )
             .pick_file() else {
@@ -4529,7 +4551,7 @@ impl WorkbenchApp {
                 "Open a binary to begin"
             });
             ui.label(
-                "Open a native Windows PE32+ x86-64 binary or a current ReSymbol package.",
+                "Open a PE32+ x86-64 binary, bounded ELF32 container, or current ReSymbol package.",
             );
             ui.label("The workbench keeps identity, status, confidence, and provenance visible independently.");
             ui.add_space(18.0);
@@ -4548,7 +4570,7 @@ impl WorkbenchApp {
             }
             ui.add_space(10.0);
             ui.small(
-                "You can also drag a supported PE container, an extensionless PE, or a .resym package onto this window.",
+                "You can also drag a supported PE, bounded ELF32 container, extensionless container, or .resym package onto this window.",
             );
         });
     }
@@ -4665,7 +4687,7 @@ impl WorkbenchApp {
                 });
 
                 workbench_card(colors).show(&mut columns[1], |ui| {
-                    ui.heading("PE inventory");
+                    ui.heading("Container inventory");
                     match project.session().base_analysis() {
                         BinaryAnalysis::Pe(pe) => {
                             property_row(ui, "Sections", &pe.sections.len().to_string(), false);
@@ -4690,15 +4712,49 @@ impl WorkbenchApp {
                                 false,
                             );
                         }
+                        BinaryAnalysis::Elf(elf) => {
+                            property_row(
+                                ui,
+                                "Program headers",
+                                &elf.program_headers.len().to_string(),
+                                false,
+                            );
+                            property_row(
+                                ui,
+                                "Load segments",
+                                &elf.load_segments.len().to_string(),
+                                false,
+                            );
+                            property_row(
+                                ui,
+                                "Section headers",
+                                &elf.section_headers.len().to_string(),
+                                false,
+                            );
+                            property_row(
+                                ui,
+                                "ELF flags",
+                                &format!("0x{:08X}", elf.flags),
+                                true,
+                            );
+                            ui.label(
+                                RichText::new("Container-only: no instruction decoding")
+                                    .color(colors.secondary_text),
+                            );
+                        }
                         _ => {
-                            ui.label("No PE inventory is available for this format.");
+                            ui.label("No container inventory is available for this format.");
                         }
                     };
                 });
             });
 
             ui.add_space(14.0);
-            ui.heading("PE sections");
+            ui.heading(match project.session().base_analysis() {
+                BinaryAnalysis::Pe(_) => "PE sections",
+                BinaryAnalysis::Elf(_) => "ELF section headers",
+                _ => "Section table",
+            });
             match project.session().base_analysis() {
                 BinaryAnalysis::Pe(pe) => {
                     TableBuilder::new(ui)
@@ -4741,6 +4797,53 @@ impl WorkbenchApp {
                             }
                         });
                 }
+                BinaryAnalysis::Elf(elf) => {
+                    TableBuilder::new(ui)
+                        .striped(true)
+                        .resizable(true)
+                        .column(Column::initial(90.0).at_least(70.0))
+                        .column(Column::initial(130.0).at_least(100.0))
+                        .column(Column::initial(140.0).at_least(110.0))
+                        .column(Column::remainder().at_least(180.0))
+                        .header(30.0, |mut header| {
+                            header.col(|ui| {
+                                ui.strong("Index");
+                            });
+                            header.col(|ui| {
+                                ui.strong("Type");
+                            });
+                            header.col(|ui| {
+                                ui.strong("VA");
+                            });
+                            header.col(|ui| {
+                                ui.strong("Size / flags");
+                            });
+                        })
+                        .body(|mut body| {
+                            for section in &elf.section_headers {
+                                body.row(28.0, |mut row| {
+                                    row.col(|ui| {
+                                        ui.monospace(section.table_index.to_string());
+                                    });
+                                    row.col(|ui| {
+                                        ui.monospace(format!("0x{:08X}", section.section_type));
+                                    });
+                                    row.col(|ui| {
+                                        ui.monospace(format!(
+                                            "0x{:08X}",
+                                            section.virtual_address
+                                        ));
+                                    });
+                                    row.col(|ui| {
+                                        ui.monospace(format!(
+                                            "0x{:X} / 0x{:08X}",
+                                            section.size, section.flags
+                                        ));
+                                    });
+                                });
+                            }
+                        });
+                }
                 _ => {
                     ui.label(
                         RichText::new("No section table is available.")
@@ -4754,8 +4857,24 @@ impl WorkbenchApp {
     fn show_address_space(&mut self, ui: &mut egui::Ui) {
         let colors = self.preferences.theme.semantic_colors();
         self.handle_address_space_shortcuts(ui);
+        let has_static_address_space = self
+            .project
+            .as_ref()
+            .expect("checked by caller")
+            .static_address_space
+            .is_some();
 
         ui.heading("Static address space");
+        if !has_static_address_space {
+            ui.label(
+                RichText::new(
+                    "Static address-space and offline-byte views are unavailable for this binary format.",
+                )
+                .color(colors.secondary_text),
+            );
+            return;
+        }
+
         ui.horizontal_wrapped(|ui| {
             ui.label(
                 RichText::new("[OFFLINE] No target code has executed")
@@ -4773,7 +4892,10 @@ impl WorkbenchApp {
         ui.add_space(8.0);
 
         let project = self.project.as_ref().expect("checked by caller");
-        let address_space = &project.static_address_space;
+        let address_space = project
+            .static_address_space
+            .as_ref()
+            .expect("format availability checked above");
         let indicator_text = project
             .protection_assessment
             .unavailable_reason()
@@ -5568,7 +5690,8 @@ impl WorkbenchApp {
         let address = RelativeAddress::new(rva);
         self.project
             .as_ref()
-            .and_then(|project| project.static_address_space.region_at(address))
+            .and_then(|project| project.static_address_space.as_ref())
+            .and_then(|address_space| address_space.region_at(address))
             .is_some_and(|region| {
                 region.access.readable && region.file_offset_at(address).is_some()
             })
@@ -5599,6 +5722,8 @@ impl WorkbenchApp {
         let last = RelativeAddress::new(last_rva);
         let region = project
             .static_address_space
+            .as_ref()
+            .ok_or("Static address-space inspection is unavailable for this binary format.")?
             .region_at(start)
             .ok_or("The selected instruction is outside the preferred static image.")?;
         if !region.access.executable || !matches!(&region.kind, StaticRegionKind::Section { .. }) {
@@ -5624,6 +5749,7 @@ impl WorkbenchApp {
         self.project
             .as_ref()?
             .static_address_space
+            .as_ref()?
             .preferred_virtual_address(RelativeAddress::new(rva))
     }
 
@@ -7020,11 +7146,16 @@ impl WorkbenchApp {
                             .selected_text(self.export_kind.label())
                             .show_ui(ui, |ui| {
                                 for kind in ExportKind::ALL {
-                                    ui.selectable_value(
-                                        &mut self.export_kind,
-                                        kind,
-                                        kind.label(),
-                                    );
+                                    let available = kind
+                                        .unavailable_reason(&project.identity.format)
+                                        .is_none();
+                                    ui.add_enabled_ui(available, |ui| {
+                                        ui.selectable_value(
+                                            &mut self.export_kind,
+                                            kind,
+                                            kind.label(),
+                                        );
+                                    });
                                 }
                             });
                         if self.export_kind != previous {
@@ -7148,10 +7279,14 @@ impl WorkbenchApp {
 
             ui.add_space(12.0);
             let exact_source_ready = project.snapshot.has_verified_source();
+            let format_unavailable = self
+                .export_kind
+                .unavailable_reason(&project.identity.format);
             let can_export = !self.publication_operation.is_pending()
                 && !self.patch_set_load_operation.is_pending()
                 && !self.project_operation.is_pending()
                 && !self.review_operation.is_pending()
+                && format_unavailable.is_none()
                 && (self.export_kind != ExportKind::Pdb || exact_source_ready);
             let action_label = if self
                 .publication_operation
@@ -7173,7 +7308,12 @@ impl WorkbenchApp {
                     .stroke(egui::Stroke::new(1.0, colors.exact_extracted))
                     .corner_radius(4),
             );
-            if self.export_kind == ExportKind::Pdb && !exact_source_ready {
+            if let Some(reason) = format_unavailable {
+                ui.label(
+                    RichText::new(format!("[UNAVAILABLE] {reason}"))
+                        .color(colors.warning_conflict),
+                );
+            } else if self.export_kind == ExportKind::Pdb && !exact_source_ready {
                 ui.label(
                     RichText::new(
                         "[SOURCE REQUIRED] Verify the exact original PE before creating a PDB.",
@@ -8623,6 +8763,23 @@ mod tests {
         (source, project)
     }
 
+    #[test]
+    fn pe_only_exports_are_disabled_for_elf_projects() {
+        for kind in [ExportKind::Map, ExportKind::Pdb] {
+            assert!(kind.unavailable_reason(&ExportBinaryFormat::Elf).is_some());
+            assert!(kind.unavailable_reason(&ExportBinaryFormat::Pe).is_none());
+        }
+        for kind in [
+            ExportKind::Package,
+            ExportKind::NeutralJson,
+            ExportKind::Markdown,
+            ExportKind::IdaPython,
+            ExportKind::GhidraJava,
+        ] {
+            assert!(kind.unavailable_reason(&ExportBinaryFormat::Elf).is_none());
+        }
+    }
+
     fn publish_test_patch(project: &LoadedProject, output: &Path) -> PublishedStaticPatch {
         let request = StaticPatchEditRequest::nop_instruction(
             THUNK_RVA,
@@ -8694,10 +8851,10 @@ mod tests {
     }
 
     #[test]
-    fn project_picker_covers_common_and_extensionless_pe_containers() {
+    fn project_picker_covers_supported_and_extensionless_containers() {
         let filters = binary_picker_filter_specs(BinaryPickerPurpose::OpenBinaryOrPackage);
 
-        assert_eq!(filters.len(), 3);
+        assert_eq!(filters.len(), 4);
         assert_eq!(filters[0].label, "PE containers");
         assert_eq!(
             filters[0].extensions,
@@ -8706,21 +8863,29 @@ mod tests {
         assert_eq!(
             filters[1],
             BinaryPickerFilterSpec {
+                label: "ELF containers",
+                extensions: &["elf", "axf"],
+            }
+        );
+        assert_eq!(
+            filters[2],
+            BinaryPickerFilterSpec {
                 label: "ReSymbol packages",
                 extensions: &["resym"],
             }
         );
-        assert_eq!(filters[2].extensions, &["*"]);
-        assert!(filters[2].label.contains("extensionless"));
+        assert_eq!(filters[3].extensions, &["*"]);
+        assert!(filters[3].label.contains("extensionless"));
     }
 
     #[test]
     fn exact_source_picker_keeps_packages_out_of_the_binary_filter_set() {
         let filters = binary_picker_filter_specs(BinaryPickerPurpose::VerifyExactBinary);
 
-        assert_eq!(filters.len(), 2);
+        assert_eq!(filters.len(), 3);
         assert_eq!(filters[0].label, "PE containers");
-        assert_eq!(filters[1].extensions, &["*"]);
+        assert_eq!(filters[1].label, "ELF containers");
+        assert_eq!(filters[2].extensions, &["*"]);
         assert!(filters.iter().all(|filter| {
             !filter
                 .extensions
@@ -9304,8 +9469,11 @@ mod tests {
     #[test]
     fn direct_target_navigation_requires_readable_exact_file_backing() {
         let (_source, project) = loaded_project_with_source();
-        let readable_backed = project
+        let address_space = project
             .static_address_space
+            .as_ref()
+            .expect("PE fixture has a static address space");
+        let readable_backed = address_space
             .regions()
             .iter()
             .find_map(|region| {
@@ -9314,8 +9482,7 @@ mod tests {
                 .then(|| region.range.start().get())
             })
             .expect("readable file-backed fixture address");
-        let readable_unbacked = project
-            .static_address_space
+        let readable_unbacked = address_space
             .regions()
             .iter()
             .find_map(|region| {
@@ -9328,7 +9495,7 @@ mod tests {
                     .then_some(first_unbacked)
             })
             .expect("readable zero-fill or mapped-padding fixture address");
-        let preferred_address = project.static_address_space.preferred_image_base + readable_backed;
+        let preferred_address = address_space.preferred_image_base + readable_backed;
         let (_context, mut app) = test_app();
         app.project = Some(project);
 
@@ -9343,8 +9510,11 @@ mod tests {
     #[test]
     fn static_nop_ui_gate_requires_an_exact_file_backed_executable_section() {
         let (_source, project) = loaded_project_with_source();
-        let executable_backed = project
+        let address_space = project
             .static_address_space
+            .as_ref()
+            .expect("PE fixture has a static address space");
+        let executable_backed = address_space
             .regions()
             .iter()
             .find(|region| {
@@ -9356,8 +9526,7 @@ mod tests {
             .range
             .start()
             .get();
-        let non_executable_backed = project
-            .static_address_space
+        let non_executable_backed = address_space
             .regions()
             .iter()
             .find(|region| {

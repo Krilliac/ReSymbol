@@ -7,6 +7,18 @@ use thiserror::Error;
 pub enum AnalysisError {
     #[error("unsupported binary format (first bytes: {magic})")]
     UnsupportedBinaryFormat { magic: String },
+    #[error("invalid ELF signature: expected 7f 45 4c 46")]
+    InvalidElfSignature,
+    #[error("unsupported ELF class {class}; only ELF32 ({expected}) is supported")]
+    UnsupportedElfClass { class: u8, expected: u8 },
+    #[error("unsupported ELF data encoding {data}; only little-endian ({expected}) is supported")]
+    UnsupportedElfDataEncoding { data: u8, expected: u8 },
+    #[error("unsupported ELF {context} version {version}; only version 1 is supported")]
+    UnsupportedElfVersion { version: u32, context: &'static str },
+    #[error("unsupported ELF type {elf_type:#06x}; only ET_EXEC ({expected:#06x}) is supported")]
+    UnsupportedElfType { elf_type: u16, expected: u16 },
+    #[error("unsupported ELF machine {machine:#06x}; only EM_MIPS ({expected:#06x}) is supported")]
+    UnsupportedElfMachine { machine: u16, expected: u16 },
     #[error("invalid DOS signature: expected MZ, found {found}")]
     InvalidDosSignature { found: String },
     #[error("invalid PE signature at file offset {offset:#x}")]

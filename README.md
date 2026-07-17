@@ -13,7 +13,7 @@ type, class, and program-structure information that can be reviewed and exported
 IDA, Ghidra, debuggers, PDB consumers, and DWARF consumers.
 
 > [!IMPORTANT]
-> ReSymbol is an early alpha. The PE analyzer and `.resym` format are usable but intentionally
+> ReSymbol is an early alpha. The binary analyzers and `.resym` format are usable but intentionally
 > narrow. The no-WASI WebAssembly Component Model, external-process, native C/C++, and
 > managed/.NET plugin runtimes are also usable. WASM is capability-limited but executes through an
 > in-process engine; the process runtimes provide crash isolation rather than an OS sandbox.
@@ -31,6 +31,9 @@ The current alpha implements and tests an end-to-end, deliberately narrow analys
   exception-directory (`RUNTIME_FUNCTION`) records, ordered TLS-directory callback entries, and
   load-config GuardCF function, address-taken IAT, long-jump, and EH-continuation tables, plus
   checked security-cookie, GuardCF, XFG, CastGuard, and GuardMemcpy storage anchors;
+- bounded container-only ingestion of ELF32 little-endian `EM_MIPS` executables, retaining checked
+  headers, section records, and sparse non-empty `PT_LOAD` mappings with a deterministic claim-free
+  base graph; this slice does not classify or decode MIPS or Emotion Engine instructions;
 - bounded discovery of modern MSVC x64 Rev1 RTTI and vftables from file-backed compiler metadata,
   including both legacy 24-byte and `BCD_HASPCHD` 28-byte base-class descriptors, validated
   class/type names, and contiguous executable slot candidates;
@@ -63,8 +66,9 @@ The current alpha implements and tests an end-to-end, deliberately narrow analys
   graph;
 - `resymbol analyze`, which writes a portable package, and `resymbol inspect`, which validates and
   summarizes a package or emits its JSON representation;
-- a Windows-first `resymbol-workbench.exe` desktop application that opens a supported PE or current
-  `.resym` package, runs core-only analysis in the background, and presents exact binary identity,
+- a Windows-first `resymbol-workbench.exe` desktop application that opens a supported PE, bounded
+  ELF32 container, or current `.resym` package, runs core-only analysis in the background, and
+  presents exact binary identity,
   durable provenance-first exact-claim review, a bounded Reconstruction Graph, a non-executing
   static Address Space/protection view with a worker-owned exact-RVA byte reader and bounded x64
   linear-disassembly preview for verified source snapshots, read-only debugger/sandbox provider
@@ -335,6 +339,7 @@ ReSymbol is growing from the working PE/package foundation toward:
   extension does not prevent the core application from starting.
 
 See the [changelog](CHANGELOG.md), [analysis-package format](docs/analysis-packages.md),
+[ELF32 MIPS container boundary](docs/elf32-mips-container.md),
 [export guide](docs/exporting.md), [architecture](docs/architecture.md),
 [plugin-system design](docs/plugin-system.md), [GUI design](docs/gui-design.md),
 [visual-capture guide](docs/visual-regression.md), and [roadmap](docs/roadmap.md) for implemented
@@ -359,7 +364,7 @@ boundaries, release-facing changes, and remaining goals.
 
 ## Quick start
 
-Analyze a supported PE file and inspect the validated package:
+Analyze a supported PE file or bounded ELF32 container and inspect the validated package:
 
 ```console
 resymbol analyze application.exe
@@ -380,7 +385,8 @@ resymbol plugin trust community.example-analyzer --fingerprint <sha256>
 resymbol analyze application.exe --plugin community.example-analyzer
 ```
 
-On Windows, open the same supported PE in the desktop workbench:
+On Windows, open the same supported container in the desktop workbench. PE-only address-space,
+offline-byte, MAP, and PDB actions stay disabled for ELF projects:
 
 ```console
 .\resymbol-workbench.exe application.exe
@@ -469,10 +475,10 @@ inspection data to stdout, ReSymbol validates the package and requires the suppl
 size and SHA-256 to match. Failures remain actionable on stderr. Human output then includes
 `source binary: <canonical-path>` and `identity gate: matched`.
 With `--json`, stdout remains the pure validated package JSON and does not gain those status lines.
-The gate works for every supported package schema, 1 through 13; it does not rerun analysis,
+The gate works for every supported package schema, 1 through 14; it does not rerun analysis,
 reconstruct missing legacy results, or rewrite either file.
 
-New analyses write package schema 13. `inspect` and `export` also accept schemas 1 through 12 through
+New analyses write package schema 14. `inspect` and `export` also accept schemas 1 through 13 through
 validated in-memory compatibility paths. Migration does not rewrite the source package or rerun
 analysis because `.resym` does not embed the executable bytes. Schema 1 therefore has no available
 recovered calls, thunks, strings, or data references. Schema 2 retains calls and thunks but predates
@@ -495,48 +501,52 @@ schema 1-through-8 package. The modern Guard target inventories are unavailable 
 1-through-9 package, and load-config security anchors are unavailable for every schema
 1-through-10 package, XFG/CastGuard anchors are unavailable for every schema 1-through-11 package,
 and the GuardMemcpy pointer-slot anchor is unavailable for every schema 1-through-12 package.
-Reanalyze the exact original binary to produce schema 13 with all current
-recovery results. A schema 2 or 3 envelope containing a schema-4
-`function-pointer` target, or any schema 1-through-4 envelope
+Schema 13 records all current PE recovery results but predates bounded ELF container intake.
+Reanalyze the exact original binary to produce schema 14. A schema 2 or 3 envelope containing a
+schema-4 `function-pointer` target, or any schema 1-through-4 envelope
 containing an RTTI base record whose `class_hierarchy_descriptor_rva` is missing or null, is
 rejected rather than treated as a relabeled legacy package. A schema 1-through-5 envelope likewise
 cannot contain a base thunk source that is valid only through schema-6 transitive endpoint seeding.
 Schemas 1 through 6 likewise cannot contain schema-7 TLS callback records or callback-only base
 thunk seeds. Schemas 1 through 7 cannot contain the exact schema-8 base-analysis `delay_imports`
-  inventory key or `directories.delay_imports` directory key. Schemas 8 through 13 always serialize the
+inventory key or `directories.delay_imports` directory key. PE analyses in schemas 8 through 14
+always serialize the
 `delay_imports` inventory, including an empty array, and reject a payload missing that marker so a
 legacy package cannot be upgraded by relabeling alone.
 Schemas 1 through 8 cannot contain schema-9 `load_config_size`, `guard_flags`,
 `guard_cf_function_table_rva`, or `guard_cf_functions` fields, the
-`directories.load_config` directory key, or core `pe-guard-cf-function` claims. Conversely, schemas
-9 through 13 always serialize the `guard_cf_functions` inventory, including an empty array, and reject a
-payload missing that marker so a schema-8 package cannot be upgraded by relabeling alone.
+`directories.load_config` directory key, or core `pe-guard-cf-function` claims. Conversely, PE
+analyses in schemas 9 through 14 always serialize the `guard_cf_functions` inventory, including an
+empty array, and reject a payload missing that marker so a schema-8 package cannot be upgraded by
+relabeling alone.
 Schemas 1 through 9 cannot contain any schema-10 Guard address-taken IAT, long-jump, or
-EH-continuation table-RVA or inventory field. Schemas 10 through 13 always serialize
+EH-continuation table-RVA or inventory field. PE analyses in schemas 10 through 14 always serialize
 `guard_address_taken_iat_entries`, `guard_long_jump_targets`, and
-`guard_eh_continuation_targets`, including empty arrays, and rejects a payload missing any marker.
+`guard_eh_continuation_targets`, including empty arrays, and reject a payload missing any marker.
 Schemas 1 through 10 cannot contain the schema-11 `load_config_security_anchors` base-analysis
-object. Schemas 11 through 13 always serialize that object, including `{}` when all three checked RVAs
-are absent, and reject a payload missing the marker or using a non-object value. Schemas 1 through
-11 cannot contain the schema-12 `load_config_xfg_anchors` object; schemas 12 and 13 always serialize
-it, including `{}` when all four anchors are absent, and reject a missing or non-object marker.
-Schemas 1 through 12 cannot contain the schema-13 `load_config_guard_memcpy_anchor` object; schema
-13 always serializes it, including `{}` when the anchor is absent, and rejects a missing or
-non-object marker.
+object. PE analyses in schemas 11 through 14 always serialize that object, including `{}` when all
+three checked RVAs are absent, and reject a payload missing the marker or using a non-object value.
+Schemas 1 through 11 cannot contain the schema-12 `load_config_xfg_anchors` object; PE analyses in
+schemas 12 through 14 always serialize it, including `{}` when all four anchors are absent, and
+reject a missing or non-object marker.
+Schemas 1 through 12 cannot contain the schema-13 `load_config_guard_memcpy_anchor` object; PE
+analyses in schemas 13 and 14 always serialize it, including `{}` when the anchor is absent, and
+reject a missing or non-object marker.
 
 TLS callback fields were introduced in package schema 7's deterministic base analysis; package
 schema 8 adds the separate ordered delay-import directory and inventory, package schema 9 adds
 load-config and GuardCF state, package schema 10 adds the three modern Guard target inventories, and
 package schema 11 adds checked security-cookie and GuardCF check/dispatch pointer-slot storage RVAs,
-package schema 12 adds checked XFG and CastGuard storage RVAs, and package schema 13 adds the checked
-GuardMemcpy function-pointer-slot RVA.
-The independently
-versioned neutral projection remains schema 6, and the plugin API and external wire handshake
+package schema 12 adds checked XFG and CastGuard storage RVAs, package schema 13 adds the checked
+GuardMemcpy function-pointer-slot RVA, and package schema 14 adds checked ELF32 little-endian
+`EM_MIPS` container metadata and sparse `PT_LOAD` mappings without instruction decoding. The
+independently versioned neutral projection remains schema 6, and the plugin API and external wire handshake
 remain unchanged. A plugin granted `symbols.read` can observe these additive result families in its
 base-analysis JSON; a plugin without that permission still receives no base analysis.
 
 The `analyze` and `inspect` summaries report recovered strings, data references, direct calls,
-thunks, security-cookie, GuardCF, XFG, CastGuard, and GuardMemcpy storage anchors, GuardCF record/function-candidate totals
+thunks, security-cookie, GuardCF, XFG, CastGuard, and GuardMemcpy storage anchors, GuardCF
+record/function-candidate totals
 and FID-/export-suppressed counts, Guard
 address-taken IAT entries, long-jump targets, EH-continuation targets, TLS callbacks, and delay-import
 libraries/symbols as well as discovered MSVC RTTI vftables,
@@ -547,8 +557,8 @@ deterministic results remain available and the package records the truncation ex
 
 The Markdown output is a deterministic, bounded presentation report for people to review. It is
 not a stable interchange format; integrations should consume the neutral JSON projection instead.
-Without `--output`, it is written as `application.symbols.md` beside the package. Package schema 13
-is used by new analyses, export also accepts package schemas 1 through 12 through validated
+Without `--output`, it is written as `application.symbols.md` beside the package. Package schema 14
+is used by new analyses, export also accepts package schemas 1 through 13 through validated
 compatibility paths, and neutral projection schema 6 remains unchanged by this presentation-only
 format. Export does not rewrite the source package.
 
@@ -557,7 +567,7 @@ default for tools that support that format. It maps selected names to one-based 
 `section:offset` values and preferred-image-base-plus-RVA addresses. Its semicolon-prefixed exact
 SHA-256 and file-size comments are informational: a MAP file cannot check the binary loaded by a
 consumer, so compare the executable with the recorded identity before using the symbols. MAP adds
-no fields to package schema 13 or neutral projection schema 6, and it does not rewrite legacy source
+no fields to package schema 14 or neutral projection schema 6, and it does not rewrite legacy source
 packages accepted through compatibility paths. The header module name is the package filename stem;
 for a valid UTF-8 stem, unsupported/non-ASCII encoded bytes become `_` and the result is capped at
 255 bytes. A non-UTF-8 or otherwise unusable stem falls back to `resymbol_<sha12>`.
