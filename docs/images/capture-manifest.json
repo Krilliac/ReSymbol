@@ -86,16 +86,16 @@
                          "view":  "disassembly",
                          "width":  1440,
                          "height":  900,
-                         "bytes":  287834,
-                         "sha256":  "2c28a048a50c10e0161ecaf04467a25e20447272eef2b5ed0c939db9b37b6016"
+                         "bytes":  287962,
+                         "sha256":  "2d1987b12af20188e31e39c8c8e88c235ffdb2a4a5c1505e7081108ef9a9bda5"
                      },
                      {
                          "file":  "workbench-disassembly-actions.png",
                          "view":  "disassembly-actions",
                          "width":  1440,
                          "height":  900,
-                         "bytes":  294027,
-                         "sha256":  "58f9500240ca9dd36067ee7e75a3c2544bfe5b3eb3366f9673ae0d408d569aae"
+                         "bytes":  293981,
+                         "sha256":  "defbccc8945e771496e68c79140e5aceea24383db2df40b1df9401676db9dd56"
                      },
                      {
                          "file":  "workbench-binary-switch-confirmation.png",
