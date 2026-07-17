@@ -1,6 +1,6 @@
 [package]
 name = "resymbol-windows-process"
-description = "Narrow atomic Windows process-containment boundary for ReSymbol"
+description = "Narrow Windows process-containment and console-bootstrap boundaries for ReSymbol"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

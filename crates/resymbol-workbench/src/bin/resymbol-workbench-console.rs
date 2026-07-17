@@ -29,11 +29,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     use std::{
         fs::OpenOptions,
         io::{self, BufReader, BufWriter, Write},
-        process::{Command, Stdio},
         sync::{Arc, Mutex},
         thread,
     };
 
+    use resymbol_windows_process::configure_utf8_console;
     use resymbol_workbench::console::{
         ConsoleToHostFrame, MAX_COMMAND_LINE_BYTES, MAX_CONSOLE_OUTPUT_BYTES, format_banner,
         format_prompt, read_bounded_line,
@@ -41,32 +41,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     const MAX_WIRE_FRAME_BYTES: usize = 32 * 1024;
 
-    let system_root = std::env::var_os("SystemRoot")
-        .map(std::path::PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .ok_or("SystemRoot is unavailable or is not absolute")?;
-    let system32 = system_root.join("System32");
-    let code_page_tool = system32.join("chcp.com");
-    if !code_page_tool.is_file() {
-        return Err(format!(
-            "UTF-8 code-page tool is missing at {}",
-            code_page_tool.display()
-        )
-        .into());
-    }
-    let code_page_status = Command::new(&code_page_tool)
-        .arg("65001")
-        .current_dir(&system32)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
-    if !code_page_status.success() {
-        return Err(format!(
-            "cannot select UTF-8 console code page (exit status {code_page_status})"
-        )
-        .into());
-    }
+    configure_utf8_console()?;
 
     let console_input = OpenOptions::new().read(true).open("CONIN$")?;
     let console_output = OpenOptions::new().write(true).open("CONOUT$")?;

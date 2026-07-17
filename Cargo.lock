@@ -3121,6 +3121,7 @@ dependencies = [
  "resymbol-core",
  "resymbol-debugger",
  "resymbol-export",
+ "resymbol-windows-process",
  "rfd",
  "serde",
  "serde_json",
