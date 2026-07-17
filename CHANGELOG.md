@@ -14,6 +14,15 @@ prereleases; breaking changes remain explicit.
   RVA and exact bytes without trusting file offsets, and uses the existing create-new static-patch
   publisher. Success prints the verified output SHA-256, signature/checksum warnings, durability,
   and an explicit no-execution receipt; failures leave the source and existing destinations intact.
+- Added a backend-neutral, bounded software-breakpoint transaction reducer. It retains exact
+  original bytes, rejects original `0xCC`, duplicate identities/addresses, capacity and token
+  violations, and emits one-byte `Arm`, hit-time `Restore`, post-step `Rearm`, and explicit `Remove`
+  compare/replace plans bound to unique operation, session, and complete stop identities. No
+  acknowledged lifecycle changes until every success field matches exactly; temporary breakpoints
+  disappear after exact hit restoration, while persistent breakpoints require an exact later-stop
+  correlation before rearming. Wrong, duplicate, or out-of-order acknowledgements poison the
+  reducer and retain bounded cleanup evidence including any operation with an unknown outcome. This
+  is a pure planner: it performs no target write or single step and changes no debugger wire version.
 - Added reproducible static patch-set documents and worker-owned **Save Patch Set...** / **Load
   Patch Set...** controls. The required `.respatch.json` format is strict schema v1: it records the
   complete source `BinaryIdentity` plus deterministically RVA-ordered, bounded NOP-instruction or
