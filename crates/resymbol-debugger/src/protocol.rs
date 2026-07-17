@@ -298,6 +298,49 @@ impl LiveTargetBinding {
         )?;
         Ok(MemoryAddress::new(address))
     }
+
+    /// Translates one actual ASLR-adjusted VA into its static main-image RVA.
+    pub fn rva_for_address(&self, address: MemoryAddress) -> Result<u64, LiveTargetBindingError> {
+        self.rva_for_address_span(address, 1)
+    }
+
+    /// Translates a nonempty actual-VA span wholly contained in SizeOfImage.
+    ///
+    /// Providers should use this checked inverse instead of subtracting the
+    /// image base themselves before calling an RVA-bound live-memory backend.
+    pub fn rva_for_address_span(
+        &self,
+        address: MemoryAddress,
+        size: u64,
+    ) -> Result<u64, LiveTargetBindingError> {
+        if size == 0 {
+            return Err(LiveTargetBindingError::EmptySpan);
+        }
+        let address = address.get();
+        let base = self.actual_image_base.get();
+        let rva = address
+            .checked_sub(base)
+            .ok_or(LiveTargetBindingError::AddressBeforeImage { address, base })?;
+        if rva >= u64::from(self.size_of_image) {
+            return Err(LiveTargetBindingError::AddressOutOfImage {
+                address,
+                base,
+                size_of_image: self.size_of_image,
+            });
+        }
+        let span_end = address
+            .checked_add(size)
+            .ok_or(LiveTargetBindingError::AddressSpanOverflow { address, size })?;
+        let image_end = self.image_end().get();
+        if span_end > image_end {
+            return Err(LiveTargetBindingError::AddressSpanOutOfImage {
+                address,
+                size,
+                image_end,
+            });
+        }
+        Ok(rva)
+    }
 }
 
 impl<'de> Deserialize<'de> for LiveTargetBinding {
@@ -337,6 +380,26 @@ pub enum LiveTargetBindingError {
         rva: u64,
         size: u64,
         size_of_image: u32,
+    },
+    #[error("actual address {address:#x} precedes live image base {base:#x}")]
+    AddressBeforeImage { address: u64, base: u64 },
+    #[error(
+        "actual address {address:#x} is outside live image {base:#x} + SizeOfImage {size_of_image:#x}"
+    )]
+    AddressOutOfImage {
+        address: u64,
+        base: u64,
+        size_of_image: u32,
+    },
+    #[error("actual address {address:#x} plus span size {size:#x} overflows")]
+    AddressSpanOverflow { address: u64, size: u64 },
+    #[error(
+        "actual address {address:#x} plus span size {size:#x} exceeds live image end {image_end:#x}"
+    )]
+    AddressSpanOutOfImage {
+        address: u64,
+        size: u64,
+        image_end: u64,
     },
 }
 
@@ -1770,6 +1833,100 @@ mod tests {
         assert_eq!(
             binding.address_for_rva_span(0, 0),
             Err(LiveTargetBindingError::EmptySpan)
+        );
+        assert_eq!(
+            binding
+                .rva_for_address(MemoryAddress::new(0x0000_7ff7_4000_1234))
+                .expect("in-image actual address"),
+            0x1234
+        );
+        assert_eq!(
+            binding
+                .rva_for_address_span(MemoryAddress::new(0x0000_7ff7_4001_ff00), 0x100)
+                .expect("actual span ending at SizeOfImage"),
+            0x1_ff00
+        );
+        assert_eq!(
+            binding
+                .rva_for_address_span(MemoryAddress::new(0x0000_7ff7_4000_0000), 0x2_0000)
+                .expect("whole image span"),
+            0
+        );
+        for (rva, size) in [(0, 1), (0x1234, 0x40), (0x1_ffff, 1)] {
+            let address = binding
+                .address_for_rva_span(rva, size)
+                .expect("valid forward translation");
+            assert_eq!(
+                binding
+                    .rva_for_address_span(address, size)
+                    .expect("valid inverse translation"),
+                rva
+            );
+        }
+        assert_eq!(
+            binding.rva_for_address(MemoryAddress::new(0x0000_7ff7_3fff_ffff)),
+            Err(LiveTargetBindingError::AddressBeforeImage {
+                address: 0x0000_7ff7_3fff_ffff,
+                base: 0x0000_7ff7_4000_0000,
+            })
+        );
+        assert_eq!(
+            binding.rva_for_address(MemoryAddress::new(0x0000_7ff7_4002_0000)),
+            Err(LiveTargetBindingError::AddressOutOfImage {
+                address: 0x0000_7ff7_4002_0000,
+                base: 0x0000_7ff7_4000_0000,
+                size_of_image: 0x2_0000,
+            })
+        );
+        assert_eq!(
+            binding.rva_for_address_span(MemoryAddress::new(0x0000_7ff7_4001_ffff), 2),
+            Err(LiveTargetBindingError::AddressSpanOutOfImage {
+                address: 0x0000_7ff7_4001_ffff,
+                size: 2,
+                image_end: 0x0000_7ff7_4002_0000,
+            })
+        );
+        assert_eq!(
+            binding.rva_for_address_span(MemoryAddress::new(0x0000_7ff7_4000_0001), u64::MAX,),
+            Err(LiveTargetBindingError::AddressSpanOverflow {
+                address: 0x0000_7ff7_4000_0001,
+                size: u64::MAX,
+            })
+        );
+        assert_eq!(
+            binding.rva_for_address_span(MemoryAddress::new(0x0000_7ff7_4000_0000), 0),
+            Err(LiveTargetBindingError::EmptySpan)
+        );
+        assert_eq!(
+            binding.rva_for_address_span(MemoryAddress::new(u64::MAX), 0),
+            Err(LiveTargetBindingError::EmptySpan)
+        );
+
+        let upper_binary_id = BinaryId::digest(b"upper-bound live target binding image");
+        let upper_bound = LiveTargetBinding::new(
+            ProcessIdentity {
+                process_id: ProcessId::new(10).expect("process id"),
+                start_key: ProcessStartKey::new(11).expect("process start key"),
+                binary_id: upper_binary_id.clone(),
+            },
+            upper_binary_id,
+            MemoryAddress::new(u64::MAX - 0x1_0000),
+            0x1_0000,
+        )
+        .expect("image whose exclusive end is u64::MAX");
+        assert_eq!(
+            upper_bound
+                .rva_for_address(MemoryAddress::new(u64::MAX - 1))
+                .expect("last mapped byte"),
+            0xffff
+        );
+        assert_eq!(
+            upper_bound.rva_for_address(MemoryAddress::new(u64::MAX)),
+            Err(LiveTargetBindingError::AddressOutOfImage {
+                address: u64::MAX,
+                base: u64::MAX - 0x1_0000,
+                size_of_image: 0x1_0000,
+            })
         );
     }
 
