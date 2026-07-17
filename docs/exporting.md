@@ -22,6 +22,23 @@ ReSymbol plugin or compiler. Ordinary PDB generation is offline and requires no 
 LLVM, or DIA installation. Richer type application and interactive in-tool bridges are later
 milestones.
 
+## Portable static patch sets
+
+Static patched binaries are a separate, exact-source workflow rather than a symbol export:
+
+```console
+resymbol patch EXACT_SOURCE_PE REVIEWED.respatch.json --output NEW_PATCHED_BINARY
+```
+
+The command analyzes and retains the exact PE, bounded-loads the strict schema-v1 patch set through
+the application service, requires its complete source identity, and reconstructs a fresh
+`StaticPatchPlan` from RVAs and exact expected/replacement bytes. Patch-set documents contain no
+trusted file offsets; application reparses the retained source layout and compares every expected
+span before creating output. Publication is create-new and no-clobber, never mutates or executes the
+source, and emits no success text until the named destination has been reopened and its size and
+SHA-256 verified. The receipt prints that output SHA-256, explicit Authenticode/PE-checksum warnings,
+and the platform-specific file/directory synchronization result.
+
 ## Output paths and overwrite policy
 
 Without `--output`, ReSymbol chooses a deterministic destination beside the package:

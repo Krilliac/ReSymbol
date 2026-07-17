@@ -8,6 +8,12 @@ prereleases; breaking changes remain explicit.
 
 ### Added
 
+- Added `resymbol patch EXACT_SOURCE_PE PATCH_SET.respatch.json --output NEW_BINARY` for audited
+  non-GUI patch publication. The command bounded-loads the strict manifest through `AppServices`,
+  verifies its complete identity against a freshly analyzed exact PE, rebuilds a checked plan from
+  RVA and exact bytes without trusting file offsets, and uses the existing create-new static-patch
+  publisher. Success prints the verified output SHA-256, signature/checksum warnings, durability,
+  and an explicit no-execution receipt; failures leave the source and existing destinations intact.
 - Added reproducible static patch-set documents and worker-owned **Save Patch Set...** / **Load
   Patch Set...** controls. The required `.respatch.json` format is strict schema v1: it records the
   complete source `BinaryIdentity` plus deterministically RVA-ordered, bounded NOP-instruction or

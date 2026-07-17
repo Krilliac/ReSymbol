@@ -13,7 +13,7 @@ use resymbol_analysis::{
     PeLoadConfigGuardMemcpyAnchor, PeLoadConfigSecurityAnchors, PeLoadConfigXfgAnchors,
     PluginRunRecord, PluginRunStatus, analyze_bytes,
 };
-use resymbol_app::AppServices;
+use resymbol_app::{AppServices, StaticPatchPlan};
 use resymbol_core::{
     BinaryId, ClaimProvenance, Confidence, DiscoveredPlugin, Evidence, PLUGIN_DISABLED_SENTINEL,
     PluginDiscoveryOptions, PluginSource, SymbolAssertion, SymbolClaim, SymbolSubject,
@@ -85,6 +85,8 @@ enum Command {
     Inspect(InspectArgs),
     /// Export reconstructed symbols for a debugger or another tool.
     Export(ExportArgs),
+    /// Apply a strict portable patch set to an exact PE without executing it.
+    Patch(PatchArgs),
     /// Inspect and manage discovered plugins.
     Plugin(PluginArgs),
 }
@@ -149,6 +151,21 @@ struct ExportArgs {
     /// Validate and render the export without creating a destination or staging file.
     #[arg(long)]
     dry_run: bool,
+}
+
+#[derive(Debug, Args)]
+struct PatchArgs {
+    /// Exact source PE named by the patch set's complete identity; it is never executed.
+    #[arg(value_name = "EXACT_SOURCE_PE")]
+    binary: PathBuf,
+
+    /// Strict schema-v1 `.respatch.json` document to validate and apply.
+    #[arg(value_name = "PATCH_SET")]
+    patch_set: PathBuf,
+
+    /// New patched-binary destination; an existing path is never replaced.
+    #[arg(short, long, value_name = "NEW_BINARY")]
+    output: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -227,6 +244,7 @@ fn main() -> Result<()> {
         Command::Analyze(args) => analyze(args, cli.safe_mode, cli.plugin_dir),
         Command::Inspect(args) => inspect(args),
         Command::Export(args) => export(args),
+        Command::Patch(args) => patch_binary(args),
         Command::Plugin(args) => plugins(args, cli.safe_mode, cli.plugin_dir),
     }
 }
@@ -386,6 +404,48 @@ fn inspect(args: InspectArgs) -> Result<()> {
             load_config_guard_memcpy_anchor: loaded.load_config_guard_memcpy_anchor_availability,
         },
     )?;
+
+    Ok(())
+}
+
+fn patch_binary(args: PatchArgs) -> Result<()> {
+    let services = AppServices::default();
+    let project = services
+        .analyze_binary(&args.binary)
+        .with_context(|| format!("cannot analyze exact source PE {}", args.binary.display()))?;
+    let manifest = services
+        .load_static_patch_set(&project, &args.patch_set)
+        .with_context(|| format!("cannot validate patch set {}", args.patch_set.display()))?;
+    // Validate the caller-visible path (including its required suffix) before
+    // resolving aliases for the receipt. This keeps relative and symlink paths
+    // from bypassing the strict `.respatch.json` name gate.
+    let patch_set = args
+        .patch_set
+        .canonicalize()
+        .with_context(|| format!("cannot resolve patch set {}", args.patch_set.display()))?;
+    let analysis = project.session().base_analysis();
+    let plan = StaticPatchPlan::new(
+        manifest.source_identity(),
+        analysis,
+        manifest.requests().to_vec(),
+    )
+    .context("cannot rebuild the checked static patch plan")?;
+    let receipt = services
+        .publish_static_patch_new(&project, &plan, &args.output)
+        .with_context(|| format!("cannot create patched binary {}", args.output.display()))?;
+
+    println!("source binary: {}", project.origin_path().display());
+    println!("source SHA-256: {}", receipt.source_identity().id);
+    println!("patch set: {}", patch_set.display());
+    println!("edits: {}", plan.edits().len());
+    println!("patched binary: {}", receipt.path().display());
+    println!("output SHA-256: {}", receipt.output_identity().id);
+    println!("warnings: {}", receipt.warnings().len());
+    for warning in receipt.warnings() {
+        println!("  - {warning}");
+    }
+    println!("durability: {}", receipt.durability());
+    println!("execution: not performed");
 
     Ok(())
 }
