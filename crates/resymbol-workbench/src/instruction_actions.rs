@@ -1,10 +1,10 @@
 //! UI-thread models for instruction actions and unpublished static patch drafts.
 //!
 //! This module owns no debugger client, target process, file writer, or patch
-//! publication service. A future adapter may convert [`StaticNopPatchDraft`]
-//! through the fallible
-//! `StaticPatchEditRequest::nop_instruction(rva, expected, label)` constructor
-//! and surface any resulting `StaticPatchError`.
+//! publication service. The workbench converts [`StaticNopPatchDraft`] values
+//! through the fallible `StaticPatchEditRequest::nop_instruction` constructor,
+//! then sends those owned requests to the application-service worker for
+//! checked plan construction and create-new publication.
 
 use resymbol_debugger::{
     BreakpointKind, CapabilityAvailability, CapabilityReport, DebugCapability, MemoryAddress,

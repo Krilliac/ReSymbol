@@ -9,7 +9,10 @@ use std::{
     thread::{self, JoinHandle},
 };
 
-use resymbol_app::{AppServices, ExportFormat, ProjectSnapshot, ReviewLedger};
+use resymbol_app::{
+    AppServices, ExportFormat, ProjectSnapshot, PublishedStaticPatch, ReviewLedger,
+    StaticPatchEditRequest, StaticPatchPlan,
+};
 use resymbol_core::BinaryIdentity;
 use resymbol_debugger::{
     CapabilityAvailability, ClientConnectionState, CommandOutcome, DebugCapability, DebugCommand,
@@ -531,6 +534,13 @@ pub enum WorkerCommand {
         rva: u64,
         size: u32,
     },
+    /// Validate and create-new publish exact static edits away from the UI thread.
+    PublishStaticPatch {
+        operation: OperationId,
+        project: Arc<ProjectSnapshot>,
+        requests: Vec<StaticPatchEditRequest>,
+        path: PathBuf,
+    },
     Shutdown,
 }
 
@@ -567,6 +577,10 @@ pub enum WorkerEvent {
     OfflineImageRead {
         operation: OperationId,
         result: Result<OfflineImageReadOutcome, OfflineImageReadFailure>,
+    },
+    StaticPatchPublished {
+        operation: OperationId,
+        result: Result<PublishedStaticPatch, String>,
     },
 }
 
@@ -713,6 +727,25 @@ fn process_command(services: &AppServices, command: WorkerCommand) -> Option<Wor
             operation,
             result: read_offline_image(project, rva, size),
         },
+        WorkerCommand::PublishStaticPatch {
+            operation,
+            project,
+            requests,
+            path,
+        } => {
+            let result = StaticPatchPlan::new(
+                project.session().base_analysis().identity(),
+                project.session().base_analysis(),
+                requests,
+            )
+            .map_err(|error| error.to_string())
+            .and_then(|plan| {
+                services
+                    .publish_static_patch_new(&project, &plan, &path)
+                    .map_err(|error| error.to_string())
+            });
+            WorkerEvent::StaticPatchPublished { operation, result }
+        }
         WorkerCommand::Shutdown => return None,
     };
     Some(event)
@@ -1038,6 +1071,11 @@ mod tests {
 
     const STRIPPED_FIXTURE: &[u8] =
         include_bytes!("../../../fixtures/pe-x64-msvc/artifacts/milestone2-stripped.exe");
+    const SYMBOLIZED_FIXTURE: &[u8] =
+        include_bytes!("../../../fixtures/pe-x64-msvc/artifacts/milestone2-symbolized.exe");
+    const THUNK_RVA: u32 = 0x1184;
+    const THUNK_FILE_OFFSET: usize = 0x584;
+    const THUNK_BYTES: [u8; 5] = [0xe9, 0x03, 0x00, 0x00, 0x00];
 
     fn project_snapshot() -> Arc<ProjectSnapshot> {
         let (_source, snapshot) = project_snapshot_with_source();
@@ -1176,6 +1214,78 @@ mod tests {
         assert!(matches!(
             event,
             WorkerEvent::ReviewSaved {
+                operation,
+                result: Err(_),
+            } if operation == second
+        ));
+    }
+
+    #[test]
+    fn worker_owns_checked_create_new_static_patch_publication() {
+        let (source, project) = project_snapshot_with_bytes(SYMBOLIZED_FIXTURE);
+        let directory = tempdir().expect("temporary patch directory");
+        let path = directory.path().join("patched.exe");
+        let request = || {
+            StaticPatchEditRequest::nop_instruction(
+                THUNK_RVA,
+                THUNK_BYTES,
+                "Disable internal jump thunk",
+            )
+            .expect("valid exact instruction request")
+        };
+        let mut sequence = OperationSequence::default();
+        let first = sequence.issue();
+
+        let event = process_command(
+            &AppServices::default(),
+            WorkerCommand::PublishStaticPatch {
+                operation: first,
+                project: Arc::clone(&project),
+                requests: vec![request()],
+                path: path.clone(),
+            },
+        )
+        .expect("static patch event");
+        match event {
+            WorkerEvent::StaticPatchPublished {
+                operation,
+                result: Ok(outcome),
+            } => {
+                assert_eq!(operation, first);
+                assert_eq!(outcome.path(), path);
+                assert_eq!(
+                    outcome.source_identity(),
+                    project.session().base_analysis().identity()
+                );
+                assert_ne!(outcome.output_identity(), outcome.source_identity());
+                assert_eq!(outcome.warnings().len(), 2);
+            }
+            _ => panic!("unexpected worker event"),
+        }
+        let patched = fs::read(&path).expect("read patched output");
+        assert_eq!(
+            &patched[THUNK_FILE_OFFSET..THUNK_FILE_OFFSET + THUNK_BYTES.len()],
+            &[0x90; THUNK_BYTES.len()]
+        );
+        assert_eq!(
+            fs::read(source.path()).expect("read unchanged source"),
+            SYMBOLIZED_FIXTURE
+        );
+
+        let second = sequence.issue();
+        let event = process_command(
+            &AppServices::default(),
+            WorkerCommand::PublishStaticPatch {
+                operation: second,
+                project,
+                requests: vec![request()],
+                path,
+            },
+        )
+        .expect("second static patch event");
+        assert!(matches!(
+            event,
+            WorkerEvent::StaticPatchPublished {
                 operation,
                 result: Err(_),
             } if operation == second

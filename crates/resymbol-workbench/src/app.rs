@@ -14,8 +14,8 @@ use resymbol_analysis::{
     disassemble_x64_linear,
 };
 use resymbol_app::{
-    DecisionAction, ExportFormat, MAX_REVIEW_ANNOTATION_BYTES, MAX_REVIEWER_BYTES, ReviewSubject,
-    PublishedStaticPatch, StaticPatchEditRequest,
+    DecisionAction, ExportFormat, MAX_REVIEW_ANNOTATION_BYTES, MAX_REVIEWER_BYTES,
+    PublishedStaticPatch, ReviewSubject, StaticPatchEditRequest,
 };
 use resymbol_core::{
     BinaryIdentity, DiscoveredPlugin, PluginDiscoveryOptions, PluginDiscoveryReport,
@@ -859,6 +859,13 @@ impl WorkbenchApp {
     }
 
     fn request_close(&mut self, context: &egui::Context) -> bool {
+        if self.static_patch_operation.is_pending() {
+            self.log(
+                ActivityLevel::Warning,
+                "Close paused until the worker-owned static patch publication finishes",
+            );
+            return false;
+        }
         // A close request supersedes an in-progress project-switch prompt. Keeping both
         // continuations alive could otherwise let one review save trigger two actions.
         self.pending_binary_open = None;
@@ -919,7 +926,8 @@ impl WorkbenchApp {
 
         let review_busy = self.project_operation.is_pending()
             || self.review_operation.is_pending()
-            || self.export_operation.is_pending();
+            || self.export_operation.is_pending()
+            || self.static_patch_operation.is_pending();
         let response = egui::Modal::new(egui::Id::new("dirty_review_close_confirmation")).show(
             context,
             |ui| {
@@ -955,7 +963,13 @@ impl WorkbenchApp {
                     {
                         action = Some(CloseDialogAction::SaveNew);
                     }
-                    if ui.button("Discard and Close").clicked() {
+                    if ui
+                        .add_enabled(
+                            !self.static_patch_operation.is_pending(),
+                            egui::Button::new("Discard and Close"),
+                        )
+                        .clicked()
+                    {
                         action = Some(CloseDialogAction::DiscardAndClose);
                     }
                     if ui.button("Cancel").clicked() {
@@ -1030,7 +1044,8 @@ impl WorkbenchApp {
             || self.review_operation.is_pending()
             || self.export_operation.is_pending()
             || self.readiness_operation.is_pending()
-            || self.offline_read.is_pending();
+            || self.offline_read.is_pending()
+            || self.static_patch_operation.is_pending();
         let response = egui::Modal::new(egui::Id::new("dirty_review_binary_switch_confirmation"))
             .show(context, |ui| {
                 ui.set_min_width(470.0);
@@ -1417,6 +1432,13 @@ impl WorkbenchApp {
             );
             return;
         }
+        if self.static_patch_operation.is_pending() {
+            self.log(
+                ActivityLevel::Warning,
+                "Wait for static patch publication before opening another binary",
+            );
+            return;
+        }
         if self
             .review
             .as_ref()
@@ -1463,6 +1485,11 @@ impl WorkbenchApp {
             return Err(
                 "wait for the debugger sandbox readiness probe before replacing the project"
                     .to_owned(),
+            );
+        }
+        if self.static_patch_operation.is_pending() {
+            return Err(
+                "wait for static patch publication before replacing the project".to_owned(),
             );
         }
         if self
@@ -1659,6 +1686,9 @@ impl WorkbenchApp {
         }
         if self.review_operation.is_pending() {
             return Err("wait for the current review save or load first".to_owned());
+        }
+        if self.static_patch_operation.is_pending() {
+            return Err("wait for static patch publication first".to_owned());
         }
         let project = self
             .project
@@ -2192,6 +2222,7 @@ impl WorkbenchApp {
                                 let error = "Static patch receipt did not match the current project identity"
                                     .to_owned();
                                 self.static_patch_result = Some(Err(error.clone()));
+                                self.console_reply(false, &error);
                                 self.log(ActivityLevel::Error, error);
                                 continue;
                             }
@@ -2203,10 +2234,12 @@ impl WorkbenchApp {
                             );
                             self.pending_static_patch_drafts.clear();
                             self.static_patch_result = Some(Ok(outcome));
+                            self.console_reply(true, &message);
                             self.log(ActivityLevel::Success, message);
                         }
                         Err(error) => {
                             self.static_patch_result = Some(Err(error.clone()));
+                            self.console_reply(false, &error);
                             self.log(
                                 ActivityLevel::Error,
                                 format!("Static patch publication failed: {error}"),
@@ -2762,6 +2795,7 @@ impl WorkbenchApp {
             && !self.review_operation.is_pending()
             && !self.readiness_operation.is_pending()
             && !self.offline_read.is_pending()
+            && !self.static_patch_operation.is_pending()
             && self.pending_binary_open.is_none();
         let recent_binaries = self.preferences.recent_binaries.clone();
         let mut choose_binary_requested = false;
@@ -5200,6 +5234,9 @@ impl WorkbenchApp {
     }
 
     fn static_nop_patchability(&self, row: &LinearInstructionRow) -> Result<(), &'static str> {
+        if self.static_patch_operation.is_pending() {
+            return Err("A static patch publication is already running.");
+        }
         if row.bytes().is_empty() {
             return Err("The selected instruction has no exact source bytes.");
         }
@@ -5272,13 +5309,16 @@ impl WorkbenchApp {
             .pending_static_patch_drafts
             .queue_nop(row.rva(), row.bytes(), label)
         {
-            Ok(PatchDraftQueueOutcome::Added) => self.log(
-                ActivityLevel::Success,
-                format!(
-                    "Queued unpublished static NOP draft for RVA 0x{:016X}; no file or process was modified",
-                    row.rva()
-                ),
-            ),
+            Ok(PatchDraftQueueOutcome::Added) => {
+                self.static_patch_result = None;
+                self.log(
+                    ActivityLevel::Success,
+                    format!(
+                        "Queued unpublished static NOP draft for RVA 0x{:016X}; no file or process was modified",
+                        row.rva()
+                    ),
+                );
+            }
             Ok(PatchDraftQueueOutcome::AlreadyQueued) => self.log(
                 ActivityLevel::Info,
                 format!(
@@ -5293,10 +5333,120 @@ impl WorkbenchApp {
         }
     }
 
+    fn choose_static_patch_destination(&self) -> Option<PathBuf> {
+        let default = self.project.as_ref().and_then(default_static_patch_path)?;
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Create a new patched binary")
+            .add_filter(PE_CONTAINER_FILTER.label, PE_CONTAINER_FILTER.extensions)
+            .add_filter(ALL_FILES_FILTER.label, ALL_FILES_FILTER.extensions);
+        if let Some(parent) = default
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            dialog = dialog.set_directory(parent);
+        }
+        if let Some(name) = default.file_name().and_then(|name| name.to_str()) {
+            dialog = dialog.set_file_name(name);
+        }
+        dialog.save_file()
+    }
+
+    fn build_static_patch_requests(&self) -> Result<Vec<StaticPatchEditRequest>, String> {
+        let drafts = self.pending_static_patch_drafts.drafts();
+        if drafts.is_empty() {
+            return Err("queue at least one static edit before publishing".to_owned());
+        }
+        let mut requests = Vec::with_capacity(drafts.len());
+        for draft in drafts {
+            let rva = u32::try_from(draft.rva()).map_err(|_| {
+                format!(
+                    "static patch draft RVA 0x{:016X} exceeds the PE RVA range",
+                    draft.rva()
+                )
+            })?;
+            let request = StaticPatchEditRequest::nop_instruction(
+                rva,
+                draft.expected().to_vec(),
+                draft.label().to_owned(),
+            )
+            .map_err(|error| format!("static patch draft at RVA 0x{rva:08X}: {error}"))?;
+            requests.push(request);
+        }
+        Ok(requests)
+    }
+
+    fn queue_static_patch_publication(&mut self, path: PathBuf) -> Result<String, String> {
+        if path.file_name().is_none() {
+            return Err("choose a destination that names a new patched binary".to_owned());
+        }
+        if path.exists() {
+            return Err(format!(
+                "choose a new path; existing patched destination {} will not be replaced",
+                path.display()
+            ));
+        }
+        if self.worker_disconnected {
+            return Err("the application-service worker is unavailable".to_owned());
+        }
+        if self.static_patch_operation.is_pending() {
+            return Err("a static patch publication is already running".to_owned());
+        }
+        if self.project_operation.is_pending() {
+            return Err(
+                "wait for the current project or source operation before publishing a patch"
+                    .to_owned(),
+            );
+        }
+        let requests = self.build_static_patch_requests()?;
+        let (project, project_name, source_path) = {
+            let project = self
+                .project
+                .as_ref()
+                .ok_or_else(|| "open a project before publishing a static patch".to_owned())?;
+            let source_path = project.snapshot.verified_source_path().ok_or_else(|| {
+                "the exact source binary must be verified before publishing a static patch"
+                    .to_owned()
+            })?;
+            (
+                Arc::clone(&project.snapshot),
+                project.identity.display_name.clone(),
+                source_path.to_path_buf(),
+            )
+        };
+        if path == source_path {
+            return Err(
+                "the patched destination must differ from the verified source path".to_owned(),
+            );
+        }
+        let edit_count = requests.len();
+        let operation = self.operation_sequence.issue();
+        self.service_worker
+            .submit(WorkerCommand::PublishStaticPatch {
+                operation,
+                project,
+                requests,
+                path: path.clone(),
+            })?;
+        self.static_patch_operation.begin(operation);
+        self.static_patch_result = None;
+        let message = format!(
+            "Queued {edit_count} exact static edit(s) for create-new publication to {} from {project_name}",
+            path.display()
+        );
+        self.log(ActivityLevel::Info, &message);
+        Ok(message)
+    }
+
     fn show_pending_static_patch_drafts(&mut self, ui: &mut egui::Ui, colors: SemanticColors) {
         ui.add_space(6.0);
         let mut remove_rva = None;
         let mut clear_all = false;
+        let mut publish_requested = false;
+        let publication_pending = self.static_patch_operation.is_pending();
+        let exact_source_ready = self
+            .project
+            .as_ref()
+            .is_some_and(|project| project.snapshot.has_verified_source());
         egui::Frame::new()
             .fill(colors.raised)
             .stroke(egui::Stroke::new(1.0, colors.border))
@@ -5316,8 +5466,13 @@ impl WorkbenchApp {
                         )
                         .color(colors.secondary_text),
                     );
-                    if !self.pending_static_patch_drafts.drafts().is_empty()
-                        && ui.button("Clear drafts").clicked()
+                    if ui
+                        .add_enabled(
+                            !publication_pending
+                                && !self.pending_static_patch_drafts.drafts().is_empty(),
+                            egui::Button::new("Clear drafts"),
+                        )
+                        .clicked()
                     {
                         clear_all = true;
                     }
@@ -5337,18 +5492,102 @@ impl WorkbenchApp {
                             ui.label("->");
                             ui.monospace(format_instruction_bytes(&replacement));
                             ui.label(draft.label());
-                            if ui.small_button("Remove").clicked() {
+                            if ui
+                                .add_enabled(
+                                    !publication_pending,
+                                    egui::Button::new("Remove").small(),
+                                )
+                                .clicked()
+                            {
                                 remove_rva = Some(draft.rva());
                             }
                         });
                     }
                 }
+                ui.separator();
+                let can_publish = !publication_pending
+                    && !self.worker_disconnected
+                    && !self.project_operation.is_pending()
+                    && exact_source_ready
+                    && !self.pending_static_patch_drafts.drafts().is_empty();
+                let publish_label = if publication_pending {
+                    "Publishing patched binary..."
+                } else {
+                    "Create New Patched Binary..."
+                };
+                let publish = ui
+                    .add_enabled(can_publish, egui::Button::new(publish_label))
+                    .on_disabled_hover_text(if publication_pending {
+                        "A worker-owned create-new publication is already running."
+                    } else if !exact_source_ready {
+                        "Verify the exact source binary before publishing static edits."
+                    } else if self.pending_static_patch_drafts.drafts().is_empty() {
+                        "Queue at least one exact instruction edit first."
+                    } else {
+                        "The application-service worker is unavailable or busy with the project."
+                    });
+                publish_requested = publish.clicked();
+                if publication_pending {
+                    ui.spinner();
+                }
+                ui.label(
+                    RichText::new(
+                        "Publication revalidates the exact source identity and expected bytes on the service worker, then creates a new file without replacing source or destination.",
+                    )
+                    .small()
+                    .color(colors.secondary_text),
+                );
+                if let Some(result) = &self.static_patch_result {
+                    ui.separator();
+                    match result {
+                        Ok(outcome) => {
+                            ui.colored_label(
+                                colors.healthy,
+                                format!("[CREATED] {}", outcome.path().display()),
+                            );
+                            ui.label(
+                                RichText::new(format!(
+                                    "Output SHA-256 {}",
+                                    outcome.output_identity().id.as_str()
+                                ))
+                                .monospace()
+                                .small()
+                                .color(colors.exact_extracted),
+                            );
+                            for warning in outcome.warnings() {
+                                ui.colored_label(
+                                    colors.warning_conflict,
+                                    format!("[INTEGRITY WARNING] {warning}"),
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            ui.colored_label(
+                                colors.destructive_quarantined,
+                                format!("[PUBLICATION FAILED] {error}"),
+                            );
+                        }
+                    }
+                }
             });
         if let Some(rva) = remove_rva {
             let _ = self.pending_static_patch_drafts.remove(rva);
+            self.static_patch_result = None;
         }
         if clear_all {
             self.pending_static_patch_drafts.clear();
+            self.static_patch_result = None;
+        }
+        if publish_requested {
+            if let Some(path) = self.choose_static_patch_destination() {
+                if let Err(error) = self.queue_static_patch_publication(path) {
+                    self.static_patch_result = Some(Err(error.clone()));
+                    self.log(
+                        ActivityLevel::Error,
+                        format!("Static patch publication failed: {error}"),
+                    );
+                }
+            }
         }
     }
 
@@ -6299,6 +6538,7 @@ impl eframe::App for WorkbenchApp {
                 || self.review_operation.is_pending()
                 || self.readiness_operation.is_pending()
                 || self.offline_read.is_pending()
+                || self.static_patch_operation.is_pending()
                 || self.console_host.is_enabled())
         {
             context.request_repaint_after(std::time::Duration::from_millis(100));
@@ -7488,6 +7728,27 @@ fn default_export_path(project: &LoadedProject, kind: ExportKind) -> PathBuf {
     path
 }
 
+fn default_static_patch_path(project: &LoadedProject) -> Option<PathBuf> {
+    let source = project.snapshot.verified_source_path()?;
+    let digest = project.identity.sha256.as_str();
+    let stem = source
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .map_or_else(|| format!("resymbol_{}", &digest[..12]), ToOwned::to_owned);
+    let file_name = source
+        .extension()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .map_or_else(
+            || format!("{stem}-patched"),
+            |extension| format!("{stem}-patched.{extension}"),
+        );
+    let mut path = source.to_path_buf();
+    path.set_file_name(file_name);
+    Some(path)
+}
+
 fn default_review_path(project: &LoadedProject) -> PathBuf {
     let digest = project.identity.sha256.as_str();
     let stem = project
@@ -8263,6 +8524,46 @@ mod tests {
         assert_eq!(
             app.static_nop_patchability(&already_nop.rows()[0]),
             Err("The selected instruction is already NOP-filled.")
+        );
+    }
+
+    #[test]
+    fn patched_binary_suggestion_uses_the_verified_source_path() {
+        let directory = tempfile::tempdir().expect("temporary source directory");
+        let source = directory.path().join("application.exe");
+        std::fs::write(&source, STRIPPED_FIXTURE).expect("write exact source fixture");
+        let snapshot = AppServices::default()
+            .analyze_binary(&source)
+            .expect("analyze exact source fixture");
+        let project = LoadedProject::from_snapshot(snapshot).expect("loaded project");
+
+        assert_eq!(
+            default_static_patch_path(&project),
+            Some(directory.path().join("application-patched.exe"))
+        );
+    }
+
+    #[test]
+    fn patch_request_conversion_revalidates_the_exact_instruction_boundary() {
+        let (_context, mut app) = test_app();
+        app.pending_static_patch_drafts
+            .queue_nop(0x1000, &[0xCC, 0xC3], "two instructions")
+            .expect("shape-valid bounded draft");
+        assert!(
+            app.build_static_patch_requests()
+                .expect_err("multi-instruction NOP must fail")
+                .contains("exactly one complete valid x64 instruction")
+        );
+
+        app.pending_static_patch_drafts.clear();
+        app.pending_static_patch_drafts
+            .queue_nop(0x1000, &[0xCC], "one instruction")
+            .expect("shape-valid exact instruction draft");
+        assert_eq!(
+            app.build_static_patch_requests()
+                .expect("single instruction request")
+                .len(),
+            1
         );
     }
 }

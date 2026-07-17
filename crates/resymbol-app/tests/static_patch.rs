@@ -87,6 +87,34 @@ fn nops_a_known_executable_instruction_without_mutating_the_source() {
 }
 
 #[test]
+fn nop_requests_require_exactly_one_complete_x64_instruction() {
+    for invalid in [&[0xe9, 0x00][..], &[0xff, 0xf8][..], &[0xcc, 0xc3][..]] {
+        assert!(matches!(
+            StaticPatchEditRequest::nop_instruction(
+                THUNK_RVA,
+                invalid,
+                "invalid instruction boundary"
+            ),
+            Err(StaticPatchError::InvalidNopInstructionEncoding { rva: THUNK_RVA, .. })
+        ));
+    }
+
+    assert!(
+        StaticPatchEditRequest::nop_instruction(THUNK_RVA, THUNK_BYTES, "one complete instruction")
+            .is_ok()
+    );
+    assert!(
+        StaticPatchEditRequest::replace_bytes(
+            THUNK_RVA,
+            [0xcc, 0xc3],
+            [0x90, 0x90],
+            "arbitrary same-size replacement remains available"
+        )
+        .is_ok()
+    );
+}
+
+#[test]
 fn stale_expected_bytes_fail_before_any_output_is_modified() {
     let temp = TempDir::new().expect("create temp directory");
     let source = write_source(&temp);
@@ -253,6 +281,16 @@ fn publication_is_create_new_and_cleans_staging_on_failure() {
     )
     .expect("valid patch plan");
     let output = temp.path().join("patched.exe");
+
+    assert!(matches!(
+        services.publish_static_patch_new(&project, &plan, &source),
+        Err(StaticPatchError::OutputMatchesSource { .. })
+    ));
+    #[cfg(windows)]
+    assert!(matches!(
+        services.publish_static_patch_new(&project, &plan, temp.path().join("SOURCE.EXE")),
+        Err(StaticPatchError::OutputMatchesSource { .. })
+    ));
 
     let receipt = services
         .publish_static_patch_new(&project, &plan, &output)

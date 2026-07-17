@@ -168,8 +168,10 @@ branch/call targets that land in readable exact file backing in the static image
 flow is unavailable rather than guessed.
 
 Instruction actions keep static and live mutation separate. **Queue NOP for Patched Binary** records
-an exact-RVA, exact-source-byte draft; a static publisher may accept it only after compare-to-source
-validation and may write only a new binary, never the open source or a process. **NOP instruction in
+an exact-RVA, exact-source-byte draft. **Create New Patched Binary** accepts only drafts that decode
+as exactly one complete x64 instruction, then performs checked plan construction, source identity and
+byte revalidation, and create-new publication on the application-service worker. It writes only a
+new binary, never the open source or a process, and presents signature/checksum warnings. **NOP instruction in
 live memory** is a different typed action: it requires an authenticated stopped session, a complete
 capability report with `LiveMemoryWrite`, an exact live-address binding, and
 `DebugCommand::WriteMemory` compare-before-write using the exact selected bytes and a same-length

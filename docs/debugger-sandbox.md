@@ -384,8 +384,11 @@ The instruction action menu maintains three separate authority domains:
 
 1. Static preview is read-only and non-executing. Copy and decoder-proven direct-target navigation
    operate only on the frozen preferred-image model.
-2. A queued static NOP is an exact-RVA, exact-byte draft. Publication requires revalidating the source
-   bytes and writing a new binary; it must never alter the open source file or a live process.
+2. A queued static NOP is an exact-RVA, exact-byte draft. **Create New Patched Binary** requires it to
+   decode as exactly one complete valid x64 instruction, then a worker-owned checked plan revalidates
+   the full source identity and expected bytes before no-clobber publication. It never alters the
+   open source file or a live process, and reports that the output's Authenticode signature and PE
+   checksum may be invalid. General same-size `ReplaceBytes` remains a separate arbitrary-byte API.
 3. Live actions are typed and visible but remain disabled until a real authenticated provider
    supplies a complete capability report, a current authenticated stop token, and the exact address
    or stopped-thread bindings required by the action. Live NOP requires `LiveMemoryWrite` and a

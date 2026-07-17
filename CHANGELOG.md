@@ -14,8 +14,10 @@ prereleases; breaking changes remain explicit.
   keep the preview non-executing and non-authoritative. Rows retain exact instruction bytes and only
   expose decoder-proven direct branch/call targets, with keyboard-accessible copy, follow, and action
   menus available from every RVA/opcode/instruction/flow/length cell. Static NOP requests are queued
-  as exact-byte drafts and may publish only through a checked
-  static patch plan that verifies the source bytes and creates a new binary. The separate live NOP,
+  as exact-byte drafts; **Create New Patched Binary** converts them to requests that must each decode
+  as exactly one complete x64 instruction, then the application-service worker builds a checked
+  plan, revalidates source identity and bytes, and no-clobber publishes a separate binary. General
+  same-size `ReplaceBytes` requests remain the explicit arbitrary-byte escape hatch. The separate live NOP,
   software-breakpoint, Run to Cursor, Step Into/Over/Out, and Continue actions expose their typed
   debugger routes but remain visibly disabled until an authenticated live provider supplies a
   complete capability report plus current stop/address/thread bindings. Live NOP uses

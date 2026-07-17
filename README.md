@@ -73,9 +73,9 @@ The current alpha implements and tests an end-to-end, deliberately narrow analys
   shares function selection with the table and inspector, and draws only retained direct-call,
   thunk, and import relationships. Accept Primary, Keep as Alias, Reject, rationale, undo, and redo
   are stored in a binary-bound create-new sidecar; a dirty ledger cannot be silently discarded by
-  the window close button or companion-console `quit`. The workbench creates new `.resym`, neutral
-  JSON, Markdown, MAP, public-symbol PDB, IDA Python, and Ghidra Java artifacts without replacing an
-  existing destination. Its separately spawned companion console is off by default; enable it from
+  the window close button or companion-console `quit`. The workbench creates new patched PE binaries,
+  `.resym`, neutral JSON, Markdown, MAP, public-symbol PDB, IDA Python, and Ghidra Java artifacts
+  without replacing an existing destination. Its separately spawned companion console is off by default; enable it from
   **View -> Companion console** when live activity and typed control are useful. Provider readiness
   is a non-mutating preflight only: it does not provision a sandbox, launch or attach to a target, or
   attest containment. The Address Space reader serves at most 256 bytes from the frozen exact source
@@ -83,8 +83,9 @@ The current alpha implements and tests an end-to-end, deliberately narrow analys
   function-boundary truth, and neither view opens a process or claims a live mapping. See
   [the debugger and sandbox architecture](docs/debugger-sandbox.md);
 - a UI-neutral, same-size static patch service for exact PE source snapshots. An immutable patch
-  plan is bound to the complete source `BinaryIdentity`; each labeled NOP-instruction or general
-  byte replacement resolves an executable, fully file-backed RVA to its exact file offset and
+  plan is bound to the complete source `BinaryIdentity`; each labeled NOP instruction must decode
+  as exactly one complete valid x64 instruction, while an explicit general byte replacement remains
+  available for arbitrary same-size edits. Each edit resolves an executable, fully file-backed RVA to its exact file offset and
   retains the expected original bytes. Plans are deterministically ordered and bounded, reject
   duplicate, overlapping, unbacked, virtual-tail, non-executable, and out-of-image ranges, and
   compare every expected span before producing a distinct patched image. Publication stages,
@@ -381,12 +382,14 @@ can return a 16, 32, 64, 128, or 256-byte file-backed RVA span through the in-pr
 show either exact hex or a capped x64 linear preview. The preview reports why it stopped, never
 claims CFG or function-boundary truth, and follows only decoder-proven direct branch/call targets.
 Gaps, zero-fill, padding, and crossing spans remain explicitly unavailable. Static NOP requests are
-exact-byte drafts for a checked create-new-binary patch path; live debugger actions remain disabled
+exact-byte drafts; **Create New Patched Binary** validates them as complete instructions on the
+application-service worker, rechecks the exact source identity and bytes, then publishes a separate
+no-clobber binary with explicit signature/checksum warnings. Live debugger actions remain disabled
 without authenticated capabilities and current tokens. Provider readiness means only that
 provisioning may be attempted; none of these surfaces executes the input or proves containment.
 The workbench opens
-current `.resym` packages and creates new `.resym`, neutral JSON, Markdown, MAP, public-symbol PDB,
-IDA Python, or Ghidra Java artifacts. It does not execute plugins, migrate legacy packages, or
+current `.resym` packages and creates new patched PE binaries, `.resym`, neutral JSON, Markdown, MAP,
+public-symbol PDB, IDA Python, or Ghidra Java artifacts. It does not execute plugins, migrate legacy packages, or
 overwrite an output or review-sidecar file.
 
 Static frontends build `StaticPatchEditRequest` values, freeze them with `StaticPatchPlan::new`,
