@@ -341,11 +341,7 @@ impl LoadedProject {
                 found_size: projection.binary.file_size,
             });
         }
-        let static_address_space = if matches!(base_analysis, BinaryAnalysis::Pe(_)) {
-            Some(StaticAddressSpace::from_analysis(base_analysis)?)
-        } else {
-            None
-        };
+        let static_address_space = Some(StaticAddressSpace::from_analysis(base_analysis)?);
         let protection_assessment = match (base_analysis, snapshot.verified_source_bytes()) {
             (BinaryAnalysis::Pe(analysis), Some(bytes)) => {
                 ProtectionAssessment::Available(scan_pe_protections(analysis, bytes)?)
@@ -973,11 +969,20 @@ mod tests {
     }
 
     #[test]
-    fn elf_container_opens_with_pe_only_views_unavailable() {
+    fn elf_container_opens_with_sparse_address_space_and_pe_only_scans_unavailable() {
         let project = loaded_fixture(&synthetic_elf32_container());
 
         assert!(matches!(project.identity.format, ExportBinaryFormat::Elf));
-        assert!(project.static_address_space.is_none());
+        let address_space = project
+            .static_address_space
+            .as_ref()
+            .expect("ELF container has a sparse static address space");
+        assert_eq!(
+            address_space.layout,
+            resymbol_debugger::StaticImageLayout::Elf
+        );
+        assert_eq!(address_space.regions().len(), 1);
+        assert_eq!(address_space.regions()[0].zero_fill_size(), 0x80);
         assert!(matches!(
             project.protection_assessment,
             ProtectionAssessment::UnsupportedFormat

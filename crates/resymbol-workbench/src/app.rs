@@ -22,7 +22,7 @@ use resymbol_core::BinaryIdentity;
 use resymbol_debugger::{
     IsolationBoundary, MemoryAccess, ProtectionSeverity, RelativeAddress, SandboxGuarantee,
     SandboxProviderReadiness, SandboxProviderReadinessReason, SandboxProviderRequirement,
-    SandboxProviderSelection, StaticRegionKind,
+    SandboxProviderSelection, StaticImageLayout, StaticRegionKind,
 };
 use resymbol_export::{ExportBinaryFormat, ExportControlFlowTarget, ExportProducer};
 use serde::{Deserialize, Serialize};
@@ -5016,15 +5016,16 @@ impl WorkbenchApp {
     fn show_address_space(&mut self, ui: &mut egui::Ui) {
         let colors = self.preferences.theme.semantic_colors();
         self.handle_address_space_shortcuts(ui);
-        let has_static_address_space = self
+        let static_layout = self
             .project
             .as_ref()
             .expect("checked by caller")
             .static_address_space
-            .is_some();
+            .as_ref()
+            .map(|address_space| address_space.layout);
 
         ui.heading("Static address space");
-        if !has_static_address_space {
+        let Some(static_layout) = static_layout else {
             ui.label(
                 RichText::new(
                     "Static address-space and offline-byte views are unavailable for this binary format.",
@@ -5032,7 +5033,7 @@ impl WorkbenchApp {
                 .color(colors.secondary_text),
             );
             return;
-        }
+        };
 
         ui.horizontal_wrapped(|ui| {
             ui.label(
@@ -5041,8 +5042,15 @@ impl WorkbenchApp {
                     .color(colors.healthy),
             );
             ui.label(
-                RichText::new("Preferred PE layout; live mappings may differ after load")
-                    .color(colors.secondary_text),
+                RichText::new(match static_layout {
+                    StaticImageLayout::Pe { .. } => {
+                        "Preferred PE layout; live mappings may differ after load"
+                    }
+                    StaticImageLayout::Elf => {
+                        "Sparse ELF PT_LOAD layout; virtual gaps are unmapped"
+                    }
+                })
+                .color(colors.secondary_text),
             );
         });
         ui.add_space(8.0);
@@ -5055,13 +5063,24 @@ impl WorkbenchApp {
             .static_address_space
             .as_ref()
             .expect("format availability checked above");
-        let indicator_text = project
-            .protection_assessment
-            .unavailable_reason()
-            .map_or_else(
-                || project.protection_assessment.findings().len().to_string(),
-                |_| "source required".to_owned(),
-            );
+        let indicator_text = match &project.protection_assessment {
+            ProtectionAssessment::Available(report) => report.findings().len().to_string(),
+            ProtectionAssessment::ExactSourceRequired => "source required".to_owned(),
+            ProtectionAssessment::UnsupportedFormat => "not applicable".to_owned(),
+        };
+        let (layout_property_label, layout_property_value) = match address_space.layout {
+            StaticImageLayout::Pe {
+                section_alignment,
+                file_alignment,
+            } => (
+                "Section / file align",
+                format!("0x{section_alignment:X} / 0x{file_alignment:X}"),
+            ),
+            StaticImageLayout::Elf => (
+                "Mapping model",
+                format!("{} sparse PT_LOAD", address_space.regions().len()),
+            ),
+        };
 
         egui::Frame::new()
             .fill(colors.raised)
@@ -5084,11 +5103,8 @@ impl WorkbenchApp {
                     );
                     property_cell(
                         &mut columns[2],
-                        "Section / file align",
-                        &format!(
-                            "0x{:X} / 0x{:X}",
-                            address_space.section_alignment, address_space.file_alignment
-                        ),
+                        layout_property_label,
+                        &layout_property_value,
                         true,
                     );
                 });
@@ -5250,6 +5266,12 @@ impl WorkbenchApp {
     }
 
     fn show_offline_byte_reader(&mut self, ui: &mut egui::Ui, colors: SemanticColors) {
+        let disassembly_available = self.x64_linear_preview_available();
+        if !disassembly_available {
+            self.offline_byte_view = OfflineByteView::Hex;
+            self.selected_disassembly_instruction = None;
+            self.disassembly_row_focus_target = None;
+        }
         let source_ready = self
             .project
             .as_ref()
@@ -5326,16 +5348,22 @@ impl WorkbenchApp {
                     ui.label(RichText::new("Preview").strong());
                     ui.selectable_value(&mut self.offline_byte_view, OfflineByteView::Hex, "Hex")
                         .on_hover_text("Show exact verified bytes (keyboard: H)");
-                    ui.selectable_value(
-                        &mut self.offline_byte_view,
-                        OfflineByteView::Disassembly,
-                        "Disassembly",
-                    )
-                    .on_hover_text("Show bounded x64 linear preview (keyboard: D)");
+                    ui.add_enabled_ui(disassembly_available, |ui| {
+                        ui.selectable_value(
+                            &mut self.offline_byte_view,
+                            OfflineByteView::Disassembly,
+                            "Disassembly",
+                        )
+                        .on_hover_text("Show bounded x64 linear preview (keyboard: D)");
+                    });
                     ui.label(
-                        RichText::new("H/D switch view; arrow keys select instructions")
-                            .small()
-                            .color(colors.secondary_text),
+                        RichText::new(if disassembly_available {
+                            "H/D switch view; arrow keys select instructions"
+                        } else {
+                            "Hex is available; x64 disassembly is PE-only"
+                        })
+                        .small()
+                        .color(colors.secondary_text),
                     );
                 });
 
@@ -5455,9 +5483,15 @@ impl WorkbenchApp {
         });
         if show_hex {
             self.offline_byte_view = OfflineByteView::Hex;
-        } else if show_disassembly {
+        } else if show_disassembly && self.x64_linear_preview_available() {
             self.offline_byte_view = OfflineByteView::Disassembly;
         }
+    }
+
+    fn x64_linear_preview_available(&self) -> bool {
+        self.project.as_ref().is_some_and(|project| {
+            matches!(project.session().base_analysis(), BinaryAnalysis::Pe(_))
+        })
     }
 
     fn show_offline_hex_preview(&self, ui: &mut egui::Ui, start_rva: u64, bytes: &[u8]) {
@@ -8094,6 +8128,10 @@ fn static_region_name(kind: &StaticRegionKind) -> String {
         StaticRegionKind::Section {
             table_index, name, ..
         } => format!("#{table_index} {name}"),
+        StaticRegionKind::LoadSegment {
+            program_header_index,
+            ..
+        } => format!("PH#{program_header_index} PT_LOAD"),
         StaticRegionKind::ImageGap => "Image gap".to_owned(),
     }
 }

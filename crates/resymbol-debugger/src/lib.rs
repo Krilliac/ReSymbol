@@ -21,7 +21,7 @@ mod software_breakpoint;
 
 pub use address_space::{
     AddressRange, FileBacking, MemoryAccess, RelativeAddress, StaticAddressSpace,
-    StaticAddressSpaceError, StaticRegion, StaticRegionKind,
+    StaticAddressSpaceError, StaticImageLayout, StaticRegion, StaticRegionKind,
 };
 pub use authorization::{
     AuthorizationIssuanceError, HostLaunchIntent, HostLaunchIntentError, HostRiskLease,

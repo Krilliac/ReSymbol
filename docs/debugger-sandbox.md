@@ -206,10 +206,11 @@ not alter an established snapshot.
 The only accepted open target is the exact canonical `OfflineTarget.path` returned for that verified
 image. In this host, `MemoryAddress` unambiguously means an RVA. A read must be nonempty, no larger
 than the protocol's 1 MiB memory-read ceiling, remain within one canonical region, and remain wholly
-inside that region's initialized file-backed prefix. Header/section bytes are returned from the
-frozen snapshot. Image gaps, section zero-fill, loader-rounded padding, raw file-alignment bytes
-beyond a smaller `VirtualSize`, address overflow, image overrun, and cross-region or cross-backing
-spans are rejected without a memory-read event.
+inside that region's initialized file-backed prefix. PE header/section bytes and ELF `PT_LOAD`
+prefixes are returned from the frozen snapshot. Sparse or partitioned image gaps, mapped zero-fill,
+PE loader-rounded padding, raw file-alignment bytes beyond a smaller `VirtualSize`, address
+overflow, image overrun, and cross-region or cross-backing spans are rejected without a memory-read
+event.
 
 `OfflineImageDebugHost` advertises `OfflineAnalysis` as available, reports every other capability as
 typed read-only or backend unavailability, and supports only capability probing, that exact offline
@@ -224,11 +225,11 @@ boundary; they do not claim target or sandbox cleanup.
 The Workbench Address Space reader owns this client only on the bounded application-service worker.
 Each request is limited to 256 bytes, and the UI publishes bytes only after the full identity,
 canonical source path, operation, span, and close/release/disconnect receipt match the current
-project. A package without verified source bytes cannot queue a read. The UI may render those exact
-bytes as hex/ASCII or pass them through the pure bounded x64 linear-preview transformer. That
-transformer has independent byte and instruction caps, reports an explicit stop reason, never
-executes the input, and does not claim CFG or function-boundary truth. It exposes only decoded direct
-branch/call targets; indirect targets remain unavailable and are never inferred.
+project. A package without verified source bytes cannot queue a read. PE and ELF bytes may be
+rendered as exact hex/ASCII. Only PE/x64 bytes may pass through the pure bounded x64 linear-preview
+transformer. That transformer has independent byte and instruction caps, reports an explicit stop
+reason, never executes the input, and does not claim CFG or function-boundary truth. It exposes only
+decoded direct branch/call targets; indirect targets remain unavailable and are never inferred.
 
 ## Session safety contract
 

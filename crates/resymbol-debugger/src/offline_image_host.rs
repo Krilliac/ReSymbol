@@ -246,14 +246,10 @@ impl VerifiedOfflineImage {
         }
 
         let relative = RelativeAddress::new(start);
-        let region =
-            self.address_space
-                .region_at(relative)
-                .ok_or(OfflineImageReadError::OutsideImage {
-                    start,
-                    end,
-                    image_size: self.address_space.image_size,
-                })?;
+        let region = self
+            .address_space
+            .region_at(relative)
+            .ok_or(OfflineImageReadError::ImageGap { start, end })?;
         if end > region.range.end() {
             return Err(OfflineImageReadError::CrossesRegion {
                 start,
@@ -343,6 +339,13 @@ impl VerifiedOfflineImage {
                     .is_some_and(|raw_size| delta < raw_size)
                 {
                     OfflineImageReadError::RawBytesOutsideVirtualSize { start, end }
+                } else {
+                    OfflineImageReadError::LoaderPadding { start, end }
+                }
+            }
+            StaticRegionKind::LoadSegment { loaded_size, .. } => {
+                if delta < *loaded_size {
+                    OfflineImageReadError::ZeroFill { start, end }
                 } else {
                     OfflineImageReadError::LoaderPadding { start, end }
                 }
@@ -554,7 +557,7 @@ pub enum OfflineImageReadError {
     },
     #[error("offline RVA range {start:#x}..{end:#x} lies in an image gap")]
     ImageGap { start: u64, end: u64 },
-    #[error("offline RVA range {start:#x}..{end:#x} lies in section zero-fill")]
+    #[error("offline RVA range {start:#x}..{end:#x} lies in mapped zero-fill")]
     ZeroFill { start: u64, end: u64 },
     #[error("offline RVA range {start:#x}..{end:#x} lies in loader-rounded padding")]
     LoaderPadding { start: u64, end: u64 },
@@ -1245,6 +1248,79 @@ mod tests {
         .expect("verified fixture")
     }
 
+    fn verified_sparse_elf() -> (TempImage, VerifiedOfflineImage) {
+        const ELF_HEADER_SIZE: usize = 52;
+        const PROGRAM_HEADER_SIZE: usize = 32;
+        let mut bytes = vec![0_u8; 0x200];
+        bytes[..16].copy_from_slice(&[0x7f, b'E', b'L', b'F', 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        put_test_u16(&mut bytes, 16, 2);
+        put_test_u16(&mut bytes, 18, 8);
+        put_test_u32(&mut bytes, 20, 1);
+        put_test_u32(&mut bytes, 24, 0x1200_0040);
+        put_test_u32(&mut bytes, 28, ELF_HEADER_SIZE as u32);
+        put_test_u16(&mut bytes, 40, ELF_HEADER_SIZE as u16);
+        put_test_u16(&mut bytes, 42, PROGRAM_HEADER_SIZE as u16);
+        put_test_u16(&mut bytes, 44, 2);
+        put_test_program_header(
+            &mut bytes,
+            ELF_HEADER_SIZE,
+            0,
+            0x1200_0000,
+            0x100,
+            0x200,
+            5,
+            0x1000,
+        );
+        put_test_program_header(
+            &mut bytes,
+            ELF_HEADER_SIZE + PROGRAM_HEADER_SIZE,
+            0x180,
+            0xf000_0180,
+            4,
+            0x80,
+            6,
+            0x10,
+        );
+        bytes[0x180..0x184].copy_from_slice(&[0x12, 0x34, 0x56, 0x78]);
+        let expected = analyze_bytes(&bytes)
+            .expect("analyze synthetic sparse ELF")
+            .identity()
+            .clone();
+        let temp = TempImage::new(&bytes);
+        let image =
+            VerifiedOfflineImage::from_snapshot(&temp.path, expected, Arc::<[u8]>::from(bytes))
+                .expect("verify synthetic sparse ELF");
+        (temp, image)
+    }
+
+    fn put_test_program_header(
+        bytes: &mut [u8],
+        offset: usize,
+        file_offset: u32,
+        virtual_address: u32,
+        file_size: u32,
+        memory_size: u32,
+        flags: u32,
+        alignment: u32,
+    ) {
+        put_test_u32(bytes, offset, 1);
+        put_test_u32(bytes, offset + 4, file_offset);
+        put_test_u32(bytes, offset + 8, virtual_address);
+        put_test_u32(bytes, offset + 12, virtual_address);
+        put_test_u32(bytes, offset + 16, file_size);
+        put_test_u32(bytes, offset + 20, memory_size);
+        put_test_u32(bytes, offset + 24, flags);
+        put_test_u32(bytes, offset + 28, alignment);
+    }
+
+    fn put_test_u16(bytes: &mut [u8], offset: usize, value: u16) {
+        bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_test_u32(bytes: &mut [u8], offset: usize, value: u32) {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
     fn patched_fixture(
         mutate: impl FnOnce(&mut [u8], usize, usize),
     ) -> (TempImage, VerifiedOfflineImage) {
@@ -1559,6 +1635,46 @@ mod tests {
         assert!(matches!(
             image.read_rva(MemoryAddress::new(raw_tail), 1),
             Err(OfflineImageReadError::RawBytesOutsideVirtualSize { .. })
+        ));
+    }
+
+    #[test]
+    fn sparse_elf_reads_only_exact_file_backed_load_prefixes() {
+        let (_file, image) = verified_sparse_elf();
+        let layout = image.address_space();
+        assert_eq!(layout.regions().len(), 2);
+
+        assert_eq!(
+            image.read_rva(MemoryAddress::new(0x40), 4).unwrap(),
+            &image.snapshot_bytes()[0x40..0x44]
+        );
+        assert!(matches!(
+            image.read_rva(MemoryAddress::new(0x1000), 1),
+            Err(OfflineImageReadError::ImageGap { .. })
+        ));
+        assert!(matches!(
+            image.read_rva(MemoryAddress::new(0x100), 1),
+            Err(OfflineImageReadError::ZeroFill { .. })
+        ));
+        assert!(matches!(
+            image.read_rva(MemoryAddress::new(0xff), 2),
+            Err(OfflineImageReadError::CrossesFileBacking { .. })
+        ));
+        assert!(matches!(
+            image.read_rva(MemoryAddress::new(0x1ff), 2),
+            Err(OfflineImageReadError::CrossesRegion { .. })
+        ));
+
+        let second = &layout.regions()[1];
+        assert_eq!(
+            image
+                .read_rva(MemoryAddress::new(second.range.start().get()), 4)
+                .unwrap(),
+            [0x12, 0x34, 0x56, 0x78]
+        );
+        assert!(matches!(
+            image.read_rva(MemoryAddress::new(second.range.start().get() + 4), 1),
+            Err(OfflineImageReadError::ZeroFill { .. })
         ));
     }
 

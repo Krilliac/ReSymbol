@@ -389,8 +389,9 @@ resymbol plugin trust community.example-analyzer --fingerprint <sha256>
 resymbol analyze application.exe --plugin community.example-analyzer
 ```
 
-On Windows, open the same supported container in the desktop workbench. PE-only address-space,
-offline-byte, MAP, and PDB actions stay disabled for ELF projects:
+On Windows, open the same supported container in the desktop workbench. ELF projects expose their
+sparse `PT_LOAD` address map and exact file-backed offline bytes as hex; x64 disassembly, static
+patching, protection analysis, MAP, and PDB remain PE-only:
 
 ```console
 .\resymbol-workbench.exe application.exe
@@ -408,9 +409,10 @@ at a clearly labeled deterministic lowest-RVA navigation fallback, synchronizes 
 function inspector, and shows only relationships retained by analysis. Large graphs are rendered
 through an explicit bounded view rather than implying complete call-graph recovery. Address Space is
 a preferred-image model, not a live process map. When an exact source snapshot is present, its reader
-can return a 16, 32, 64, 128, or 256-byte file-backed RVA span through the in-process offline host and
-show either exact hex or a capped x64 linear preview. The preview reports why it stopped, never
-claims CFG or function-boundary truth, and follows only decoder-proven direct branch/call targets.
+can return a 16, 32, 64, 128, or 256-byte file-backed RVA span through the in-process offline host.
+Both PE and ELF mappings support exact hex; PE/x64 bytes can additionally use the capped linear
+preview. The preview reports why it stopped, never claims CFG or function-boundary truth, and
+follows only decoder-proven direct branch/call targets.
 Gaps, zero-fill, padding, and crossing spans remain explicitly unavailable. Static NOP requests are
 exact-byte drafts; **Create New Patched Binary** validates them as complete instructions on the
 application-service worker, rechecks the exact source identity and bytes, then publishes a separate

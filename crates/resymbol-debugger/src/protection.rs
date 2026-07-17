@@ -393,7 +393,9 @@ fn scan_entry_point(
         StaticRegionKind::Section {
             table_index, name, ..
         } => Some((*table_index, name)),
-        StaticRegionKind::Headers | StaticRegionKind::ImageGap => None,
+        StaticRegionKind::Headers
+        | StaticRegionKind::LoadSegment { .. }
+        | StaticRegionKind::ImageGap => None,
     }) else {
         let in_header_mapping =
             region.is_some_and(|region| matches!(&region.kind, StaticRegionKind::Headers));
@@ -607,7 +609,9 @@ fn entropy_millibits(bytes: &[u8]) -> u16 {
 fn section_table_index(region: &StaticRegion) -> Option<u32> {
     match &region.kind {
         StaticRegionKind::Section { table_index, .. } => Some(*table_index),
-        StaticRegionKind::Headers | StaticRegionKind::ImageGap => None,
+        StaticRegionKind::Headers
+        | StaticRegionKind::LoadSegment { .. }
+        | StaticRegionKind::ImageGap => None,
     }
 }
 
