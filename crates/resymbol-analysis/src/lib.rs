@@ -1,10 +1,11 @@
 //! Safe, bounded binary ingestion for ReSymbol.
 //!
 //! This crate treats every input byte as untrusted. It does not load or execute
-//! binaries, and the PE parser uses checked arithmetic and explicit collection
-//! limits throughout.
+//! binaries, and each container parser uses checked arithmetic and explicit
+//! collection limits throughout.
 
 mod code_recovery;
+mod elf;
 mod error;
 mod instruction;
 mod linear_disassembly;
@@ -14,6 +15,7 @@ mod session;
 mod string_recovery;
 mod types;
 
+pub use elf::analyze_elf;
 pub use error::AnalysisError;
 pub use instruction::{
     ExactX64InstructionError, MAX_X64_INSTRUCTION_BYTES, validate_exact_x64_instruction,
@@ -30,9 +32,10 @@ pub use pe::{
 };
 pub use session::{AnalysisSession, PluginRunRecord, PluginRunStatus, SessionValidationError};
 pub use types::{
-    BinaryAnalysis, CoffHeader, DataDirectory, ImportTarget, MsvcRttiBaseClass, MsvcRttiVftable,
-    PeAnalysis, PeControlFlowTarget, PeDataDirectories, PeDataReference, PeDelayImportLibrary,
-    PeDirectCall, PeExport, PeExportName, PeGuardAddressTakenIatEntry, PeGuardCfFunction,
+    BinaryAnalysis, CoffHeader, DataDirectory, ElfAnalysis, ElfLoadSegment, ElfProgramHeader,
+    ElfSectionHeader, ImportTarget, MsvcRttiBaseClass, MsvcRttiVftable, PeAnalysis,
+    PeControlFlowTarget, PeDataDirectories, PeDataReference, PeDelayImportLibrary, PeDirectCall,
+    PeExport, PeExportName, PeGuardAddressTakenIatEntry, PeGuardCfFunction,
     PeGuardEhContinuationTarget, PeGuardLongJumpTarget, PeImport, PeImportLibrary,
     PeLoadConfigGuardMemcpyAnchor, PeLoadConfigSecurityAnchors, PeLoadConfigXfgAnchors,
     PeRecoveredString, PeSection, PeStringEncoding, PeThunk, PeTlsCallback, RuntimeFunction,
@@ -40,11 +43,15 @@ pub use types::{
 
 /// Detect and analyze a supported binary container.
 ///
-/// Currently only PE32+ x86-64 images are accepted. Unsupported formats are
-/// reported explicitly rather than guessed from a filename.
+/// PE32+ x86-64 images and bounded container-only ELF32 little-endian
+/// `EM_MIPS` images are accepted. Unsupported formats are reported explicitly
+/// rather than guessed from a filename.
 pub fn analyze_bytes(bytes: &[u8]) -> Result<BinaryAnalysis, AnalysisError> {
     if bytes.starts_with(b"MZ") {
         return analyze_pe(bytes).map(BinaryAnalysis::Pe);
+    }
+    if bytes.starts_with(b"\x7fELF") {
+        return analyze_elf(bytes).map(BinaryAnalysis::Elf);
     }
 
     let magic = bytes

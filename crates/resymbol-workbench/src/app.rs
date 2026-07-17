@@ -24,7 +24,7 @@ use resymbol_debugger::{
     SandboxProviderReadiness, SandboxProviderReadinessReason, SandboxProviderRequirement,
     SandboxProviderSelection, StaticRegionKind,
 };
-use resymbol_export::{ExportControlFlowTarget, ExportProducer};
+use resymbol_export::{ExportBinaryFormat, ExportControlFlowTarget, ExportProducer};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -76,6 +76,10 @@ const OFFLINE_READ_SIZES: [u32; 5] = [16, 32, 64, 128, MAX_OFFLINE_IMAGE_UI_READ
 const OFFLINE_HEX_ROW_BYTES: usize = 16;
 const OFFLINE_DISASSEMBLY_INSTRUCTION_LIMIT: usize = 64;
 const FUNCTION_KEYBOARD_PAGE_ROWS: usize = 10;
+#[cfg(any(test, feature = "screenshot"))]
+const SCREENSHOT_CANONICAL_JCC_RVA: u64 = 0x0000_116E;
+#[cfg(any(test, feature = "screenshot"))]
+const SCREENSHOT_CANONICAL_JCC_READ_BYTES: u32 = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BinaryPickerPurpose {
@@ -93,21 +97,26 @@ const PE_CONTAINER_FILTER: BinaryPickerFilterSpec = BinaryPickerFilterSpec {
     label: "PE containers",
     extensions: &["exe", "dll", "sys", "cpl", "ocx", "scr", "efi"],
 };
+const ELF_CONTAINER_FILTER: BinaryPickerFilterSpec = BinaryPickerFilterSpec {
+    label: "ELF containers",
+    extensions: &["elf", "axf"],
+};
 const RESYMBOL_PACKAGE_FILTER: BinaryPickerFilterSpec = BinaryPickerFilterSpec {
     label: "ReSymbol packages",
     extensions: &["resym"],
 };
 const ALL_FILES_FILTER: BinaryPickerFilterSpec = BinaryPickerFilterSpec {
-    label: "All files (including extensionless PE)",
+    label: "All files (including extensionless containers)",
     extensions: &["*"],
 };
 const OPEN_BINARY_OR_PACKAGE_FILTERS: &[BinaryPickerFilterSpec] = &[
     PE_CONTAINER_FILTER,
+    ELF_CONTAINER_FILTER,
     RESYMBOL_PACKAGE_FILTER,
     ALL_FILES_FILTER,
 ];
 const VERIFY_EXACT_BINARY_FILTERS: &[BinaryPickerFilterSpec] =
-    &[PE_CONTAINER_FILTER, ALL_FILES_FILTER];
+    &[PE_CONTAINER_FILTER, ELF_CONTAINER_FILTER, ALL_FILES_FILTER];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkflowStage {
@@ -140,6 +149,69 @@ enum MainTab {
     AddressSpace,
     DebuggerSandbox,
     Exports,
+}
+
+#[cfg(any(test, feature = "screenshot"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScreenshotScenario {
+    OpenEmpty,
+    Overview,
+    Functions,
+    FunctionsFocused,
+    Graph,
+    AddressSpace,
+    Disassembly,
+    DisassemblyActions,
+    BinarySwitchConfirmation,
+    DebuggerSandbox,
+    DebuggerReadinessResult,
+    Exports,
+}
+
+#[cfg(any(test, feature = "screenshot"))]
+impl ScreenshotScenario {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "open-empty" => Some(Self::OpenEmpty),
+            "overview" => Some(Self::Overview),
+            "functions" => Some(Self::Functions),
+            "functions-focused" => Some(Self::FunctionsFocused),
+            "graph" => Some(Self::Graph),
+            "address-space" | "memory-map" => Some(Self::AddressSpace),
+            "disassembly" => Some(Self::Disassembly),
+            "disassembly-actions" => Some(Self::DisassemblyActions),
+            "binary-switch-confirmation" => Some(Self::BinarySwitchConfirmation),
+            "debugger-sandbox" | "readiness" => Some(Self::DebuggerSandbox),
+            "debugger-readiness-result" => Some(Self::DebuggerReadinessResult),
+            "exports" => Some(Self::Exports),
+            _ => None,
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::OpenEmpty => "open-empty",
+            Self::Overview => "overview",
+            Self::Functions => "functions",
+            Self::FunctionsFocused => "functions-focused",
+            Self::Graph => "graph",
+            Self::AddressSpace => "address-space",
+            Self::Disassembly => "disassembly",
+            Self::DisassemblyActions => "disassembly-actions",
+            Self::BinarySwitchConfirmation => "binary-switch-confirmation",
+            Self::DebuggerSandbox => "debugger-sandbox",
+            Self::DebuggerReadinessResult => "debugger-readiness-result",
+            Self::Exports => "exports",
+        }
+    }
+
+    const fn needs_offline_read(self) -> bool {
+        matches!(self, Self::Disassembly | Self::DisassemblyActions)
+    }
+
+    const fn needs_readiness_result(self) -> bool {
+        matches!(self, Self::DebuggerSandbox | Self::DebuggerReadinessResult)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -272,6 +344,15 @@ impl ExportKind {
             Self::IdaPython => WorkerExportKind::Service(ExportFormat::IdaPython),
             Self::GhidraJava => WorkerExportKind::Service(ExportFormat::GhidraJava),
         }
+    }
+
+    const fn requires_pe(self) -> bool {
+        matches!(self, Self::Map | Self::Pdb)
+    }
+
+    fn unavailable_reason(self, format: &ExportBinaryFormat) -> Option<&'static str> {
+        (self.requires_pe() && !matches!(format, ExportBinaryFormat::Pe))
+            .then_some("Microsoft MAP and PDB exports are available only for PE/x86-64 projects.")
     }
 }
 
@@ -566,6 +647,8 @@ pub struct WorkbenchApp {
     export_destination: String,
     export_result: Option<Result<String, String>>,
     #[cfg(feature = "screenshot")]
+    screenshot_scenario: Option<ScreenshotScenario>,
+    #[cfg(feature = "screenshot")]
     screenshot_destination: Option<PathBuf>,
     #[cfg(feature = "screenshot")]
     screenshot_frame_count: u8,
@@ -618,6 +701,14 @@ impl WorkbenchApp {
             );
             creation_context.egui_ctx.set_zoom_factor(zoom);
         }
+        #[cfg(feature = "screenshot")]
+        let screenshot_scenario =
+            std::env::var("RESYMBOL_WORKBENCH_SCREENSHOT_TAB")
+                .ok()
+                .map(|value| {
+                    ScreenshotScenario::parse(&value)
+                        .unwrap_or_else(|| panic!("unsupported screenshot scenario {value:?}"))
+                });
         let mut preferences: Preferences = if cfg!(feature = "screenshot") {
             Preferences::default()
         } else {
@@ -681,6 +772,8 @@ impl WorkbenchApp {
             export_destination: String::new(),
             export_result: None,
             #[cfg(feature = "screenshot")]
+            screenshot_scenario,
+            #[cfg(feature = "screenshot")]
             screenshot_destination: std::env::var_os("RESYMBOL_WORKBENCH_SCREENSHOT_TO")
                 .map(PathBuf::from),
             #[cfg(feature = "screenshot")]
@@ -718,7 +811,15 @@ impl WorkbenchApp {
         );
 
         #[cfg(feature = "screenshot")]
-        if let Ok(tab) = std::env::var("RESYMBOL_WORKBENCH_SCREENSHOT_TAB") {
+        if let Some(scenario) = app.screenshot_scenario {
+            if scenario == ScreenshotScenario::OpenEmpty {
+                app.log(
+                    ActivityLevel::Info,
+                    "Prepared empty Open Binary visual regression scenario",
+                );
+                app.begin_initial_plugin_catalog_refresh();
+                return app;
+            }
             let path = startup_path
                 .as_ref()
                 .expect("screenshot mode requires an input binary path");
@@ -731,7 +832,7 @@ impl WorkbenchApp {
                 .map(|function| function.projection_index);
             let reconstruction_graph = ReconstructionGraph::from_project(&project);
             app.graph_root_rva = reconstruction_graph.default_root().map(|root| root.rva);
-            if tab == "graph" {
+            if scenario == ScreenshotScenario::Graph {
                 app.selected_projection_index = app.graph_root_rva.and_then(|root_rva| {
                     project
                         .functions
@@ -751,47 +852,71 @@ impl WorkbenchApp {
             );
             app.analysis_path = Some(path.clone());
             app.stage = WorkflowStage::Review;
-            app.main_tab = match tab.as_str() {
-                "overview" => MainTab::Overview,
-                "functions" | "functions-focused" => MainTab::Functions,
-                "graph" => MainTab::Graph,
-                "address-space" | "memory-map" | "disassembly" => MainTab::AddressSpace,
-                "debugger-sandbox" | "readiness" => MainTab::DebuggerSandbox,
-                "exports" => {
+            app.main_tab = match scenario {
+                ScreenshotScenario::Overview | ScreenshotScenario::BinarySwitchConfirmation => {
+                    MainTab::Overview
+                }
+                ScreenshotScenario::Functions | ScreenshotScenario::FunctionsFocused => {
+                    MainTab::Functions
+                }
+                ScreenshotScenario::Graph => MainTab::Graph,
+                ScreenshotScenario::AddressSpace
+                | ScreenshotScenario::Disassembly
+                | ScreenshotScenario::DisassemblyActions => MainTab::AddressSpace,
+                ScreenshotScenario::DebuggerSandbox
+                | ScreenshotScenario::DebuggerReadinessResult => MainTab::DebuggerSandbox,
+                ScreenshotScenario::Exports => {
                     app.stage = WorkflowStage::Export;
                     MainTab::Exports
                 }
-                _ => panic!("unsupported screenshot tab {tab:?}"),
+                ScreenshotScenario::OpenEmpty => unreachable!("handled before project load"),
             };
             app.project = Some(project);
-            if tab == "disassembly" {
-                let entry_rva = app
-                    .project
-                    .as_ref()
-                    .and_then(|project| match project.session().base_analysis() {
-                        BinaryAnalysis::Pe(analysis) => Some(u64::from(analysis.entry_point_rva)),
-                        _ => None,
-                    })
-                    .filter(|rva| *rva != 0)
-                    .or_else(|| app.project.as_ref()?.functions.first().map(|row| row.rva))
-                    .expect("screenshot fixture needs a disassembly seed");
-                app.offline_read_rva_input = format!("0x{entry_rva:08X}");
-                app.offline_read_size = 128;
+            if scenario.needs_offline_read() {
+                let (start_rva, read_size) = if scenario == ScreenshotScenario::DisassemblyActions {
+                    (
+                        SCREENSHOT_CANONICAL_JCC_RVA,
+                        SCREENSHOT_CANONICAL_JCC_READ_BYTES,
+                    )
+                } else {
+                    let entry_rva = app
+                        .project
+                        .as_ref()
+                        .and_then(|project| match project.session().base_analysis() {
+                            BinaryAnalysis::Pe(analysis) => {
+                                Some(u64::from(analysis.entry_point_rva))
+                            }
+                            _ => None,
+                        })
+                        .filter(|rva| *rva != 0)
+                        .or_else(|| app.project.as_ref()?.functions.first().map(|row| row.rva))
+                        .expect("screenshot fixture needs a disassembly seed");
+                    (entry_rva, 128)
+                };
+                app.offline_read_rva_input = format!("0x{start_rva:08X}");
+                app.offline_read_size = read_size;
                 app.offline_byte_view = OfflineByteView::Disassembly;
                 app.selected_disassembly_instruction = Some(0);
                 app.queue_offline_image_read()
                     .unwrap_or_else(|error| panic!("cannot queue disassembly capture: {error}"));
             }
-            if tab == "functions-focused" {
+            if scenario == ScreenshotScenario::FunctionsFocused {
                 app.function_row_focus_target = app.selected_projection_index;
             }
-            if app.main_tab == MainTab::DebuggerSandbox {
+            if scenario.needs_readiness_result() {
                 app.queue_sandbox_readiness_probe()
                     .unwrap_or_else(|error| panic!("cannot queue readiness capture: {error}"));
             }
+            if scenario == ScreenshotScenario::BinarySwitchConfirmation {
+                app.prepare_screenshot_binary_switch_confirmation();
+            }
             app.log(
                 ActivityLevel::Success,
-                format!("Loaded {} for visual regression capture", path.display()),
+                format!(
+                    "Loaded {} for {} visual regression capture",
+                    path.display(),
+                    scenario.name()
+                ),
             );
             app.begin_initial_plugin_catalog_refresh();
             return app;
@@ -830,6 +955,40 @@ impl WorkbenchApp {
     }
 
     #[cfg(feature = "screenshot")]
+    fn prepare_screenshot_binary_switch_confirmation(&mut self) {
+        let subject = self
+            .project
+            .as_ref()
+            .and_then(|project| {
+                project.functions.iter().find_map(|row| {
+                    project
+                        .function_detail(row.projection_index)
+                        .and_then(|detail| {
+                            detail
+                                .claims
+                                .iter()
+                                .find_map(|claim| claim.review_subject().cloned())
+                        })
+                })
+            })
+            .expect("screenshot fixture needs a reviewable exact name claim");
+        self.review
+            .as_mut()
+            .expect("screenshot project has a bound review ledger")
+            .apply_disposition(
+                &subject,
+                DecisionAction::Reject,
+                "visual-regression",
+                "Deterministic unsaved decision for binary-switch confirmation",
+            )
+            .expect("screenshot fixture accepts a deterministic review decision");
+        self.pending_binary_open = Some(PathBuf::from(
+            r"C:\visual-regression\replacement-candidate.exe",
+        ));
+        self.open_after_review_save = false;
+    }
+
+    #[cfg(feature = "screenshot")]
     fn advance_screenshot_capture(&mut self, context: &egui::Context) {
         const SETTLE_FRAMES: u8 = 12;
         if self.screenshot_destination.is_none() {
@@ -857,7 +1016,11 @@ impl WorkbenchApp {
             return;
         }
 
-        if self.main_tab == MainTab::DebuggerSandbox && self.readiness_operation.is_pending() {
+        let scenario_work_is_pending = self.screenshot_scenario.is_some_and(|scenario| {
+            (scenario.needs_readiness_result() && self.readiness_operation.is_pending())
+                || (scenario.needs_offline_read() && self.offline_read.is_pending())
+        });
+        if scenario_work_is_pending {
             self.screenshot_frame_count = 0;
             context.request_repaint();
             return;
@@ -1720,6 +1883,9 @@ impl WorkbenchApp {
                 .project
                 .as_ref()
                 .ok_or_else(|| "open a binary or package before exporting".to_owned())?;
+            if let Some(reason) = kind.unavailable_reason(&project.identity.format) {
+                return Err(reason.to_owned());
+            }
             if kind == ExportKind::Pdb && !project.snapshot.has_verified_source() {
                 return Err(
                     "PDB export requires the exact source binary; package-only projects must verify it first"
@@ -2311,8 +2477,9 @@ impl WorkbenchApp {
                         ),
                         OfflineReadEventDisposition::Available { byte_count } => {
                             #[cfg(feature = "screenshot")]
-                            if std::env::var("RESYMBOL_WORKBENCH_SCREENSHOT_TAB")
-                                .is_ok_and(|tab| tab == "disassembly")
+                            if self
+                                .screenshot_scenario
+                                .is_some_and(ScreenshotScenario::needs_offline_read)
                             {
                                 self.offline_byte_view = OfflineByteView::Disassembly;
                                 self.selected_disassembly_instruction = Some(0);
@@ -2828,7 +2995,7 @@ impl WorkbenchApp {
 
     fn choose_binary(&mut self, _context: &egui::Context) {
         let mut dialog = binary_picker_dialog(
-            "Open a PE32+ x86-64 container or current ReSymbol package",
+            "Open a supported binary container or current ReSymbol package",
             BinaryPickerPurpose::OpenBinaryOrPackage,
         );
         if let Some(directory) = self
@@ -3068,7 +3235,7 @@ impl WorkbenchApp {
                                 "Drop exactly one binary"
                             });
                             ui.label(
-                                "PE32+ .exe/.dll/.sys/.cpl/.ocx/.scr/.efi or extensionless files, plus current .resym packages, are supported.",
+                                "PE32+ .exe/.dll/.sys/.cpl/.ocx/.scr/.efi, ELF32 .elf/.axf, extensionless containers, and current .resym packages are supported.",
                             );
                             ui.small(
                                 "The active project remains intact unless the replacement opens successfully.",
@@ -3493,11 +3660,16 @@ impl WorkbenchApp {
                         self.stage = WorkflowStage::Review;
                     }
                     if ui
-                        .selectable_label(
-                            self.main_tab == MainTab::AddressSpace,
-                            format!(
-                                "Address space ({})",
-                                project.static_address_space.regions().len()
+                        .add_enabled(
+                            project.static_address_space.is_some(),
+                            egui::Button::selectable(
+                                self.main_tab == MainTab::AddressSpace,
+                                project.static_address_space.as_ref().map_or_else(
+                                    || "Address space (unavailable)".to_owned(),
+                                    |address_space| {
+                                        format!("Address space ({})", address_space.regions().len())
+                                    },
+                                ),
                             ),
                         )
                         .clicked()
@@ -4508,7 +4680,7 @@ impl WorkbenchApp {
 
         if verify_source {
             let Some(path) = binary_picker_dialog(
-                "Verify the exact original PE for this package",
+                "Verify the exact original binary for this package",
                 BinaryPickerPurpose::VerifyExactBinary,
             )
             .pick_file() else {
@@ -4529,7 +4701,7 @@ impl WorkbenchApp {
                 "Open a binary to begin"
             });
             ui.label(
-                "Open a native Windows PE32+ x86-64 binary or a current ReSymbol package.",
+                "Open a PE32+ x86-64 binary, bounded ELF32 container, or current ReSymbol package.",
             );
             ui.label("The workbench keeps identity, status, confidence, and provenance visible independently.");
             ui.add_space(18.0);
@@ -4548,7 +4720,7 @@ impl WorkbenchApp {
             }
             ui.add_space(10.0);
             ui.small(
-                "You can also drag a supported PE container, an extensionless PE, or a .resym package onto this window.",
+                "You can also drag a supported PE, bounded ELF32 container, extensionless container, or .resym package onto this window.",
             );
         });
     }
@@ -4665,7 +4837,7 @@ impl WorkbenchApp {
                 });
 
                 workbench_card(colors).show(&mut columns[1], |ui| {
-                    ui.heading("PE inventory");
+                    ui.heading("Container inventory");
                     match project.session().base_analysis() {
                         BinaryAnalysis::Pe(pe) => {
                             property_row(ui, "Sections", &pe.sections.len().to_string(), false);
@@ -4690,15 +4862,49 @@ impl WorkbenchApp {
                                 false,
                             );
                         }
+                        BinaryAnalysis::Elf(elf) => {
+                            property_row(
+                                ui,
+                                "Program headers",
+                                &elf.program_headers.len().to_string(),
+                                false,
+                            );
+                            property_row(
+                                ui,
+                                "Load segments",
+                                &elf.load_segments.len().to_string(),
+                                false,
+                            );
+                            property_row(
+                                ui,
+                                "Section headers",
+                                &elf.section_headers.len().to_string(),
+                                false,
+                            );
+                            property_row(
+                                ui,
+                                "ELF flags",
+                                &format!("0x{:08X}", elf.flags),
+                                true,
+                            );
+                            ui.label(
+                                RichText::new("Container-only: no instruction decoding")
+                                    .color(colors.secondary_text),
+                            );
+                        }
                         _ => {
-                            ui.label("No PE inventory is available for this format.");
+                            ui.label("No container inventory is available for this format.");
                         }
                     };
                 });
             });
 
             ui.add_space(14.0);
-            ui.heading("PE sections");
+            ui.heading(match project.session().base_analysis() {
+                BinaryAnalysis::Pe(_) => "PE sections",
+                BinaryAnalysis::Elf(_) => "ELF section headers",
+                _ => "Section table",
+            });
             match project.session().base_analysis() {
                 BinaryAnalysis::Pe(pe) => {
                     TableBuilder::new(ui)
@@ -4741,6 +4947,53 @@ impl WorkbenchApp {
                             }
                         });
                 }
+                BinaryAnalysis::Elf(elf) => {
+                    TableBuilder::new(ui)
+                        .striped(true)
+                        .resizable(true)
+                        .column(Column::initial(90.0).at_least(70.0))
+                        .column(Column::initial(130.0).at_least(100.0))
+                        .column(Column::initial(140.0).at_least(110.0))
+                        .column(Column::remainder().at_least(180.0))
+                        .header(30.0, |mut header| {
+                            header.col(|ui| {
+                                ui.strong("Index");
+                            });
+                            header.col(|ui| {
+                                ui.strong("Type");
+                            });
+                            header.col(|ui| {
+                                ui.strong("VA");
+                            });
+                            header.col(|ui| {
+                                ui.strong("Size / flags");
+                            });
+                        })
+                        .body(|mut body| {
+                            for section in &elf.section_headers {
+                                body.row(28.0, |mut row| {
+                                    row.col(|ui| {
+                                        ui.monospace(section.table_index.to_string());
+                                    });
+                                    row.col(|ui| {
+                                        ui.monospace(format!("0x{:08X}", section.section_type));
+                                    });
+                                    row.col(|ui| {
+                                        ui.monospace(format!(
+                                            "0x{:08X}",
+                                            section.virtual_address
+                                        ));
+                                    });
+                                    row.col(|ui| {
+                                        ui.monospace(format!(
+                                            "0x{:X} / 0x{:08X}",
+                                            section.size, section.flags
+                                        ));
+                                    });
+                                });
+                            }
+                        });
+                }
                 _ => {
                     ui.label(
                         RichText::new("No section table is available.")
@@ -4754,8 +5007,24 @@ impl WorkbenchApp {
     fn show_address_space(&mut self, ui: &mut egui::Ui) {
         let colors = self.preferences.theme.semantic_colors();
         self.handle_address_space_shortcuts(ui);
+        let has_static_address_space = self
+            .project
+            .as_ref()
+            .expect("checked by caller")
+            .static_address_space
+            .is_some();
 
         ui.heading("Static address space");
+        if !has_static_address_space {
+            ui.label(
+                RichText::new(
+                    "Static address-space and offline-byte views are unavailable for this binary format.",
+                )
+                .color(colors.secondary_text),
+            );
+            return;
+        }
+
         ui.horizontal_wrapped(|ui| {
             ui.label(
                 RichText::new("[OFFLINE] No target code has executed")
@@ -4773,7 +5042,10 @@ impl WorkbenchApp {
         ui.add_space(8.0);
 
         let project = self.project.as_ref().expect("checked by caller");
-        let address_space = &project.static_address_space;
+        let address_space = project
+            .static_address_space
+            .as_ref()
+            .expect("format availability checked above");
         let indicator_text = project
             .protection_assessment
             .unavailable_reason()
@@ -5564,11 +5836,63 @@ impl WorkbenchApp {
         }
     }
 
+    #[cfg(feature = "screenshot")]
+    fn screenshot_disassembly_action_row(&self) -> Option<LinearInstructionRow> {
+        let OfflineReadPresentation::Outcome(outcome) = self.offline_read.presentation.as_ref()?
+        else {
+            return None;
+        };
+        let bytes = outcome.availability().bytes()?;
+        let limits =
+            LinearDisassemblyLimits::new(bytes.len().max(1), OFFLINE_DISASSEMBLY_INSTRUCTION_LIMIT)
+                .ok()?;
+        let preview = disassemble_x64_linear(bytes, outcome.span().rva(), limits);
+        let row = preview.rows().first()?.clone();
+        (row.rva() == SCREENSHOT_CANONICAL_JCC_RVA
+            && ConditionalBranchPatch::InvertCondition
+                .replacement(row.bytes())
+                .is_some())
+        .then_some(row)
+    }
+
+    #[cfg(feature = "screenshot")]
+    fn show_screenshot_scenario_overlay(&mut self, context: &egui::Context) {
+        if self.screenshot_scenario != Some(ScreenshotScenario::DisassemblyActions) {
+            return;
+        }
+        if self.offline_read.is_pending() {
+            return;
+        }
+        let row = self.screenshot_disassembly_action_row().unwrap_or_else(|| {
+            panic!(
+                "disassembly-actions scenario requires canonical Jcc bytes at fixture RVA 0x{SCREENSHOT_CANONICAL_JCC_RVA:08X}"
+            )
+        });
+        let colors = self.preferences.theme.semantic_colors();
+        let screen = context.screen_rect();
+        let popup_width = 430.0;
+        let position = egui::pos2(
+            (screen.center().x - popup_width / 2.0).max(screen.left() + 8.0),
+            screen.top() + 128.0,
+        );
+        egui::Area::new(egui::Id::new("screenshot_disassembly_action_menu"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(position)
+            .movable(false)
+            .show(context, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_min_width(popup_width);
+                    self.show_instruction_action_menu(ui, &row, colors);
+                });
+            });
+    }
+
     fn static_rva_has_readable_file_backing(&self, rva: u64) -> bool {
         let address = RelativeAddress::new(rva);
         self.project
             .as_ref()
-            .and_then(|project| project.static_address_space.region_at(address))
+            .and_then(|project| project.static_address_space.as_ref())
+            .and_then(|address_space| address_space.region_at(address))
             .is_some_and(|region| {
                 region.access.readable && region.file_offset_at(address).is_some()
             })
@@ -5599,6 +5923,8 @@ impl WorkbenchApp {
         let last = RelativeAddress::new(last_rva);
         let region = project
             .static_address_space
+            .as_ref()
+            .ok_or("Static address-space inspection is unavailable for this binary format.")?
             .region_at(start)
             .ok_or("The selected instruction is outside the preferred static image.")?;
         if !region.access.executable || !matches!(&region.kind, StaticRegionKind::Section { .. }) {
@@ -5624,6 +5950,7 @@ impl WorkbenchApp {
         self.project
             .as_ref()?
             .static_address_space
+            .as_ref()?
             .preferred_virtual_address(RelativeAddress::new(rva))
     }
 
@@ -6967,7 +7294,13 @@ impl WorkbenchApp {
 
             ui.add_space(12.0);
             if let Some(outcome) = &self.readiness_outcome {
-                show_sandbox_readiness_outcome(ui, outcome, colors);
+                let response = show_sandbox_readiness_outcome(ui, outcome, colors);
+                #[cfg(feature = "screenshot")]
+                if self.screenshot_scenario
+                    == Some(ScreenshotScenario::DebuggerReadinessResult)
+                {
+                    response.scroll_to_me(Some(Align::Center));
+                }
             } else if !self.readiness_operation.is_pending() && self.readiness_error.is_none() {
                 ui.label(
                     RichText::new(
@@ -7020,11 +7353,16 @@ impl WorkbenchApp {
                             .selected_text(self.export_kind.label())
                             .show_ui(ui, |ui| {
                                 for kind in ExportKind::ALL {
-                                    ui.selectable_value(
-                                        &mut self.export_kind,
-                                        kind,
-                                        kind.label(),
-                                    );
+                                    let available = kind
+                                        .unavailable_reason(&project.identity.format)
+                                        .is_none();
+                                    ui.add_enabled_ui(available, |ui| {
+                                        ui.selectable_value(
+                                            &mut self.export_kind,
+                                            kind,
+                                            kind.label(),
+                                        );
+                                    });
                                 }
                             });
                         if self.export_kind != previous {
@@ -7148,10 +7486,14 @@ impl WorkbenchApp {
 
             ui.add_space(12.0);
             let exact_source_ready = project.snapshot.has_verified_source();
+            let format_unavailable = self
+                .export_kind
+                .unavailable_reason(&project.identity.format);
             let can_export = !self.publication_operation.is_pending()
                 && !self.patch_set_load_operation.is_pending()
                 && !self.project_operation.is_pending()
                 && !self.review_operation.is_pending()
+                && format_unavailable.is_none()
                 && (self.export_kind != ExportKind::Pdb || exact_source_ready);
             let action_label = if self
                 .publication_operation
@@ -7173,7 +7515,12 @@ impl WorkbenchApp {
                     .stroke(egui::Stroke::new(1.0, colors.exact_extracted))
                     .corner_radius(4),
             );
-            if self.export_kind == ExportKind::Pdb && !exact_source_ready {
+            if let Some(reason) = format_unavailable {
+                ui.label(
+                    RichText::new(format!("[UNAVAILABLE] {reason}"))
+                        .color(colors.warning_conflict),
+                );
+            } else if self.export_kind == ExportKind::Pdb && !exact_source_ready {
                 ui.label(
                     RichText::new(
                         "[SOURCE REQUIRED] Verify the exact original PE before creating a PDB.",
@@ -7230,6 +7577,8 @@ impl eframe::App for WorkbenchApp {
         self.show_activity_panel(context);
         self.show_central(context);
         self.show_binary_drop_target(context);
+        #[cfg(feature = "screenshot")]
+        self.show_screenshot_scenario_overlay(context);
         self.show_binary_switch_confirmation(context);
         self.show_close_confirmation(context);
 
@@ -7265,7 +7614,7 @@ fn show_sandbox_readiness_outcome(
     ui: &mut egui::Ui,
     outcome: &DebuggerReadinessOutcome,
     colors: SemanticColors,
-) {
+) -> egui::Response {
     let report = outcome.report();
     let (status, status_color) = match report.readiness() {
         SandboxProviderReadiness::ReadyForProvisioningAttempt => {
@@ -7347,7 +7696,8 @@ fn show_sandbox_readiness_outcome(
                 .strong()
                 .color(colors.warning_conflict),
             );
-        });
+        })
+        .response
 }
 
 fn provider_selection_label(provider: &SandboxProviderSelection) -> String {
@@ -8623,6 +8973,23 @@ mod tests {
         (source, project)
     }
 
+    #[test]
+    fn pe_only_exports_are_disabled_for_elf_projects() {
+        for kind in [ExportKind::Map, ExportKind::Pdb] {
+            assert!(kind.unavailable_reason(&ExportBinaryFormat::Elf).is_some());
+            assert!(kind.unavailable_reason(&ExportBinaryFormat::Pe).is_none());
+        }
+        for kind in [
+            ExportKind::Package,
+            ExportKind::NeutralJson,
+            ExportKind::Markdown,
+            ExportKind::IdaPython,
+            ExportKind::GhidraJava,
+        ] {
+            assert!(kind.unavailable_reason(&ExportBinaryFormat::Elf).is_none());
+        }
+    }
+
     fn publish_test_patch(project: &LoadedProject, output: &Path) -> PublishedStaticPatch {
         let request = StaticPatchEditRequest::nop_instruction(
             THUNK_RVA,
@@ -8687,6 +9054,72 @@ mod tests {
     }
 
     #[test]
+    fn screenshot_scenario_names_are_stable_and_complete() {
+        let scenarios = [
+            ScreenshotScenario::OpenEmpty,
+            ScreenshotScenario::Overview,
+            ScreenshotScenario::Functions,
+            ScreenshotScenario::FunctionsFocused,
+            ScreenshotScenario::Graph,
+            ScreenshotScenario::AddressSpace,
+            ScreenshotScenario::Disassembly,
+            ScreenshotScenario::DisassemblyActions,
+            ScreenshotScenario::BinarySwitchConfirmation,
+            ScreenshotScenario::DebuggerSandbox,
+            ScreenshotScenario::DebuggerReadinessResult,
+            ScreenshotScenario::Exports,
+        ];
+        for scenario in scenarios {
+            assert_eq!(ScreenshotScenario::parse(scenario.name()), Some(scenario));
+        }
+        assert!(ScreenshotScenario::parse("unknown-scenario").is_none());
+        assert!(ScreenshotScenario::DisassemblyActions.needs_offline_read());
+        assert!(ScreenshotScenario::DebuggerReadinessResult.needs_readiness_result());
+        assert!(!ScreenshotScenario::OpenEmpty.needs_offline_read());
+    }
+
+    #[test]
+    fn screenshot_fixture_retains_the_canonical_conditional_branch() {
+        let (_source, project) = loaded_project_with_bytes(SYMBOLIZED_FIXTURE);
+        let address = RelativeAddress::new(SCREENSHOT_CANONICAL_JCC_RVA);
+        let region = project
+            .static_address_space
+            .as_ref()
+            .expect("PE screenshot fixture has a static address space")
+            .region_at(address)
+            .expect("capture Jcc is mapped");
+        let file_offset = usize::try_from(
+            region
+                .file_offset_at(address)
+                .expect("capture Jcc is file backed"),
+        )
+        .expect("capture Jcc offset fits usize");
+        let read_size = usize::try_from(SCREENSHOT_CANONICAL_JCC_READ_BYTES)
+            .expect("capture read size fits usize");
+        let bytes = &SYMBOLIZED_FIXTURE[file_offset..file_offset + read_size];
+        let preview = disassemble_x64_linear(
+            bytes,
+            SCREENSHOT_CANONICAL_JCC_RVA,
+            LinearDisassemblyLimits::new(read_size, OFFLINE_DISASSEMBLY_INSTRUCTION_LIMIT)
+                .expect("capture disassembly limits"),
+        );
+        let row = preview.rows().first().expect("capture Jcc row");
+
+        assert_eq!(row.rva(), SCREENSHOT_CANONICAL_JCC_RVA);
+        assert_eq!(row.bytes(), &[0x74, 0x0A]);
+        assert!(
+            ConditionalBranchPatch::InvertCondition
+                .replacement(row.bytes())
+                .is_some()
+        );
+        assert!(
+            ConditionalBranchPatch::AlwaysTaken
+                .replacement(row.bytes())
+                .is_some()
+        );
+    }
+
+    #[test]
     fn dirty_close_requires_an_explicit_discard() {
         assert!(close_requires_confirmation(true, false));
         assert!(!close_requires_confirmation(false, false));
@@ -8694,10 +9127,10 @@ mod tests {
     }
 
     #[test]
-    fn project_picker_covers_common_and_extensionless_pe_containers() {
+    fn project_picker_covers_supported_and_extensionless_containers() {
         let filters = binary_picker_filter_specs(BinaryPickerPurpose::OpenBinaryOrPackage);
 
-        assert_eq!(filters.len(), 3);
+        assert_eq!(filters.len(), 4);
         assert_eq!(filters[0].label, "PE containers");
         assert_eq!(
             filters[0].extensions,
@@ -8706,21 +9139,29 @@ mod tests {
         assert_eq!(
             filters[1],
             BinaryPickerFilterSpec {
+                label: "ELF containers",
+                extensions: &["elf", "axf"],
+            }
+        );
+        assert_eq!(
+            filters[2],
+            BinaryPickerFilterSpec {
                 label: "ReSymbol packages",
                 extensions: &["resym"],
             }
         );
-        assert_eq!(filters[2].extensions, &["*"]);
-        assert!(filters[2].label.contains("extensionless"));
+        assert_eq!(filters[3].extensions, &["*"]);
+        assert!(filters[3].label.contains("extensionless"));
     }
 
     #[test]
     fn exact_source_picker_keeps_packages_out_of_the_binary_filter_set() {
         let filters = binary_picker_filter_specs(BinaryPickerPurpose::VerifyExactBinary);
 
-        assert_eq!(filters.len(), 2);
+        assert_eq!(filters.len(), 3);
         assert_eq!(filters[0].label, "PE containers");
-        assert_eq!(filters[1].extensions, &["*"]);
+        assert_eq!(filters[1].label, "ELF containers");
+        assert_eq!(filters[2].extensions, &["*"]);
         assert!(filters.iter().all(|filter| {
             !filter
                 .extensions
@@ -9304,8 +9745,11 @@ mod tests {
     #[test]
     fn direct_target_navigation_requires_readable_exact_file_backing() {
         let (_source, project) = loaded_project_with_source();
-        let readable_backed = project
+        let address_space = project
             .static_address_space
+            .as_ref()
+            .expect("PE fixture has a static address space");
+        let readable_backed = address_space
             .regions()
             .iter()
             .find_map(|region| {
@@ -9314,8 +9758,7 @@ mod tests {
                 .then(|| region.range.start().get())
             })
             .expect("readable file-backed fixture address");
-        let readable_unbacked = project
-            .static_address_space
+        let readable_unbacked = address_space
             .regions()
             .iter()
             .find_map(|region| {
@@ -9328,7 +9771,7 @@ mod tests {
                     .then_some(first_unbacked)
             })
             .expect("readable zero-fill or mapped-padding fixture address");
-        let preferred_address = project.static_address_space.preferred_image_base + readable_backed;
+        let preferred_address = address_space.preferred_image_base + readable_backed;
         let (_context, mut app) = test_app();
         app.project = Some(project);
 
@@ -9343,8 +9786,11 @@ mod tests {
     #[test]
     fn static_nop_ui_gate_requires_an_exact_file_backed_executable_section() {
         let (_source, project) = loaded_project_with_source();
-        let executable_backed = project
+        let address_space = project
             .static_address_space
+            .as_ref()
+            .expect("PE fixture has a static address space");
+        let executable_backed = address_space
             .regions()
             .iter()
             .find(|region| {
@@ -9356,8 +9802,7 @@ mod tests {
             .range
             .start()
             .get();
-        let non_executable_backed = project
-            .static_address_space
+        let non_executable_backed = address_space
             .regions()
             .iter()
             .find(|region| {

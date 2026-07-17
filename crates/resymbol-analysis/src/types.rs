@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 #[non_exhaustive]
 pub enum BinaryAnalysis {
     Pe(PeAnalysis),
+    Elf(ElfAnalysis),
 }
 
 impl BinaryAnalysis {
@@ -15,6 +16,7 @@ impl BinaryAnalysis {
     pub const fn identity(&self) -> &BinaryIdentity {
         match self {
             Self::Pe(analysis) => &analysis.identity,
+            Self::Elf(analysis) => &analysis.identity,
         }
     }
 
@@ -23,6 +25,7 @@ impl BinaryAnalysis {
     pub const fn symbol_graph(&self) -> &SymbolGraph {
         match self {
             Self::Pe(analysis) => &analysis.symbol_graph,
+            Self::Elf(analysis) => &analysis.symbol_graph,
         }
     }
 
@@ -30,6 +33,7 @@ impl BinaryAnalysis {
     pub fn validate(&self) -> Result<(), crate::AnalysisError> {
         match self {
             Self::Pe(analysis) => analysis.validate(),
+            Self::Elf(analysis) => analysis.validate(),
         }
     }
 
@@ -38,7 +42,171 @@ impl BinaryAnalysis {
     pub(crate) const fn image_size(&self) -> u64 {
         match self {
             Self::Pe(analysis) => analysis.size_of_image as u64,
+            Self::Elf(analysis) => analysis.image_size,
         }
+    }
+}
+
+/// Deterministic, container-only analysis of an ELF32 little-endian `EM_MIPS` image.
+///
+/// This model deliberately makes no instruction-set or ABI claim beyond the exact
+/// ELF container fields. In particular, `EM_MIPS` does not imply that a generic
+/// MIPS32 decoder is correct for a PlayStation 2 Emotion Engine executable.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "UncheckedElfAnalysis")]
+pub struct ElfAnalysis {
+    pub identity: BinaryIdentity,
+    pub os_abi: u8,
+    pub abi_version: u8,
+    pub elf_type: u16,
+    pub machine: u16,
+    pub elf_version: u32,
+    pub entry_va: u32,
+    pub entry_rva: u32,
+    pub flags: u32,
+    pub header_size: u16,
+    pub program_header_offset: u32,
+    pub program_header_entry_size: u16,
+    pub program_headers: Vec<ElfProgramHeader>,
+    pub section_header_offset: u32,
+    pub section_header_entry_size: u16,
+    pub section_name_table_index: u16,
+    pub section_headers: Vec<ElfSectionHeader>,
+    /// Sorted, non-empty `PT_LOAD` mappings. Virtual gaps are not materialized.
+    pub load_segments: Vec<ElfLoadSegment>,
+    /// Half-open RVA extent from the lowest mapped VA to the highest mapped end.
+    pub image_size: u64,
+    /// Container intake contributes the exact binary identity and no symbol claims.
+    pub symbol_graph: SymbolGraph,
+}
+
+impl ElfAnalysis {
+    /// Validate cross-field invariants and the deterministic empty base graph.
+    pub fn validate(&self) -> Result<(), crate::AnalysisError> {
+        crate::elf::validate_elf_analysis(self)
+    }
+
+    /// Rebuild the base graph from exact container identity only.
+    pub fn rebuild_symbol_graph(&self) -> Result<SymbolGraph, crate::AnalysisError> {
+        crate::elf::build_symbol_graph(&self.identity)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UncheckedElfAnalysis {
+    identity: BinaryIdentity,
+    os_abi: u8,
+    abi_version: u8,
+    elf_type: u16,
+    machine: u16,
+    elf_version: u32,
+    entry_va: u32,
+    entry_rva: u32,
+    flags: u32,
+    header_size: u16,
+    program_header_offset: u32,
+    program_header_entry_size: u16,
+    program_headers: Vec<ElfProgramHeader>,
+    section_header_offset: u32,
+    section_header_entry_size: u16,
+    section_name_table_index: u16,
+    section_headers: Vec<ElfSectionHeader>,
+    load_segments: Vec<ElfLoadSegment>,
+    image_size: u64,
+    symbol_graph: SymbolGraph,
+}
+
+impl TryFrom<UncheckedElfAnalysis> for ElfAnalysis {
+    type Error = crate::AnalysisError;
+
+    fn try_from(value: UncheckedElfAnalysis) -> Result<Self, Self::Error> {
+        let analysis = Self {
+            identity: value.identity,
+            os_abi: value.os_abi,
+            abi_version: value.abi_version,
+            elf_type: value.elf_type,
+            machine: value.machine,
+            elf_version: value.elf_version,
+            entry_va: value.entry_va,
+            entry_rva: value.entry_rva,
+            flags: value.flags,
+            header_size: value.header_size,
+            program_header_offset: value.program_header_offset,
+            program_header_entry_size: value.program_header_entry_size,
+            program_headers: value.program_headers,
+            section_header_offset: value.section_header_offset,
+            section_header_entry_size: value.section_header_entry_size,
+            section_name_table_index: value.section_name_table_index,
+            section_headers: value.section_headers,
+            load_segments: value.load_segments,
+            image_size: value.image_size,
+            symbol_graph: value.symbol_graph,
+        };
+        analysis.validate()?;
+        Ok(analysis)
+    }
+}
+
+/// One exact 32-byte ELF32 program-header record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ElfProgramHeader {
+    pub table_index: u16,
+    pub segment_type: u32,
+    pub file_offset: u32,
+    pub virtual_address: u32,
+    pub physical_address: u32,
+    pub file_size: u32,
+    pub memory_size: u32,
+    pub flags: u32,
+    pub alignment: u32,
+}
+
+/// One exact 40-byte ELF32 section-header record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ElfSectionHeader {
+    pub table_index: u16,
+    pub name_offset: u32,
+    pub section_type: u32,
+    pub flags: u32,
+    pub virtual_address: u32,
+    pub file_offset: u32,
+    pub size: u32,
+    pub link: u32,
+    pub info: u32,
+    pub address_alignment: u32,
+    pub entry_size: u32,
+}
+
+/// One non-empty sparse `PT_LOAD` mapping, sorted by virtual address.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ElfLoadSegment {
+    pub program_header_index: u16,
+    pub file_offset: u32,
+    pub file_size: u32,
+    pub virtual_address: u32,
+    pub memory_size: u32,
+    pub flags: u32,
+    pub alignment: u32,
+}
+
+impl ElfLoadSegment {
+    #[must_use]
+    pub const fn readable(&self) -> bool {
+        self.flags & 4 != 0
+    }
+
+    #[must_use]
+    pub const fn writable(&self) -> bool {
+        self.flags & 2 != 0
+    }
+
+    #[must_use]
+    pub const fn executable(&self) -> bool {
+        self.flags & 1 != 0
     }
 }
 

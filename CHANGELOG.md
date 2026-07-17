@@ -8,6 +8,12 @@ prereleases; breaking changes remain explicit.
 
 ### Added
 
+- Added schema-14, container-only intake for ELF32 little-endian `EM_MIPS` executables. Checked
+  header and table parsing retains sparse non-empty `PT_LOAD` mappings and a deterministic
+  identity-only graph without decoding or executing instructions. A source-built synthetic fixture
+  covers zero-sized load records, large virtual gaps, package round trips, and malformed identity
+  and segment fields. PE/x86-64-only plugin hosts, patching, linear preview, MAP, PDB, protection,
+  and workbench offline-address-space actions remain explicitly unavailable for this format.
 - Added `resymbol patch EXACT_SOURCE_PE PATCH_SET.respatch.json --output NEW_BINARY` for audited
   non-GUI patch publication. The command bounded-loads the strict manifest through `AppServices`,
   verifies its complete identity against a freshly analyzed exact PE, rebuilds a checked plan from
@@ -362,7 +368,7 @@ prereleases; breaking changes remain explicit.
   size rules. `resymbol export --fail-on-loss` rejects neutral-warning or target-loss occurrences
   before rendering and publication, while every successful export prints both totals.
 - Added optional `resymbol inspect PACKAGE --binary EXACT_ORIGINAL_BINARY` verification for package
-  schemas 1 through 13. Inspection validates the package first, then requires the supplied file's
+  schemas 1 through 14. Inspection validates the package first, then requires the supplied file's
   exact size and SHA-256 to match before any inspection output reaches stdout. Failures report on
   stderr. Human summaries add
   `source binary: <canonical-path>` and `identity gate: matched`; `--json` remains pure package JSON.
@@ -427,7 +433,7 @@ prereleases; breaking changes remain explicit.
   and no longer quarantine the plugin artifact.
 - Raised the pinned Rust source-build toolchain and workspace MSRV to 1.86 for the Component Model
   host. Ordinary release users and users of the bundled WASM example still need no compiler.
-- New `.resym` analyses use package schema 13. Schema 4 introduced the `function-pointer`
+- New `.resym` analyses use package schema 14. Schema 4 introduced the `function-pointer`
   control-flow target, which persists both the read-only slot RVA and resolved function RVA and
   requires a paired same-site slot data reference for a direct call but not for a pointer thunk.
   Schema 5 preserves a legacy 24-byte RTTI base-class descriptor with a null
@@ -439,9 +445,9 @@ prereleases; breaking changes remain explicit.
   inventory. Schema 9 adds load-config size and GuardFlags state plus the ordered GFIDS inventory.
   Schema 10 adds the ordered Guard address-taken IAT, long-jump, and EH-continuation inventories.
   Schema 11 adds checked storage RVAs for the security cookie and the GuardCF check/dispatch
-  function-pointer slots. Schema 12 adds checked XFG and CastGuard storage anchors, and schema 13
-  adds the checked GuardMemcpy function-pointer-slot anchor. Their versioned objects are serialized
-  even when empty;
+  function-pointer slots. Schema 12 adds checked XFG and CastGuard storage anchors, schema 13 adds
+  the checked GuardMemcpy function-pointer-slot anchor, and schema 14 adds the separate bounded ELF
+  analysis variant. The PE versioned objects are serialized even when empty;
   each version-introducing inventory or object remains an explicit anti-relabel compatibility marker.
 - The debugger-neutral JSON projection now uses schema 6. Schema 4 added attributed string and
   data-reference arrays to schema 3's entry attribution and control-flow relationships; schema 5
@@ -504,8 +510,9 @@ schema versions independently.
   schemas 1 through 9 report modern Guard target inventories unavailable, schemas 1 through 10
   report load-config security anchors unavailable, schemas 1 through 11 report XFG/CastGuard
   anchors unavailable, and schemas 1 through 12 report the GuardMemcpy anchor unavailable. None can
-  be synthesized during loading. Reanalyze the exact original binary to create schema 13
-  with current recovery. The
+  be synthesized during loading. Reanalyze the exact original binary to create schema 14 with all
+  current results. Schema 13 retains every current PE recovery family but predates bounded ELF
+  container intake. The
   reader rejects schema 2 or 3 envelopes containing schema-4
   function-pointer targets in base relationships,
   symbol graphs, or plugin claims. It also rejects a schema 1-through-4 payload containing an RTTI
@@ -514,28 +521,30 @@ schema versions independently.
   source that depends on schema-6 transitive endpoint seeding, and rejects schema 1-through-6
   envelopes containing schema-7 TLS callback state or callback-only base thunk seeds. It also
   rejects schema 1-through-7 envelopes containing the exact schema-8 base-analysis `delay_imports`
-  inventory key or `directories.delay_imports` directory key. Schemas 8 through 13 require that
-  explicit inventory marker, even when empty. Changing only the envelope label is never migration.
+  inventory key or `directories.delay_imports` directory key. PE analyses in schemas 8 through 14
+  require that explicit inventory marker, even when empty. Changing only the envelope label is
+  never migration.
   Schemas 1 through 8 also reject schema-9 load-config/GuardCF fields,
-  `directories.load_config`, and core `pe-guard-cf-function` claims. Schemas 9 through 13 require
-  the explicit `guard_cf_functions` inventory even when empty.
+  `directories.load_config`, and core `pe-guard-cf-function` claims. PE analyses in schemas 9
+  through 14 require the explicit `guard_cf_functions` inventory even when empty.
   Schemas 1 through 9 reject schema-10 Guard address-taken IAT, long-jump, and EH-continuation
-  table-RVA and inventory fields. Schemas 10 through 13 require all three inventory arrays even
-  when empty.
+  table-RVA and inventory fields. PE analyses in schemas 10 through 14 require all three inventory
+  arrays even when empty.
   Schemas 1 through 10 reject the exact schema-11 `load_config_security_anchors` base-analysis key;
-  schemas 11 through 13 require that value to be an object even when all anchors are absent. Schemas
-  1 through 11 reject the schema-12 `load_config_xfg_anchors` key; schemas 12 and 13 require that
-  value to be an object even when all anchors are absent. Schemas 1 through 12 reject the schema-13
-  `load_config_guard_memcpy_anchor` key; schema 13 requires an object even when the anchor is absent.
-- Package schema 13 and neutral projection schema 6 are independent version domains. Generic
+  PE analyses in schemas 11 through 14 require that value to be an object even when all anchors are
+  absent. Schemas 1 through 11 reject the schema-12 `load_config_xfg_anchors` key; PE analyses in
+  schemas 12 through 14 require that value to be an object even when all anchors are absent.
+  Schemas 1 through 12 reject the schema-13 `load_config_guard_memcpy_anchor` key; PE analyses in
+  schemas 13 and 14 require an object even when the anchor is absent.
+- Package schema 14 and neutral projection schema 6 are independent version domains. Generic
   package readers still require an explicit compatibility range and application-defined payload
   migration to accept an older schema.
 - Markdown export is presentation-only and does not change either version domain: new analyses
-  continue to use package schema 13 and the neutral projection continues to use schema 6.
+  continue to use package schema 14 and the neutral projection continues to use schema 6.
 - MAP export consumes the current validated session and neutral projection without adding fields to
-  package schema 13 or projection schema 6.
+  package schema 14 or projection schema 6.
 - PDB export consumes the same current session and projection plus a byte-backed inspection of the
-  exact original PE. It does not add fields to package schema 13 or projection schema 6.
+  exact original PE. It does not add fields to package schema 14 or projection schema 6.
 - The external plugin wire remains protocol 1.0. Dual-layout RTTI recovery changes deterministic
   base-analysis/package content but adds no plugin assertion or control-flow target shape.
   Transitive built-in thunk discovery likewise composes existing exact `thunk-target` claims and

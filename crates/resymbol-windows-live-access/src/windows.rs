@@ -755,7 +755,7 @@ fn open_exact_executable(
     let start_key_before = process_start_key(process)?;
     let queried_path = query_executable_path(process)?;
     let path = canonical_executable_path(&queried_path)?;
-    let file = OpenOptions::new()
+    let mut file = OpenOptions::new()
         .read(true)
         // Successful opening with read-only sharing excludes existing or new
         // writers/deleters for the lifetime of this retained handle.
@@ -777,6 +777,8 @@ fn open_exact_executable(
         return Err(LiveAccessError::ExecutableNotRegular { path });
     }
     let size_of_image = file_pe_size_of_image(&file, before.len(), &path)?;
+    // Earlier positional header reads may still advance a shared Windows file
+    // cursor, so the complete identity hash always starts from byte zero.
     let mut hash_reader = BufReader::new(&file);
     hash_reader
         .seek(SeekFrom::Start(0))
