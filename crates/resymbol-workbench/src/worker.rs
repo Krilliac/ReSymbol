@@ -9,7 +9,7 @@ use std::{
     thread::{self, JoinHandle},
 };
 
-use resymbol_app::{AppServices, ExportFormat, ProjectSnapshot, ReviewLedger};
+use resymbol_app::{AppServices, ExportFormat, PluginCatalog, ProjectSnapshot, ReviewLedger};
 use resymbol_core::BinaryIdentity;
 use resymbol_debugger::{
     CapabilityAvailability, ClientConnectionState, CommandOutcome, DebugCapability, DebugCommand,
@@ -519,6 +519,11 @@ pub enum WorkerCommand {
         project: Arc<ProjectSnapshot>,
         path: PathBuf,
     },
+    /// Refresh the presentation-only plugin catalog without loading or executing plugins.
+    RefreshPluginCatalog {
+        operation: OperationId,
+        root: PathBuf,
+    },
     ProbeSandboxProvider {
         operation: OperationId,
         evidence: DebuggerReadinessEvidence,
@@ -559,6 +564,10 @@ pub enum WorkerEvent {
     ReviewLoaded {
         operation: OperationId,
         result: Result<ReviewLoadOutcome, String>,
+    },
+    PluginCatalogRefreshed {
+        operation: OperationId,
+        result: Result<PluginCatalog, String>,
     },
     SandboxProviderProbed {
         operation: OperationId,
@@ -697,6 +706,14 @@ fn process_command(services: &AppServices, command: WorkerCommand) -> Option<Wor
                     })
                 }),
         },
+        WorkerCommand::RefreshPluginCatalog { operation, root } => {
+            WorkerEvent::PluginCatalogRefreshed {
+                operation,
+                result: services
+                    .inspect_plugin_catalog(root)
+                    .map_err(|error| error.to_string()),
+            }
+        }
         WorkerCommand::ProbeSandboxProvider {
             operation,
             evidence,
@@ -1028,6 +1045,7 @@ fn apply_reviews(
 mod tests {
     use std::{fs, io::Write as _};
 
+    use resymbol_app::PluginArtifactPolicyStatus;
     use resymbol_core::{BinaryFormat, BinaryId, BinaryIdentity};
     use resymbol_debugger::{
         DiagnosticText, ProviderProbeObservation, SandboxProviderProbeRequest,
@@ -1055,6 +1073,56 @@ mod tests {
             .analyze_binary(source.path())
             .expect("analyze worker fixture");
         (source, snapshot)
+    }
+
+    #[test]
+    fn plugin_catalog_refresh_runs_as_a_non_executing_worker_workflow() {
+        let temporary = tempdir().expect("temporary plugin root");
+        let plugin = temporary.path().join("worker-wasm");
+        fs::create_dir(&plugin).expect("create plugin directory");
+        fs::write(plugin.join("plugin.wasm"), b"not executable wasm").expect("write entrypoint");
+        fs::write(
+            plugin.join("plugin.toml"),
+            r#"manifest_version = 1
+id = "community.resymbol.worker-wasm"
+name = "Worker WASM"
+version = "1.0.0"
+api = "^0.1"
+capabilities = ["analyzer.binary"]
+permissions = ["binary.read", "claims.submit"]
+
+[runtime]
+kind = "wasm"
+entrypoint = "plugin.wasm"
+"#,
+        )
+        .expect("write plugin manifest");
+        let operation = OperationSequence::default().issue();
+
+        let event = process_command(
+            &AppServices::default(),
+            WorkerCommand::RefreshPluginCatalog {
+                operation,
+                root: temporary.path().to_path_buf(),
+            },
+        )
+        .expect("plugin catalog event");
+        let WorkerEvent::PluginCatalogRefreshed {
+            operation: actual,
+            result,
+        } = event
+        else {
+            panic!("unexpected worker event")
+        };
+        assert_eq!(actual, operation);
+        let catalog = result.expect("worker catalog refresh");
+        assert_eq!(catalog.entries().len(), 1);
+        assert_eq!(
+            catalog.entries()[0].artifact_policy,
+            PluginArtifactPolicyStatus::Sandboxed
+        );
+        let entrypoint = fs::read(plugin.join("plugin.wasm")).expect("entrypoint unchanged");
+        assert_eq!(entrypoint.as_slice(), b"not executable wasm");
     }
 
     fn offline_read(

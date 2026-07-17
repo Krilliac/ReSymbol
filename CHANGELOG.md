@@ -8,6 +8,16 @@ prereleases; breaking changes remain explicit.
 
 ### Added
 
+- Added a refreshable exact-artifact policy catalog to the desktop workbench. Scans run on the
+  bounded application-service worker and replace one owned snapshot, while the UI remains strictly
+  non-executing. Every fingerprintable unpacked candidate with a valid manifest reports its exact
+  SHA-256 and policy status as `SANDBOXED`, `TRUSTED`, `APPROVAL REQUIRED`, `DISABLED`,
+  `QUARANTINED`, `CORRUPT STATE`, or `UNAVAILABLE`. Sandboxed WASM needs no trust record; non-WASM
+  runtimes require trust for the exact fingerprint, mutations return to approval-required, and
+  policy-relevant corrupt or quarantined state fails closed. Discovery health includes manifest,
+  API, entrypoint, duplicate-ID, and declared plugin-dependency checks. Passing this policy does not
+  claim full CLI executability; runtime support, capability selection, host/helper availability,
+  granted permissions, target compatibility, and launch-time revalidation remain separate.
 - Added a responsive, keyboard-first workbench navigation slice. The default 1440x900 review shell
   keeps all eight main views on one compact row and fits all six Function columns with both side
   panels open; the documented 1024x680 minimum uses an explicit all-view selector and a labeled

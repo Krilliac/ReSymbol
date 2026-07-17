@@ -10,7 +10,7 @@ mod review;
 
 pub use error::AppError;
 pub use export::{ExportFormat, PreparedExport};
-pub use plugins::{PluginCatalog, PluginCatalogEntry};
+pub use plugins::{PluginArtifactPolicyStatus, PluginCatalog, PluginCatalogEntry};
 pub use project::{AppServices, DEFAULT_MAX_BINARY_BYTES, ExactBinary, ProjectSnapshot};
 pub use review::{
     DecisionAction, MAX_REVIEW_ANNOTATION_BYTES, MAX_REVIEW_DECISIONS, MAX_REVIEW_SIDECAR_BYTES,
