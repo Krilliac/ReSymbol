@@ -5,6 +5,7 @@
 
 use std::{marker::PhantomData, rc::Rc};
 
+use resymbol_core::BinaryId;
 use thiserror::Error;
 
 use crate::authorization::{HostRiskVerifier, SandboxOwnershipVerifier};
@@ -325,7 +326,8 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
     }
 
     /// Returns the exact validated main-module mapping for the active live
-    /// attach, if the host supplied it and the session remains live.
+    /// launch or debug attach, if the host supplied it and the session remains
+    /// live.
     ///
     /// The binding is invalidated on terminal state, connection failure, or
     /// replacement evidence. Callers receive no mutable access to it.
@@ -1206,13 +1208,13 @@ fn accept_live_target_binding(
     binding: &LiveTargetBinding,
     evidence: &mut ResponseEvidence,
 ) -> Result<(), DebugHostClientError> {
-    let DebugCommand::Open(request @ DebugTargetRequest::Attach(target)) = &envelope.command else {
+    let DebugCommand::Open(request) = &envelope.command else {
         return Err(DebugHostClientError::UnexpectedCommandEvidence {
             command_id: envelope.command_id,
             evidence: "live-target-binding",
         });
     };
-    if target.mode != crate::protocol::AttachMode::Debug || reducer.target() != Some(request) {
+    if reducer.target() != Some(request) {
         return Err(DebugHostClientError::UnexpectedCommandEvidence {
             command_id: envelope.command_id,
             evidence: "live-target-binding",
@@ -1223,15 +1225,48 @@ fn accept_live_target_binding(
             command_id: envelope.command_id,
         });
     }
-    let expected = match &target.scope {
-        crate::protocol::AttachScope::Host { process, .. }
-        | crate::protocol::AttachScope::OwnedSandbox { process, .. } => process,
-    };
-    if binding.process() != expected {
-        return Err(DebugHostClientError::LiveTargetProcessMismatch {
-            expected: expected.clone(),
-            actual: binding.process().clone(),
-        });
+    match request {
+        DebugTargetRequest::Attach(target) if target.mode == crate::protocol::AttachMode::Debug => {
+            let expected = match &target.scope {
+                crate::protocol::AttachScope::Host { process, .. }
+                | crate::protocol::AttachScope::OwnedSandbox { process, .. } => process,
+            };
+            require_live_target_process(binding, expected)?;
+        }
+        DebugTargetRequest::Launch(target) => {
+            if binding.main_module_binary_id() != &target.binary_id {
+                return Err(DebugHostClientError::LiveTargetBinaryMismatch {
+                    expected: target.binary_id.clone(),
+                    actual: binding.main_module_binary_id().clone(),
+                });
+            }
+            if matches!(
+                &target.environment,
+                crate::protocol::LaunchEnvironment::Sandboxed { .. }
+            ) {
+                if !evidence.attestation_accepted {
+                    return Err(
+                        DebugHostClientError::LiveTargetBindingBeforeSandboxAttestation {
+                            command_id: envelope.command_id,
+                        },
+                    );
+                }
+                let attested = reducer.accepted_sandbox_attestation().ok_or(
+                    DebugHostClientError::LiveTargetBindingBeforeSandboxAttestation {
+                        command_id: envelope.command_id,
+                    },
+                )?;
+                require_live_target_process(binding, &attested.process)?;
+            }
+        }
+        DebugTargetRequest::Attach(_)
+        | DebugTargetRequest::Dump(_)
+        | DebugTargetRequest::Offline(_) => {
+            return Err(DebugHostClientError::UnexpectedCommandEvidence {
+                command_id: envelope.command_id,
+                evidence: "live-target-binding",
+            });
+        }
     }
     if let Some(existing) = current.as_ref() {
         if existing == binding {
@@ -1243,6 +1278,20 @@ fn accept_live_target_binding(
     require_unique_evidence(&mut evidence.live_target_bound, "live-target-binding")?;
     *current = Some(binding.clone());
     Ok(())
+}
+
+fn require_live_target_process(
+    binding: &LiveTargetBinding,
+    expected: &ProcessIdentity,
+) -> Result<(), DebugHostClientError> {
+    if binding.process() == expected {
+        Ok(())
+    } else {
+        Err(DebugHostClientError::LiveTargetProcessMismatch {
+            expected: expected.clone(),
+            actual: binding.process().clone(),
+        })
+    }
 }
 
 fn invalidate_binding_for_state(session: &mut ClientSession) {
@@ -1910,19 +1959,29 @@ fn validate_success_evidence(
             final_state,
         });
     }
-    if matches!(
-        &envelope.command,
-        DebugCommand::Open(DebugTargetRequest::Attach(crate::protocol::AttachTarget {
-            mode: crate::protocol::AttachMode::Debug,
-            ..
-        }))
-    ) && !evidence.live_target_bound
-    {
-        return Err(DebugHostClientError::MissingCommandEvidence {
-            command_id,
-            command: "debug-attach-binding",
-            final_state,
-        });
+    if !evidence.live_target_bound {
+        let binding_command = match &envelope.command {
+            DebugCommand::Open(DebugTargetRequest::Attach(crate::protocol::AttachTarget {
+                mode: crate::protocol::AttachMode::Debug,
+                ..
+            })) => Some("debug-attach-binding"),
+            DebugCommand::Open(DebugTargetRequest::Launch(crate::protocol::LaunchTarget {
+                environment: crate::protocol::LaunchEnvironment::Host { .. },
+                ..
+            })) => Some("host-launch-binding"),
+            DebugCommand::Open(DebugTargetRequest::Launch(crate::protocol::LaunchTarget {
+                environment: crate::protocol::LaunchEnvironment::Sandboxed { .. },
+                ..
+            })) => Some("sandboxed-launch-binding"),
+            _ => None,
+        };
+        if let Some(command) = binding_command {
+            return Err(DebugHostClientError::MissingCommandEvidence {
+                command_id,
+                command,
+                final_state,
+            });
+        }
     }
     Ok(())
 }
@@ -2093,9 +2152,18 @@ pub enum DebugHostClientError {
     EventAfterCommandResult { command_id: CommandId },
     #[error("host returned duplicate {evidence} evidence")]
     DuplicateCommandEvidence { evidence: &'static str },
-    #[error("live target binding arrived before the attach opening state for {command_id:?}")]
+    #[error("live target binding arrived before the target opening state for {command_id:?}")]
     LiveTargetBindingBeforeOpenState { command_id: CommandId },
-    #[error("live target binding process differs from the exact attach target")]
+    #[error(
+        "sandbox live target binding arrived before exact process attestation for {command_id:?}"
+    )]
+    LiveTargetBindingBeforeSandboxAttestation { command_id: CommandId },
+    #[error("live target binding main-module identity differs from the exact launch binary")]
+    LiveTargetBinaryMismatch {
+        expected: BinaryId,
+        actual: BinaryId,
+    },
+    #[error("live target binding process differs from the exact target process")]
     LiveTargetProcessMismatch {
         expected: ProcessIdentity,
         actual: ProcessIdentity,
@@ -5901,6 +5969,530 @@ mod tests {
                 .expect("translate RVA"),
             MemoryAddress::new(0x0000_7ff6_8000_1200)
         );
+    }
+
+    #[test]
+    fn correlated_host_launch_requires_and_stores_exact_aslr_binding() {
+        let binary_id = BinaryId::digest(b"correlated host launch image");
+        let risk_id = HostRiskLeaseId::new("e".repeat(64)).expect("host-risk id");
+        let target = LaunchTarget {
+            binary_id: binary_id.clone(),
+            executable: PathBuf::from("host-launch.exe"),
+            arguments: vec!["--stopped".to_owned()],
+            working_directory: None,
+            environment: LaunchEnvironment::Host {
+                risk_lease: risk_id.clone(),
+            },
+            stop_before_entry: true,
+        };
+        let mut client = DebugHostClient::connect(
+            AsyncQueueHost::new(Vec::new()),
+            [0x6d; 16],
+            "controller/build-7",
+            "host/build-4",
+        )
+        .expect("connect test client");
+        client
+            .begin_session(session_id(), provisioning_epoch(), helper_build())
+            .expect("begin session");
+        client
+            .register_host_risk_verifier(HostRiskVerifier::new(
+                risk_id,
+                session_id(),
+                provisioning_epoch(),
+                HostRiskOperation::Launch {
+                    intent: HostLaunchIntent::from_target(&target).expect("host launch intent"),
+                },
+            ))
+            .expect("register verifier");
+
+        let command_id = CommandId::new(1).expect("command id");
+        let envelope = CommandEnvelope {
+            version: ProtocolVersion::current(),
+            command_id,
+            session_id: Some(session_id()),
+            expected_state: Some(client.session_state().expect("idle state").state_token()),
+            command: DebugCommand::Open(DebugTargetRequest::Launch(target)),
+        };
+        let (checkpoint, opening) = {
+            let session = client.session.as_mut().expect("client session");
+            let checkpoint = session
+                .reducer
+                .begin_remote_command(&envelope)
+                .expect("begin remote host launch");
+            (checkpoint, session.reducer.state().clone())
+        };
+        let opening_token = opening.state_token();
+        let stopped = SessionState::Stopped {
+            token: StopToken {
+                state: StateToken {
+                    session_id: session_id(),
+                    generation: opening_token
+                        .generation
+                        .checked_next()
+                        .expect("next generation"),
+                },
+                stop_id: StopId::new(1).expect("initial stop id"),
+            },
+            reason: StopReason::Initial,
+            thread_id: ThreadId::new(9).expect("initial thread"),
+        };
+        let stopped_token = stopped.state_token();
+        let process = ProcessIdentity {
+            process_id: ProcessId::new(8_001).expect("launched process id"),
+            start_key: ProcessStartKey::new(55_001).expect("launched process start key"),
+            binary_id: binary_id.clone(),
+        };
+        let binding = LiveTargetBinding::new(
+            process,
+            binary_id,
+            MemoryAddress::new(0x0000_7ff7_2000_0000),
+            0x7_0000,
+        )
+        .expect("host launch binding");
+        let frames = vec![
+            correlated_event_frame(
+                2,
+                1,
+                command_id,
+                opening_token,
+                DebugEvent::StateChanged(opening.clone()),
+            ),
+            correlated_event_frame(
+                3,
+                2,
+                command_id,
+                opening_token,
+                DebugEvent::LiveTargetBound {
+                    state: opening_token,
+                    binding: binding.clone(),
+                },
+            ),
+            correlated_event_frame(
+                4,
+                3,
+                command_id,
+                stopped_token,
+                DebugEvent::StateChanged(stopped.clone()),
+            ),
+            correlated_event_frame(
+                5,
+                4,
+                command_id,
+                stopped_token,
+                DebugEvent::CommandResult {
+                    command_id,
+                    outcome: CommandOutcome::Succeeded,
+                },
+            ),
+        ];
+        let batch = HostResponseBatch::try_from_frames(frames, DEFAULT_HOST_RESPONSE_LIMITS)
+            .expect("bounded host launch response");
+
+        let receipt = client
+            .accept_response_batch(&envelope, checkpoint, Some(opening), batch)
+            .expect("accept exact host launch response");
+        assert_eq!(receipt.outcome, CommandOutcome::Succeeded);
+        assert_eq!(client.session_state(), Some(&stopped));
+        assert_eq!(client.live_target_binding(), Some(&binding));
+        assert_eq!(
+            client
+                .live_target_binding()
+                .expect("stored launch binding")
+                .address_for_rva(0x2_4000)
+                .expect("translate ASLR-adjusted RVA"),
+            MemoryAddress::new(0x0000_7ff7_2002_4000)
+        );
+    }
+
+    #[test]
+    fn correlated_sandbox_launch_binds_mapping_to_attested_process_identity() {
+        let target = sandbox_target();
+        let mut client = DebugHostClient::connect(
+            AsyncQueueHost::new(Vec::new()),
+            [0x6d; 16],
+            "controller/build-7",
+            "host/build-4",
+        )
+        .expect("connect test client");
+        client
+            .begin_session(session_id(), provisioning_epoch(), helper_build())
+            .expect("begin session");
+
+        let command_id = CommandId::new(1).expect("command id");
+        let envelope = CommandEnvelope {
+            version: ProtocolVersion::current(),
+            command_id,
+            session_id: Some(session_id()),
+            expected_state: Some(client.session_state().expect("idle state").state_token()),
+            command: DebugCommand::Open(target),
+        };
+        let (checkpoint, opening, expected) = {
+            let session = client.session.as_mut().expect("client session");
+            let checkpoint = session
+                .reducer
+                .begin_remote_command(&envelope)
+                .expect("begin remote sandbox launch");
+            (
+                checkpoint,
+                session.reducer.state().clone(),
+                session
+                    .reducer
+                    .expected_attestation()
+                    .expect("sandbox attestation expectation")
+                    .clone(),
+            )
+        };
+        let opening_token = opening.state_token();
+        let process = test_process_identity(&expected);
+        let awaiting_token = StateToken {
+            session_id: session_id(),
+            generation: opening_token
+                .generation
+                .checked_next()
+                .expect("awaiting-attestation generation"),
+        };
+        let awaiting = SessionState::AwaitingAttestation {
+            token: awaiting_token,
+            process: process.clone(),
+        };
+        let attestation = test_attestation(&expected);
+        assert_eq!(attestation.process, process);
+        let attested_token = StateToken {
+            session_id: session_id(),
+            generation: awaiting_token
+                .generation
+                .checked_next()
+                .expect("attestation-accepted generation"),
+        };
+        let stopped = SessionState::Stopped {
+            token: StopToken {
+                state: StateToken {
+                    session_id: session_id(),
+                    generation: attested_token
+                        .generation
+                        .checked_next()
+                        .expect("stopped generation"),
+                },
+                stop_id: StopId::new(1).expect("initial stop id"),
+            },
+            reason: StopReason::Initial,
+            thread_id: ThreadId::new(9).expect("initial thread"),
+        };
+        let stopped_token = stopped.state_token();
+        let binding = LiveTargetBinding::new(
+            process.clone(),
+            process.binary_id.clone(),
+            MemoryAddress::new(0x0000_7ff8_6000_0000),
+            0x9_0000,
+        )
+        .expect("sandbox launch binding");
+        let frames = vec![
+            correlated_event_frame(
+                2,
+                1,
+                command_id,
+                opening_token,
+                DebugEvent::StateChanged(opening.clone()),
+            ),
+            correlated_event_frame(
+                3,
+                2,
+                command_id,
+                awaiting_token,
+                DebugEvent::StateChanged(awaiting),
+            ),
+            correlated_event_frame(
+                4,
+                3,
+                command_id,
+                awaiting_token,
+                DebugEvent::SandboxAttested(attestation),
+            ),
+            correlated_event_frame(
+                5,
+                4,
+                command_id,
+                attested_token,
+                DebugEvent::LiveTargetBound {
+                    state: attested_token,
+                    binding: binding.clone(),
+                },
+            ),
+            correlated_event_frame(
+                6,
+                5,
+                command_id,
+                stopped_token,
+                DebugEvent::StateChanged(stopped.clone()),
+            ),
+            correlated_event_frame(
+                7,
+                6,
+                command_id,
+                stopped_token,
+                DebugEvent::CommandResult {
+                    command_id,
+                    outcome: CommandOutcome::Succeeded,
+                },
+            ),
+        ];
+        let batch = HostResponseBatch::try_from_frames(frames, DEFAULT_HOST_RESPONSE_LIMITS)
+            .expect("bounded sandbox launch response");
+
+        let receipt = client
+            .accept_response_batch(&envelope, checkpoint, Some(opening), batch)
+            .expect("accept exact sandbox launch response");
+        assert_eq!(receipt.outcome, CommandOutcome::Succeeded);
+        assert_eq!(client.session_state(), Some(&stopped));
+        assert_eq!(client.live_target_binding(), Some(&binding));
+        assert_eq!(binding.process(), &process);
+        assert_eq!(
+            binding
+                .address_for_rva(0x1_1000)
+                .expect("translate sandbox RVA"),
+            MemoryAddress::new(0x0000_7ff8_6001_1000)
+        );
+    }
+
+    #[test]
+    fn launch_binding_rejects_missing_forged_and_replayed_evidence() {
+        let host_binary = BinaryId::digest(b"host launch binding requirement");
+        let risk_id = HostRiskLeaseId::new("f".repeat(64)).expect("host-risk id");
+        let host_target = LaunchTarget {
+            binary_id: host_binary.clone(),
+            executable: PathBuf::from("host-launch.exe"),
+            arguments: Vec::new(),
+            working_directory: None,
+            environment: LaunchEnvironment::Host {
+                risk_lease: risk_id.clone(),
+            },
+            stop_before_entry: true,
+        };
+        let mut host_reducer =
+            SessionMachine::new(session_id(), provisioning_epoch(), helper_build());
+        host_reducer
+            .register_host_risk_verifier(HostRiskVerifier::new(
+                risk_id,
+                session_id(),
+                provisioning_epoch(),
+                HostRiskOperation::Launch {
+                    intent: HostLaunchIntent::from_target(&host_target)
+                        .expect("host launch intent"),
+                },
+            ))
+            .expect("register verifier");
+        let host_envelope = CommandEnvelope {
+            version: ProtocolVersion::current(),
+            command_id: CommandId::new(1).expect("command id"),
+            session_id: Some(session_id()),
+            expected_state: Some(host_reducer.state().state_token()),
+            command: DebugCommand::Open(DebugTargetRequest::Launch(host_target)),
+        };
+        let _host_checkpoint = host_reducer
+            .begin_remote_command(&host_envelope)
+            .expect("begin host launch");
+        host_reducer
+            .mark_stopped(
+                StopReason::Initial,
+                ThreadId::new(3).expect("host launch thread"),
+            )
+            .expect("host launch stopped");
+        let mut host_evidence = ResponseEvidence {
+            state_changed: true,
+            command_state_observed: true,
+            ..ResponseEvidence::default()
+        };
+        assert_eq!(
+            validate_success_evidence(&host_envelope, &host_reducer, &host_evidence),
+            Err(DebugHostClientError::MissingCommandEvidence {
+                command_id: host_envelope.command_id,
+                command: "host-launch-binding",
+                final_state: SessionStateKind::Stopped,
+            })
+        );
+        let forged_binary = BinaryId::digest(b"forged host launch mapping");
+        let forged_process = ProcessIdentity {
+            process_id: ProcessId::new(8_002).expect("forged process id"),
+            start_key: ProcessStartKey::new(55_002).expect("forged process start key"),
+            binary_id: forged_binary.clone(),
+        };
+        let forged = LiveTargetBinding::new(
+            forged_process,
+            forged_binary.clone(),
+            MemoryAddress::new(0x0000_7ff7_3000_0000),
+            0x5_0000,
+        )
+        .expect("structurally valid forged binding");
+        let mut current = None;
+        assert_eq!(
+            accept_live_target_binding(
+                &host_envelope,
+                &host_reducer,
+                &mut current,
+                &forged,
+                &mut host_evidence,
+            ),
+            Err(DebugHostClientError::LiveTargetBinaryMismatch {
+                expected: host_binary,
+                actual: forged_binary,
+            })
+        );
+        assert!(current.is_none());
+
+        let mut sandbox_reducer =
+            SessionMachine::new(session_id(), provisioning_epoch(), helper_build());
+        let sandbox_envelope = CommandEnvelope {
+            version: ProtocolVersion::current(),
+            command_id: CommandId::new(1).expect("command id"),
+            session_id: Some(session_id()),
+            expected_state: Some(sandbox_reducer.state().state_token()),
+            command: DebugCommand::Open(sandbox_target()),
+        };
+        let _sandbox_checkpoint = sandbox_reducer
+            .begin_remote_command(&sandbox_envelope)
+            .expect("begin sandbox launch");
+        let expected = sandbox_reducer
+            .expected_attestation()
+            .expect("sandbox expectation")
+            .clone();
+        let process = test_process_identity(&expected);
+        let exact = LiveTargetBinding::new(
+            process.clone(),
+            process.binary_id.clone(),
+            MemoryAddress::new(0x0000_7ff8_7000_0000),
+            0x8_0000,
+        )
+        .expect("exact sandbox mapping");
+        let mut sandbox_evidence = ResponseEvidence {
+            command_state_observed: true,
+            ..ResponseEvidence::default()
+        };
+        assert_eq!(
+            accept_live_target_binding(
+                &sandbox_envelope,
+                &sandbox_reducer,
+                &mut current,
+                &exact,
+                &mut sandbox_evidence,
+            ),
+            Err(
+                DebugHostClientError::LiveTargetBindingBeforeSandboxAttestation {
+                    command_id: sandbox_envelope.command_id,
+                }
+            )
+        );
+        sandbox_reducer
+            .target_created_suspended(process.clone())
+            .expect("record suspended sandbox target");
+        let attestation = test_attestation(&expected);
+        sandbox_reducer
+            .accept_sandbox_attestation(&attestation)
+            .expect("accept exact sandbox attestation");
+        sandbox_evidence.attestation_accepted = true;
+        sandbox_reducer
+            .mark_stopped(
+                StopReason::Initial,
+                ThreadId::new(4).expect("sandbox launch thread"),
+            )
+            .expect("sandbox launch stopped");
+        let missing_sandbox_evidence = ResponseEvidence {
+            state_changed: true,
+            command_state_observed: true,
+            attestation_accepted: true,
+            ..ResponseEvidence::default()
+        };
+        assert_eq!(
+            validate_success_evidence(
+                &sandbox_envelope,
+                &sandbox_reducer,
+                &missing_sandbox_evidence,
+            ),
+            Err(DebugHostClientError::MissingCommandEvidence {
+                command_id: sandbox_envelope.command_id,
+                command: "sandboxed-launch-binding",
+                final_state: SessionStateKind::Stopped,
+            })
+        );
+
+        let replayed_process = ProcessIdentity {
+            process_id: process.process_id,
+            start_key: ProcessStartKey::new(process.start_key.get() + 1)
+                .expect("replayed process start key"),
+            binary_id: process.binary_id.clone(),
+        };
+        let replayed = LiveTargetBinding::new(
+            replayed_process.clone(),
+            replayed_process.binary_id.clone(),
+            MemoryAddress::new(0x0000_7ff8_7000_0000),
+            0x8_0000,
+        )
+        .expect("structurally valid replayed mapping");
+        assert_eq!(
+            accept_live_target_binding(
+                &sandbox_envelope,
+                &sandbox_reducer,
+                &mut current,
+                &replayed,
+                &mut sandbox_evidence,
+            ),
+            Err(DebugHostClientError::LiveTargetProcessMismatch {
+                expected: process,
+                actual: replayed_process,
+            })
+        );
+        accept_live_target_binding(
+            &sandbox_envelope,
+            &sandbox_reducer,
+            &mut current,
+            &exact,
+            &mut sandbox_evidence,
+        )
+        .expect("accept exact sandbox mapping once");
+        assert_eq!(
+            accept_live_target_binding(
+                &sandbox_envelope,
+                &sandbox_reducer,
+                &mut current,
+                &exact,
+                &mut sandbox_evidence,
+            ),
+            Err(DebugHostClientError::DuplicateLiveTargetBinding)
+        );
+
+        let mut offline_reducer =
+            SessionMachine::new(session_id(), provisioning_epoch(), helper_build());
+        let offline_envelope = CommandEnvelope {
+            version: ProtocolVersion::current(),
+            command_id: CommandId::new(1).expect("command id"),
+            session_id: Some(session_id()),
+            expected_state: Some(offline_reducer.state().state_token()),
+            command: DebugCommand::Open(DebugTargetRequest::Offline(OfflineTarget {
+                path: PathBuf::from("offline.exe"),
+            })),
+        };
+        let _offline_checkpoint = offline_reducer
+            .begin_remote_command(&offline_envelope)
+            .expect("begin offline open");
+        let mut offline_binding = None;
+        let mut offline_evidence = ResponseEvidence {
+            command_state_observed: true,
+            ..ResponseEvidence::default()
+        };
+        assert_eq!(
+            accept_live_target_binding(
+                &offline_envelope,
+                &offline_reducer,
+                &mut offline_binding,
+                &exact,
+                &mut offline_evidence,
+            ),
+            Err(DebugHostClientError::UnexpectedCommandEvidence {
+                command_id: offline_envelope.command_id,
+                evidence: "live-target-binding",
+            })
+        );
+        assert!(offline_binding.is_none());
     }
 
     #[test]
