@@ -80,8 +80,8 @@
                          "view":  "address-space",
                          "width":  1440,
                          "height":  900,
-                         "bytes":  268251,
-                         "sha256":  "9e8a25eefd0c5d357de16b2165b3eab3ce4ad36c49b09d910e24e6a541c088f7"
+                         "bytes":  268254,
+                         "sha256":  "94787fd5ab726c0c43d6926ebf9476f6da76903ef0eb69561f2366925a51ea84"
                      },
                      {
                          "file":  "workbench-disassembly.png",
