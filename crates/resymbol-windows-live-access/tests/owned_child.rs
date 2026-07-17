@@ -7,7 +7,9 @@ use std::{
 };
 
 use resymbol_core::BinaryId;
-use resymbol_debugger::protocol::{LiveTargetBindingError, ProcessId};
+use resymbol_debugger::protocol::{
+    LiveTargetBindingError, MemoryAddress, ProcessId, ProcessStartKey,
+};
 use resymbol_windows_live_access::{
     LiveAccessError, MutatingLiveProcessAccess, OpenLiveProcessRequest, ReadOnlyLiveProcessAccess,
 };
@@ -64,26 +66,86 @@ fn exact_binding_read_compare_write_and_restore_owned_child() {
     BufReader::new(stdout)
         .read_line(&mut line)
         .expect("read fixture target address");
+    let mut fields = line.split_ascii_whitespace();
+    let start_key = u64::from_str_radix(
+        fields.next().expect("fixture emits a process start key"),
+        16,
+    )
+    .expect("fixture start key is hexadecimal");
+    let image_base =
+        u64::from_str_radix(fields.next().expect("fixture emits a main-image base"), 16)
+            .expect("fixture image base is hexadecimal");
     let absolute_address =
-        u64::from_str_radix(line.trim(), 16).expect("fixture emits a hexadecimal address");
+        u64::from_str_radix(fields.next().expect("fixture emits a target address"), 16)
+            .expect("fixture target address is hexadecimal");
+    assert!(
+        fields.next().is_none(),
+        "fixture emits exactly three fields"
+    );
+    let start_key = ProcessStartKey::new(start_key).expect("fixture start key is nonzero");
+    let image_base = MemoryAddress::new(image_base);
 
     let (binary_id, _) =
         BinaryId::digest_reader(File::open(fixture).expect("open exact owned fixture executable"))
             .expect("hash exact owned fixture executable");
     let process_id = ProcessId::new(owned.child.id()).expect("child PID is nonzero");
+    let wrong_identity = ReadOnlyLiveProcessAccess::open_read_only(OpenLiveProcessRequest::new(
+        process_id,
+        start_key,
+        image_base,
+        BinaryId::digest(b"not the owned fixture"),
+    ));
+    assert!(
+        matches!(
+            &wrong_identity,
+            Err(LiveAccessError::BinaryIdentityMismatch { .. })
+        ),
+        "unexpected wrong-identity result: {wrong_identity:?}"
+    );
+
+    let wrong_start_key = ProcessStartKey::new(
+        start_key
+            .get()
+            .checked_add(1)
+            .expect("fixture start key has successor"),
+    )
+    .expect("wrong start key remains nonzero");
     assert!(matches!(
         ReadOnlyLiveProcessAccess::open_read_only(OpenLiveProcessRequest::new(
             process_id,
-            BinaryId::digest(b"not the owned fixture"),
+            wrong_start_key,
+            image_base,
+            binary_id.clone(),
         )),
-        Err(LiveAccessError::BinaryIdentityMismatch { .. })
+        Err(LiveAccessError::ProcessStartIdentityMismatch { .. })
+    ));
+
+    let wrong_image_base = MemoryAddress::new(
+        image_base
+            .get()
+            .checked_add(0x1_0000)
+            .expect("fixture image base has bounded successor"),
+    );
+    assert!(matches!(
+        ReadOnlyLiveProcessAccess::open_read_only(OpenLiveProcessRequest::new(
+            process_id,
+            start_key,
+            wrong_image_base,
+            binary_id.clone(),
+        )),
+        Err(LiveAccessError::MainModuleBaseMismatch { .. })
     ));
 
     let read_only = ReadOnlyLiveProcessAccess::open_read_only(OpenLiveProcessRequest::new(
         process_id,
+        start_key,
+        image_base,
         binary_id.clone(),
     ))
     .expect("open exact owned fixture read-only");
+    let canonical_fixture =
+        std::fs::canonicalize(fixture).expect("canonicalize owned fixture executable");
+    assert_eq!(read_only.executable_path(), canonical_fixture.as_path());
     let read_only_binding = read_only.binding().clone();
     let read_only_rva = absolute_address
         .checked_sub(read_only_binding.actual_image_base().get())
@@ -97,7 +159,7 @@ fn exact_binding_read_compare_write_and_restore_owned_child() {
     drop(read_only);
 
     let mut access = MutatingLiveProcessAccess::open_mutating(OpenLiveProcessRequest::new(
-        process_id, binary_id,
+        process_id, start_key, image_base, binary_id,
     ))
     .expect("open exact owned fixture for mutation");
     let binding = access.binding().clone();
@@ -141,7 +203,7 @@ fn exact_binding_read_compare_write_and_restore_owned_child() {
         REPLACEMENT
     );
 
-    access
+    let _restore_receipt = access
         .compare_before_write_rva(&binding, rva, REPLACEMENT, ORIGINAL)
         .expect("restore exact fixture bytes");
     assert_eq!(

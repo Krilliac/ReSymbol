@@ -11,7 +11,9 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use resymbol_core::BinaryId;
-use resymbol_debugger::protocol::{MAX_MEMORY_READ_BYTES, MAX_MEMORY_WRITE_BYTES, ProcessId};
+use resymbol_debugger::protocol::{
+    MAX_MEMORY_READ_BYTES, MAX_MEMORY_WRITE_BYTES, MemoryAddress, ProcessId, ProcessStartKey,
+};
 use thiserror::Error;
 
 #[cfg(windows)]
@@ -29,22 +31,33 @@ pub const MAX_EXACT_READ_BYTES: usize = MAX_MEMORY_READ_BYTES as usize;
 /// Largest compare-before-write mutation accepted by this boundary.
 pub const MAX_COMPARE_WRITE_BYTES: usize = MAX_MEMORY_WRITE_BYTES;
 
-/// Explicit authority-free selection used to open a live process handle.
+/// Exact comparison data used to open a live process handle.
 ///
-/// This request is not an attach lease and does not authorize execution
-/// control. The Windows adapter derives the process start key and runtime image
-/// mapping itself and rejects an executable whose exact SHA-256 differs.
+/// This cloneable value is not an attach lease, proves no provenance, and does
+/// not authorize execution control. A trusted provider must populate its start
+/// key and image base from prior process/debug-event evidence. The Windows
+/// adapter independently re-derives them and rejects an executable whose exact
+/// SHA-256 differs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenLiveProcessRequest {
     process_id: ProcessId,
+    expected_start_key: ProcessStartKey,
+    expected_main_image_base: MemoryAddress,
     expected_main_module_binary_id: BinaryId,
 }
 
 impl OpenLiveProcessRequest {
     #[must_use]
-    pub const fn new(process_id: ProcessId, expected_main_module_binary_id: BinaryId) -> Self {
+    pub const fn new(
+        process_id: ProcessId,
+        expected_start_key: ProcessStartKey,
+        expected_main_image_base: MemoryAddress,
+        expected_main_module_binary_id: BinaryId,
+    ) -> Self {
         Self {
             process_id,
+            expected_start_key,
+            expected_main_image_base,
             expected_main_module_binary_id,
         }
     }
@@ -52,6 +65,16 @@ impl OpenLiveProcessRequest {
     #[must_use]
     pub const fn process_id(&self) -> ProcessId {
         self.process_id
+    }
+
+    #[must_use]
+    pub const fn expected_start_key(&self) -> ProcessStartKey {
+        self.expected_start_key
+    }
+
+    #[must_use]
+    pub const fn expected_main_image_base(&self) -> MemoryAddress {
+        self.expected_main_image_base
     }
 
     #[must_use]

@@ -35,9 +35,10 @@ provider. The current types and UI must not be described as a working malware sa
 debugger.
 
 The separate Windows-only `resymbol-windows-live-access` crate is a lower-level building block, not
-a provider. It opens one explicitly selected PID only when the current executable's exact SHA-256
-matches the caller's expectation, derives the creation `FILETIME`, actual ASLR main-module base, and
-PE `SizeOfImage`, and returns the validated protocol `LiveTargetBinding`. Separate read-only and
+a provider. It opens one explicitly selected PID only when its creation `FILETIME`, debug-event image
+base, and current executable's exact SHA-256 match the caller's prior evidence; the start key detects
+PID reuse across handle acquisition. It independently derives the actual ASLR main-module base and PE
+`SizeOfImage`, and returns the validated protocol `LiveTargetBinding`. Separate read-only and
 mutating typestates request different process rights, and the read-only type has no write method. The
 exact executable is hashed and parsed through one file handle retained without write/delete sharing;
 its `SizeOfImage` must match both Tool Help's main module and the remote PE header. This strongly
@@ -48,11 +49,18 @@ same-account actor able to duplicate/tamper with handles or mutate process state
 Its public reads accept only bounded exact main-image RVA spans and revalidate the binding before and
 after the read. A write accepts only the exact retained binding, exact expected bytes, and an
 equal-length changed replacement inside one uniform committed executable `MEM_IMAGE` region. It
-compare-checks before changing protection, flushes the instruction cache, restores the captured
-protection, verifies readback, and reports whether recovery restored bytes/cache/protection after any
-later failure. It rejects cross-region writes rather than restoring one region's protection over
-another. It does not stop threads or grant mutation authority: an authenticated provider must retain
-a current stopped-state token and keep the target stopped for the complete operation.
+compare-checks before and after changing protection, flushes the instruction cache, restores the
+captured protection, verifies readback, and reports whether recovery restored
+bytes/cache/protection after any later failure. It rejects cross-region and cross-system-page writes
+rather than restoring a first page's protection over another. A pre-write race restores only
+protection and reports that ReSymbol made no byte-write attempt; it does not claim target-side bytes
+were stable. It does not stop threads or grant mutation authority: an authenticated provider must
+retain a current stopped-state token and keep the target stopped for the complete operation.
+
+The adapter compares Tool Help's reported main-module path with the retained file, requires the
+reported base to equal caller-supplied independent create-process debug-event evidence, and validates
+every reported image region; Tool Help itself remains target-loader-derived corroboration. The debug
+event's image-file handle should be retained when Windows supplies it.
 
 ## Ownership and thread affinity
 

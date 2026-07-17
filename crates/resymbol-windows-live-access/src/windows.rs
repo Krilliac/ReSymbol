@@ -37,6 +37,7 @@ use windows_sys::Win32::{
             PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_NOACCESS,
             PAGE_PROTECTION_FLAGS, VirtualProtectEx, VirtualQueryEx,
         },
+        SystemInformation::{GetSystemInfo, SYSTEM_INFO},
         Threading::{
             GetProcessId, GetProcessTimes, OpenProcess, PROCESS_QUERY_INFORMATION,
             PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE, QueryFullProcessImageNameW,
@@ -113,10 +114,18 @@ impl<Mode> LiveProcessAccess<Mode> {
         // returned real handle is immediately transferred to `OwnedHandle`.
         let raw = unsafe { OpenProcess(process_access, FALSE, request.process_id().get()) };
         let process = owned_handle(raw, "open selected live process")?;
+        let actual_start_key = process_start_key(&process)?;
+        if actual_start_key != request.expected_start_key().get() {
+            return Err(LiveAccessError::ProcessStartIdentityMismatch {
+                expected: request.expected_start_key().get(),
+                actual: actual_start_key,
+            });
+        }
         let executable = open_exact_executable(&process, request.expected_main_module_binary_id())?;
         let binding = observe_live_target(
             &process,
             request.process_id(),
+            request.expected_main_image_base(),
             request.expected_main_module_binary_id(),
             &executable,
         )?;
@@ -181,6 +190,7 @@ impl<Mode> LiveProcessAccess<Mode> {
         let observed = observe_live_target(
             &self.process,
             self.binding.process().process_id,
+            self.binding.actual_image_base(),
             self.binding.main_module_binary_id(),
             &self.executable,
         )?;
@@ -200,9 +210,10 @@ impl LiveProcessAccess<MutationAccess> {
     /// The caller must present the exact retained binding and exact bytes it
     /// expects to replace. The operation revalidates binding before comparison,
     /// again immediately before changing protection, and after readback. It
-    /// rejects cross-region writes so one captured page protection can be
-    /// restored exactly, flushes the instruction cache, restores protection,
-    /// and verifies the replacement bytes before returning a receipt.
+    /// rejects cross-region and cross-system-page writes so one captured page
+    /// protection can be restored exactly, flushes the instruction cache,
+    /// restores protection, and verifies the replacement bytes before
+    /// returning a receipt.
     pub fn compare_before_write_rva(
         &mut self,
         expected_binding: &LiveTargetBinding,
@@ -235,30 +246,86 @@ impl LiveProcessAccess<MutationAccess> {
             PAGE_EXECUTE_READWRITE,
         )?;
         if original_protection != region.protection {
-            let recovery =
-                recover_original_bytes(&self.process, address, expected, original_protection, true);
+            // `VirtualProtectEx` changed protection, but ReSymbol has not
+            // written any bytes. Abort without calling byte recovery: doing so
+            // could overwrite a concurrent target-side change with the stale
+            // compare buffer. Only undo our protection change.
+            let protection_restored = self.restore_prewrite_protection(
+                expected_binding,
+                address,
+                expected.len(),
+                original_protection,
+            );
             return Err(LiveAccessError::MutationFailed {
                 stage: MutationStage::ProtectionRace,
                 failure: format!(
                     "queried protection {:#x} changed to {original_protection:#x}",
                     region.protection
                 ),
-                recovery,
+                recovery: MutationRecovery::NoWriteAttempted {
+                    protection_restored,
+                },
             });
+        }
+
+        match read_raw_exact(&self.process, address, expected.len()) {
+            Ok(actual) if actual == expected => {}
+            Ok(_) => {
+                let protection_restored = self.restore_prewrite_protection(
+                    expected_binding,
+                    address,
+                    expected.len(),
+                    original_protection,
+                );
+                return Err(LiveAccessError::MutationFailed {
+                    stage: MutationStage::RevalidateExpectedBytes,
+                    failure: "live bytes changed after the initial comparison".to_owned(),
+                    recovery: MutationRecovery::NoWriteAttempted {
+                        protection_restored,
+                    },
+                });
+            }
+            Err(error) => {
+                let protection_restored = self.restore_prewrite_protection(
+                    expected_binding,
+                    address,
+                    expected.len(),
+                    original_protection,
+                );
+                return Err(LiveAccessError::MutationFailed {
+                    stage: MutationStage::RevalidateExpectedBytes,
+                    failure: error.to_string(),
+                    recovery: MutationRecovery::NoWriteAttempted {
+                        protection_restored,
+                    },
+                });
+            }
         }
 
         if let Err(error) = write_raw_exact(&self.process, address, replacement) {
             return Err(mutation_failure(
                 MutationStage::WriteReplacement,
                 error,
-                recover_original_bytes(&self.process, address, expected, original_protection, true),
+                self.recover_original_bytes(
+                    expected_binding,
+                    address,
+                    expected,
+                    original_protection,
+                    true,
+                ),
             ));
         }
         if let Err(error) = flush_raw(&self.process, address, replacement.len()) {
             return Err(mutation_failure(
                 MutationStage::FlushReplacement,
                 error,
-                recover_original_bytes(&self.process, address, expected, original_protection, true),
+                self.recover_original_bytes(
+                    expected_binding,
+                    address,
+                    expected,
+                    original_protection,
+                    true,
+                ),
             ));
         }
         if let Err(error) = restore_raw(
@@ -270,7 +337,13 @@ impl LiveProcessAccess<MutationAccess> {
             return Err(mutation_failure(
                 MutationStage::RestoreProtection,
                 error,
-                recover_original_bytes(&self.process, address, expected, original_protection, true),
+                self.recover_original_bytes(
+                    expected_binding,
+                    address,
+                    expected,
+                    original_protection,
+                    true,
+                ),
             ));
         }
 
@@ -280,8 +353,8 @@ impl LiveProcessAccess<MutationAccess> {
                 return Err(LiveAccessError::MutationFailed {
                     stage: MutationStage::VerifyReplacement,
                     failure: "replacement readback did not match".to_owned(),
-                    recovery: recover_original_bytes(
-                        &self.process,
+                    recovery: self.recover_original_bytes(
+                        expected_binding,
                         address,
                         expected,
                         original_protection,
@@ -293,8 +366,8 @@ impl LiveProcessAccess<MutationAccess> {
                 return Err(mutation_failure(
                     MutationStage::VerifyReplacement,
                     error,
-                    recover_original_bytes(
-                        &self.process,
+                    self.recover_original_bytes(
+                        expected_binding,
                         address,
                         expected,
                         original_protection,
@@ -308,8 +381,8 @@ impl LiveProcessAccess<MutationAccess> {
             return Err(mutation_failure(
                 MutationStage::ValidateFinalBinding,
                 error,
-                recover_original_bytes(
-                    &self.process,
+                self.recover_original_bytes(
+                    expected_binding,
                     address,
                     expected,
                     original_protection,
@@ -323,6 +396,80 @@ impl LiveProcessAccess<MutationAccess> {
             rva,
             bytes_written: replacement.len(),
         })
+    }
+
+    fn recover_original_bytes(
+        &self,
+        expected_binding: &LiveTargetBinding,
+        address: u64,
+        expected: &[u8],
+        original_protection: PAGE_PROTECTION_FLAGS,
+        protection_may_be_changed: bool,
+    ) -> MutationRecovery {
+        if self.ensure_exact_binding(expected_binding).is_err() {
+            return MutationRecovery::Indeterminate {
+                bytes_restored: false,
+                instruction_cache_flushed: false,
+                protection_restored: false,
+            };
+        }
+        let Ok(region) =
+            writable_code_region(&self.process, expected_binding, address, expected.len())
+        else {
+            return MutationRecovery::Indeterminate {
+                bytes_restored: false,
+                instruction_cache_flushed: false,
+                protection_restored: false,
+            };
+        };
+        let protection_is_changed = if protection_may_be_changed {
+            if region.protection == PAGE_EXECUTE_READWRITE {
+                true
+            } else if region.protection == original_protection {
+                false
+            } else {
+                return MutationRecovery::Indeterminate {
+                    bytes_restored: false,
+                    instruction_cache_flushed: false,
+                    protection_restored: false,
+                };
+            }
+        } else if region.protection == original_protection {
+            false
+        } else {
+            return MutationRecovery::Indeterminate {
+                bytes_restored: false,
+                instruction_cache_flushed: false,
+                protection_restored: false,
+            };
+        };
+        recover_original_bytes_unchecked(
+            &self.process,
+            address,
+            expected,
+            original_protection,
+            protection_is_changed,
+        )
+    }
+
+    fn restore_prewrite_protection(
+        &self,
+        expected_binding: &LiveTargetBinding,
+        address: u64,
+        size: usize,
+        original_protection: PAGE_PROTECTION_FLAGS,
+    ) -> bool {
+        if self.ensure_exact_binding(expected_binding).is_err() {
+            return false;
+        }
+        let Ok(region) = writable_code_region(&self.process, expected_binding, address, size)
+        else {
+            return false;
+        };
+        if region.protection != PAGE_EXECUTE_READWRITE {
+            return false;
+        }
+        restore_raw(&self.process, address, size, original_protection).is_ok()
     }
 }
 
@@ -355,6 +502,8 @@ impl WriteReceipt {
 pub enum MutationStage {
     #[error("detecting a protection race")]
     ProtectionRace,
+    #[error("revalidating expected bytes after changing protection")]
+    RevalidateExpectedBytes,
     #[error("writing replacement bytes")]
     WriteReplacement,
     #[error("flushing replacement instructions")]
@@ -369,6 +518,15 @@ pub enum MutationStage {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MutationRecovery {
+    /// ReSymbol detected failure before calling `WriteProcessMemory`.
+    ///
+    /// This makes no claim about concurrent target-side writes; it records
+    /// only that this operation did not attempt to modify the byte span.
+    NoWriteAttempted {
+        /// Whether the protection observed immediately before ReSymbol's
+        /// change was successfully restored.
+        protection_restored: bool,
+    },
     Restored,
     Indeterminate {
         bytes_restored: bool,
@@ -380,6 +538,12 @@ pub enum MutationRecovery {
 impl fmt::Display for MutationRecovery {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::NoWriteAttempted {
+                protection_restored,
+            } => write!(
+                formatter,
+                "no byte write attempted (protection_restored={protection_restored})"
+            ),
             Self::Restored => formatter.write_str("original bytes and protection restored"),
             Self::Indeterminate {
                 bytes_restored,
@@ -409,6 +573,10 @@ pub enum LiveAccessError {
     ProcessIdChanged,
     #[error("selected process creation identity changed")]
     ProcessStartIdentityChanged,
+    #[error(
+        "selected process creation identity mismatch: expected {expected:#x}, observed {actual:#x}"
+    )]
+    ProcessStartIdentityMismatch { expected: u64, actual: u64 },
     #[error("Windows returned an invalid zero process creation identity")]
     ZeroProcessStartKey,
     #[error("queried executable path is empty, relative, or over the Windows path bound")]
@@ -441,6 +609,14 @@ pub enum LiveAccessError {
     ModuleProcessMismatch,
     #[error("main module has a zero base or zero image size")]
     EmptyMainModule,
+    #[error("Tool Help returned an empty, relative, or truncated main-module path")]
+    InvalidMainModulePath,
+    #[error("Tool Help's main-module path differs from the retained exact executable")]
+    MainModulePathMismatch,
+    #[error(
+        "main-module base differs from provider evidence: expected {expected:#x}, observed {actual:#x}"
+    )]
+    MainModuleBaseMismatch { expected: u64, actual: u64 },
     #[error("main module range overflows the target address space")]
     MainModuleRangeOverflow,
     #[error("main-module file SizeOfImage {file:#x} differs from Tool Help size {module:#x}")]
@@ -469,8 +645,12 @@ pub enum LiveAccessError {
         "live bytes no longer match the compare-before-write expectation at RVA {rva:#x} ({size} bytes)"
     )]
     CompareMismatch { rva: u64, size: usize },
-    #[error("write span is not wholly inside one committed executable main-image region")]
+    #[error(
+        "write span is not wholly inside one committed executable main-image region and one system page"
+    )]
     UnsafeWriteRegion,
+    #[error("Windows returned an invalid zero system page size")]
+    InvalidSystemPageSize,
     #[error("mutation failed while {stage}: {failure}; recovery: {recovery}")]
     MutationFailed {
         stage: MutationStage,
@@ -501,6 +681,7 @@ struct WritableCodeRegion {
 fn observe_live_target(
     process: &OwnedHandle,
     selected_pid: resymbol_debugger::protocol::ProcessId,
+    expected_image_base: MemoryAddress,
     expected_binary_id: &BinaryId,
     executable: &ExactExecutable,
 ) -> Result<LiveTargetBinding, LiveAccessError> {
@@ -517,7 +698,13 @@ fn observe_live_target(
     let start_key_before = process_start_key(process)?;
     validate_exact_executable(process, executable)?;
 
-    let module = main_module(selected_pid.get())?;
+    let module = main_module(selected_pid.get(), &executable.path)?;
+    if module.base != expected_image_base.get() {
+        return Err(LiveAccessError::MainModuleBaseMismatch {
+            expected: expected_image_base.get(),
+            actual: module.base,
+        });
+    }
     validate_main_module_mapping(process, module)?;
     if executable.size_of_image != module.size_of_image {
         return Err(LiveAccessError::FileModuleSizeMismatch {
@@ -824,7 +1011,7 @@ fn nt_size_of_image(nt: &[u8; NT_HEADER_PREFIX_BYTES]) -> Result<u32, LiveAccess
     Ok(size)
 }
 
-fn main_module(process_id: u32) -> Result<MainModule, LiveAccessError> {
+fn main_module(process_id: u32, expected_path: &Path) -> Result<MainModule, LiveAccessError> {
     for attempt in 0..MODULE_SNAPSHOT_ATTEMPTS {
         // SAFETY: arguments are scalar snapshot flags and the selected PID;
         // any valid returned handle is immediately transferred to one owner.
@@ -856,6 +1043,11 @@ fn main_module(process_id: u32) -> Result<MainModule, LiveAccessError> {
         if entry.th32ProcessID != process_id {
             return Err(LiveAccessError::ModuleProcessMismatch);
         }
+        let module_path = module_entry_path(&entry)?;
+        let module_path = canonical_executable_path(&module_path)?;
+        if module_path != expected_path {
+            return Err(LiveAccessError::MainModulePathMismatch);
+        }
         let base = pointer_to_u64(entry.modBaseAddr.cast_const().cast());
         if base == 0 || entry.modBaseSize == 0 {
             return Err(LiveAccessError::EmptyMainModule);
@@ -870,29 +1062,81 @@ fn main_module(process_id: u32) -> Result<MainModule, LiveAccessError> {
     Err(last_win32("snapshot selected process modules"))
 }
 
+fn module_entry_path(entry: &MODULEENTRY32W) -> Result<PathBuf, LiveAccessError> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+
+    let Some(length) = entry.szExePath.iter().position(|character| *character == 0) else {
+        return Err(LiveAccessError::InvalidMainModulePath);
+    };
+    // A terminator only in the final fixed-size slot is indistinguishable from
+    // a truncated Tool Help path. Reject that ambiguous edge rather than
+    // treating a prefix as exact module evidence.
+    if length == 0 || length + 1 == entry.szExePath.len() {
+        return Err(LiveAccessError::InvalidMainModulePath);
+    }
+    let path = PathBuf::from(OsString::from_wide(&entry.szExePath[..length]));
+    if !path.is_absolute() {
+        return Err(LiveAccessError::InvalidMainModulePath);
+    }
+    Ok(path)
+}
+
 fn validate_main_module_mapping(
     process: &OwnedHandle,
     module: MainModule,
 ) -> Result<(), LiveAccessError> {
-    let information = query_region(process, module.base)?;
-    let allocation_base = pointer_to_u64(information.AllocationBase.cast_const());
-    let region_base = pointer_to_u64(information.BaseAddress.cast_const());
-    let region_end = region_base
-        .checked_add(usize_to_u64(information.RegionSize))
-        .ok_or(LiveAccessError::MainModuleRangeOverflow)?;
     let module_end = module
         .base
         .checked_add(u64::from(module.size_of_image))
         .ok_or(LiveAccessError::MainModuleRangeOverflow)?;
-    if allocation_base != module.base
-        || region_base != module.base
-        || information.State != MEM_COMMIT
-        || information.Type != MEM_IMAGE
+
+    let mut cursor = module.base;
+    while cursor < module_end {
+        let information = query_region(process, cursor)?;
+        let allocation_base = pointer_to_u64(information.AllocationBase.cast_const());
+        let region_base = pointer_to_u64(information.BaseAddress.cast_const());
+        cursor = next_main_image_cursor(
+            module,
+            cursor,
+            allocation_base,
+            region_base,
+            usize_to_u64(information.RegionSize),
+            information.State,
+            information.Type,
+        )?;
+    }
+    Ok(())
+}
+
+fn next_main_image_cursor(
+    module: MainModule,
+    cursor: u64,
+    allocation_base: u64,
+    region_base: u64,
+    region_size: u64,
+    state: u32,
+    memory_type: u32,
+) -> Result<u64, LiveAccessError> {
+    let module_end = module
+        .base
+        .checked_add(u64::from(module.size_of_image))
+        .ok_or(LiveAccessError::MainModuleRangeOverflow)?;
+    let region_end = region_base
+        .checked_add(region_size)
+        .ok_or(LiveAccessError::MainModuleRangeOverflow)?;
+    if cursor < module.base
+        || cursor >= module_end
+        || allocation_base != module.base
+        || region_base != cursor
+        || state != MEM_COMMIT
+        || memory_type != MEM_IMAGE
+        || region_end <= cursor
         || region_end > module_end
     {
         return Err(LiveAccessError::InvalidMainModuleMapping);
     }
-    Ok(())
+    Ok(region_end)
 }
 
 fn remote_pe_size_of_image(
@@ -936,6 +1180,7 @@ fn writable_code_region(
     let write_end = address
         .checked_add(usize_to_u64(size))
         .ok_or(LiveAccessError::UnsafeWriteRegion)?;
+    let page_size = system_page_size()?;
     let protection_base = information.Protect & PROTECTION_BASE_MASK;
     let executable = matches!(
         protection_base,
@@ -949,12 +1194,38 @@ fn writable_code_region(
         || information.Protect & PAGE_GUARD != 0
         || protection_base == PAGE_NOACCESS
         || !executable
+        || !span_fits_single_page(address, size, page_size)
     {
         return Err(LiveAccessError::UnsafeWriteRegion);
     }
     Ok(WritableCodeRegion {
         protection: information.Protect,
     })
+}
+
+fn span_fits_single_page(address: u64, size: usize, page_size: u64) -> bool {
+    if size == 0 || page_size == 0 {
+        return false;
+    }
+    let Some(end) = address.checked_add(usize_to_u64(size)) else {
+        return false;
+    };
+    let Some(last_address) = end.checked_sub(1) else {
+        return false;
+    };
+    address / page_size == last_address / page_size
+}
+
+fn system_page_size() -> Result<u64, LiveAccessError> {
+    let mut information = SYSTEM_INFO::default();
+    // SAFETY: `information` is writable at the exact size expected by Win32.
+    unsafe { GetSystemInfo(&mut information) };
+    let page_size = u64::from(information.dwPageSize);
+    if page_size == 0 {
+        Err(LiveAccessError::InvalidSystemPageSize)
+    } else {
+        Ok(page_size)
+    }
 }
 
 fn query_region(
@@ -1096,7 +1367,7 @@ fn flush_raw(process: &OwnedHandle, address: u64, size: usize) -> Result<(), Liv
     }
 }
 
-fn recover_original_bytes(
+fn recover_original_bytes_unchecked(
     process: &OwnedHandle,
     address: u64,
     expected: &[u8],
@@ -1194,9 +1465,17 @@ fn last_win32(operation: &'static str) -> LiveAccessError {
 
 #[cfg(test)]
 mod tests {
+    use std::{os::windows::ffi::OsStrExt as _, path::Path};
+
+    use windows_sys::Win32::System::{
+        Diagnostics::ToolHelp::MODULEENTRY32W,
+        Memory::{MEM_COMMIT, MEM_IMAGE},
+    };
+
     use super::{
-        DOS_HEADER_BYTES, IMAGE_DOS_SIGNATURE, LiveAccessError, NT_HEADER_PREFIX_BYTES,
-        PE_SIGNATURE_BYTES, PE32_PLUS_MAGIC, nt_size_of_image, pe_offset,
+        DOS_HEADER_BYTES, IMAGE_DOS_SIGNATURE, LiveAccessError, MainModule, MutationRecovery,
+        NT_HEADER_PREFIX_BYTES, PE_SIGNATURE_BYTES, PE32_PLUS_MAGIC, module_entry_path,
+        next_main_image_cursor, nt_size_of_image, pe_offset, span_fits_single_page,
     };
 
     fn valid_headers() -> ([u8; DOS_HEADER_BYTES], [u8; NT_HEADER_PREFIX_BYTES]) {
@@ -1242,5 +1521,186 @@ mod tests {
             nt_size_of_image(&nt),
             Err(LiveAccessError::InvalidPeImage { .. })
         ));
+    }
+
+    #[test]
+    fn module_entry_path_requires_unambiguous_absolute_utf16() {
+        let absolute = Path::new(r"C:\Program Files\ReSymbol\fixture.exe");
+        let encoded: Vec<u16> = absolute.as_os_str().encode_wide().collect();
+        let mut entry = MODULEENTRY32W::default();
+        assert!(encoded.len() + 1 < entry.szExePath.len());
+        entry.szExePath[..encoded.len()].copy_from_slice(&encoded);
+        assert_eq!(
+            module_entry_path(&entry).expect("absolute terminated module path"),
+            absolute.to_path_buf()
+        );
+
+        let mut empty = MODULEENTRY32W::default();
+        assert!(matches!(
+            module_entry_path(&empty),
+            Err(LiveAccessError::InvalidMainModulePath)
+        ));
+
+        let relative = Path::new("fixture.exe");
+        let encoded: Vec<u16> = relative.as_os_str().encode_wide().collect();
+        empty.szExePath[..encoded.len()].copy_from_slice(&encoded);
+        assert!(matches!(
+            module_entry_path(&empty),
+            Err(LiveAccessError::InvalidMainModulePath)
+        ));
+
+        let mut unterminated = MODULEENTRY32W::default();
+        unterminated.szExePath.fill(u16::from(b'x'));
+        assert!(matches!(
+            module_entry_path(&unterminated),
+            Err(LiveAccessError::InvalidMainModulePath)
+        ));
+
+        let mut ambiguous = MODULEENTRY32W::default();
+        let last = ambiguous.szExePath.len() - 1;
+        ambiguous.szExePath[..last].fill(u16::from(b'x'));
+        ambiguous.szExePath[..3].copy_from_slice(&[
+            u16::from(b'C'),
+            u16::from(b':'),
+            u16::from(b'\\'),
+        ]);
+        assert!(matches!(
+            module_entry_path(&ambiguous),
+            Err(LiveAccessError::InvalidMainModulePath)
+        ));
+    }
+
+    #[test]
+    fn complete_main_image_walk_rejects_gaps_aliases_and_overshoot() {
+        let module = MainModule {
+            base: 0x1_0000,
+            size_of_image: 0x3_000,
+        };
+        let second = next_main_image_cursor(
+            module,
+            module.base,
+            module.base,
+            module.base,
+            0x1_000,
+            MEM_COMMIT,
+            MEM_IMAGE,
+        )
+        .expect("first exact image region");
+        assert_eq!(second, 0x1_1000);
+        assert_eq!(
+            next_main_image_cursor(
+                module,
+                second,
+                module.base,
+                second,
+                0x2_000,
+                MEM_COMMIT,
+                MEM_IMAGE,
+            )
+            .expect("second exact image region"),
+            0x1_3000
+        );
+
+        let invalid = [
+            (module.base + 1, module.base, 0x1_000, MEM_COMMIT, MEM_IMAGE),
+            (module.base, module.base + 1, 0x1_000, MEM_COMMIT, MEM_IMAGE),
+            (module.base, module.base, 0, MEM_COMMIT, MEM_IMAGE),
+            (module.base, module.base, 0x1_000, 0, MEM_IMAGE),
+            (module.base, module.base, 0x1_000, MEM_COMMIT, 0),
+            (module.base, module.base, 0x4_000, MEM_COMMIT, MEM_IMAGE),
+        ];
+        for (allocation_base, region_base, region_size, state, memory_type) in invalid {
+            assert!(matches!(
+                next_main_image_cursor(
+                    module,
+                    module.base,
+                    allocation_base,
+                    region_base,
+                    region_size,
+                    state,
+                    memory_type,
+                ),
+                Err(LiveAccessError::InvalidMainModuleMapping)
+            ));
+        }
+        assert!(matches!(
+            next_main_image_cursor(
+                module,
+                module.base - 1,
+                module.base,
+                module.base - 1,
+                1,
+                MEM_COMMIT,
+                MEM_IMAGE,
+            ),
+            Err(LiveAccessError::InvalidMainModuleMapping)
+        ));
+        assert!(matches!(
+            next_main_image_cursor(
+                module,
+                module.base + u64::from(module.size_of_image),
+                module.base,
+                module.base + u64::from(module.size_of_image),
+                1,
+                MEM_COMMIT,
+                MEM_IMAGE,
+            ),
+            Err(LiveAccessError::InvalidMainModuleMapping)
+        ));
+
+        let overflowing_module = MainModule {
+            base: u64::MAX - 0x10,
+            size_of_image: 0x100,
+        };
+        assert!(matches!(
+            next_main_image_cursor(
+                overflowing_module,
+                overflowing_module.base,
+                overflowing_module.base,
+                overflowing_module.base,
+                1,
+                MEM_COMMIT,
+                MEM_IMAGE,
+            ),
+            Err(LiveAccessError::MainModuleRangeOverflow)
+        ));
+        let overflowing_region = MainModule {
+            base: u64::MAX - 0x2_000,
+            size_of_image: 0x1_000,
+        };
+        assert!(matches!(
+            next_main_image_cursor(
+                overflowing_region,
+                overflowing_region.base,
+                overflowing_region.base,
+                overflowing_region.base,
+                0x3_000,
+                MEM_COMMIT,
+                MEM_IMAGE,
+            ),
+            Err(LiveAccessError::MainModuleRangeOverflow)
+        ));
+    }
+
+    #[test]
+    fn write_spans_are_nonempty_overflow_safe_and_page_bounded() {
+        assert!(span_fits_single_page(0x1_000, 1, 0x1_000));
+        assert!(span_fits_single_page(0x1_000, 0x1_000, 0x1_000));
+        assert!(span_fits_single_page(0x1_001, 0xfff, 0x1_000));
+        assert!(!span_fits_single_page(0x1_fff, 2, 0x1_000));
+        assert!(!span_fits_single_page(0x1_000, 0, 0x1_000));
+        assert!(!span_fits_single_page(0x1_000, 1, 0));
+        assert!(!span_fits_single_page(u64::MAX, 2, 0x1_000));
+    }
+
+    #[test]
+    fn prewrite_failure_evidence_does_not_claim_target_bytes_are_stable() {
+        assert_eq!(
+            MutationRecovery::NoWriteAttempted {
+                protection_restored: true,
+            }
+            .to_string(),
+            "no byte write attempted (protection_restored=true)"
+        );
     }
 }

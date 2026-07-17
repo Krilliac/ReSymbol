@@ -10,18 +10,22 @@ prereleases; breaking changes remain explicit.
 
 - Added `resymbol-windows-live-access`, a narrowly scoped Windows-only process-memory foundation
   for a future authenticated debugger helper. It opens only an explicitly selected PID with an
-  expected executable SHA-256, derives a trusted process-creation `FILETIME`, and retains the exact
+  expected executable SHA-256 plus previously observed creation `FILETIME` and debug-event image
+  base, independently re-derives both runtime values, and retains the exact
   hashed/parsed executable file handle without write/delete sharing for the access object's lifetime.
   Its PE `SizeOfImage` is corroborated against both the Tool Help main-module record and remote PE
   header before constructing `LiveTargetBinding` with the actual ASLR base. Read-only and explicitly
   mutating opens request different least-privilege process rights. Public operations re-derive the
   binding from the retained evidence; reads are exact and bounded to the main image, while writes
   require the exact binding, exact expected bytes, an equal-length changed replacement, and one
-  committed executable `MEM_IMAGE` region. A mutation compare-checks first, changes and restores
-  the region's exact protection, flushes the instruction cache, verifies
-  readback, and reports truthful recovery evidence after any post-protection failure. This primitive
+  committed executable `MEM_IMAGE` region and one system page. A mutation compare-checks before and
+  after changing protection, restores protection without attempting a byte write if either race
+  check fails, flushes the instruction cache, verifies readback, and reports truthful recovery
+  evidence after any post-protection failure. This primitive
   does not attach, stop, launch, resume, step, set breakpoints, authenticate a transport, or wire the
   workbench, and a future provider must hold the process stopped before granting mutation authority.
+  Tool Help module discovery is only corroborating evidence; the request's image base must come from
+  independent authenticated debug-event evidence before the caller treats the binding as authority.
 - Added a bounded x64 linear-disassembly preview to the workbench Address Space reader. Hex and
   disassembly views share the same verified frozen-source bytes; independent byte and instruction
   limits, explicit stop reasons, and the visible "not CFG or function-boundary truth" disclaimer
