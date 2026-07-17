@@ -6,6 +6,10 @@ use resymbol_core::{
     DiscoveredPlugin, PluginDiscoveryOptions, PluginSource, discover_plugins,
     plugin_api::{PluginHealthState, PluginRuntimeKind},
 };
+use resymbol_plugin_state::{
+    ArtifactStateKey, ArtifactTrustPolicy, FingerprintLimits, PluginExecutionPolicy,
+    PluginStateStore, fingerprint_plugin_directory,
+};
 
 use crate::{AppError, AppServices};
 
@@ -33,9 +37,67 @@ impl PluginCatalog {
         &self.entries
     }
 
+    /// Count candidates that pass discovery and manifest-level loadability checks.
+    ///
+    /// This does not include exact-artifact trust policy. A loadable non-WASM plugin may still
+    /// require approval for its current fingerprint.
     #[must_use]
     pub fn loadable_count(&self) -> usize {
         self.entries.iter().filter(|entry| entry.loadable).count()
+    }
+
+    /// Count candidates that pass both discovery and exact-artifact policy.
+    #[must_use]
+    pub fn artifact_policy_allowed_count(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| entry.artifact_policy.allows_by_artifact_policy())
+            .count()
+    }
+}
+
+/// Effective discovery and exact-artifact policy status for one plugin candidate.
+///
+/// Passing this policy is necessary but not sufficient for command-line execution. Discovery
+/// already evaluates manifest validity, API compatibility, entrypoint safety, duplicate IDs, and
+/// declared plugin dependencies. Runtime support, capability selection, host/helper availability,
+/// granted permissions, target compatibility, and launch-time revalidation are separate gates. The
+/// desktop workbench only presents this status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginArtifactPolicyStatus {
+    /// A WASM artifact does not require an approval record under the sandboxed policy.
+    Sandboxed,
+    /// A non-WASM artifact's exact ID and artifact fingerprint are trusted.
+    Trusted,
+    /// A non-WASM artifact needs approval for this exact fingerprint.
+    ApprovalRequired,
+    /// Discovery, safe mode, host configuration, or a manual sentinel disables the candidate.
+    Disabled,
+    /// Discovery or exact-artifact state quarantined the artifact.
+    Quarantined,
+    /// Host-owned policy state could not be validated and the policy fails closed.
+    CorruptState,
+    /// Compatibility, packaging, or fingerprinting blocks exact-artifact policy evaluation.
+    Unavailable,
+}
+
+impl PluginArtifactPolicyStatus {
+    #[must_use]
+    pub const fn allows_by_artifact_policy(self) -> bool {
+        matches!(self, Self::Sandboxed | Self::Trusted)
+    }
+
+    #[must_use]
+    pub const fn badge_label(self) -> &'static str {
+        match self {
+            Self::Sandboxed => "SANDBOXED",
+            Self::Trusted => "TRUSTED",
+            Self::ApprovalRequired => "APPROVAL REQUIRED",
+            Self::Disabled => "DISABLED",
+            Self::Quarantined => "QUARANTINED",
+            Self::CorruptState => "CORRUPT STATE",
+            Self::Unavailable => "UNAVAILABLE",
+        }
     }
 }
 
@@ -53,13 +115,31 @@ pub struct PluginCatalogEntry {
     pub description: Option<String>,
     pub runtime: Option<String>,
     pub health: String,
+    /// Whether discovery and manifest-level checks consider the candidate loadable.
+    ///
+    /// This is intentionally distinct from [`Self::artifact_policy`].
     pub loadable: bool,
+    /// Canonical lowercase SHA-256 fingerprint of this exact unpacked artifact.
+    pub artifact_fingerprint: Option<String>,
+    /// Effective discovery and exact-artifact policy status.
+    pub artifact_policy: PluginArtifactPolicyStatus,
     pub diagnostics: Vec<String>,
     pub capabilities: Vec<String>,
     pub permissions: Vec<String>,
 }
 
 impl AppServices {
+    /// Inspect normal exact-artifact plugin policy without loading or executing a plugin.
+    ///
+    /// Desktop callers should use this workflow instead of safe-mode discovery when they need an
+    /// accurate health report. Passing artifact policy is not a complete CLI execution decision.
+    pub fn inspect_plugin_catalog(
+        &self,
+        root: impl AsRef<Path>,
+    ) -> Result<PluginCatalog, AppError> {
+        self.discover_plugins(root, false)
+    }
+
     /// Discover plugin metadata without loading or executing any plugin.
     pub fn discover_plugins(
         &self,
@@ -73,10 +153,11 @@ impl AppServices {
         };
         let report = discover_plugins(root, &options)
             .map_err(|source| AppError::io("scan plugin directory", root, source))?;
+        let state = PluginStateStore::new(&report.root);
         let entries = report
             .plugins
             .iter()
-            .map(PluginCatalogEntry::from_discovered)
+            .map(|plugin| PluginCatalogEntry::from_discovered(plugin, &state))
             .collect();
         Ok(PluginCatalog {
             root: report.root,
@@ -87,7 +168,7 @@ impl AppServices {
 }
 
 impl PluginCatalogEntry {
-    fn from_discovered(plugin: &DiscoveredPlugin) -> Self {
+    fn from_discovered(plugin: &DiscoveredPlugin, state: &PluginStateStore) -> Self {
         let manifest = plugin.manifest.as_ref();
         let diagnostics = plugin
             .health
@@ -121,7 +202,7 @@ impl PluginCatalogEntry {
             })
             .unwrap_or_default();
 
-        Self {
+        let mut entry = Self {
             path: plugin.path.clone(),
             source: plugin_source_label(plugin.source).to_owned(),
             id: manifest.map(|value| value.id.as_str().to_owned()),
@@ -131,10 +212,81 @@ impl PluginCatalogEntry {
             runtime: manifest.map(|value| runtime_kind_label(value.runtime.kind()).to_owned()),
             health: health_label(plugin.health.state).to_owned(),
             loadable: plugin.is_loadable(),
+            artifact_fingerprint: None,
+            artifact_policy: discovery_policy(plugin.health.state),
             diagnostics,
             capabilities,
             permissions,
+        };
+
+        if plugin.source != PluginSource::Directory {
+            return entry;
         }
+        let Some(manifest) = manifest else {
+            return entry;
+        };
+
+        let fingerprint = match fingerprint_plugin_directory(
+            &plugin.path,
+            FingerprintLimits::default(),
+        ) {
+            Ok(report) => report.fingerprint,
+            Err(error) => {
+                entry.artifact_policy = PluginArtifactPolicyStatus::Unavailable;
+                let diagnostic = format!(
+                    "error [artifact-fingerprint]: exact artifact fingerprint unavailable: {error}"
+                );
+                entry.diagnostics.push(diagnostic);
+                return entry;
+            }
+        };
+        entry.artifact_fingerprint = Some(fingerprint.to_hex());
+
+        if !plugin.is_loadable() {
+            return entry;
+        }
+
+        let key = ArtifactStateKey::new(manifest.id.clone(), fingerprint);
+        let trust_policy = if manifest.runtime.kind() == PluginRuntimeKind::Wasm {
+            ArtifactTrustPolicy::Sandboxed
+        } else {
+            ArtifactTrustPolicy::RequireApproval
+        };
+        entry.artifact_policy = match state.execution_policy(&plugin.path, &key, trust_policy) {
+            Ok(PluginExecutionPolicy::Allowed)
+                if trust_policy == ArtifactTrustPolicy::Sandboxed =>
+            {
+                PluginArtifactPolicyStatus::Sandboxed
+            }
+            Ok(PluginExecutionPolicy::Allowed) => PluginArtifactPolicyStatus::Trusted,
+            Ok(PluginExecutionPolicy::Disabled) => PluginArtifactPolicyStatus::Disabled,
+            Ok(PluginExecutionPolicy::ApprovalRequired) => {
+                PluginArtifactPolicyStatus::ApprovalRequired
+            }
+            Ok(PluginExecutionPolicy::Quarantined { reason }) => {
+                entry
+                    .diagnostics
+                    .push(format!("error [artifact-quarantine]: {reason}"));
+                PluginArtifactPolicyStatus::Quarantined
+            }
+            Err(error) => {
+                entry.diagnostics.push(format!(
+                    "error [plugin-state]: execution policy unavailable; failed closed: {error}"
+                ));
+                PluginArtifactPolicyStatus::CorruptState
+            }
+        };
+        entry
+    }
+}
+
+const fn discovery_policy(state: PluginHealthState) -> PluginArtifactPolicyStatus {
+    match state {
+        PluginHealthState::Disabled => PluginArtifactPolicyStatus::Disabled,
+        PluginHealthState::Quarantined | PluginHealthState::DevelopmentError => {
+            PluginArtifactPolicyStatus::Quarantined
+        }
+        _ => PluginArtifactPolicyStatus::Unavailable,
     }
 }
 

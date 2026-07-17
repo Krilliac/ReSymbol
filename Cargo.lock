@@ -2961,6 +2961,7 @@ dependencies = [
  "resymbol-core",
  "resymbol-export",
  "resymbol-package",
+ "resymbol-plugin-state",
  "serde",
  "serde_json",
  "tempfile",

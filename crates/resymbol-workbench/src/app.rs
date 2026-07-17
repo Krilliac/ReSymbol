@@ -11,12 +11,10 @@ use eframe::egui::{self, Align, Key, Layout, RichText, ScrollArea, Sense, TextEd
 use egui_extras::{Column, TableBuilder};
 use resymbol_analysis::BinaryAnalysis;
 use resymbol_app::{
-    DecisionAction, ExportFormat, MAX_REVIEW_ANNOTATION_BYTES, MAX_REVIEWER_BYTES, ReviewSubject,
+    DecisionAction, ExportFormat, MAX_REVIEW_ANNOTATION_BYTES, MAX_REVIEWER_BYTES,
+    PluginArtifactPolicyStatus, PluginCatalog, PluginCatalogEntry, ReviewSubject,
 };
-use resymbol_core::{
-    BinaryIdentity, DiscoveredPlugin, PluginDiscoveryOptions, PluginDiscoveryReport,
-    discover_plugins, plugin_api::PluginHealthState,
-};
+use resymbol_core::BinaryIdentity;
 use resymbol_debugger::{
     IsolationBoundary, MemoryAccess, ProtectionSeverity, SandboxGuarantee,
     SandboxProviderReadiness, SandboxProviderReadinessReason, SandboxProviderRequirement,
@@ -528,6 +526,7 @@ pub struct WorkbenchApp {
     project_operation: OperationGate,
     export_operation: OperationGate,
     review_operation: OperationGate,
+    plugin_operation: OperationGate,
     readiness_operation: OperationGate,
     worker_disconnected: bool,
     analysis_path: Option<PathBuf>,
@@ -542,7 +541,7 @@ pub struct WorkbenchApp {
     reconstruction_graph: Option<ReconstructionGraph>,
     activity: Vec<ActivityEntry>,
     console_host: ConsoleHost,
-    plugin_report: Result<PluginDiscoveryReport, String>,
+    plugin_catalog: Option<Result<PluginCatalog, String>>,
     export_kind: ExportKind,
     export_destination: String,
     export_result: Option<Result<String, String>>,
@@ -623,13 +622,6 @@ impl WorkbenchApp {
             );
         }
 
-        let plugin_options = PluginDiscoveryOptions {
-            safe_mode: true,
-            ..PluginDiscoveryOptions::default()
-        };
-        let plugin_report = discover_plugins("plugins", &plugin_options)
-            .map_err(|error| bounded_message(format!("cannot inspect plugin directory: {error}")));
-
         let mut app = Self {
             preferences,
             stage: WorkflowStage::Open,
@@ -642,6 +634,7 @@ impl WorkbenchApp {
             project_operation: OperationGate::default(),
             export_operation: OperationGate::default(),
             review_operation: OperationGate::default(),
+            plugin_operation: OperationGate::default(),
             readiness_operation: OperationGate::default(),
             worker_disconnected: false,
             analysis_path: None,
@@ -656,7 +649,7 @@ impl WorkbenchApp {
             reconstruction_graph: None,
             activity: Vec::new(),
             console_host: ConsoleHost::new(),
-            plugin_report,
+            plugin_catalog: None,
             export_kind: ExportKind::Package,
             export_destination: String::new(),
             export_result: None,
@@ -688,7 +681,7 @@ impl WorkbenchApp {
         };
         app.log(
             ActivityLevel::Info,
-            "Workbench ready in core-only safe review mode",
+            "Workbench ready in core-only non-executing review mode",
         );
 
         #[cfg(feature = "screenshot")]
@@ -749,6 +742,7 @@ impl WorkbenchApp {
                 ActivityLevel::Success,
                 format!("Loaded {} for visual regression capture", path.display()),
             );
+            app.begin_initial_plugin_catalog_refresh();
             return app;
         }
 
@@ -757,6 +751,7 @@ impl WorkbenchApp {
                 app.log(ActivityLevel::Error, error);
             }
         }
+        app.begin_initial_plugin_catalog_refresh();
         app
     }
 
@@ -1492,6 +1487,48 @@ impl WorkbenchApp {
         );
     }
 
+    fn queue_plugin_catalog_refresh(&mut self) -> Result<String, String> {
+        if self.plugin_operation.is_pending() {
+            return Err("a plugin catalog refresh is already running".to_owned());
+        }
+        if self.worker_disconnected {
+            return Err("the application-service worker is unavailable".to_owned());
+        }
+        let operation = self.operation_sequence.issue();
+        self.service_worker
+            .submit(WorkerCommand::RefreshPluginCatalog {
+                operation,
+                root: PathBuf::from("plugins"),
+            })?;
+        self.plugin_operation.begin(operation);
+        let message =
+            "Queued read-only plugin policy refresh; no plugin will be executed".to_owned();
+        self.log(ActivityLevel::Info, &message);
+        Ok(message)
+    }
+
+    fn begin_initial_plugin_catalog_refresh(&mut self) {
+        if let Err(error) = self.queue_plugin_catalog_refresh() {
+            self.plugin_catalog = Some(Err(error.clone()));
+            self.log(
+                ActivityLevel::Error,
+                format!("Plugin catalog refresh failed: {error}"),
+            );
+        }
+    }
+
+    fn accept_plugin_catalog(
+        &mut self,
+        operation: OperationId,
+        result: Result<PluginCatalog, String>,
+    ) -> bool {
+        if !self.plugin_operation.finish(operation) {
+            return false;
+        }
+        self.plugin_catalog = Some(result);
+        true
+    }
+
     fn queue_sandbox_readiness_probe(&mut self) -> Result<String, String> {
         if self.readiness_operation.is_pending() {
             return Err("a provider readiness check is already running".to_owned());
@@ -2058,6 +2095,35 @@ impl WorkbenchApp {
                         }
                     }
                 }
+                WorkerEvent::PluginCatalogRefreshed { operation, result } => {
+                    let message = match &result {
+                        Ok(catalog) => format!(
+                            "Plugin policy catalog refreshed: {} candidate(s), {} pass exact-artifact policy; execution is not implied",
+                            catalog.entries().len(),
+                            catalog.artifact_policy_allowed_count()
+                        ),
+                        Err(error) => format!("Plugin policy catalog refresh failed: {error}"),
+                    };
+                    let success = result.is_ok();
+                    if !self.accept_plugin_catalog(operation, result) {
+                        self.log(
+                            ActivityLevel::Warning,
+                            format!(
+                                "Ignored stale plugin catalog result for operation {}",
+                                operation.get()
+                            ),
+                        );
+                        continue;
+                    }
+                    self.log(
+                        if success {
+                            ActivityLevel::Success
+                        } else {
+                            ActivityLevel::Error
+                        },
+                        message,
+                    );
+                }
                 WorkerEvent::SandboxProviderProbed { operation, result } => {
                     if !self.readiness_operation.finish(operation) {
                         self.log(
@@ -2153,6 +2219,7 @@ impl WorkbenchApp {
         self.project_operation.invalidate();
         self.export_operation.invalidate();
         self.review_operation.invalidate();
+        self.plugin_operation.invalidate();
         self.readiness_operation.invalidate();
         self.offline_read.clear();
         if let Some(previous) = self.pending_review_rollback.take() {
@@ -3043,7 +3110,7 @@ impl WorkbenchApp {
                             "Schema {}",
                             project.snapshot.package().schema_version()
                         ));
-                        ui.label("Core-only safe review mode");
+                        ui.label("Core-only non-executing review mode");
                     });
                     if ui
                         .selectable_label(
@@ -3105,7 +3172,7 @@ impl WorkbenchApp {
                 }
 
                 ui.separator();
-                ui.collapsing("Plugins (read-only safe mode)", |ui| {
+                ui.collapsing("Plugins (read-only policy catalog)", |ui| {
                     self.show_plugin_list(ui);
                 });
                 ui.separator();
@@ -3143,17 +3210,44 @@ impl WorkbenchApp {
             });
     }
 
-    fn show_plugin_list(&self, ui: &mut egui::Ui) {
-        match &self.plugin_report {
-            Ok(report) if report.plugins.is_empty() => {
+    fn show_plugin_list(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let can_refresh = !self.plugin_operation.is_pending() && !self.worker_disconnected;
+            if ui
+                .add_enabled(can_refresh, egui::Button::new("Refresh"))
+                .on_hover_text(
+                    "Re-scan plugin artifacts and exact-fingerprint policy off the UI thread",
+                )
+                .clicked()
+            {
+                if let Err(error) = self.queue_plugin_catalog_refresh() {
+                    self.log(
+                        ActivityLevel::Error,
+                        format!("Plugin catalog refresh failed: {error}"),
+                    );
+                }
+            }
+            if self.plugin_operation.is_pending() {
+                ui.label(RichText::new("Scanning...").weak());
+            }
+        });
+        ui.small(
+            "Discovery health includes manifest, API, entrypoint, duplicate-ID, and declared plugin-dependency checks. Runtime, capability selection, host/helper, granted-permission, target, and launch-time gates are not evaluated. The workbench never executes plugins.",
+        );
+        match &self.plugin_catalog {
+            None => {
+                ui.label("[--] Plugin catalog has not completed yet");
+            }
+            Some(Ok(report)) if report.entries().is_empty() => {
                 ui.label("[--] No plugins discovered");
             }
-            Ok(report) => {
-                for plugin in &report.plugins {
+            Some(Ok(report)) => {
+                ui.small(format!("Root: {}", report.root().display()));
+                for plugin in report.entries() {
                     show_plugin(ui, plugin, self.preferences.theme.semantic_colors());
                 }
             }
-            Err(error) => {
+            Some(Err(error)) => {
                 ui.colored_label(
                     self.preferences
                         .theme
@@ -5894,29 +5988,76 @@ fn write_screenshot_new(path: &Path, image: &egui::ColorImage) -> Result<(), Str
         .map_err(|error| format!("PNG finish failed: {error}"))
 }
 
-fn show_plugin(ui: &mut egui::Ui, plugin: &DiscoveredPlugin, colors: SemanticColors) {
-    let (prefix, color) = match plugin.health.state {
-        PluginHealthState::Discovered | PluginHealthState::Enabled => ("OK", colors.healthy),
-        PluginHealthState::Disabled => ("OFF", colors.fallback),
-        PluginHealthState::Incompatible => ("INCOMPATIBLE", colors.warning_conflict),
-        PluginHealthState::Quarantined | PluginHealthState::DevelopmentError => {
-            ("QUARANTINED", colors.destructive_quarantined)
+fn show_plugin(ui: &mut egui::Ui, plugin: &PluginCatalogEntry, colors: SemanticColors) {
+    let color = match plugin.artifact_policy {
+        PluginArtifactPolicyStatus::Sandboxed | PluginArtifactPolicyStatus::Trusted => {
+            colors.healthy
         }
-        _ => ("STATE", colors.fallback),
+        PluginArtifactPolicyStatus::ApprovalRequired => colors.warning_conflict,
+        PluginArtifactPolicyStatus::Disabled => colors.fallback,
+        PluginArtifactPolicyStatus::Quarantined | PluginArtifactPolicyStatus::CorruptState => {
+            colors.destructive_quarantined
+        }
+        PluginArtifactPolicyStatus::Unavailable => colors.warning_conflict,
     };
-    let name = plugin.manifest.as_ref().map_or_else(
-        || plugin.path.display().to_string(),
-        |manifest| manifest.name.clone(),
-    );
+    let name = plugin
+        .name
+        .as_ref()
+        .map_or_else(|| plugin.path.display().to_string(), |name| name.clone());
     ui.collapsing(
-        RichText::new(format!("[{prefix}] {name}")).color(color),
+        RichText::new(format!("[{}] {name}", plugin.artifact_policy.badge_label())).color(color),
         |ui| {
-            ui.label(format!("State: {:?}", plugin.health.state));
-            ui.label(format!("Path: {}", plugin.path.display()));
-            for diagnostic in &plugin.health.diagnostics {
-                ui.label(format!("{:?}: {}", diagnostic.severity, diagnostic.message));
+            ui.label(format!("Source: {}", plugin.source));
+            if let Some(id) = &plugin.id {
+                ui.label(format!("ID: {id}"));
             }
-            if plugin.health.diagnostics.is_empty() {
+            if let Some(version) = &plugin.version {
+                ui.label(format!("Version: {version}"));
+            }
+            if let Some(description) = &plugin.description {
+                ui.label(description);
+            }
+            ui.label(format!("Discovery health: {}", plugin.health));
+            ui.label(format!(
+                "Discovery loadable: {}",
+                if plugin.loadable { "yes" } else { "no" }
+            ));
+            ui.label(format!(
+                "Exact-artifact policy: {}",
+                if plugin.artifact_policy.allows_by_artifact_policy() {
+                    "passes"
+                } else {
+                    "blocked"
+                }
+            ));
+            ui.label("Full CLI execution eligibility: not evaluated");
+            ui.label("Workbench execution: not supported");
+            if let Some(runtime) = &plugin.runtime {
+                ui.label(format!("Runtime: {runtime}"));
+            }
+            if !plugin.capabilities.is_empty() {
+                ui.label(format!(
+                    "Declared capabilities: {}",
+                    plugin.capabilities.join(", ")
+                ));
+            }
+            if !plugin.permissions.is_empty() {
+                ui.label(format!(
+                    "Requested permissions: {}",
+                    plugin.permissions.join(", ")
+                ));
+            }
+            ui.label(format!("Path: {}", plugin.path.display()));
+            if let Some(fingerprint) = &plugin.artifact_fingerprint {
+                ui.label("Exact artifact SHA-256:");
+                ui.monospace(fingerprint);
+            } else {
+                ui.label("Exact artifact SHA-256: unavailable");
+            }
+            for diagnostic in &plugin.diagnostics {
+                ui.label(diagnostic);
+            }
+            if plugin.diagnostics.is_empty() {
                 ui.label("No diagnostics");
             }
         },
@@ -6990,6 +7131,60 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn plugin_catalog_accepts_only_current_refresh_across_project_acceptance() {
+        let (_context, mut app) = test_app();
+        let temporary = tempfile::tempdir().expect("temporary plugin root");
+        let catalog = resymbol_app::AppServices::default()
+            .inspect_plugin_catalog(temporary.path())
+            .expect("empty plugin catalog");
+        app.plugin_operation.invalidate();
+        app.plugin_catalog = None;
+        let stale = app.operation_sequence.issue();
+        let current = app.operation_sequence.issue();
+        app.plugin_operation.begin(current);
+
+        let (source, project) = loaded_project_with_source();
+        app.analysis_path = Some(source.path().to_path_buf());
+        app.accept_project(project, ProjectAcceptance::NewProject);
+        assert!(
+            app.plugin_operation.is_pending(),
+            "project-independent catalog refresh remains current"
+        );
+
+        assert!(!app.accept_plugin_catalog(stale, Ok(catalog.clone())));
+        assert!(app.plugin_catalog.is_none());
+        assert!(app.plugin_operation.is_pending());
+
+        assert!(app.accept_plugin_catalog(current, Ok(catalog)));
+        assert!(!app.plugin_operation.is_pending());
+        let accepted = app
+            .plugin_catalog
+            .as_ref()
+            .expect("accepted snapshot")
+            .as_ref()
+            .expect("successful snapshot");
+        assert_eq!(accepted.root(), temporary.path());
+    }
+
+    #[test]
+    fn plugin_policy_badges_are_explicit_and_unambiguous() {
+        for (eligibility, badge) in [
+            (PluginArtifactPolicyStatus::Sandboxed, "SANDBOXED"),
+            (PluginArtifactPolicyStatus::Trusted, "TRUSTED"),
+            (
+                PluginArtifactPolicyStatus::ApprovalRequired,
+                "APPROVAL REQUIRED",
+            ),
+            (PluginArtifactPolicyStatus::Disabled, "DISABLED"),
+            (PluginArtifactPolicyStatus::Quarantined, "QUARANTINED"),
+            (PluginArtifactPolicyStatus::CorruptState, "CORRUPT STATE"),
+            (PluginArtifactPolicyStatus::Unavailable, "UNAVAILABLE"),
+        ] {
+            assert_eq!(eligibility.badge_label(), badge);
+        }
     }
 
     #[test]

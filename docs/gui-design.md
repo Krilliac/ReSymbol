@@ -74,14 +74,20 @@ The approved left rail presents the current project as a tree:
 - plugins and their health; and
 - project settings.
 
-The plugin node can expand to individual analyzers and matchers. Healthy, disabled, incompatible,
-approval-required, and quarantined states use an icon plus text. A quarantined plugin remains
-visible with its reason and recovery path; it does not disappear or prevent the project from
-opening.
+The plugin node expands to exact-artifact policy details. A worker-owned Refresh action replaces one
+catalog snapshot without blocking rendering. Each fingerprintable unpacked candidate with a valid
+manifest shows its complete exact artifact SHA-256 and a text badge: `SANDBOXED`, `TRUSTED`,
+`APPROVAL REQUIRED`, `DISABLED`, `QUARANTINED`, `CORRUPT STATE`, or `UNAVAILABLE`. Corrupt state and
+quarantine are visible and fail closed instead of hiding the candidate or preventing the project
+from opening.
 
-The first slice shows discovered plugin health as read-only information. It does not execute,
-enable, disable, approve, or recover plugins from the GUI, and analyzed sessions contain only core
-results.
+These badges combine discovery health with exact-artifact trust, disablement, and quarantine
+policy. Discovery health includes manifest validity, API compatibility, entrypoint safety,
+duplicate IDs, and declared plugin-dependency resolution. Passing the combined policy does not
+establish full CLI executability: runtime support, capability selection, host/helper availability,
+granted permissions, target compatibility, and launch-time revalidation remain unevaluated. The
+workbench remains read-only: it does not load, execute, enable, disable, approve, trust, reset, or
+recover plugins, and analyzed sessions contain only core results.
 
 ### Main work area
 

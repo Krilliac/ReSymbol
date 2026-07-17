@@ -18,7 +18,7 @@ pub use patch::{
     PublishedStaticPatch, StaticPatchEdit, StaticPatchEditRequest, StaticPatchError,
     StaticPatchKind, StaticPatchPlan, StaticPatchWarning,
 };
-pub use plugins::{PluginCatalog, PluginCatalogEntry};
+pub use plugins::{PluginArtifactPolicyStatus, PluginCatalog, PluginCatalogEntry};
 pub use project::{AppServices, DEFAULT_MAX_BINARY_BYTES, ExactBinary, ProjectSnapshot};
 pub use review::{
     DecisionAction, MAX_REVIEW_ANNOTATION_BYTES, MAX_REVIEW_DECISIONS, MAX_REVIEW_SIDECAR_BYTES,
