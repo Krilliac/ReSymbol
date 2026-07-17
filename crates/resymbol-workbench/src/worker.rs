@@ -11,10 +11,11 @@ use std::{
 };
 
 use resymbol_app::{
-    AppServices, ExportFormat, PluginCatalog, ProjectSnapshot, PublishedStaticPatch, ReviewLedger,
-    StaticPatchEditRequest, StaticPatchPlan, StaticPatchSetManifest,
+    AppServices, ExportFormat, MAX_STATIC_PATCH_BYTES, MAX_STATIC_PATCH_EDITS, PluginCatalog,
+    ProjectSnapshot, PublishedStaticPatch, ReviewLedger, StaticPatchEditRequest, StaticPatchPlan,
+    StaticPatchSetManifest, StaticPatchWarning,
 };
-use resymbol_core::BinaryIdentity;
+use resymbol_core::{BinaryId, BinaryIdentity};
 use resymbol_debugger::{
     CapabilityAvailability, ClientConnectionState, CommandOutcome, DebugCapability, DebugCommand,
     DebugEvent, DebugHostClient, DebugTargetRequest, HelperBuildId, MemoryAddress,
@@ -319,6 +320,219 @@ pub struct ExportOutcome {
 pub struct PatchSetOutcome {
     pub path: PathBuf,
     pub manifest: StaticPatchSetManifest,
+}
+
+/// Exact project and canonical edit snapshot for one no-write patch preview.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaticPatchPreviewBinding {
+    source_identity: BinaryIdentity,
+    requests: Vec<StaticPatchEditRequest>,
+    request_fingerprint: BinaryId,
+}
+
+impl StaticPatchPreviewBinding {
+    pub fn new(
+        source_identity: BinaryIdentity,
+        mut requests: Vec<StaticPatchEditRequest>,
+    ) -> Result<Self, String> {
+        source_identity
+            .validate()
+            .map_err(|error| format!("invalid static patch preview source identity: {error}"))?;
+        if requests.is_empty() {
+            return Err("static patch preview requires at least one edit".to_owned());
+        }
+        if requests.len() > MAX_STATIC_PATCH_EDITS {
+            return Err(format!(
+                "static patch preview has {} edits; the limit is {MAX_STATIC_PATCH_EDITS}",
+                requests.len()
+            ));
+        }
+        let changed_bytes = requests.iter().try_fold(0usize, |total, request| {
+            total.checked_add(request.expected().len())
+        });
+        let changed_bytes = changed_bytes.ok_or_else(|| {
+            "static patch preview changed-byte count overflowed the platform".to_owned()
+        })?;
+        if changed_bytes > MAX_STATIC_PATCH_BYTES {
+            return Err(format!(
+                "static patch preview changes {changed_bytes} bytes; the limit is {MAX_STATIC_PATCH_BYTES}"
+            ));
+        }
+        requests.sort_by_key(StaticPatchEditRequest::rva);
+        let request_fingerprint = fingerprint_static_patch_requests(&requests)?;
+        Ok(Self {
+            source_identity,
+            requests,
+            request_fingerprint,
+        })
+    }
+
+    #[must_use]
+    pub const fn source_identity(&self) -> &BinaryIdentity {
+        &self.source_identity
+    }
+
+    #[must_use]
+    pub fn requests(&self) -> &[StaticPatchEditRequest] {
+        &self.requests
+    }
+
+    #[must_use]
+    pub fn changed_bytes(&self) -> usize {
+        self.requests
+            .iter()
+            .map(|request| request.expected().len())
+            .sum()
+    }
+
+    #[must_use]
+    pub const fn request_fingerprint(&self) -> &BinaryId {
+        &self.request_fingerprint
+    }
+}
+
+/// Deterministic in-memory patch result. No destination was opened or written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaticPatchPreviewOutcome {
+    source_identity: BinaryIdentity,
+    output_identity: BinaryIdentity,
+    edit_count: usize,
+    changed_bytes: usize,
+    warnings: [StaticPatchWarning; 2],
+    plan_fingerprint: BinaryId,
+}
+
+impl StaticPatchPreviewOutcome {
+    #[cfg(test)]
+    pub(crate) fn from_parts_for_test(
+        source_identity: BinaryIdentity,
+        output_identity: BinaryIdentity,
+        edit_count: usize,
+        changed_bytes: usize,
+        warnings: [StaticPatchWarning; 2],
+        plan_fingerprint: BinaryId,
+    ) -> Self {
+        Self {
+            source_identity,
+            output_identity,
+            edit_count,
+            changed_bytes,
+            warnings,
+            plan_fingerprint,
+        }
+    }
+
+    #[must_use]
+    pub const fn source_identity(&self) -> &BinaryIdentity {
+        &self.source_identity
+    }
+
+    #[must_use]
+    pub const fn output_identity(&self) -> &BinaryIdentity {
+        &self.output_identity
+    }
+
+    #[must_use]
+    pub const fn edit_count(&self) -> usize {
+        self.edit_count
+    }
+
+    #[must_use]
+    pub const fn changed_bytes(&self) -> usize {
+        self.changed_bytes
+    }
+
+    #[must_use]
+    pub const fn warnings(&self) -> &[StaticPatchWarning] {
+        &self.warnings
+    }
+
+    #[must_use]
+    pub const fn plan_fingerprint(&self) -> &BinaryId {
+        &self.plan_fingerprint
+    }
+}
+
+const STATIC_PATCH_PREVIEW_FINGERPRINT_DOMAIN: &[u8] = b"resymbol.static-patch-preview.plan.v1\0";
+
+fn fingerprint_static_patch_requests(
+    requests: &[StaticPatchEditRequest],
+) -> Result<BinaryId, String> {
+    let mut encoded = static_patch_fingerprint_header(requests.len())?;
+    for request in requests {
+        append_static_patch_fingerprint_edit(
+            &mut encoded,
+            request.rva(),
+            request.kind().label(),
+            request.expected(),
+            request.replacement(),
+            request.label(),
+        )?;
+    }
+    Ok(BinaryId::digest(&encoded))
+}
+
+fn fingerprint_static_patch_plan(plan: &StaticPatchPlan) -> Result<BinaryId, String> {
+    let mut encoded = static_patch_fingerprint_header(plan.edits().len())?;
+    for edit in plan.edits() {
+        append_static_patch_fingerprint_edit(
+            &mut encoded,
+            edit.rva(),
+            edit.kind().label(),
+            edit.expected(),
+            edit.replacement(),
+            edit.label(),
+        )?;
+    }
+    Ok(BinaryId::digest(&encoded))
+}
+
+fn static_patch_fingerprint_header(edit_count: usize) -> Result<Vec<u8>, String> {
+    let edit_count = u64::try_from(edit_count)
+        .map_err(|_| "static patch fingerprint edit count does not fit u64".to_owned())?;
+    let capacity = STATIC_PATCH_PREVIEW_FINGERPRINT_DOMAIN
+        .len()
+        .checked_add(std::mem::size_of::<u64>())
+        .ok_or_else(|| "static patch fingerprint header length overflowed".to_owned())?;
+    let mut encoded = Vec::new();
+    encoded
+        .try_reserve_exact(capacity)
+        .map_err(|error| format!("could not allocate static patch fingerprint header: {error}"))?;
+    encoded.extend_from_slice(STATIC_PATCH_PREVIEW_FINGERPRINT_DOMAIN);
+    encoded.extend_from_slice(&edit_count.to_le_bytes());
+    Ok(encoded)
+}
+
+fn append_static_patch_fingerprint_edit(
+    encoded: &mut Vec<u8>,
+    rva: u32,
+    kind: &str,
+    expected: &[u8],
+    replacement: &[u8],
+    label: &str,
+) -> Result<(), String> {
+    encoded
+        .try_reserve_exact(std::mem::size_of::<u32>())
+        .map_err(|error| format!("could not allocate static patch fingerprint RVA: {error}"))?;
+    encoded.extend_from_slice(&rva.to_le_bytes());
+    append_static_patch_fingerprint_part(encoded, kind.as_bytes())?;
+    append_static_patch_fingerprint_part(encoded, expected)?;
+    append_static_patch_fingerprint_part(encoded, replacement)?;
+    append_static_patch_fingerprint_part(encoded, label.as_bytes())
+}
+
+fn append_static_patch_fingerprint_part(encoded: &mut Vec<u8>, value: &[u8]) -> Result<(), String> {
+    let length = u64::try_from(value.len())
+        .map_err(|_| "static patch fingerprint field length does not fit u64".to_owned())?;
+    let additional = std::mem::size_of::<u64>()
+        .checked_add(value.len())
+        .ok_or_else(|| "static patch fingerprint field length overflowed".to_owned())?;
+    encoded
+        .try_reserve_exact(additional)
+        .map_err(|error| format!("could not allocate static patch fingerprint field: {error}"))?;
+    encoded.extend_from_slice(&length.to_le_bytes());
+    encoded.extend_from_slice(value);
+    Ok(())
 }
 
 /// Exact ledger snapshot and destination completed by one save operation.
@@ -729,6 +943,12 @@ pub enum WorkerCommand {
         rva: u64,
         size: u32,
     },
+    /// Validate and apply exact edits entirely in memory; no path is accepted.
+    PreviewStaticPatch {
+        operation: OperationId,
+        project: Arc<ProjectSnapshot>,
+        binding: StaticPatchPreviewBinding,
+    },
     /// Validate and create-new publish exact static edits away from the UI thread.
     PublishStaticPatch {
         operation: OperationId,
@@ -789,6 +1009,11 @@ pub enum WorkerEvent {
     OfflineImageRead {
         operation: OperationId,
         result: Result<OfflineImageReadOutcome, OfflineImageReadFailure>,
+    },
+    StaticPatchPreviewed {
+        operation: OperationId,
+        binding: StaticPatchPreviewBinding,
+        result: Result<StaticPatchPreviewOutcome, String>,
     },
     StaticPatchPublished {
         operation: OperationId,
@@ -955,6 +1180,18 @@ fn process_command(services: &AppServices, command: WorkerCommand) -> Option<Wor
             operation,
             result: read_offline_image(project, rva, size),
         },
+        WorkerCommand::PreviewStaticPatch {
+            operation,
+            project,
+            binding,
+        } => {
+            let result = preview_static_patch(services, &project, &binding);
+            WorkerEvent::StaticPatchPreviewed {
+                operation,
+                binding,
+                result,
+            }
+        }
         WorkerCommand::PublishStaticPatch {
             operation,
             project,
@@ -1000,6 +1237,35 @@ fn process_command(services: &AppServices, command: WorkerCommand) -> Option<Wor
         WorkerCommand::Shutdown => return None,
     };
     Some(event)
+}
+
+fn preview_static_patch(
+    services: &AppServices,
+    project: &ProjectSnapshot,
+    binding: &StaticPatchPreviewBinding,
+) -> Result<StaticPatchPreviewOutcome, String> {
+    let analysis = project.session().base_analysis();
+    if analysis.identity() != binding.source_identity() {
+        return Err("static patch preview binding does not match the worker project".to_owned());
+    }
+    let plan = StaticPatchPlan::new(
+        binding.source_identity(),
+        analysis,
+        binding.requests().to_vec(),
+    )
+    .map_err(|error| error.to_string())?;
+    let plan_fingerprint = fingerprint_static_patch_plan(&plan)?;
+    let image = services
+        .apply_static_patch(project, &plan)
+        .map_err(|error| error.to_string())?;
+    Ok(StaticPatchPreviewOutcome {
+        source_identity: image.source_identity().clone(),
+        output_identity: image.output_identity().clone(),
+        edit_count: plan.edits().len(),
+        changed_bytes: plan.total_patch_bytes(),
+        warnings: [image.warnings()[0], image.warnings()[1]],
+        plan_fingerprint,
+    })
 }
 
 fn process_sandbox_provider_probe<B>(
@@ -1617,6 +1883,150 @@ entrypoint = "plugin.wasm"
                 operation,
                 result: Err(_),
             } if operation == second
+        ));
+    }
+
+    #[test]
+    fn worker_previews_exact_patch_hash_without_any_filesystem_side_effect() {
+        let directory = tempdir().expect("temporary preview directory");
+        let source_path = directory.path().join("source.exe");
+        fs::write(&source_path, SYMBOLIZED_FIXTURE).expect("write preview fixture");
+        let services = AppServices::default();
+        let project = services
+            .analyze_binary(&source_path)
+            .expect("analyze preview fixture");
+        let request = StaticPatchEditRequest::nop_instruction(
+            THUNK_RVA,
+            THUNK_BYTES,
+            "Disable internal jump thunk",
+        )
+        .expect("valid preview request");
+        let binding = StaticPatchPreviewBinding::new(
+            project.session().base_analysis().identity().clone(),
+            vec![request],
+        )
+        .expect("bounded preview binding");
+        let before_entries = fs::read_dir(directory.path())
+            .expect("read preview directory before")
+            .map(|entry| entry.expect("preview directory entry").file_name())
+            .collect::<Vec<_>>();
+        let operation = OperationSequence::default().issue();
+
+        let event = process_command(
+            &services,
+            WorkerCommand::PreviewStaticPatch {
+                operation,
+                project: Arc::clone(&project),
+                binding: binding.clone(),
+            },
+        )
+        .expect("preview event");
+
+        let WorkerEvent::StaticPatchPreviewed {
+            operation: actual_operation,
+            binding: actual_binding,
+            result: Ok(outcome),
+        } = event
+        else {
+            panic!("unexpected preview event");
+        };
+        assert_eq!(actual_operation, operation);
+        assert_eq!(actual_binding, binding);
+        assert_eq!(
+            outcome.source_identity(),
+            project.session().base_analysis().identity()
+        );
+        assert_eq!(outcome.edit_count(), 1);
+        assert_eq!(outcome.changed_bytes(), THUNK_BYTES.len());
+        assert_eq!(outcome.warnings().len(), 2);
+        assert_eq!(
+            outcome.plan_fingerprint(),
+            binding.request_fingerprint(),
+            "the independently encoded resolved plan must match the bound canonical requests"
+        );
+        let mut expected_output = SYMBOLIZED_FIXTURE.to_vec();
+        expected_output[THUNK_FILE_OFFSET..THUNK_FILE_OFFSET + THUNK_BYTES.len()].fill(0x90);
+        assert_eq!(
+            outcome.output_identity().id,
+            BinaryId::digest(&expected_output)
+        );
+        assert_eq!(
+            fs::read(&source_path).expect("read unchanged preview source"),
+            SYMBOLIZED_FIXTURE
+        );
+        let after_entries = fs::read_dir(directory.path())
+            .expect("read preview directory after")
+            .map(|entry| entry.expect("preview directory entry").file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(after_entries, before_entries);
+    }
+
+    #[test]
+    fn worker_preview_rejects_stale_bytes_and_package_only_sources() {
+        let (_source, project) = project_snapshot_with_bytes(SYMBOLIZED_FIXTURE);
+        let stale_request = StaticPatchEditRequest::nop_instruction(
+            THUNK_RVA,
+            [0xe9, 0x04, 0x00, 0x00, 0x00],
+            "Stale internal jump thunk",
+        )
+        .expect("structurally valid stale request");
+        let stale_binding = StaticPatchPreviewBinding::new(
+            project.session().base_analysis().identity().clone(),
+            vec![stale_request],
+        )
+        .expect("bounded stale preview binding");
+        let stale = process_command(
+            &AppServices::default(),
+            WorkerCommand::PreviewStaticPatch {
+                operation: OperationSequence::default().issue(),
+                project: Arc::clone(&project),
+                binding: stale_binding,
+            },
+        )
+        .expect("stale preview event");
+        assert!(matches!(
+            stale,
+            WorkerEvent::StaticPatchPreviewed {
+                result: Err(error),
+                ..
+            } if error.contains("source bytes are stale")
+        ));
+
+        let services = AppServices::default();
+        let directory = tempdir().expect("temporary package-only preview directory");
+        let package_path = directory.path().join("preview.resym");
+        services
+            .save_package_new(&project, &package_path)
+            .expect("save preview package");
+        let package_only = services
+            .open_package(&package_path)
+            .expect("open package-only preview");
+        let request = StaticPatchEditRequest::nop_instruction(
+            THUNK_RVA,
+            THUNK_BYTES,
+            "Package-only internal jump thunk",
+        )
+        .expect("valid package-only request");
+        let binding = StaticPatchPreviewBinding::new(
+            package_only.session().base_analysis().identity().clone(),
+            vec![request],
+        )
+        .expect("bounded package-only binding");
+        let package_event = process_command(
+            &services,
+            WorkerCommand::PreviewStaticPatch {
+                operation: OperationSequence::default().issue(),
+                project: package_only,
+                binding,
+            },
+        )
+        .expect("package-only preview event");
+        assert!(matches!(
+            package_event,
+            WorkerEvent::StaticPatchPreviewed {
+                result: Err(error),
+                ..
+            } if error.contains("exact verified source binary")
         ));
     }
 

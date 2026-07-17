@@ -8,6 +8,18 @@ prereleases; breaking changes remain explicit.
 
 ### Added
 
+- Added a no-write static patch validation preview to the Workbench. The bounded application-service
+  worker rebuilds the exact canonical edit plan, applies it only to the retained verified source
+  bytes in memory, and reports the exact source/output identities, deterministic output SHA-256,
+  edit and changed-byte counts, and integrity warnings. A bounded, domain-separated canonical
+  SHA-256 is independently derived from the exact request snapshot and the resolved worker plan,
+  while the output digest must differ from the source and its size, format, architecture, and image
+  base must remain equal to the source metadata.
+  The result is correlated to its operation, project identity, complete request snapshot, and plan
+  fingerprint, so same-shape alternate edits, changed drafts, replaced projects, and stale or
+  out-of-order responses cannot update the visible preview. The preview accepts no destination path,
+  writes no file, leaves unpublished drafts intact, and blocks patched-binary publication plus
+  patch-set save/load while pending.
 - Added a backend-neutral `LivePatchHistory` reducer for future authenticated live-memory UI
   integration. It is bound to one immutable session and exact process-instance/image mapping,
   reserves a maximum of 256 entries and 1 MiB of before/after bytes before dispatch, and emits only

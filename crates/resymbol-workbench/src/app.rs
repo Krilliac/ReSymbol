@@ -64,8 +64,8 @@ use crate::{
         MAX_OFFLINE_IMAGE_UI_READ_BYTES, OfflineImageReadAvailability, OfflineImageReadFailure,
         OfflineImageReadOutcome, OfflineImageReadSpan, OperationGate, OperationId,
         OperationSequence, PatchSetOutcome, PublicationDestination, PublicationGate,
-        PublicationKind, ReviewSaveOutcome, ServiceWorker, WorkerCommand, WorkerEvent,
-        WorkerExportKind,
+        PublicationKind, ReviewSaveOutcome, ServiceWorker, StaticPatchPreviewBinding,
+        StaticPatchPreviewOutcome, WorkerCommand, WorkerEvent, WorkerExportKind,
     },
 };
 
@@ -642,6 +642,7 @@ pub struct WorkbenchApp {
     plugin_operation: OperationGate,
     readiness_operation: OperationGate,
     patch_set_load_operation: OperationGate,
+    static_patch_preview_operation: OperationGate,
     worker_disconnected: bool,
     analysis_path: Option<PathBuf>,
     function_filter: FunctionFilter,
@@ -692,6 +693,10 @@ pub struct WorkbenchApp {
     static_exact_byte_edit: Option<StaticExactByteEdit>,
     static_exact_byte_edit_error: Option<String>,
     static_patch_result: Option<Result<PublishedStaticPatch, String>>,
+    static_patch_preview_result: Option<(
+        StaticPatchPreviewBinding,
+        Result<StaticPatchPreviewOutcome, String>,
+    )>,
     patch_set_result: Option<Result<String, String>>,
 }
 
@@ -769,6 +774,7 @@ impl WorkbenchApp {
             plugin_operation: OperationGate::default(),
             readiness_operation: OperationGate::default(),
             patch_set_load_operation: OperationGate::default(),
+            static_patch_preview_operation: OperationGate::default(),
             worker_disconnected: false,
             analysis_path: None,
             function_filter: FunctionFilter::default(),
@@ -820,6 +826,7 @@ impl WorkbenchApp {
             static_exact_byte_edit: None,
             static_exact_byte_edit_error: None,
             static_patch_result: None,
+            static_patch_preview_result: None,
             patch_set_result: None,
         };
         app.log(
@@ -2536,6 +2543,13 @@ impl WorkbenchApp {
                         ),
                     }
                 }
+                WorkerEvent::StaticPatchPreviewed {
+                    operation,
+                    binding,
+                    result,
+                } => {
+                    self.finish_static_patch_preview(operation, binding, result);
+                }
                 WorkerEvent::StaticPatchPublished { operation, result } => {
                     self.finish_static_patch_publication(operation, result);
                 }
@@ -2547,6 +2561,76 @@ impl WorkbenchApp {
                 }
             }
         }
+    }
+
+    fn finish_static_patch_preview(
+        &mut self,
+        operation: OperationId,
+        binding: StaticPatchPreviewBinding,
+        result: Result<StaticPatchPreviewOutcome, String>,
+    ) {
+        if !self.static_patch_preview_operation.finish(operation) {
+            self.log(
+                ActivityLevel::Warning,
+                format!(
+                    "Ignored stale static patch preview result for operation {}",
+                    operation.get()
+                ),
+            );
+            return;
+        }
+        let current = self.build_static_patch_preview_binding();
+        if current.as_ref().ok() != Some(&binding) {
+            self.log(
+                ActivityLevel::Warning,
+                "Ignored static patch preview for a stale project or draft snapshot",
+            );
+            return;
+        }
+        if let Ok(outcome) = &result {
+            let source_identity = binding.source_identity();
+            let output_identity = outcome.output_identity();
+            let output_metadata_matches = output_identity.size == source_identity.size
+                && output_identity.format.eq(&source_identity.format)
+                && output_identity.architecture.as_str() == source_identity.architecture.as_str()
+                && output_identity.image_base == source_identity.image_base;
+            let evidence_matches = outcome.source_identity() == source_identity
+                && outcome.edit_count() == binding.requests().len()
+                && outcome.changed_bytes() == binding.changed_bytes()
+                && outcome.plan_fingerprint() == binding.request_fingerprint()
+                && output_identity.id != source_identity.id
+                && output_identity.validate().is_ok()
+                && output_metadata_matches;
+            if !evidence_matches {
+                self.static_patch_preview_result = Some((
+                    binding,
+                    Err(
+                        "Static patch preview returned invalid or uncorrelated evidence".to_owned(),
+                    ),
+                ));
+                self.log(
+                    ActivityLevel::Error,
+                    "Static patch preview failed closed on invalid worker evidence",
+                );
+                return;
+            }
+        }
+        let message = match &result {
+            Ok(outcome) => format!(
+                "Validated {} static edit(s), {} changed byte(s), and deterministic output SHA-256 {} entirely in memory; no file was written",
+                outcome.edit_count(),
+                outcome.changed_bytes(),
+                outcome.output_identity().id.as_str()
+            ),
+            Err(error) => format!("Static patch in-memory validation failed: {error}"),
+        };
+        let level = if result.is_ok() {
+            ActivityLevel::Success
+        } else {
+            ActivityLevel::Error
+        };
+        self.static_patch_preview_result = Some((binding, result));
+        self.log(level, message);
     }
 
     fn finish_static_patch_publication(
@@ -2732,6 +2816,8 @@ impl WorkbenchApp {
         let interrupted_publication = self.publication_operation.invalidate();
         let patch_set_load_was_pending = self.patch_set_load_operation.is_pending();
         self.patch_set_load_operation.invalidate();
+        let static_patch_preview_was_pending = self.static_patch_preview_operation.is_pending();
+        self.static_patch_preview_operation.invalidate();
         self.review_operation.invalidate();
         self.plugin_operation.invalidate();
         self.readiness_operation.invalidate();
@@ -2767,6 +2853,9 @@ impl WorkbenchApp {
             self.patch_set_result = Some(Err(
                 "the application-service worker disconnected during patch-set load".to_owned(),
             ));
+        }
+        if static_patch_preview_was_pending {
+            self.static_patch_preview_result = None;
         }
         self.log(ActivityLevel::Error, error);
     }
@@ -2907,6 +2996,7 @@ impl WorkbenchApp {
             .map(ToOwned::to_owned);
         self.publication_operation.invalidate();
         self.patch_set_load_operation.invalidate();
+        self.static_patch_preview_operation.invalidate();
         self.review_operation.invalidate();
         self.readiness_operation.invalidate();
         self.offline_read.clear();
@@ -2924,6 +3014,7 @@ impl WorkbenchApp {
             self.selected_disassembly_instruction = None;
             self.disassembly_row_focus_target = None;
             self.static_patch_result = None;
+            self.static_patch_preview_result = None;
             self.patch_set_result = None;
         }
         self.analysis_path = Some(project.identity.active_binary_path().to_path_buf());
@@ -6635,11 +6726,89 @@ impl WorkbenchApp {
         Ok(requests)
     }
 
+    fn build_static_patch_preview_binding(&self) -> Result<StaticPatchPreviewBinding, String> {
+        let project = self
+            .project
+            .as_ref()
+            .ok_or_else(|| "open a project before validating static patch drafts".to_owned())?;
+        if !project.snapshot.has_verified_source() {
+            return Err(
+                "the exact source binary must be verified before validating static patch drafts"
+                    .to_owned(),
+            );
+        }
+        StaticPatchPreviewBinding::new(
+            project.session().base_analysis().identity().clone(),
+            self.build_static_patch_requests()?,
+        )
+    }
+
+    fn queue_static_patch_preview(&mut self) -> Result<String, String> {
+        if self.static_patch_preview_operation.is_pending() {
+            return Err("a static patch preview is already running".to_owned());
+        }
+        if self.worker_disconnected {
+            return Err("the application-service worker is unavailable".to_owned());
+        }
+        if self.project_operation.is_pending() {
+            return Err(
+                "wait for the current project or source operation before validating static patches"
+                    .to_owned(),
+            );
+        }
+        if self.publication_operation.is_pending() {
+            return Err(
+                "wait for the current file publication before validating static patches".to_owned(),
+            );
+        }
+        if self.patch_set_load_operation.is_pending() {
+            return Err(
+                "wait for the current patch-set load before validating static patches".to_owned(),
+            );
+        }
+        let binding = self.build_static_patch_preview_binding()?;
+        let project = Arc::clone(
+            &self
+                .project
+                .as_ref()
+                .expect("preview binding requires a current project")
+                .snapshot,
+        );
+        let edit_count = binding.requests().len();
+        let changed_bytes = binding.changed_bytes();
+        let operation = self.operation_sequence.issue();
+        self.static_patch_preview_operation.begin(operation);
+        let submit = self
+            .service_worker
+            .submit(WorkerCommand::PreviewStaticPatch {
+                operation,
+                project,
+                binding,
+            });
+        if let Err(error) = submit {
+            let finished = self.static_patch_preview_operation.finish(operation);
+            debug_assert!(finished, "failed preview submission releases its gate");
+            return Err(error);
+        }
+        self.static_patch_preview_result = None;
+        let message = format!(
+            "Queued in-memory validation for {edit_count} static edit(s) changing {changed_bytes} byte(s); no file will be written"
+        );
+        self.log(ActivityLevel::Info, &message);
+        Ok(message)
+    }
+
     fn queue_static_patch_set_save(&mut self, path: PathBuf) -> Result<String, String> {
         if !is_static_patch_set_path(&path) {
             return Err(format!(
                 "patch-set destination must end with {STATIC_PATCH_SET_SUFFIX}"
             ));
+        }
+        if self.static_patch_preview_operation.is_pending() {
+            return Err(
+                "wait for the current no-write static patch preview before saving a patch set"
+                    .to_owned(),
+            );
         }
         if path.exists() {
             return Err(format!(
@@ -6707,6 +6876,12 @@ impl WorkbenchApp {
                 "patch-set input must end with {STATIC_PATCH_SET_SUFFIX}"
             ));
         }
+        if self.static_patch_preview_operation.is_pending() {
+            return Err(
+                "wait for the current no-write static patch preview before loading a patch set"
+                    .to_owned(),
+            );
+        }
         if self.worker_disconnected {
             return Err("the application-service worker is unavailable".to_owned());
         }
@@ -6744,6 +6919,12 @@ impl WorkbenchApp {
     fn queue_static_patch_publication(&mut self, path: PathBuf) -> Result<String, String> {
         if path.file_name().is_none() {
             return Err("choose a destination that names a new patched binary".to_owned());
+        }
+        if self.static_patch_preview_operation.is_pending() {
+            return Err(
+                "wait for the current no-write static patch preview before publishing a patch"
+                    .to_owned(),
+            );
         }
         if path.exists() {
             return Err(format!(
@@ -6822,11 +7003,13 @@ impl WorkbenchApp {
         ui.add_space(6.0);
         let mut remove_rva = None;
         let mut clear_all = false;
+        let mut preview_requested = false;
         let mut publish_requested = false;
         let mut save_patch_set_requested = false;
         let mut load_patch_set_requested = false;
         let publication_pending = self.publication_operation.is_pending();
         let patch_set_load_pending = self.patch_set_load_operation.is_pending();
+        let static_patch_preview_pending = self.static_patch_preview_operation.is_pending();
         let patch_set_busy = publication_pending || patch_set_load_pending;
         let static_publication_pending = self
             .publication_operation
@@ -6849,6 +7032,11 @@ impl WorkbenchApp {
                 identity.image_base
             )
         });
+        let current_preview_binding = self.build_static_patch_preview_binding().ok();
+        let preview_result_is_current = self
+            .static_patch_preview_result
+            .as_ref()
+            .is_some_and(|(binding, _)| Some(binding) == current_preview_binding.as_ref());
         egui::Frame::new()
             .fill(colors.raised)
             .stroke(egui::Stroke::new(1.0, colors.border))
@@ -6917,6 +7105,7 @@ impl WorkbenchApp {
                 ui.separator();
                 ui.horizontal_wrapped(|ui| {
                     let can_save_patch_set = !patch_set_busy
+                        && !static_patch_preview_pending
                         && !self.worker_disconnected
                         && !self.project_operation.is_pending()
                         && !self.pending_static_patch_drafts.drafts().is_empty();
@@ -6927,9 +7116,11 @@ impl WorkbenchApp {
                     };
                     save_patch_set_requested = ui
                         .add_enabled(can_save_patch_set, egui::Button::new(save_label))
-                        .on_disabled_hover_text(
-                            "Saving requires at least one validated draft and an idle application-service worker.",
-                        )
+                        .on_disabled_hover_text(if static_patch_preview_pending {
+                            "Wait for the current no-write preview before saving a patch set."
+                        } else {
+                            "Saving requires at least one validated draft and an idle application-service worker."
+                        })
                         .clicked();
                     let load_label = if patch_set_load_pending {
                         "Loading Patch Set..."
@@ -6939,14 +7130,17 @@ impl WorkbenchApp {
                     load_patch_set_requested = ui
                         .add_enabled(
                             !patch_set_busy
+                                && !static_patch_preview_pending
                                 && !self.worker_disconnected
                                 && !self.project_operation.is_pending()
                                 && self.project.is_some(),
                             egui::Button::new(load_label),
                         )
-                        .on_disabled_hover_text(
-                            "Loading replaces drafts only after strict schema, source identity, edit, and overlap validation succeeds.",
-                        )
+                        .on_disabled_hover_text(if static_patch_preview_pending {
+                            "Wait for the current no-write preview before loading a patch set."
+                        } else {
+                            "Loading replaces drafts only after strict schema, source identity, edit, and overlap validation succeeds."
+                        })
                         .clicked();
                 });
                 ui.small(format!(
@@ -6966,13 +7160,102 @@ impl WorkbenchApp {
                     }
                 }
                 ui.separator();
+                let can_preview = !patch_set_busy
+                    && !static_patch_preview_pending
+                    && !self.worker_disconnected
+                    && !self.project_operation.is_pending()
+                    && exact_source_ready
+                    && !self.pending_static_patch_drafts.drafts().is_empty();
+                let preview_label = if static_patch_preview_pending {
+                    "Validating Drafts in Memory..."
+                } else {
+                    "Validate Drafts / Preview Output Hash"
+                };
+                preview_requested = ui
+                    .add_enabled(can_preview, egui::Button::new(preview_label))
+                    .on_disabled_hover_text(if static_patch_preview_pending {
+                        "The application-service worker is validating the exact draft snapshot."
+                    } else if patch_set_busy {
+                        "Wait for the current patch-set or publication operation."
+                    } else if !exact_source_ready {
+                        "Verify the exact source binary before validating static edits."
+                    } else if self.pending_static_patch_drafts.drafts().is_empty() {
+                        "Queue at least one exact instruction edit first."
+                    } else {
+                        "The application-service worker is unavailable or busy with the project."
+                    })
+                    .clicked();
+                if static_patch_preview_pending {
+                    ui.spinner();
+                }
+                ui.label(
+                    RichText::new(
+                        "Dry run only: reconstructs the complete patched image in memory, validates exact source bytes and PE mappings, and computes its deterministic SHA-256. No destination is opened and no file is written.",
+                    )
+                    .small()
+                    .color(colors.secondary_text),
+                );
+                if let Some((_, result)) = self
+                    .static_patch_preview_result
+                    .as_ref()
+                    .filter(|_| preview_result_is_current)
+                {
+                    match result {
+                        Ok(outcome) => {
+                            ui.colored_label(
+                                colors.healthy,
+                                "[VALIDATED IN MEMORY] NO FILE WRITTEN",
+                            );
+                            ui.label(
+                                RichText::new(format!(
+                                    "Output SHA-256 {}",
+                                    outcome.output_identity().id.as_str()
+                                ))
+                                .monospace()
+                                .small()
+                                .color(colors.exact_extracted),
+                            );
+                            ui.small(format!(
+                                "Exact source SHA-256 {}; {} edit(s), {} changed byte(s)",
+                                outcome.source_identity().id.as_str(),
+                                outcome.edit_count(),
+                                outcome.changed_bytes()
+                            ));
+                            ui.small(format!(
+                                "Canonical request/plan SHA-256 {}",
+                                outcome.plan_fingerprint().as_str()
+                            ));
+                            for warning in outcome.warnings() {
+                                ui.colored_label(
+                                    colors.warning_conflict,
+                                    format!("[PREVIEW WARNING] {warning}"),
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            ui.colored_label(
+                                colors.destructive_quarantined,
+                                format!("[PREVIEW FAILED] {error} — NO FILE WRITTEN"),
+                            );
+                        }
+                    }
+                } else if self.static_patch_preview_result.is_some() {
+                    ui.colored_label(
+                        colors.warning_conflict,
+                        "[PREVIEW STALE] The project or draft snapshot changed; validate again. No file was written.",
+                    );
+                }
+                ui.separator();
                 let can_publish = !patch_set_busy
+                    && !static_patch_preview_pending
                     && !self.worker_disconnected
                     && !self.project_operation.is_pending()
                     && exact_source_ready
                     && !self.pending_static_patch_drafts.drafts().is_empty();
                 let publish_label = if static_publication_pending {
                     "Publishing patched binary..."
+                } else if static_patch_preview_pending {
+                    "Validating drafts in memory..."
                 } else if patch_set_load_pending {
                     "Loading patch set..."
                 } else if publication_pending {
@@ -7070,6 +7353,17 @@ impl WorkbenchApp {
             self.static_exact_byte_edit_error = None;
             self.static_patch_result = None;
             self.patch_set_result = None;
+        }
+        if preview_requested {
+            if let Err(error) = self.queue_static_patch_preview() {
+                if let Ok(binding) = self.build_static_patch_preview_binding() {
+                    self.static_patch_preview_result = Some((binding, Err(error.clone())));
+                }
+                self.log(
+                    ActivityLevel::Error,
+                    format!("Static patch preview failed: {error}"),
+                );
+            }
         }
         if save_patch_set_requested {
             if let Some(path) = self.choose_static_patch_set_save_destination() {
@@ -9603,6 +9897,26 @@ mod tests {
         PatchSetOutcome { path, manifest }
     }
 
+    fn preview_outcome(
+        project: &LoadedProject,
+        binding: &StaticPatchPreviewBinding,
+    ) -> StaticPatchPreviewOutcome {
+        let analysis = project.session().base_analysis();
+        let plan = StaticPatchPlan::new(analysis.identity(), analysis, binding.requests().to_vec())
+            .expect("valid preview plan");
+        let image = AppServices::default()
+            .apply_static_patch(&project.snapshot, &plan)
+            .expect("apply preview entirely in memory");
+        StaticPatchPreviewOutcome::from_parts_for_test(
+            image.source_identity().clone(),
+            image.output_identity().clone(),
+            plan.edits().len(),
+            plan.total_patch_bytes(),
+            [image.warnings()[0], image.warnings()[1]],
+            binding.request_fingerprint().clone(),
+        )
+    }
+
     fn test_app() -> (egui::Context, WorkbenchApp) {
         let context = egui::Context::default();
         let creation_context = eframe::CreationContext::_new_kittest(context.clone());
@@ -10704,6 +11018,266 @@ mod tests {
         );
         assert_eq!(app.pending_static_patch_drafts.drafts().len(), 1);
         assert!(app.static_patch_result.is_none());
+    }
+
+    #[test]
+    fn matching_static_preview_is_accepted_without_clearing_drafts() {
+        let (_context, mut app) = test_app();
+        let (_source, project) = loaded_project_with_bytes(SYMBOLIZED_FIXTURE);
+        let request =
+            StaticPatchEditRequest::nop_instruction(THUNK_RVA, THUNK_BYTES, "previewed draft")
+                .expect("valid preview request");
+        let binding = StaticPatchPreviewBinding::new(
+            project.session().base_analysis().identity().clone(),
+            vec![request],
+        )
+        .expect("preview binding");
+        let outcome = preview_outcome(&project, &binding);
+        app.finish_project_open(Ok(project));
+        app.pending_static_patch_drafts
+            .queue_nop(THUNK_RVA.into(), &THUNK_BYTES, "previewed draft")
+            .expect("queue previewed draft");
+        assert_eq!(
+            app.build_static_patch_preview_binding()
+                .expect("current preview binding"),
+            binding
+        );
+        let operation = app.operation_sequence.issue();
+        app.static_patch_preview_operation.begin(operation);
+
+        app.finish_static_patch_preview(operation, binding.clone(), Ok(outcome));
+
+        assert!(!app.static_patch_preview_operation.is_pending());
+        assert_eq!(app.pending_static_patch_drafts.drafts().len(), 1);
+        assert!(matches!(
+            app.static_patch_preview_result.as_ref(),
+            Some((actual, Ok(outcome)))
+                if actual == &binding
+                    && outcome.edit_count() == 1
+                    && outcome.changed_bytes() == THUNK_BYTES.len()
+        ));
+        assert!(app.static_patch_result.is_none());
+    }
+
+    #[test]
+    fn alternate_fingerprint_and_output_metadata_fail_closed_without_clearing_drafts() {
+        let (_context, mut app) = test_app();
+        let (_source, project) = loaded_project_with_bytes(SYMBOLIZED_FIXTURE);
+        let request = StaticPatchEditRequest::nop_instruction(
+            THUNK_RVA,
+            THUNK_BYTES,
+            "current preview request",
+        )
+        .expect("valid current preview request");
+        let binding = StaticPatchPreviewBinding::new(
+            project.session().base_analysis().identity().clone(),
+            vec![request],
+        )
+        .expect("current preview binding");
+        let valid = preview_outcome(&project, &binding);
+        let alternate_request = StaticPatchEditRequest::replace_bytes(
+            THUNK_RVA,
+            THUNK_BYTES,
+            [0xcc; THUNK_BYTES.len()],
+            "alternate same-size replacement",
+        )
+        .expect("valid alternate request");
+        let alternate_binding = StaticPatchPreviewBinding::new(
+            project.session().base_analysis().identity().clone(),
+            vec![alternate_request.clone()],
+        )
+        .expect("alternate preview binding");
+        let alternate_plan = StaticPatchPlan::new(
+            project.session().base_analysis().identity(),
+            project.session().base_analysis(),
+            vec![alternate_request],
+        )
+        .expect("alternate plan");
+        let alternate_image = AppServices::default()
+            .apply_static_patch(&project.snapshot, &alternate_plan)
+            .expect("plausible alternate output");
+        let alternate = StaticPatchPreviewOutcome::from_parts_for_test(
+            alternate_image.source_identity().clone(),
+            alternate_image.output_identity().clone(),
+            binding.requests().len(),
+            binding.changed_bytes(),
+            [alternate_image.warnings()[0], alternate_image.warnings()[1]],
+            alternate_binding.request_fingerprint().clone(),
+        );
+        assert_ne!(alternate.plan_fingerprint(), binding.request_fingerprint());
+        let mut wrong_metadata = valid.output_identity().clone();
+        wrong_metadata.size += 1;
+        let wrong_metadata = StaticPatchPreviewOutcome::from_parts_for_test(
+            valid.source_identity().clone(),
+            wrong_metadata,
+            valid.edit_count(),
+            valid.changed_bytes(),
+            [valid.warnings()[0], valid.warnings()[1]],
+            binding.request_fingerprint().clone(),
+        );
+        app.finish_project_open(Ok(project));
+        app.pending_static_patch_drafts
+            .queue_nop(THUNK_RVA.into(), &THUNK_BYTES, "current preview request")
+            .expect("queue current preview request");
+        let operation = app.operation_sequence.issue();
+        app.static_patch_preview_operation.begin(operation);
+
+        app.finish_static_patch_preview(operation, binding.clone(), Ok(alternate));
+
+        assert!(!app.static_patch_preview_operation.is_pending());
+        assert_eq!(app.pending_static_patch_drafts.drafts().len(), 1);
+        assert!(matches!(
+            app.static_patch_preview_result.as_ref(),
+            Some((actual, Err(_))) if actual == &binding
+        ));
+
+        let metadata_operation = app.operation_sequence.issue();
+        app.static_patch_preview_operation.begin(metadata_operation);
+        app.finish_static_patch_preview(metadata_operation, binding.clone(), Ok(wrong_metadata));
+
+        assert!(matches!(
+            app.static_patch_preview_result.as_ref(),
+            Some((actual, Err(_))) if actual == &binding
+        ));
+        assert_eq!(app.pending_static_patch_drafts.drafts().len(), 1);
+        assert!(app.static_patch_result.is_none());
+    }
+
+    #[test]
+    fn unchanged_output_digest_receipt_fails_closed_without_clearing_drafts() {
+        let (_context, mut app) = test_app();
+        let (_source, project) = loaded_project_with_bytes(SYMBOLIZED_FIXTURE);
+        let request = StaticPatchEditRequest::nop_instruction(
+            THUNK_RVA,
+            THUNK_BYTES,
+            "unchanged digest receipt",
+        )
+        .expect("valid preview request");
+        let binding = StaticPatchPreviewBinding::new(
+            project.session().base_analysis().identity().clone(),
+            vec![request],
+        )
+        .expect("preview binding");
+        let valid = preview_outcome(&project, &binding);
+        let unchanged = StaticPatchPreviewOutcome::from_parts_for_test(
+            valid.source_identity().clone(),
+            valid.source_identity().clone(),
+            valid.edit_count(),
+            valid.changed_bytes(),
+            [valid.warnings()[0], valid.warnings()[1]],
+            binding.request_fingerprint().clone(),
+        );
+        app.finish_project_open(Ok(project));
+        app.pending_static_patch_drafts
+            .queue_nop(THUNK_RVA.into(), &THUNK_BYTES, "unchanged digest receipt")
+            .expect("queue preview draft");
+        let operation = app.operation_sequence.issue();
+        app.static_patch_preview_operation.begin(operation);
+
+        app.finish_static_patch_preview(operation, binding.clone(), Ok(unchanged));
+
+        assert!(matches!(
+            app.static_patch_preview_result.as_ref(),
+            Some((actual, Err(_))) if actual == &binding
+        ));
+        assert_eq!(app.pending_static_patch_drafts.drafts().len(), 1);
+        assert!(app.static_patch_result.is_none());
+    }
+
+    #[test]
+    fn pending_static_preview_rejects_publication_and_patch_set_io() {
+        let (_context, mut app) = test_app();
+        let (_source, project) = loaded_project_with_bytes(SYMBOLIZED_FIXTURE);
+        app.finish_project_open(Ok(project));
+        app.pending_static_patch_drafts
+            .queue_nop(THUNK_RVA.into(), &THUNK_BYTES, "preview-gated patch set")
+            .expect("queue preview-gated draft");
+        let preview = app.operation_sequence.issue();
+        app.static_patch_preview_operation.begin(preview);
+        let directory = tempfile::tempdir().expect("temporary patch-set gate directory");
+        let save_path = directory
+            .path()
+            .join(format!("save{STATIC_PATCH_SET_SUFFIX}"));
+        let load_path = directory
+            .path()
+            .join(format!("load{STATIC_PATCH_SET_SUFFIX}"));
+        let publication_path = directory.path().join("patched.exe");
+
+        let save_error = app
+            .queue_static_patch_set_save(save_path)
+            .expect_err("preview must block patch-set save");
+        let load_error = app
+            .queue_static_patch_set_load(load_path)
+            .expect_err("preview must block patch-set load");
+        let publication_error = app
+            .queue_static_patch_publication(publication_path)
+            .expect_err("preview must block patched-binary publication");
+
+        assert!(save_error.contains("no-write static patch preview"));
+        assert!(load_error.contains("no-write static patch preview"));
+        assert!(publication_error.contains("no-write static patch preview"));
+        assert!(app.static_patch_preview_operation.is_pending());
+        assert!(!app.publication_operation.is_pending());
+        assert!(!app.patch_set_load_operation.is_pending());
+        assert_eq!(app.pending_static_patch_drafts.drafts().len(), 1);
+    }
+
+    #[test]
+    fn stale_operation_and_changed_drafts_cannot_publish_a_preview_result() {
+        let (_context, mut app) = test_app();
+        let (_source, project) = loaded_project_with_bytes(SYMBOLIZED_FIXTURE);
+        app.finish_project_open(Ok(project));
+        app.pending_static_patch_drafts
+            .queue_nop(THUNK_RVA.into(), &THUNK_BYTES, "current preview draft")
+            .expect("queue current preview draft");
+        let binding = app
+            .build_static_patch_preview_binding()
+            .expect("current preview binding");
+        let stale = app.operation_sequence.issue();
+        let current = app.operation_sequence.issue();
+        app.static_patch_preview_operation.begin(current);
+
+        app.finish_static_patch_preview(stale, binding.clone(), Err("stale result".to_owned()));
+
+        assert!(app.static_patch_preview_operation.is_pending());
+        assert!(app.static_patch_preview_result.is_none());
+        assert_eq!(app.pending_static_patch_drafts.drafts().len(), 1);
+
+        app.pending_static_patch_drafts
+            .queue_nop(0x1200, &[0xcc], "newer draft snapshot")
+            .expect("queue newer draft");
+        app.finish_static_patch_preview(
+            current,
+            binding,
+            Err("result for prior draft snapshot".to_owned()),
+        );
+
+        assert!(!app.static_patch_preview_operation.is_pending());
+        assert!(app.static_patch_preview_result.is_none());
+        assert_eq!(app.pending_static_patch_drafts.drafts().len(), 2);
+    }
+
+    #[test]
+    fn changed_project_rejects_correlated_static_preview_and_preserves_drafts() {
+        let (_context, mut app) = test_app();
+        let (_source, project) = loaded_project_with_bytes(SYMBOLIZED_FIXTURE);
+        app.finish_project_open(Ok(project));
+        app.pending_static_patch_drafts
+            .queue_nop(THUNK_RVA.into(), &THUNK_BYTES, "project-bound preview")
+            .expect("queue project-bound draft");
+        let binding = app
+            .build_static_patch_preview_binding()
+            .expect("project-bound preview binding");
+        let operation = app.operation_sequence.issue();
+        app.static_patch_preview_operation.begin(operation);
+        let (_other_source, other_project) = loaded_project_with_source();
+        app.project = Some(other_project);
+
+        app.finish_static_patch_preview(operation, binding, Err("wrong-project result".to_owned()));
+
+        assert!(!app.static_patch_preview_operation.is_pending());
+        assert!(app.static_patch_preview_result.is_none());
+        assert_eq!(app.pending_static_patch_drafts.drafts().len(), 1);
     }
 
     #[test]
