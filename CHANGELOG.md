@@ -8,6 +8,20 @@ prereleases; breaking changes remain explicit.
 
 ### Added
 
+- Added `resymbol-windows-live-access`, a narrowly scoped Windows-only process-memory foundation
+  for a future authenticated debugger helper. It opens only an explicitly selected PID with an
+  expected executable SHA-256, derives a trusted process-creation `FILETIME`, and retains the exact
+  hashed/parsed executable file handle without write/delete sharing for the access object's lifetime.
+  Its PE `SizeOfImage` is corroborated against both the Tool Help main-module record and remote PE
+  header before constructing `LiveTargetBinding` with the actual ASLR base. Read-only and explicitly
+  mutating opens request different least-privilege process rights. Public operations re-derive the
+  binding from the retained evidence; reads are exact and bounded to the main image, while writes
+  require the exact binding, exact expected bytes, an equal-length changed replacement, and one
+  committed executable `MEM_IMAGE` region. A mutation compare-checks first, changes and restores
+  the region's exact protection, flushes the instruction cache, verifies
+  readback, and reports truthful recovery evidence after any post-protection failure. This primitive
+  does not attach, stop, launch, resume, step, set breakpoints, authenticate a transport, or wire the
+  workbench, and a future provider must hold the process stopped before granting mutation authority.
 - Added a bounded x64 linear-disassembly preview to the workbench Address Space reader. Hex and
   disassembly views share the same verified frozen-source bytes; independent byte and instruction
   limits, explicit stop reasons, and the visible "not CFG or function-boundary truth" disclaimer
@@ -106,9 +120,10 @@ prereleases; breaking changes remain explicit.
   host, read-only provider-readiness discovery, and fail-closed sandbox policy, attestation,
   lifecycle, and cleanup records. The workbench now exposes the preferred-image Address Space view
   and evidence for entry-point, TLS, anti-debug-import, packer, entropy, and writable/executable-section
-  findings. No process-executing debugger helper, Windows AppContainer provider, Hyper-V guest, attach
-  path, or live memory mutation is implemented yet; the test host and readiness reports must not be
-  represented as an operating-system security boundary.
+  findings. No process-executing debugger helper, Windows AppContainer provider, Hyper-V guest,
+  attach path, authenticated stopped-state authority, or provider/UI live-memory integration is
+  implemented yet; the test host, readiness reports, and lower-level Windows live-access primitive
+  must not be represented as an operating-system security boundary or working debugger.
 - Added a production, strictly non-executing `OfflineImageDebugHost`. It freezes one exact
   identity-verified image snapshot, exposes only bounded canonical file-backed RVA reads, reports a
   complete capability matrix with only `OfflineAnalysis` available, and rejects every live,
