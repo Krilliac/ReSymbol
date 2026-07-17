@@ -3,7 +3,7 @@ use std::{
     ffi::c_void,
     fmt,
     fs::{self, File, OpenOptions},
-    io::{self, BufReader},
+    io::{self, BufReader, Seek},
     marker::PhantomData,
     mem::size_of,
     os::windows::{
@@ -751,7 +751,7 @@ fn open_exact_executable(
     let start_key_before = process_start_key(process)?;
     let queried_path = query_executable_path(process)?;
     let path = canonical_executable_path(&queried_path)?;
-    let file = OpenOptions::new()
+    let mut file = OpenOptions::new()
         .read(true)
         // Successful opening with read-only sharing excludes existing or new
         // writers/deleters for the lifetime of this retained handle.
@@ -773,6 +773,15 @@ fn open_exact_executable(
         return Err(LiveAccessError::ExecutableNotRegular { path });
     }
     let size_of_image = file_pe_size_of_image(&file, before.len(), &path)?;
+    // Windows' positional `FileExt::seek_read` also leaves the shared file
+    // cursor at the end of its read. The PE-header reads above therefore must
+    // not determine where the whole-file identity hash begins.
+    file.rewind()
+        .map_err(|source| LiveAccessError::ExecutableIo {
+            operation: "rewind before hash",
+            path: path.clone(),
+            source,
+        })?;
     let (binary_id, hashed_size) =
         BinaryId::digest_reader(BufReader::new(&file)).map_err(|source| {
             LiveAccessError::ExecutableIo {
