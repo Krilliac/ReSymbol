@@ -3,7 +3,7 @@ use std::{
     ffi::c_void,
     fmt,
     fs::{self, File, OpenOptions},
-    io::{self, BufReader},
+    io::{self, BufReader, Seek as _, SeekFrom},
     marker::PhantomData,
     mem::size_of,
     os::windows::{
@@ -773,13 +773,19 @@ fn open_exact_executable(
         return Err(LiveAccessError::ExecutableNotRegular { path });
     }
     let size_of_image = file_pe_size_of_image(&file, before.len(), &path)?;
+    let mut hash_reader = BufReader::new(&file);
+    hash_reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|source| LiveAccessError::ExecutableIo {
+            operation: "rewind before hash",
+            path: path.clone(),
+            source,
+        })?;
     let (binary_id, hashed_size) =
-        BinaryId::digest_reader(BufReader::new(&file)).map_err(|source| {
-            LiveAccessError::ExecutableIo {
-                operation: "hash",
-                path: path.clone(),
-                source,
-            }
+        BinaryId::digest_reader(hash_reader).map_err(|source| LiveAccessError::ExecutableIo {
+            operation: "hash",
+            path: path.clone(),
+            source,
         })?;
     let after = file
         .metadata()
