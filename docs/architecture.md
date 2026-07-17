@@ -564,12 +564,49 @@ protocol reflection, replay, downgrade, and accidental build mismatch, but its e
 self-reported strings are plaintext correlation—not peer or process authentication. A production
 external transport must independently authenticate the helper channel and process identity.
 
-No Windows debugger-host process, live transport, AppContainer or Hyper-V provider, guest agent,
-live launch/attach, breakpoint engine, register service, or process-memory service is implemented.
-The production offline host does not change that boundary: the current contracts and readiness UI
-are not a working malware sandbox or live debugger. [debugger-sandbox.md](debugger-sandbox.md)
-records the exact ownership, authorization, containment, cleanup, and verification gates that future
-live providers must satisfy.
+`crates/resymbol-windows-live-access` now supplies one lower-level process-memory primitive for a
+future authenticated helper. Its opaque, single-owner handle opens only an explicitly selected PID,
+previously observed creation `FILETIME`, debug-event image base, and expected executable SHA-256. It
+immediately rejects a reused PID and independently matches the supplied runtime base. Read-only and
+explicitly mutating typestates request separate least-privilege process rights, so the read-only type
+exposes no mutation method. It derives the
+creation `FILETIME`, actual ASLR main-module base, and PE `SizeOfImage` from the same process handle
+plus a Tool Help snapshot. The executable is hashed and parsed through one file handle opened without
+write/delete sharing and retained for the access object's lifetime; the file, Tool Help, and remote
+PE `SizeOfImage` values must agree before it constructs `LiveTargetBinding`. Every public operation
+re-derives that binding from the retained evidence without repeatedly hashing the entire executable.
+Reads are exact and main-image-RVA bounded. Writes additionally require exact expected bytes, an
+equal-length changed replacement, and one `VirtualQueryEx`-uniform committed executable `MEM_IMAGE`
+region so the captured protection can be restored without applying one page's protection to a
+different region. Mutations are additionally restricted to one system page because
+`VirtualProtectEx` reports only the first page's old protection for a multi-page span. Expected bytes
+are checked again after the protection change; a race abort restores only protection and records that
+ReSymbol made no byte-write attempt, without claiming a concurrent target left the bytes unchanged.
+Post-protection failure returns explicit recovery evidence; success requires a cache flush,
+protection restoration, replacement readback, and final binding validation.
+
+This adapter does not freeze the current executable path into an immutable loaded-image snapshot.
+The retained no-write/delete-sharing file handle, exact hash, and file/remote/module PE-header
+corroboration close ordinary path races, but an already-authorized same-account actor that can
+duplicate/tamper with handles or mutate process state remains outside this primitive's threat
+boundary. It also does not stop target threads, so a future provider must hold an authenticated
+stopped-state authority while mutating code.
+
+Tool Help module enumeration remains corroboration rather than security authority: Microsoft notes
+that a target's corrupted or changing loader table can produce incorrect snapshot information. The
+adapter now requires Tool Help's module path to match the retained exact executable, requires its base
+to equal the caller's independent `CREATE_PROCESS_DEBUG_EVENT` `lpBaseOfImage` evidence, and walks the
+complete reported image extent through a fixed region-count budget as committed `MEM_IMAGE` regions
+from one allocation, after first matching its size to the retained file. A future live
+provider must supply that evidence (and retain the event's image-file handle when available) before
+authorizing reads or writes.
+
+No Windows debugger-host process, authenticated live transport, AppContainer or Hyper-V provider,
+guest agent, live launch/attach, breakpoint engine, register service, or provider-integrated
+process-memory service is implemented. The offline host and live-access primitive do not change that
+boundary: the current contracts and readiness UI are not a working malware sandbox or live debugger.
+[debugger-sandbox.md](debugger-sandbox.md) records the exact ownership, authorization, containment,
+cleanup, and verification gates that future live providers must satisfy.
 
 ## Workbench GUI
 
