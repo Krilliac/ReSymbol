@@ -62,6 +62,20 @@ pub struct SessionMachine {
     pending_remote_command: Option<CommandId>,
 }
 
+/// Failure while applying an already decoded batch of uncorrelated host
+/// observations.
+///
+/// This stays crate-private because only the validating host client may turn
+/// untrusted event envelopes into reducer observations.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum UnsolicitedObservationError {
+    Reducer(SessionMachineError),
+    StateMismatch {
+        expected: SessionState,
+        actual: SessionState,
+    },
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct ReducerInstanceBinding;
 
@@ -628,6 +642,48 @@ impl SessionMachine {
             exit_code,
         })?;
         Ok(&self.state)
+    }
+
+    /// Applies a complete batch of uncorrelated stopped/exited observations or
+    /// restores every reducer field those transitions can mutate.
+    ///
+    /// The host client performs envelope, session, correlation, frame, and
+    /// event-sequence validation before calling this method. Replaying the
+    /// observations through the real reducer here is important: the broader
+    /// wire successor relation also describes correlated command evidence and
+    /// is intentionally not the reducer contract for unsolicited events.
+    pub(crate) fn apply_unsolicited_observations<'a>(
+        &mut self,
+        observations: impl IntoIterator<Item = &'a SessionState>,
+    ) -> Result<(), UnsolicitedObservationError> {
+        let checkpoint_state = self.state.clone();
+        let checkpoint_last_stop_id = self.last_stop_id;
+        let checkpoint_sandbox = self.sandbox.clone();
+
+        let result = observations.into_iter().try_for_each(|observed| {
+            let applied = match observed {
+                SessionState::Stopped {
+                    reason, thread_id, ..
+                } => self.mark_stopped(reason.clone(), *thread_id),
+                SessionState::Exited { exit_code, .. } => self.mark_exited(*exit_code),
+                _ => unreachable!("host client restricts unsolicited observations"),
+            }
+            .map_err(UnsolicitedObservationError::Reducer)?;
+            if applied != observed {
+                return Err(UnsolicitedObservationError::StateMismatch {
+                    expected: applied.clone(),
+                    actual: observed.clone(),
+                });
+            }
+            Ok(())
+        });
+
+        if result.is_err() {
+            self.state = checkpoint_state;
+            self.last_stop_id = checkpoint_last_stop_id;
+            self.sandbox = checkpoint_sandbox;
+        }
+        result
     }
 
     pub fn mark_failed(
