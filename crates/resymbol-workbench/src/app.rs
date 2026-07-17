@@ -8731,10 +8731,12 @@ mod tests {
             .analyze_binary(&source)
             .expect("analyze exact source fixture");
         let project = LoadedProject::from_snapshot(snapshot).expect("loaded project");
+        let verified_directory =
+            std::fs::canonicalize(directory.path()).expect("canonical temporary source directory");
 
         assert_eq!(
             default_static_patch_path(&project),
-            Some(directory.path().join("application-patched.exe"))
+            Some(verified_directory.join("application-patched.exe"))
         );
     }
 
