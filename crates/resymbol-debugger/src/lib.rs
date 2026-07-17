@@ -17,6 +17,7 @@ pub mod protocol;
 mod provider_probe;
 pub mod sandbox;
 mod session_machine;
+mod software_breakpoint;
 
 pub use address_space::{
     AddressRange, FileBacking, MemoryAccess, RelativeAddress, StaticAddressSpace,
@@ -93,4 +94,14 @@ pub use sandbox::{
 pub use session_machine::{
     MAX_REGISTERED_AUTHORIZATION_LEASES, RemoteCommandCheckpoint, SessionMachine,
     SessionMachineError,
+};
+pub use software_breakpoint::{
+    INT3_OPCODE, MAX_SOFTWARE_BREAKPOINTS, SoftwareBreakpointAcknowledgement,
+    SoftwareBreakpointAcknowledgementRejection, SoftwareBreakpointAction,
+    SoftwareBreakpointActionAcknowledgement, SoftwareBreakpointActionPlan,
+    SoftwareBreakpointBytePlan, SoftwareBreakpointCleanupEvidence, SoftwareBreakpointError,
+    SoftwareBreakpointOperationId, SoftwareBreakpointOperationIdError,
+    SoftwareBreakpointPersistence, SoftwareBreakpointPhase, SoftwareBreakpointPoisonEvidence,
+    SoftwareBreakpointSingleStepAcknowledgement, SoftwareBreakpointSnapshot,
+    SoftwareBreakpointStateMachine, SoftwareBreakpointTransition,
 };

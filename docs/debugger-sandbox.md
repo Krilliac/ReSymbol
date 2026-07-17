@@ -19,7 +19,9 @@ ReSymbol currently implements the non-executing foundation for debugger and sand
   every unsupported operation, and never fabricates target, attestation, or cleanup evidence;
 - a production, in-process `OfflineImageDebugHost` that freezes an identity-checked image snapshot,
   advertises only offline analysis, and serves bounded reads from exact canonical file-backed image
-  ranges without opening a process or executing target code; and
+  ranges without opening a process or executing target code;
+- a pure, bounded software-breakpoint transaction reducer that retains exact original bytes and
+  emits correlated one-byte action plans without reading, writing, or executing a target; and
 - sandbox policy, attestation, failure, lifecycle, resource-limit, and cleanup-receipt data models.
 
 The debugger crate also exposes a bounded provider-readiness service. It is discovery only: it
@@ -28,7 +30,7 @@ provision any other resource. A readiness result means only that a caller may at
 the suspended target still needs the exact policy/provider/build attestation described below.
 
 The Windows debugger host process, pipe transport, AppContainer provider, Hyper-V provider, guest
-agent, live process attach, breakpoint engine, register access, live memory access, and live
+agent, live process attach, live breakpoint backend, register access, live memory access, and live
 instruction editing are not implemented. `SyntheticDebugHost` is available only to crate tests or
 the explicit `test-support` feature. It is not a security boundary or platform provider. The current
 types and UI must not be described as a working malware sandbox or live debugger.
@@ -63,6 +65,29 @@ Workbench UI thread
   cleanup complete.
 - The backend-neutral crate forbids unsafe code. Platform FFI belongs in a narrow Windows provider
   crate whose public types are opaque and whose cleanup behavior is testable.
+
+## Software-breakpoint transaction planner
+
+`SoftwareBreakpointStateMachine` is a host-local reducer, not a debugger backend. One session owner
+may retain at most 1,024 validated software breakpoints and one pending operation. `Arm` and `Rearm`
+plans compare the exact retained original byte before replacing it with x86 `INT3` (`0xCC`);
+hit-time `Restore` and explicit `Remove` plans compare `0xCC` before restoring that original byte.
+An original `0xCC`, duplicate identity or process-global address, wrong-session token, stale hit or
+step token, invalid lifecycle transition, second pending action, and capacity exhaustion all fail
+before an action plan is issued.
+
+Planning reserves a unique monotonic operation identity but does not alter acknowledged breakpoint
+state. Every success acknowledgement must exactly echo the action, operation, session, complete stop
+token, breakpoint specification, address, and byte pair before the transition commits. A hit always
+plans restoration. Its exact acknowledgement removes a temporary breakpoint; a persistent one
+waits for an exact externally supplied later-stop correlation before it can plan rearming. That
+correlation is not evidence that an operating-system single step occurred.
+
+Any wrong, duplicate, stale, or out-of-order acknowledgement poisons the reducer permanently. The
+first mismatch freezes the last acknowledged table plus the exact pending plan whose physical
+outcome is now unknown, so cleanup can reconcile exact bytes without falsely reporting a clean
+target. The reducer itself performs no target access, continuation, single step, Win32 call, wire
+serialization, or protocol-version change and makes no claim that any planned operation succeeded.
 
 ## Read-only provider discovery
 
