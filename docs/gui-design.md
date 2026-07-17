@@ -174,10 +174,21 @@ branch/call targets that land in readable exact file backing in the static image
 flow is unavailable rather than guessed.
 
 Instruction actions keep static and live mutation separate. **Queue NOP for Patched Binary** records
-an exact-RVA, exact-source-byte draft. **Create New Patched Binary** accepts only drafts that decode
-as exactly one complete x64 instruction, then performs checked plan construction, source identity and
-byte revalidation, and create-new publication on the application-service worker. It writes only a
-new binary, never the open source or a process, and presents signature/checksum warnings. Static
+an exact-RVA, exact-source-byte draft. **Edit Exact Bytes...** exposes the existing same-length
+`ReplaceBytes` path for the selected instruction; when that complete immutable source span already
+has a draft, the action becomes **Edit Queued Patch...** and replacement is transactional. The modal
+shows the original bytes and decoded instruction as read-only evidence, accepts only changed,
+equal-length canonical `AA BB` hexadecimal input, and linearly decodes the bounded replacement span.
+A complete one-or-more-instruction preview is informational; invalid or trailing partial encodings
+are called out explicitly without pretending the arbitrary-byte escape hatch is assembly validation.
+**Restore Original** removes only the draft with the same RVA and complete expected-byte span—the
+verified source buffer is never changed. All add/edit operations retain canonical RVA ordering and
+revalidate overlap, count, per-edit, and aggregate-byte limits before swapping draft state.
+
+**Create New Patched Binary** accepts the resulting drafts, then performs checked plan construction,
+source identity and byte revalidation, and create-new publication on the application-service worker.
+It writes only a new binary, never the open source or a process, and presents signature/checksum
+warnings. Static
 patches and ordinary exports share one canonical destination reservation, so their worker-owned
 publication lifecycles cannot overlap. A successful patch receipt requires the named destination to
 be reopened and match the expected exact size and SHA-256; post-publication directory-sync failure

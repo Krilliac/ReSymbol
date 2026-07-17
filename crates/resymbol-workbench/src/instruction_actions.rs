@@ -157,7 +157,7 @@ impl StaticPatchDraft {
 }
 
 /// Bounded collection of unpublished static edits.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct PendingStaticPatchDrafts {
     drafts: Vec<StaticPatchDraft>,
 }
@@ -193,6 +193,21 @@ impl PendingStaticPatchDrafts {
         &self.drafts
     }
 
+    /// Returns a queued draft only when its complete immutable source span is
+    /// the exact selected instruction. Matching an RVA alone is deliberately
+    /// insufficient: imported general replacements may span more than one
+    /// decoded row.
+    #[must_use]
+    pub(crate) fn draft_for_exact_selection(
+        &self,
+        rva: u64,
+        expected: &[u8],
+    ) -> Option<&StaticPatchDraft> {
+        self.drafts
+            .iter()
+            .find(|draft| draft.rva == rva && draft.expected == expected)
+    }
+
     pub(crate) fn queue_nop(
         &mut self,
         rva: u64,
@@ -215,6 +230,38 @@ impl PendingStaticPatchDrafts {
             replacement,
             label,
         )?)
+    }
+
+    /// Replaces one queued draft at the exact selected source span.
+    ///
+    /// The candidate is fully validated and queued into a cloned collection
+    /// before the current collection is swapped. A malformed replacement,
+    /// stale selection, overlap, or aggregate-limit failure therefore leaves
+    /// every existing draft untouched and in canonical RVA order.
+    pub(crate) fn replace_exact_with_bytes(
+        &mut self,
+        rva: u64,
+        expected: &[u8],
+        replacement: &[u8],
+        label: impl Into<String>,
+    ) -> Result<PatchDraftQueueOutcome, StaticPatchDraftError> {
+        let candidate = StaticPatchDraft::replace_bytes(rva, expected, replacement, label)?;
+        let Some(index) = self.drafts.iter().position(|draft| draft.rva == rva) else {
+            return Err(StaticPatchDraftError::MissingDraftAtSelection { rva });
+        };
+        if self.drafts[index].expected != expected {
+            return Err(StaticPatchDraftError::DraftSourceMismatch { rva });
+        }
+        if self.drafts[index].replacement == replacement {
+            return Ok(PatchDraftQueueOutcome::AlreadyQueued);
+        }
+
+        let mut staged = self.clone();
+        staged.drafts.remove(index);
+        let outcome = staged.queue(candidate)?;
+        debug_assert_eq!(outcome, PatchDraftQueueOutcome::Added);
+        *self = staged;
+        Ok(outcome)
     }
 
     fn queue(
@@ -271,6 +318,16 @@ impl PendingStaticPatchDrafts {
         self.drafts.len() != before
     }
 
+    /// Removes only the draft whose complete immutable expected span matches
+    /// the selected instruction. This is the static editor's Restore Original
+    /// operation: the verified source bytes themselves are never mutated.
+    pub(crate) fn remove_exact_selection(&mut self, rva: u64, expected: &[u8]) -> bool {
+        let before = self.drafts.len();
+        self.drafts
+            .retain(|draft| draft.rva != rva || draft.expected != expected);
+        self.drafts.len() != before
+    }
+
     pub(crate) fn clear(&mut self) {
         self.drafts.clear();
     }
@@ -308,6 +365,217 @@ pub(crate) enum StaticPatchDraftError {
     AggregateBytesExceeded { actual: usize, maximum: usize },
     #[error("the loaded patch set uses an unsupported future static edit kind")]
     UnsupportedPatchKind,
+    #[error("no pending static patch draft exists at RVA 0x{rva:016X}")]
+    MissingDraftAtSelection { rva: u64 },
+    #[error("the pending draft at RVA 0x{rva:016X} is bound to different source bytes")]
+    DraftSourceMismatch { rva: u64 },
+}
+
+/// Whether the exact-byte modal will add a draft or transactionally replace
+/// the queued draft bound to the same complete source instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StaticExactByteEditMode {
+    QueueNew,
+    EditQueued,
+}
+
+/// UI-thread state for one static-only exact-byte edit.
+///
+/// Original bytes and decoded text are immutable evidence. Only the bounded
+/// canonical replacement text is editable; validation produces a fresh owned
+/// byte vector and never changes a draft collection by itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StaticExactByteEdit {
+    mode: StaticExactByteEditMode,
+    rva: u64,
+    original: Vec<u8>,
+    original_instruction: String,
+    initial_replacement: Vec<u8>,
+    replacement_hex: String,
+}
+
+impl StaticExactByteEdit {
+    pub(crate) fn for_instruction(
+        rva: u64,
+        original: &[u8],
+        original_instruction: impl Into<String>,
+    ) -> Result<Self, StaticExactByteEditError> {
+        validate_exact_edit_source(rva, original)?;
+        Ok(Self {
+            mode: StaticExactByteEditMode::QueueNew,
+            rva,
+            original: original.to_vec(),
+            original_instruction: original_instruction.into(),
+            initial_replacement: original.to_vec(),
+            replacement_hex: canonical_hex_bytes(original),
+        })
+    }
+
+    pub(crate) fn for_queued_draft(
+        draft: &StaticPatchDraft,
+        original_instruction: impl Into<String>,
+    ) -> Self {
+        Self {
+            mode: StaticExactByteEditMode::EditQueued,
+            rva: draft.rva,
+            original: draft.expected.clone(),
+            original_instruction: original_instruction.into(),
+            initial_replacement: draft.replacement.clone(),
+            replacement_hex: canonical_hex_bytes(&draft.replacement),
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn mode(&self) -> StaticExactByteEditMode {
+        self.mode
+    }
+
+    #[must_use]
+    pub(crate) const fn rva(&self) -> u64 {
+        self.rva
+    }
+
+    #[must_use]
+    pub(crate) fn original(&self) -> &[u8] {
+        &self.original
+    }
+
+    #[must_use]
+    pub(crate) fn original_instruction(&self) -> &str {
+        &self.original_instruction
+    }
+
+    #[must_use]
+    pub(crate) fn replacement_hex(&self) -> &str {
+        &self.replacement_hex
+    }
+
+    pub(crate) fn replacement_hex_mut(&mut self) -> &mut String {
+        &mut self.replacement_hex
+    }
+
+    #[must_use]
+    pub(crate) fn maximum_replacement_hex_characters(&self) -> usize {
+        canonical_hex_character_count(self.original.len())
+    }
+
+    /// Parses canonical `AA BB` text with the exact immutable source length.
+    /// This intentionally does not apply the change checks so the UI can show
+    /// a decoder preview while separately explaining why submission is gated.
+    pub(crate) fn parsed_replacement(&self) -> Result<Vec<u8>, StaticExactByteEditError> {
+        parse_canonical_exact_hex(&self.replacement_hex, self.original.len())
+    }
+
+    /// Returns a submission-ready replacement. New edits must differ from the
+    /// immutable source; queued edits must also differ from their current
+    /// replacement so clicking Save cannot silently rewrite metadata only.
+    pub(crate) fn validated_replacement(&self) -> Result<Vec<u8>, StaticExactByteEditError> {
+        let replacement = self.parsed_replacement()?;
+        if replacement == self.original {
+            return Err(StaticExactByteEditError::UnchangedOriginal);
+        }
+        if self.mode == StaticExactByteEditMode::EditQueued
+            && replacement == self.initial_replacement
+        {
+            return Err(StaticExactByteEditError::UnchangedQueuedReplacement);
+        }
+        Ok(replacement)
+    }
+}
+
+fn validate_exact_edit_source(rva: u64, original: &[u8]) -> Result<(), StaticExactByteEditError> {
+    if original.is_empty() {
+        return Err(StaticExactByteEditError::EmptySource);
+    }
+    if original.len() > MAX_STATIC_PATCH_BYTES_PER_EDIT {
+        return Err(StaticExactByteEditError::SourceTooLarge {
+            actual: original.len(),
+            maximum: MAX_STATIC_PATCH_BYTES_PER_EDIT,
+        });
+    }
+    if rva.checked_add(original.len() as u64).is_none() {
+        return Err(StaticExactByteEditError::AddressOverflow);
+    }
+    Ok(())
+}
+
+#[must_use]
+pub(crate) fn canonical_hex_bytes(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn canonical_hex_character_count(byte_count: usize) -> usize {
+    byte_count.saturating_mul(3).saturating_sub(1)
+}
+
+/// Strict parser for the modal's canonical byte grammar. Every byte is exactly
+/// two ASCII hexadecimal digits and adjacent bytes have exactly one ASCII
+/// space; prefixes, commas, underscores, and surrounding whitespace fail.
+pub(crate) fn parse_canonical_exact_hex(
+    input: &str,
+    expected_len: usize,
+) -> Result<Vec<u8>, StaticExactByteEditError> {
+    if input.is_empty() {
+        return Err(StaticExactByteEditError::EmptyReplacement);
+    }
+    let maximum_characters = canonical_hex_character_count(expected_len);
+    if input.len() > maximum_characters {
+        return Err(StaticExactByteEditError::ReplacementTextTooLong {
+            actual: input.len(),
+            maximum: maximum_characters,
+        });
+    }
+    let tokens = input.split(' ').collect::<Vec<_>>();
+    if tokens
+        .iter()
+        .any(|token| token.len() != 2 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        return Err(StaticExactByteEditError::NonCanonicalHex);
+    }
+    if tokens.len() != expected_len {
+        return Err(StaticExactByteEditError::ReplacementLengthMismatch {
+            expected: expected_len,
+            actual: tokens.len(),
+        });
+    }
+    tokens
+        .into_iter()
+        .map(|token| {
+            u8::from_str_radix(token, 16).map_err(|_| StaticExactByteEditError::NonCanonicalHex)
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub(crate) enum StaticExactByteEditError {
+    #[error("the selected instruction has no immutable source bytes")]
+    EmptySource,
+    #[error("the selected source span is {actual} bytes; the limit is {maximum}")]
+    SourceTooLarge { actual: usize, maximum: usize },
+    #[error("the selected instruction range overflows the RVA address space")]
+    AddressOverflow,
+    #[error("enter replacement bytes as canonical hexadecimal pairs, for example: 75 05")]
+    EmptyReplacement,
+    #[error(
+        "replacement bytes must use exactly two hexadecimal digits per byte and one ASCII space between bytes"
+    )]
+    NonCanonicalHex,
+    #[error(
+        "replacement text is {actual} UTF-8 bytes; at most {maximum} are allowed for this instruction"
+    )]
+    ReplacementTextTooLong { actual: usize, maximum: usize },
+    #[error("replacement contains {actual} byte(s); exactly {expected} are required")]
+    ReplacementLengthMismatch { expected: usize, actual: usize },
+    #[error(
+        "replacement bytes are identical to the immutable original; use Restore Original for a queued patch"
+    )]
+    UnchangedOriginal,
+    #[error("replacement bytes are unchanged from the queued patch")]
+    UnchangedQueuedReplacement,
 }
 
 /// Same-size edits available for canonical x86-64 conditional branches.
@@ -843,6 +1111,127 @@ mod tests {
         assert_eq!(drafts.drafts()[1].rva(), 0x2000);
         assert_eq!(drafts.drafts()[1].expected(), &[0x11; 32]);
         assert_eq!(drafts.drafts()[1].replacement(), &[0x22; 32]);
+    }
+
+    #[test]
+    fn exact_byte_input_accepts_only_canonical_changed_equal_length_hex() {
+        assert_eq!(parse_canonical_exact_hex("75 0a", 2), Ok(vec![0x75, 0x0a]));
+        for malformed in ["75,0A", "7 0A", "750A", "GG 0A"] {
+            assert_eq!(
+                parse_canonical_exact_hex(malformed, 2),
+                Err(StaticExactByteEditError::NonCanonicalHex),
+                "{malformed:?}"
+            );
+        }
+        for oversized in [" 75 0A", "75 0A ", "75  0A", "0x75 0A"] {
+            assert!(matches!(
+                parse_canonical_exact_hex(oversized, 2),
+                Err(StaticExactByteEditError::ReplacementTextTooLong { maximum: 5, .. })
+            ));
+        }
+        assert_eq!(
+            parse_canonical_exact_hex("75", 2),
+            Err(StaticExactByteEditError::ReplacementLengthMismatch {
+                expected: 2,
+                actual: 1,
+            })
+        );
+        assert_eq!(
+            parse_canonical_exact_hex("", 2),
+            Err(StaticExactByteEditError::EmptyReplacement)
+        );
+
+        let mut edit = StaticExactByteEdit::for_instruction(0x1000, &[0x74, 0x05], "je short")
+            .expect("bounded exact edit");
+        assert_eq!(edit.mode(), StaticExactByteEditMode::QueueNew);
+        assert_eq!(edit.replacement_hex(), "74 05");
+        assert_eq!(
+            edit.validated_replacement(),
+            Err(StaticExactByteEditError::UnchangedOriginal)
+        );
+        *edit.replacement_hex_mut() = "75 05".to_owned();
+        assert_eq!(edit.validated_replacement(), Ok(vec![0x75, 0x05]));
+    }
+
+    #[test]
+    fn queued_exact_byte_edit_requires_a_new_value_and_retains_source_evidence() {
+        let draft = StaticPatchDraft::replace_bytes(
+            0x2000,
+            &[0x0f, 0x84, 0, 0, 0, 0],
+            &[0x0f, 0x85, 0, 0, 0, 0],
+            "invert branch",
+        )
+        .expect("queued replacement");
+        let mut edit = StaticExactByteEdit::for_queued_draft(&draft, "je near");
+
+        assert_eq!(edit.mode(), StaticExactByteEditMode::EditQueued);
+        assert_eq!(edit.rva(), 0x2000);
+        assert_eq!(edit.original(), &[0x0f, 0x84, 0, 0, 0, 0]);
+        assert_eq!(edit.original_instruction(), "je near");
+        assert_eq!(edit.replacement_hex(), "0F 85 00 00 00 00");
+        assert_eq!(
+            edit.validated_replacement(),
+            Err(StaticExactByteEditError::UnchangedQueuedReplacement)
+        );
+        *edit.replacement_hex_mut() = "0F 84 00 00 00 00".to_owned();
+        assert_eq!(
+            edit.validated_replacement(),
+            Err(StaticExactByteEditError::UnchangedOriginal)
+        );
+    }
+
+    #[test]
+    fn exact_draft_replacement_is_transactional_and_keeps_canonical_order() {
+        let mut drafts = PendingStaticPatchDrafts::default();
+        drafts
+            .queue_nop(0x3000, &[0xcc], "later")
+            .expect("later draft");
+        drafts
+            .queue_nop(0x1000, &[0xcc], "selected")
+            .expect("selected draft");
+        let before = drafts.clone();
+
+        assert_eq!(
+            drafts.replace_exact_with_bytes(0x1000, &[0xcc], &[0x90, 0x90], "invalid replacement",),
+            Err(StaticPatchDraftError::ReplacementLengthMismatch {
+                expected: 1,
+                replacement: 2,
+            })
+        );
+        assert_eq!(drafts, before);
+        assert_eq!(
+            drafts.replace_exact_with_bytes(0x1000, &[0xcd], &[0x90], "stale source"),
+            Err(StaticPatchDraftError::DraftSourceMismatch { rva: 0x1000 })
+        );
+        assert_eq!(drafts, before);
+        assert_eq!(
+            drafts.replace_exact_with_bytes(0x2000, &[0xcc], &[0x90], "missing"),
+            Err(StaticPatchDraftError::MissingDraftAtSelection { rva: 0x2000 })
+        );
+        assert_eq!(drafts, before);
+
+        assert_eq!(
+            drafts
+                .replace_exact_with_bytes(0x1000, &[0xcc], &[0xc3], "exact bytes")
+                .expect("transactional replacement"),
+            PatchDraftQueueOutcome::Added
+        );
+        assert_eq!(
+            drafts
+                .drafts()
+                .iter()
+                .map(StaticPatchDraft::rva)
+                .collect::<Vec<_>>(),
+            vec![0x1000, 0x3000]
+        );
+        let edited = drafts
+            .draft_for_exact_selection(0x1000, &[0xcc])
+            .expect("edited exact selection");
+        assert_eq!(edited.kind(), StaticPatchDraftKind::ReplaceBytes);
+        assert_eq!(edited.replacement(), &[0xc3]);
+        assert!(drafts.remove_exact_selection(0x1000, &[0xcc]));
+        assert!(!drafts.remove_exact_selection(0x3000, &[0xcd]));
+        assert_eq!(drafts.drafts()[0].rva(), 0x3000);
     }
 
     #[test]

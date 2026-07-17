@@ -8,6 +8,15 @@ prereleases; breaking changes remain explicit.
 
 ### Added
 
+- Added a static-only exact-byte editor to every bounded x64 disassembly row. **Edit Exact Bytes...**
+  queues the existing same-size `ReplaceBytes` request, while **Edit Queued Patch...** transactionally
+  replaces the draft bound to that exact RVA and immutable source instruction. The modal accepts only
+  changed, equal-length canonical `AA BB` hex, retains the original bytes and decoded instruction as
+  read-only evidence, and shows a bounded replacement decode or an explicit invalid/partial warning.
+  **Restore Original** removes the matching unpublished draft because the verified source is never
+  mutated. Draft ordering, overlap, edit-count, and aggregate-byte limits remain enforced before a
+  collection swap; publication still creates a separate binary, and every live-memory action remains
+  disconnected until an authenticated provider supplies current authority.
 - Added protocol-1.6 `MemoryWriteFailed` evidence for future live providers. A failure is bound to
   the exact write command's stop, address, and size and reports one canonical mutation stage plus
   explicit recovery proof. A fully restored operation or a byte-write that was never attempted with
