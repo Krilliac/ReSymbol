@@ -918,18 +918,39 @@ mod tests {
                 .disabled_reason(),
             Some("The live session has no complete validated capability report.")
         );
-        let invalid_report = CapabilityReport {
+        let empty_report = CapabilityReport {
             statuses: Vec::new(),
         };
         let stopped_state = authenticated_stopped_state();
-        let invalid_capabilities = LiveDebuggerActionContext::from_authenticated_session(
+        let missing_execution = LiveDebuggerActionContext::from_authenticated_session(
             &stopped_state,
-            &invalid_report,
+            &empty_report,
             Some(exact_live_address()),
             Some(selected_thread()),
         );
         assert_eq!(
-            invalid_capabilities
+            missing_execution
+                .availability(LiveInstructionAction::Continue, &[0xCC])
+                .disabled_reason(),
+            Some(
+                "Required capability ExecutionControl is missing from the live session capability report."
+            )
+        );
+
+        let required_only_report = CapabilityReport {
+            statuses: vec![CapabilityStatus {
+                capability: DebugCapability::ExecutionControl,
+                availability: CapabilityAvailability::Available,
+            }],
+        };
+        let incomplete_capabilities = LiveDebuggerActionContext::from_authenticated_session(
+            &stopped_state,
+            &required_only_report,
+            Some(exact_live_address()),
+            Some(selected_thread()),
+        );
+        assert_eq!(
+            incomplete_capabilities
                 .availability(LiveInstructionAction::Continue, &[0xCC])
                 .disabled_reason(),
             Some("The live session capability report failed complete protocol validation.")
