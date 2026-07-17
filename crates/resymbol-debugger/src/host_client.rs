@@ -28,7 +28,7 @@ use crate::protocol::{
 use crate::sandbox::{
     AttestationMismatch, CleanupAttemptFailureError, CleanupReceiptError, DiagnosticText,
     HelperBuildId, SandboxAttestation, SandboxCleanupReceipt, SandboxFailure, SandboxFailureStage,
-    SandboxLifecycleEvent, SandboxLifecycleState, SandboxProviderSelection,
+    SandboxLifecycleEvent, SandboxLifecycleState, SandboxMachineError, SandboxProviderSelection,
 };
 use crate::session_machine::RemoteCommandCheckpoint;
 use crate::{SessionMachine, SessionMachineError};
@@ -987,8 +987,8 @@ fn apply_state_event(
         });
     }
     match next {
-        SessionState::AwaitingAttestation { .. } => {
-            reducer.target_created_suspended()?;
+        SessionState::AwaitingAttestation { process, .. } => {
+            reducer.target_created_suspended(process.clone())?;
         }
         SessionState::Offline { .. } => {
             reducer.complete_open_offline()?;
@@ -1048,11 +1048,13 @@ fn accept_attestation_event(
             actual: actual.session_id,
         });
     }
-    let expected = reducer
-        .expected_attestation()
-        .ok_or(DebugHostClientError::UnexpectedSandboxEvidence)?;
-    expected.validate_exact(actual)?;
-    reducer.accept_sandbox_attestation(actual)?;
+    match reducer.accept_sandbox_attestation(actual) {
+        Ok(_) => {}
+        Err(SessionMachineError::Sandbox(SandboxMachineError::Attestation(error))) => {
+            return Err(DebugHostClientError::Attestation(error));
+        }
+        Err(error) => return Err(DebugHostClientError::SessionMachine(error)),
+    }
     evidence.sandbox_event = true;
     Ok(())
 }
@@ -1151,6 +1153,7 @@ fn validate_sandbox_lifecycle(
         SandboxLifecycleEvent::Failed(failure) => {
             reducer.validate_sandbox_failure(failure)?;
             validate_sandbox_failure_phase(envelope, reducer, failure, evidence, false)?;
+            reducer.retain_sandbox_failure_target_creation(failure)?;
             observe_sandbox_rejection_diagnostic(
                 evidence,
                 SandboxRejectionDiagnostic::Failed {
@@ -1166,13 +1169,10 @@ fn validate_sandbox_lifecycle(
                     evidence: "sandbox-cleanup-evidence",
                 });
             }
-            if let Some(expected) = reducer.expected_attestation() {
-                attempt.receipt.validate_against(expected)?;
-            } else {
-                reducer.validate_cleanup_attempt_receipt(&attempt.receipt)?;
-            }
+            preserve_cleanup_error(reducer.validate_cleanup_attempt_receipt(&attempt.receipt))?;
             reducer.validate_sandbox_failure(&attempt.failure)?;
             validate_sandbox_failure_phase(envelope, reducer, &attempt.failure, evidence, true)?;
+            reducer.retain_sandbox_failure_target_creation(&attempt.failure)?;
             observe_sandbox_rejection_diagnostic(
                 evidence,
                 SandboxRejectionDiagnostic::Failed {
@@ -1194,18 +1194,24 @@ fn validate_sandbox_lifecycle(
                     evidence: "sandbox-cleanup-evidence",
                 });
             }
-            if let Some(expected) = reducer.expected_attestation() {
-                receipt.validate_against(expected)?;
-            } else if reducer.inherited_sandbox().is_some() {
-                reducer.validate_cleanup_receipt(receipt)?;
-            } else {
-                return Err(DebugHostClientError::UnexpectedSandboxEvidence);
-            }
+            preserve_cleanup_error(reducer.validate_cleanup_receipt(receipt))?;
             evidence.cleanup_receipt = Some(receipt.clone());
             evidence.sandbox_event = true;
         }
     }
     Ok(())
+}
+
+fn preserve_cleanup_error(
+    result: Result<(), SessionMachineError>,
+) -> Result<(), DebugHostClientError> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(SessionMachineError::Sandbox(SandboxMachineError::Cleanup(error))) => {
+            Err(DebugHostClientError::CleanupReceipt(error))
+        }
+        Err(error) => Err(DebugHostClientError::SessionMachine(error)),
+    }
 }
 
 fn require_command_state_before_sandbox_evidence(
@@ -2284,7 +2290,8 @@ mod tests {
         PolicyDigest, ProcessMitigationProfile, ProviderUnavailable, ProviderUnavailableReason,
         SandboxCleanupAttemptFailure, SandboxFailure, SandboxFailureContext, SandboxFailureKind,
         SandboxFailureValidationError, SandboxGuarantee, SandboxNetworkMode, SandboxPolicy,
-        SandboxPolicyApprovalId, SandboxProviderSelection, SandboxResourceLimits, Win32kProfile,
+        SandboxPolicyApprovalId, SandboxProviderSelection, SandboxResourceLimits,
+        SandboxTargetCreationOutcome, Win32kProfile,
     };
 
     const TEST_SANDBOX_FAILURE_DETAIL: &str = "sandbox helper failed with cleanup still required";
@@ -2546,8 +2553,12 @@ mod tests {
     #[derive(Debug, Clone, Copy)]
     enum ScriptedAttack {
         ForgedAttestation,
+        WrongAttestationProcess,
+        MissingAttestation,
         MissingCleanup,
         WrongCleanup,
+        MissingCleanupProcess,
+        WrongCleanupProcess,
         InheritedCleanup,
         WrongInheritedCleanup,
         ProviderUnavailableRejection,
@@ -2599,7 +2610,9 @@ mod tests {
                 .ok_or_else(|| HostTransportError::protocol("script omitted session"))?;
             let mut batch = Vec::new();
             match self.attack {
-                ScriptedAttack::ForgedAttestation => {
+                ScriptedAttack::ForgedAttestation
+                | ScriptedAttack::WrongAttestationProcess
+                | ScriptedAttack::MissingAttestation => {
                     let mut reducer =
                         SessionMachine::new(session_id, provisioning_epoch(), helper_build());
                     reducer.accept_command(envelope).map_err(machine_error)?;
@@ -2610,7 +2623,14 @@ mod tests {
                         reducer.state().state_token(),
                         DebugEvent::StateChanged(reducer.state().clone()),
                     )?;
-                    reducer.target_created_suspended().map_err(machine_error)?;
+                    let process = test_process_identity(
+                        reducer
+                            .expected_attestation()
+                            .expect("sandbox command creates expectation"),
+                    );
+                    reducer
+                        .target_created_suspended(process)
+                        .map_err(machine_error)?;
                     self.push_scripted_event(
                         &mut batch,
                         envelope.command_id,
@@ -2618,23 +2638,53 @@ mod tests {
                         reducer.state().state_token(),
                         DebugEvent::StateChanged(reducer.state().clone()),
                     )?;
-                    let mut forged = test_attestation(
+                    let mut attestation = test_attestation(
                         reducer
                             .expected_attestation()
                             .expect("sandbox command creates expectation"),
                     );
-                    forged.helper_build =
-                        HelperBuildId::new("forged-helper-build").expect("forged build id");
-                    self.push_scripted_event(
-                        &mut batch,
-                        envelope.command_id,
-                        session_id,
-                        reducer.state().state_token(),
-                        DebugEvent::SandboxAttested(forged),
-                    )?;
+                    match self.attack {
+                        ScriptedAttack::ForgedAttestation => {
+                            attestation.helper_build =
+                                HelperBuildId::new("forged-helper-build").expect("forged build id");
+                            self.push_scripted_event(
+                                &mut batch,
+                                envelope.command_id,
+                                session_id,
+                                reducer.state().state_token(),
+                                DebugEvent::SandboxAttested(attestation),
+                            )?;
+                        }
+                        ScriptedAttack::WrongAttestationProcess => {
+                            attestation.process.start_key =
+                                ProcessStartKey::new(8).expect("wrong process start key");
+                            self.push_scripted_event(
+                                &mut batch,
+                                envelope.command_id,
+                                session_id,
+                                reducer.state().state_token(),
+                                DebugEvent::SandboxAttested(attestation),
+                            )?;
+                        }
+                        ScriptedAttack::MissingAttestation => {
+                            self.push_scripted_event(
+                                &mut batch,
+                                envelope.command_id,
+                                session_id,
+                                reducer.state().state_token(),
+                                DebugEvent::CommandResult {
+                                    command_id: envelope.command_id,
+                                    outcome: CommandOutcome::Succeeded,
+                                },
+                            )?;
+                        }
+                        _ => unreachable!("matched attestation attack"),
+                    }
                 }
                 ScriptedAttack::MissingCleanup
                 | ScriptedAttack::WrongCleanup
+                | ScriptedAttack::MissingCleanupProcess
+                | ScriptedAttack::WrongCleanupProcess
                 | ScriptedAttack::InheritedCleanup
                 | ScriptedAttack::WrongInheritedCleanup => {
                     let prior = envelope
@@ -2651,9 +2701,22 @@ mod tests {
                         closing_token,
                         DebugEvent::StateChanged(closing),
                     )?;
-                    if matches!(self.attack, ScriptedAttack::WrongCleanup) {
+                    if matches!(
+                        self.attack,
+                        ScriptedAttack::WrongCleanup
+                            | ScriptedAttack::MissingCleanupProcess
+                            | ScriptedAttack::WrongCleanupProcess
+                    ) {
                         let mut wrong = test_cleanup_receipt(&expected_sandbox_attestation());
-                        wrong.handles_closed = false;
+                        match self.attack {
+                            ScriptedAttack::WrongCleanup => wrong.handles_closed = false,
+                            ScriptedAttack::MissingCleanupProcess => wrong.process = None,
+                            ScriptedAttack::WrongCleanupProcess => {
+                                wrong.process.as_mut().expect("created process").start_key =
+                                    ProcessStartKey::new(8).expect("wrong process start key");
+                            }
+                            _ => unreachable!("matched cleanup attack"),
+                        }
                         self.push_scripted_event(
                             &mut batch,
                             envelope.command_id,
@@ -2766,8 +2829,12 @@ mod tests {
                             SandboxFailureStage::Discovery,
                         ),
                         ScriptedAttack::ForgedAttestation
+                        | ScriptedAttack::WrongAttestationProcess
+                        | ScriptedAttack::MissingAttestation
                         | ScriptedAttack::MissingCleanup
                         | ScriptedAttack::WrongCleanup
+                        | ScriptedAttack::MissingCleanupProcess
+                        | ScriptedAttack::WrongCleanupProcess
                         | ScriptedAttack::InheritedCleanup
                         | ScriptedAttack::WrongInheritedCleanup
                         | ScriptedAttack::ProvisioningFailureThenCleanup
@@ -2888,6 +2955,11 @@ mod tests {
                 operation_token,
                 DebugEvent::StateChanged(operation_state),
             )?;
+            if reducer.sandbox_target_creation_outcome().is_none() {
+                reducer
+                    .record_sandbox_target_not_created()
+                    .map_err(machine_error)?;
+            }
             let kind = failure_kind_for_stage(stage);
             let failure = reducer
                 .bind_sandbox_failure(
@@ -2897,6 +2969,9 @@ mod tests {
                     DiagnosticText::new(TEST_SANDBOX_FAILURE_DETAIL)
                         .expect("bounded sandbox failure"),
                 )
+                .map_err(machine_error)?;
+            reducer
+                .retain_sandbox_failure_target_creation(&failure)
                 .map_err(machine_error)?;
             self.push_scripted_event(
                 batch,
@@ -2982,7 +3057,7 @@ mod tests {
                 }
                 _ => {}
             }
-            let attempt = cleanup_attempt_failure(cleanup_receipt);
+            let attempt = cleanup_attempt_failure(cleanup_receipt, inherited);
             self.push_scripted_event(
                 batch,
                 envelope.command_id,
@@ -3056,14 +3131,16 @@ mod tests {
                     token: closing_token,
                 }),
             )?;
+            let mut cleanup = test_cleanup_receipt(&expected_sandbox_attestation());
+            if matches!(self.attack, ScriptedAttack::ProvisioningFailureThenCleanup) {
+                cleanup.process = None;
+            }
             self.push_scripted_event(
                 batch,
                 envelope.command_id,
                 session_id,
                 closing_token,
-                DebugEvent::SandboxLifecycle(SandboxLifecycleEvent::Closed(test_cleanup_receipt(
-                    &expected_sandbox_attestation(),
-                ))),
+                DebugEvent::SandboxLifecycle(SandboxLifecycleEvent::Closed(cleanup)),
             )?;
             let closed_token = next_state_token(prior, 2);
             self.push_scripted_event(
@@ -3187,7 +3264,14 @@ mod tests {
                     command: DebugCommand::Open(sandbox_target()),
                 })
                 .map_err(machine_error)?;
-            reducer.target_created_suspended().map_err(machine_error)?;
+            let process = test_process_identity(
+                reducer
+                    .expected_attestation()
+                    .expect("sandbox expectation exists"),
+            );
+            reducer
+                .target_created_suspended(process)
+                .map_err(machine_error)?;
             let attestation = test_attestation(
                 reducer
                     .expected_attestation()
@@ -3391,6 +3475,7 @@ mod tests {
     fn test_attestation(expected: &ExpectedSandboxAttestation) -> SandboxAttestation {
         SandboxAttestation {
             binary_id: expected.binary_id.clone(),
+            process: test_process_identity(expected),
             session_id: expected.session_id,
             provisioning_epoch: expected.provisioning_epoch.clone(),
             policy_digest: expected.policy_digest.clone(),
@@ -3403,6 +3488,14 @@ mod tests {
         }
     }
 
+    fn test_process_identity(expected: &ExpectedSandboxAttestation) -> ProcessIdentity {
+        ProcessIdentity {
+            process_id: ProcessId::new(41).expect("sandbox process id"),
+            start_key: ProcessStartKey::new(7).expect("sandbox process start key"),
+            binary_id: expected.binary_id.clone(),
+        }
+    }
+
     fn test_cleanup_receipt(expected: &ExpectedSandboxAttestation) -> SandboxCleanupReceipt {
         SandboxCleanupReceipt {
             receipt_id: CleanupReceiptId::new("adversarial-cleanup-receipt")
@@ -3411,7 +3504,7 @@ mod tests {
             provisioning_epoch: expected.provisioning_epoch.clone(),
             provider: expected.provider.clone(),
             policy_digest: expected.policy_digest.clone(),
-            process: None,
+            process: Some(test_process_identity(expected)),
             outcome: CleanupOutcome::Complete,
             process_tree_terminated_and_reaped: true,
             handles_closed: true,
@@ -3438,17 +3531,29 @@ mod tests {
         receipt
     }
 
-    fn cleanup_attempt_failure(receipt: SandboxCleanupReceipt) -> SandboxCleanupAttemptFailure {
+    fn cleanup_attempt_failure(
+        receipt: SandboxCleanupReceipt,
+        inherited: bool,
+    ) -> SandboxCleanupAttemptFailure {
         let expected = expected_sandbox_attestation();
-        let context = match &receipt.process {
-            Some(process) => SandboxFailureContext::InheritedAttach {
-                process: process.clone(),
+        let context = if inherited {
+            SandboxFailureContext::InheritedAttach {
+                process: receipt
+                    .process
+                    .clone()
+                    .expect("inherited cleanup carries a process identity"),
                 mode: inherited_binding().mode(),
-            },
-            None => SandboxFailureContext::Launch {
+            }
+        } else {
+            let target_creation = match receipt.process.clone() {
+                Some(process) => SandboxTargetCreationOutcome::Created { process },
+                None => SandboxTargetCreationOutcome::NotCreated,
+            };
+            SandboxFailureContext::Launch {
                 binary_id: expected.binary_id,
                 helper_build: expected.helper_build,
-            },
+                target_creation,
+            }
         };
         SandboxCleanupAttemptFailure {
             failure: SandboxFailure {
@@ -3520,6 +3625,7 @@ mod tests {
             context: SandboxFailureContext::Launch {
                 binary_id: expected.binary_id,
                 helper_build: expected.helper_build,
+                target_creation: SandboxTargetCreationOutcome::NotCreated,
             },
             stage,
             kind: failure_kind_for_stage(stage),
@@ -3558,7 +3664,12 @@ mod tests {
                 command: DebugCommand::Open(sandbox_target()),
             };
             reducer.accept_command(&open).unwrap();
-            reducer.target_created_suspended().unwrap();
+            let process = test_process_identity(
+                reducer
+                    .expected_attestation()
+                    .expect("sandbox expectation exists"),
+            );
+            reducer.target_created_suspended(process).unwrap();
             let attestation = test_attestation(
                 reducer
                     .expected_attestation()
@@ -3721,6 +3832,9 @@ mod tests {
         let _checkpoint = reducer
             .begin_remote_command(&envelope)
             .expect("begin sandbox open");
+        reducer
+            .record_sandbox_target_not_created()
+            .expect("record trusted pre-target outcome");
 
         let policy = reducer
             .bind_sandbox_failure(
@@ -3765,8 +3879,17 @@ mod tests {
         );
         evidence.attestation_accepted = false;
 
+        let mut reducer = SessionMachine::new(session_id(), provisioning_epoch(), helper_build());
+        let _created_checkpoint = reducer
+            .begin_remote_command(&envelope)
+            .expect("begin created-target sandbox open");
+        let process = test_process_identity(
+            reducer
+                .expected_attestation()
+                .expect("sandbox expectation exists"),
+        );
         reducer
-            .target_created_suspended()
+            .target_created_suspended(process)
             .expect("target created suspended");
         let attestation_failure = reducer
             .bind_sandbox_failure(
@@ -3856,8 +3979,13 @@ mod tests {
                 evidence: "sandbox-lifecycle-state",
             })
         );
+        let process = test_process_identity(
+            reducer
+                .expected_attestation()
+                .expect("sandbox expectation exists"),
+        );
         reducer
-            .target_created_suspended()
+            .target_created_suspended(process)
             .expect("advance sandbox lifecycle");
         validate_sandbox_lifecycle(
             &envelope,
@@ -4321,7 +4449,11 @@ mod tests {
             })
         );
 
-        client.transport.attack = ScriptedAttack::ProvisioningFailureThenCleanup;
+        // This session already created and attested a target before cleanup
+        // failed, so the retry must carry that exact process identity. The
+        // provisioning-failure script intentionally omits one because it
+        // models failure before process creation.
+        client.transport.attack = ScriptedAttack::RuntimeFailureThenCleanup;
         let failed = client.session_state().expect("failed state").state_token();
         client
             .submit(DebugCommand::Close { state: failed })
@@ -4469,6 +4601,35 @@ mod tests {
     }
 
     #[test]
+    fn client_rejects_wrong_or_missing_sandbox_attestation_process_evidence() {
+        let mut wrong = scripted_client(ScriptedAttack::WrongAttestationProcess);
+        wrong
+            .begin_session(session_id(), provisioning_epoch(), helper_build())
+            .unwrap();
+        assert_eq!(
+            wrong.submit(DebugCommand::Open(sandbox_target())),
+            Err(DebugHostClientError::Attestation(
+                AttestationMismatch::ProcessIdentity
+            ))
+        );
+        assert_eq!(wrong.connection_state(), ClientConnectionState::Failed);
+
+        let mut missing = scripted_client(ScriptedAttack::MissingAttestation);
+        missing
+            .begin_session(session_id(), provisioning_epoch(), helper_build())
+            .unwrap();
+        assert!(matches!(
+            missing.submit(DebugCommand::Open(sandbox_target())),
+            Err(DebugHostClientError::MissingCommandEvidence {
+                command: "open",
+                final_state: SessionStateKind::AwaitingAttestation,
+                ..
+            })
+        ));
+        assert_eq!(missing.connection_state(), ClientConnectionState::Failed);
+    }
+
+    #[test]
     fn client_rejects_closed_without_cleanup_receipt() {
         let mut client = scripted_client(ScriptedAttack::MissingCleanup);
         prime_sandbox_stopped(&mut client);
@@ -4500,6 +4661,29 @@ mod tests {
             client.session_state().unwrap().kind(),
             SessionStateKind::Stopped
         );
+    }
+
+    #[test]
+    fn client_rejects_missing_or_mismatched_created_process_cleanup_binding() {
+        for attack in [
+            ScriptedAttack::MissingCleanupProcess,
+            ScriptedAttack::WrongCleanupProcess,
+        ] {
+            let mut client = scripted_client(attack);
+            prime_sandbox_stopped(&mut client);
+            let state = client.session_state().unwrap().state_token();
+            assert_eq!(
+                client.submit(DebugCommand::Close { state }),
+                Err(DebugHostClientError::CleanupReceipt(
+                    CleanupReceiptError::BindingMismatch
+                ))
+            );
+            assert_eq!(client.connection_state(), ClientConnectionState::Failed);
+            assert_eq!(
+                client.session_state().map(SessionState::kind),
+                Some(SessionStateKind::Stopped)
+            );
+        }
     }
 
     #[test]

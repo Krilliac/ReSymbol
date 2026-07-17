@@ -7,7 +7,7 @@
 use thiserror::Error;
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 2;
+pub const PROTOCOL_MINOR: u16 = 3;
 pub const MAX_CONTROL_BYTES: usize = 64 * 1024;
 pub const MAX_RAW_BYTES: u32 = 8 * 1024 * 1024;
 pub const MAX_BUILD_ID_BYTES: usize = 256;
@@ -31,7 +31,7 @@ impl ProtocolVersion {
     };
 
     fn validate(self) -> Result<(), WireError> {
-        if self.major != PROTOCOL_MAJOR || self.minor > PROTOCOL_MINOR {
+        if self != Self::CURRENT {
             return Err(WireError::UnsupportedVersion {
                 major: self.major,
                 minor: self.minor,
@@ -1110,6 +1110,22 @@ mod tests {
         assert!(matches!(
             BuildClaimHandshake::initiator_for_version(
                 EndpointRole::Controller,
+                [0x40; 16],
+                "controller/build",
+                "host/build",
+                ProtocolVersion {
+                    major: PROTOCOL_MAJOR,
+                    minor: 2,
+                },
+            ),
+            Err(HandshakeError::Wire(WireError::UnsupportedVersion {
+                major: PROTOCOL_MAJOR,
+                minor: 2,
+            }))
+        ));
+        assert!(matches!(
+            BuildClaimHandshake::initiator_for_version(
+                EndpointRole::Controller,
                 [0x41; 16],
                 "controller/build",
                 "host/build",
@@ -1120,6 +1136,27 @@ mod tests {
             ),
             Err(HandshakeError::Wire(WireError::UnsupportedVersion { .. }))
         ));
+    }
+
+    #[test]
+    fn responder_rejects_legacy_1_2_hello_before_negotiation() {
+        let mut legacy = hello(1);
+        legacy.version = ProtocolVersion {
+            major: PROTOCOL_MAJOR,
+            minor: 2,
+        };
+        let mut host =
+            BuildClaimHandshake::responder(EndpointRole::Host, "host/build", "controller/test")
+                .expect("responder");
+
+        assert_eq!(
+            host.accept(&legacy),
+            Err(HandshakeError::Wire(WireError::UnsupportedVersion {
+                major: PROTOCOL_MAJOR,
+                minor: 2,
+            }))
+        );
+        assert_eq!(host.state(), HandshakeState::Failed);
     }
 
     #[test]

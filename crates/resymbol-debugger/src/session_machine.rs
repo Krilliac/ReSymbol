@@ -13,14 +13,15 @@ use crate::authorization::{
 use crate::identity::{HostRiskLeaseId, ProvisioningEpoch, SandboxOwnershipLeaseId};
 use crate::protocol::{
     AttachMode, AttachScope, CommandEnvelope, CommandId, DebugCommand, DebugTargetRequest,
-    ProcessId, ProtocolValidationError, RunId, RunToken, SessionId, SessionState, SessionStateKind,
-    StateGeneration, StateToken, StopId, StopReason, StopToken, ThreadId,
+    ProcessId, ProcessIdentity, ProtocolValidationError, RunId, RunToken, SessionId, SessionState,
+    SessionStateKind, StateGeneration, StateToken, StopId, StopReason, StopToken, ThreadId,
 };
 use crate::sandbox::{
     CleanupOutcome, DiagnosticText, ExpectedSandboxAttestation, HelperBuildId,
     PolicyValidationError, SandboxAttestation, SandboxCleanupReceipt, SandboxFailure,
     SandboxFailureContext, SandboxFailureKind, SandboxFailureStage, SandboxFailureValidationError,
-    SandboxLifecycleState, SandboxMachine, SandboxMachineError, provider_boundary,
+    SandboxLifecycleState, SandboxMachine, SandboxMachineError, SandboxTargetCreationOutcome,
+    provider_boundary,
 };
 
 pub const MAX_REGISTERED_AUTHORIZATION_LEASES: usize = 64;
@@ -218,6 +219,27 @@ impl SessionMachine {
         self.sandbox
             .as_ref()
             .map(SandboxMachine::expected_attestation)
+    }
+
+    #[must_use]
+    pub fn created_sandbox_process(&self) -> Option<&ProcessIdentity> {
+        self.sandbox
+            .as_ref()
+            .and_then(SandboxMachine::created_process)
+    }
+
+    #[must_use]
+    pub fn sandbox_target_creation_outcome(&self) -> Option<&SandboxTargetCreationOutcome> {
+        self.sandbox
+            .as_ref()
+            .and_then(SandboxMachine::target_creation_outcome)
+    }
+
+    #[must_use]
+    pub fn accepted_sandbox_attestation(&self) -> Option<&SandboxAttestation> {
+        self.sandbox
+            .as_ref()
+            .and_then(SandboxMachine::accepted_attestation)
     }
 
     #[must_use]
@@ -472,7 +494,10 @@ impl SessionMachine {
 
     /// Records the creation-time suspended target before accepting any
     /// sandbox attestation.
-    pub fn target_created_suspended(&mut self) -> Result<&SessionState, SessionMachineError> {
+    pub fn target_created_suspended(
+        &mut self,
+        process: ProcessIdentity,
+    ) -> Result<&SessionState, SessionMachineError> {
         self.require_state("record suspended target", &[SessionStateKind::Opening])?;
         if self.execution_gate != ExecutionGate::SandboxPending {
             return Err(SessionMachineError::SandboxNotPending);
@@ -481,8 +506,11 @@ impl SessionMachine {
         self.sandbox
             .as_mut()
             .ok_or(SessionMachineError::SandboxNotPending)?
-            .target_created_suspended()?;
-        self.transition_to(SessionState::AwaitingAttestation { token: next })?;
+            .target_created_suspended(process.clone())?;
+        self.transition_to(SessionState::AwaitingAttestation {
+            token: next,
+            process,
+        })?;
         Ok(&self.state)
     }
 
@@ -668,6 +696,20 @@ impl SessionMachine {
         self.sandbox.is_some() || self.inherited_sandbox.is_some()
     }
 
+    /// Records that a sandbox launch failed before creating any target. Hosts
+    /// must call this from their trusted creation path before binding failure
+    /// evidence; an omitted state event is never equivalent to this result.
+    pub fn record_sandbox_target_not_created(&mut self) -> Result<(), SessionMachineError> {
+        match (&mut self.sandbox, &self.inherited_sandbox) {
+            (Some(sandbox), None) => sandbox
+                .record_target_not_created()
+                .map_err(SessionMachineError::from),
+            (None, None) => Err(SessionMachineError::UnexpectedSandboxFailure),
+            (Some(_), Some(_)) => Err(SessionMachineError::ConflictingSandboxOwnership),
+            (None, Some(_)) => Err(SandboxFailureValidationError::ContextKind.into()),
+        }
+    }
+
     /// Produces exact, non-authority failure evidence from the reducer's
     /// sandbox operation context. Host implementations should use this instead
     /// of rebuilding evidence from command payloads.
@@ -689,6 +731,7 @@ impl SessionMachine {
                     context: SandboxFailureContext::Launch {
                         binary_id: expected.binary_id.clone(),
                         helper_build: expected.helper_build.clone(),
+                        target_creation: sandbox.failure_target_creation()?.clone(),
                     },
                     stage,
                     kind,
@@ -725,7 +768,10 @@ impl SessionMachine {
     ) -> Result<(), SessionMachineError> {
         match (&self.sandbox, &self.inherited_sandbox) {
             (Some(sandbox), None) => {
-                failure.validate_against_expected(sandbox.expected_attestation())?;
+                failure.validate_against_expected(
+                    sandbox.expected_attestation(),
+                    sandbox.target_creation_outcome(),
+                )?;
                 Ok(())
             }
             (None, Some(binding)) => {
@@ -741,6 +787,47 @@ impl SessionMachine {
             }
             (None, None) => Err(SessionMachineError::UnexpectedSandboxFailure),
             (Some(_), Some(_)) => Err(SessionMachineError::ConflictingSandboxOwnership),
+        }
+    }
+
+    /// Retains the explicit launch target-creation outcome only for a
+    /// cleanup-owning failure. Policy and discovery failures remain
+    /// effect-free and therefore leave remote rollback possible.
+    pub fn retain_sandbox_failure_target_creation(
+        &mut self,
+        failure: &SandboxFailure,
+    ) -> Result<(), SessionMachineError> {
+        self.validate_sandbox_failure(failure)?;
+        if matches!(
+            failure.stage,
+            SandboxFailureStage::Policy | SandboxFailureStage::Discovery
+        ) {
+            return Ok(());
+        }
+        match (&mut self.sandbox, &self.inherited_sandbox, &failure.context) {
+            (
+                Some(sandbox),
+                None,
+                SandboxFailureContext::Launch {
+                    target_creation, ..
+                },
+            ) => {
+                let may_establish_not_created = matches!(
+                    failure.stage,
+                    SandboxFailureStage::Provisioning | SandboxFailureStage::Launch
+                ) && sandbox.state()
+                    == SandboxLifecycleState::Provisioning;
+                if sandbox.target_creation_outcome().is_none() && !may_establish_not_created {
+                    return Err(SandboxMachineError::TargetCreationOutcomeMismatch.into());
+                }
+                sandbox
+                    .retain_failure_target_creation(target_creation)
+                    .map_err(SessionMachineError::from)
+            }
+            (None, Some(_), SandboxFailureContext::InheritedAttach { .. }) => Ok(()),
+            (None, None, _) => Err(SessionMachineError::UnexpectedSandboxFailure),
+            (Some(_), Some(_), _) => Err(SessionMachineError::ConflictingSandboxOwnership),
+            _ => Err(SandboxFailureValidationError::ContextKind.into()),
         }
     }
 
@@ -777,9 +864,7 @@ impl SessionMachine {
     ) -> Result<(), SessionMachineError> {
         match (&self.sandbox, &self.inherited_sandbox) {
             (Some(sandbox), None) => {
-                receipt
-                    .validate_against(sandbox.expected_attestation())
-                    .map_err(SandboxMachineError::Cleanup)?;
+                sandbox.validate_cleanup_receipt(receipt)?;
                 Ok(())
             }
             (None, Some(binding)) => Self::validate_inherited_cleanup_binding(binding, receipt),
@@ -1146,13 +1231,13 @@ mod tests {
     use crate::authorization::{HostRiskLeaseIssuer, SandboxOwnershipLeaseIssuer};
     use crate::protocol::{
         AttachTarget, DebugTargetRequest, LaunchEnvironment, LaunchTarget, MemoryAddress,
-        ProcessIdentity, ProcessStartKey, ProtocolVersion,
+        ProcessStartKey, ProtocolVersion,
     };
     use crate::sandbox::{
-        ChildProcessProfile, CleanupOutcome, CleanupReceiptId, DynamicCodeProfile,
-        IsolationBoundary, PolicyDigest, ProcessMitigationProfile, SandboxGuarantee,
-        SandboxNetworkMode, SandboxPolicy, SandboxPolicyApprovalId, SandboxProviderSelection,
-        SandboxResourceLimits, Win32kProfile,
+        ChildProcessProfile, CleanupOutcome, CleanupReceiptError, CleanupReceiptId,
+        DynamicCodeProfile, IsolationBoundary, PolicyDigest, ProcessMitigationProfile,
+        SandboxGuarantee, SandboxNetworkMode, SandboxPolicy, SandboxPolicyApprovalId,
+        SandboxProviderSelection, SandboxResourceLimits, Win32kProfile,
     };
 
     fn session_id() -> SessionId {
@@ -1300,6 +1385,7 @@ mod tests {
     fn actual_attestation(expected: &ExpectedSandboxAttestation) -> SandboxAttestation {
         SandboxAttestation {
             binary_id: expected.binary_id.clone(),
+            process: sandbox_process_identity(expected),
             session_id: expected.session_id,
             provisioning_epoch: expected.provisioning_epoch.clone(),
             policy_digest: expected.policy_digest.clone(),
@@ -1312,6 +1398,14 @@ mod tests {
         }
     }
 
+    fn sandbox_process_identity(expected: &ExpectedSandboxAttestation) -> ProcessIdentity {
+        ProcessIdentity {
+            process_id: ProcessId::new(4242).expect("sandbox process id"),
+            start_key: ProcessStartKey::new(31).expect("sandbox process start key"),
+            binary_id: expected.binary_id.clone(),
+        }
+    }
+
     fn cleanup_receipt(expected: &ExpectedSandboxAttestation) -> SandboxCleanupReceipt {
         SandboxCleanupReceipt {
             receipt_id: CleanupReceiptId::new("cleanup-11").expect("receipt id"),
@@ -1319,7 +1413,7 @@ mod tests {
             provisioning_epoch: expected.provisioning_epoch.clone(),
             provider: expected.provider.clone(),
             policy_digest: expected.policy_digest.clone(),
-            process: None,
+            process: Some(sandbox_process_identity(expected)),
             outcome: CleanupOutcome::Complete,
             process_tree_terminated_and_reaped: true,
             handles_closed: true,
@@ -1373,8 +1467,13 @@ mod tests {
                 DebugCommand::Open(sandbox_target(binary)),
             ))
             .expect("open command");
+        let process = sandbox_process_identity(
+            machine
+                .expected_attestation()
+                .expect("expected attestation"),
+        );
         machine
-            .target_created_suspended()
+            .target_created_suspended(process)
             .expect("suspended target");
         let actual = actual_attestation(
             machine
@@ -1406,8 +1505,13 @@ mod tests {
         assert_eq!(machine.state().kind(), SessionStateKind::Opening);
         assert_eq!(machine.state().state_token().generation.get(), 2);
 
+        let process = sandbox_process_identity(
+            machine
+                .expected_attestation()
+                .expect("expected attestation"),
+        );
         machine
-            .target_created_suspended()
+            .target_created_suspended(process)
             .expect("suspended target");
         assert_eq!(
             machine.state().kind(),
@@ -1735,6 +1839,56 @@ mod tests {
     }
 
     #[test]
+    fn recorded_sandbox_process_cannot_be_rolled_back_through_remote_ticket() {
+        let mut machine = machine();
+        let initial = machine.state().state_token();
+        let checkpoint = machine
+            .begin_remote_command(&command(
+                1,
+                initial,
+                DebugCommand::Open(sandbox_target(BinaryId::digest(b"recorded process"))),
+            ))
+            .expect("remote sandbox open");
+        let commit_ticket = duplicate_remote_checkpoint(&checkpoint);
+        let process =
+            sandbox_process_identity(machine.expected_attestation().expect("sandbox expectation"));
+        machine
+            .target_created_suspended(process.clone())
+            .expect("record suspended target");
+        let failure = machine
+            .bind_sandbox_failure(
+                SandboxFailureStage::Attestation,
+                SandboxFailureKind::AttestationRejected,
+                false,
+                DiagnosticText::new("attestation rejected").expect("detail"),
+            )
+            .expect("bind created target failure");
+        assert!(matches!(
+            &failure.context,
+            SandboxFailureContext::Launch {
+                target_creation: SandboxTargetCreationOutcome::Created { process: bound },
+                ..
+            } if bound == &process
+        ));
+        machine
+            .validate_sandbox_failure(&failure)
+            .expect("validate created target failure");
+
+        assert_eq!(
+            machine.reject_remote_command(checkpoint, CommandId::new(1).expect("command id")),
+            Err(SessionMachineError::RemoteCommandStateChanged)
+        );
+        assert_eq!(machine.created_sandbox_process(), Some(&process));
+        assert_eq!(
+            machine.state().kind(),
+            SessionStateKind::AwaitingAttestation
+        );
+        machine
+            .commit_remote_command(commit_ticket, CommandId::new(1).expect("command id"))
+            .expect("retain recorded process effect");
+    }
+
+    #[test]
     fn retained_sandbox_failure_commit_allows_later_exact_close() {
         let mut machine = machine();
         let initial = machine.state().state_token();
@@ -1749,9 +1903,38 @@ mod tests {
             .expected_attestation()
             .expect("expected sandbox evidence")
             .clone();
+        assert_eq!(
+            machine.bind_sandbox_failure(
+                SandboxFailureStage::Provisioning,
+                SandboxFailureKind::HelperFailure,
+                true,
+                DiagnosticText::new("provider failed after provisioning").expect("detail"),
+            ),
+            Err(SessionMachineError::Sandbox(
+                SandboxMachineError::TargetCreationOutcomeMissing
+            ))
+        );
+        machine
+            .record_sandbox_target_not_created()
+            .expect("record trusted pre-target outcome");
+        let failure = machine
+            .bind_sandbox_failure(
+                SandboxFailureStage::Provisioning,
+                SandboxFailureKind::HelperFailure,
+                true,
+                DiagnosticText::new("provider failed after provisioning").expect("detail"),
+            )
+            .expect("bind pre-target failure");
+        machine
+            .retain_sandbox_failure_target_creation(&failure)
+            .expect("retain exact not-created outcome");
         machine
             .mark_failed("provider failed after provisioning")
             .expect("cleanup-required failure");
+        assert_eq!(
+            machine.sandbox_target_creation_outcome(),
+            Some(&SandboxTargetCreationOutcome::NotCreated)
+        );
         machine
             .commit_remote_command(checkpoint, CommandId::new(1).expect("command id"))
             .expect("retain failure transaction");
@@ -1760,10 +1943,43 @@ mod tests {
         machine
             .accept_command(&command(2, failed, DebugCommand::Close { state: failed }))
             .expect("close after retained failure");
+        let mut cleanup = cleanup_receipt(&expected);
+        cleanup.process = None;
         machine
-            .complete_close(Some(&cleanup_receipt(&expected)))
+            .complete_close(Some(&cleanup))
             .expect("exact cleanup closes session");
         assert_eq!(machine.state().kind(), SessionStateKind::Closed);
+    }
+
+    #[test]
+    fn processless_cleanup_is_rejected_without_retained_not_created_evidence() {
+        let mut machine = machine();
+        let initial = machine.state().state_token();
+        machine
+            .accept_command(&command(
+                1,
+                initial,
+                DebugCommand::Open(sandbox_target(BinaryId::digest(b"unknown creation"))),
+            ))
+            .expect("sandbox open");
+        let expected = machine
+            .expected_attestation()
+            .expect("sandbox expectation")
+            .clone();
+        let opening = machine.state().state_token();
+        machine
+            .accept_command(&command(2, opening, DebugCommand::Close { state: opening }))
+            .expect("close while target creation is unknown");
+        let mut cleanup = cleanup_receipt(&expected);
+        cleanup.process = None;
+
+        assert_eq!(
+            machine.complete_close(Some(&cleanup)),
+            Err(SessionMachineError::Sandbox(
+                SandboxMachineError::TargetCreationOutcomeMissing
+            ))
+        );
+        assert_eq!(machine.state().kind(), SessionStateKind::Closing);
     }
 
     #[test]
@@ -1794,6 +2010,26 @@ mod tests {
             machine.complete_close(Some(&wrong)),
             Err(SessionMachineError::Sandbox(SandboxMachineError::Cleanup(
                 _
+            )))
+        ));
+        let mut missing_process = cleanup_receipt(&expected);
+        missing_process.process = None;
+        assert!(matches!(
+            machine.complete_close(Some(&missing_process)),
+            Err(SessionMachineError::Sandbox(SandboxMachineError::Cleanup(
+                CleanupReceiptError::BindingMismatch
+            )))
+        ));
+        let mut wrong_process = cleanup_receipt(&expected);
+        wrong_process
+            .process
+            .as_mut()
+            .expect("created process")
+            .start_key = ProcessStartKey::new(32).expect("wrong start key");
+        assert!(matches!(
+            machine.complete_close(Some(&wrong_process)),
+            Err(SessionMachineError::Sandbox(SandboxMachineError::Cleanup(
+                CleanupReceiptError::BindingMismatch
             )))
         ));
         let receipt = cleanup_receipt(&expected);
@@ -2268,7 +2504,7 @@ mod tests {
     }
 
     #[test]
-    fn host_reducer_binds_rollback_failure_without_restoring_command_authority() {
+    fn controller_accepts_explicit_rollback_failure_without_restoring_command_authority() {
         let mut machine = machine();
         let initial = machine.state().state_token();
         let open = command(
@@ -2279,20 +2515,37 @@ mod tests {
         let checkpoint = machine
             .begin_remote_command(&open)
             .expect("begin host-side open");
-        let failure = machine
-            .bind_sandbox_failure(
-                SandboxFailureStage::Discovery,
-                SandboxFailureKind::HelperFailure,
-                true,
-                DiagnosticText::new("provider discovery failed").expect("detail"),
-            )
-            .expect("bind exact launch context");
+        let expected = machine
+            .expected_attestation()
+            .expect("sandbox expectation")
+            .clone();
+        let failure = SandboxFailure {
+            session_id: expected.session_id,
+            provisioning_epoch: expected.provisioning_epoch,
+            policy_digest: expected.policy_digest,
+            provider: expected.provider,
+            context: SandboxFailureContext::Launch {
+                binary_id: expected.binary_id,
+                helper_build: expected.helper_build,
+                target_creation: SandboxTargetCreationOutcome::NotCreated,
+            },
+            stage: SandboxFailureStage::Discovery,
+            kind: SandboxFailureKind::HelperFailure,
+            retryable: true,
+            detail: DiagnosticText::new("provider discovery failed").expect("detail"),
+        };
         machine
             .validate_sandbox_failure(&failure)
-            .expect("host and validating reducer share the binding");
+            .expect("explicit rollback evidence matches the controller binding");
+        machine
+            .retain_sandbox_failure_target_creation(&failure)
+            .expect("rollback-safe evidence has no retained effect");
         assert!(matches!(
             failure.context,
-            SandboxFailureContext::Launch { .. }
+            SandboxFailureContext::Launch {
+                target_creation: SandboxTargetCreationOutcome::NotCreated,
+                ..
+            }
         ));
 
         machine
@@ -2300,6 +2553,7 @@ mod tests {
             .expect("rollback visible state");
         assert_eq!(machine.state().kind(), SessionStateKind::Idle);
         assert_eq!(machine.state().state_token(), initial);
+        assert_eq!(machine.sandbox_target_creation_outcome(), None);
         assert!(machine.expected_attestation().is_none());
         assert_eq!(machine.last_command_id(), Some(open.command_id));
         assert!(matches!(

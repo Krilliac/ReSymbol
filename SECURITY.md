@@ -60,11 +60,22 @@ processes must enforce; serializing those types does not create containment.
 
 The live-operation contract accepts only one-use lease identifiers registered locally by the trusted
 session worker. Host launch leases bind the exact binary; host attach leases bind PID, a trusted
-process-start key, executable identity, and attach mode; sandbox-ownership leases additionally bind provider,
-policy digest, and a fresh provisioning epoch. Attestation and cleanup evidence carry that same epoch
-to reject replay across otherwise identical provisioning attempts. Identifier constructors validate
-shape, not randomness: production hosts must generate lease IDs and epochs with a cryptographically
-secure source and must never expose grant registration to untrusted command senders.
+process-start key, executable identity, and attach mode; sandbox-ownership leases additionally bind
+provider, policy digest, and a fresh provisioning epoch. For sandboxed launches, the suspended-target
+state, provider attestation, and any cleanup after target creation also carry the exact created
+PID/start-key/image identity. The reducer retains the created identity and accepted attestation and
+rejects missing, mismatched, or replayed evidence before resume or release. Before binding a launch
+failure, a trusted host path must explicitly retain `NotCreated` or `Created` with that exact process
+identity; the binder rejects an unknown result. Processless cleanup is valid only after exact
+`NotCreated` evidence has been validated and retained; omission of a target state leaves the outcome
+unknown and fails closed. Attestation and cleanup evidence carry the same
+fresh epoch to reject replay across otherwise identical provisioning attempts. The wire accepts
+exactly debugger protocol 1.3 and rejects 1.2 before negotiation because the older schema cannot
+represent these required fields. Raw expected-attestation and cleanup comparison helpers are
+crate-private; public acceptance always compares against reducer-retained identity. Identifier
+constructors validate shape, not randomness: production hosts must generate lease IDs and epochs
+with a cryptographically secure source and must never expose grant registration to untrusted command
+senders.
 
 There is currently no shipped AppContainer launcher, debugger-host process, Hyper-V guest agent, or
 verified cleanup journal. Do not execute a hostile sample through the current workbench. Use a
