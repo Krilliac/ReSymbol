@@ -1264,22 +1264,26 @@ mod tests {
         put_test_program_header(
             &mut bytes,
             ELF_HEADER_SIZE,
-            0,
-            0x1200_0000,
-            0x100,
-            0x200,
-            5,
-            0x1000,
+            TestProgramHeader {
+                file_offset: 0,
+                virtual_address: 0x1200_0000,
+                file_size: 0x100,
+                memory_size: 0x200,
+                flags: 5,
+                alignment: 0x1000,
+            },
         );
         put_test_program_header(
             &mut bytes,
             ELF_HEADER_SIZE + PROGRAM_HEADER_SIZE,
-            0x180,
-            0xf000_0180,
-            4,
-            0x80,
-            6,
-            0x10,
+            TestProgramHeader {
+                file_offset: 0x180,
+                virtual_address: 0xf000_0180,
+                file_size: 4,
+                memory_size: 0x80,
+                flags: 6,
+                alignment: 0x10,
+            },
         );
         bytes[0x180..0x184].copy_from_slice(&[0x12, 0x34, 0x56, 0x78]);
         let expected = analyze_bytes(&bytes)
@@ -1293,24 +1297,24 @@ mod tests {
         (temp, image)
     }
 
-    fn put_test_program_header(
-        bytes: &mut [u8],
-        offset: usize,
+    struct TestProgramHeader {
         file_offset: u32,
         virtual_address: u32,
         file_size: u32,
         memory_size: u32,
         flags: u32,
         alignment: u32,
-    ) {
+    }
+
+    fn put_test_program_header(bytes: &mut [u8], offset: usize, header: TestProgramHeader) {
         put_test_u32(bytes, offset, 1);
-        put_test_u32(bytes, offset + 4, file_offset);
-        put_test_u32(bytes, offset + 8, virtual_address);
-        put_test_u32(bytes, offset + 12, virtual_address);
-        put_test_u32(bytes, offset + 16, file_size);
-        put_test_u32(bytes, offset + 20, memory_size);
-        put_test_u32(bytes, offset + 24, flags);
-        put_test_u32(bytes, offset + 28, alignment);
+        put_test_u32(bytes, offset + 4, header.file_offset);
+        put_test_u32(bytes, offset + 8, header.virtual_address);
+        put_test_u32(bytes, offset + 12, header.virtual_address);
+        put_test_u32(bytes, offset + 16, header.file_size);
+        put_test_u32(bytes, offset + 20, header.memory_size);
+        put_test_u32(bytes, offset + 24, header.flags);
+        put_test_u32(bytes, offset + 28, header.alignment);
     }
 
     fn put_test_u16(bytes: &mut [u8], offset: usize, value: u16) {

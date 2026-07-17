@@ -4670,7 +4670,7 @@ mod tests {
                 stop.state,
                 DebugEvent::BreakpointChanged {
                     stop,
-                    breakpoint: breakpoint.clone(),
+                    breakpoint,
                     change: BreakpointChange::Set {
                         persistence: BreakpointPersistence::Persistent,
                     },
@@ -4698,7 +4698,7 @@ mod tests {
         assert_eq!(
             client.submit(DebugCommand::SetBreakpoint {
                 stop,
-                breakpoint: breakpoint.clone(),
+                breakpoint,
                 persistence: BreakpointPersistence::Temporary,
             }),
             Err(DebugHostClientError::UnexpectedCommandEvidence {
@@ -4754,7 +4754,7 @@ mod tests {
                     stop.state,
                     DebugEvent::BreakpointChanged {
                         stop,
-                        breakpoint: breakpoint.clone(),
+                        breakpoint,
                         change: BreakpointChange::Set { persistence },
                     },
                 ),
@@ -4778,7 +4778,7 @@ mod tests {
             ]);
             let command = DebugCommand::SetBreakpoint {
                 stop,
-                breakpoint: breakpoint.clone(),
+                breakpoint,
                 persistence,
             };
 
@@ -4841,7 +4841,7 @@ mod tests {
         };
         let breakpoint_event = DebugEvent::BreakpointChanged {
             stop,
-            breakpoint: breakpoint.clone(),
+            breakpoint,
             change: BreakpointChange::Set {
                 persistence: BreakpointPersistence::Temporary,
             },
@@ -4870,7 +4870,7 @@ mod tests {
         assert_eq!(
             replayed.submit(DebugCommand::SetBreakpoint {
                 stop,
-                breakpoint: breakpoint.clone(),
+                breakpoint,
                 persistence: BreakpointPersistence::Temporary,
             }),
             Err(DebugHostClientError::DuplicateCommandEvidence {
@@ -4921,7 +4921,7 @@ mod tests {
                 stop.state,
                 DebugEvent::BreakpointChanged {
                     stop,
-                    breakpoint: breakpoint.clone(),
+                    breakpoint,
                     change: BreakpointChange::Set {
                         persistence: BreakpointPersistence::Temporary,
                     },

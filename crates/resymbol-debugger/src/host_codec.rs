@@ -608,7 +608,7 @@ mod tests {
             caused_by: Some(command.command_id),
             event: DebugEvent::BreakpointChanged {
                 stop,
-                breakpoint: breakpoint.clone(),
+                breakpoint,
                 change,
             },
         };
