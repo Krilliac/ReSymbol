@@ -57,6 +57,12 @@ fn nops_a_known_executable_instruction_without_mutating_the_source() {
         &[0x90; 5]
     );
     assert_eq!(patched.bytes().len(), EXACT_PE.len());
+    let shared_bytes = patched.bytes_arc();
+    assert_eq!(
+        patched.bytes().as_ptr(),
+        shared_bytes.as_slice().as_ptr(),
+        "cloning the output owner must not copy the full image"
+    );
     assert_eq!(project.verified_source_bytes(), Some(EXACT_PE));
     assert_eq!(
         fs::read(&source).expect("read source after patch"),
@@ -84,6 +90,55 @@ fn nops_a_known_executable_instruction_without_mutating_the_source() {
         limited.apply_static_patch(&project, &plan),
         Err(StaticPatchError::SourceTooLarge { .. })
     ));
+}
+
+#[test]
+fn serialized_false_section_mapping_never_authorizes_a_patch() {
+    let temp = TempDir::new().expect("create temp directory");
+    let source = write_source(&temp);
+    let services = AppServices::default();
+    let project = services.analyze_binary(&source).expect("analyze exact PE");
+    let mut forged_analysis = project.session().base_analysis().clone();
+    let BinaryAnalysis::Pe(pe) = &mut forged_analysis;
+
+    assert_eq!(pe.sections[0].raw_data_offset, 0x400);
+    assert_eq!(pe.sections[4].raw_data_offset, 0x1200);
+    for section in &mut pe.sections[..4] {
+        section.raw_data_offset += 0x200;
+    }
+    pe.sections[4].raw_data_offset = 0;
+    pe.sections[4].raw_data_size = 0;
+    forged_analysis
+        .validate()
+        .expect("crafted package analysis remains internally valid");
+
+    let false_file_offset = 0x600usize;
+    let expected_at_false_location = EXACT_PE[false_file_offset];
+    let request = StaticPatchEditRequest::replace_bytes(
+        0x1000,
+        [expected_at_false_location],
+        [expected_at_false_location ^ 0xff],
+        "forged package mapping",
+    )
+    .expect("shape-valid replacement");
+    let plan = StaticPatchPlan::new(
+        project.session().base_analysis().identity(),
+        &forged_analysis,
+        vec![request],
+    )
+    .expect("forged serialized mapping passes model-only plan validation");
+    assert_eq!(plan.edits()[0].file_offset(), false_file_offset as u64);
+
+    assert!(matches!(
+        services.apply_static_patch(&project, &plan),
+        Err(StaticPatchError::SourceLayoutMismatch {
+            rva: 0x1000,
+            planned_file_offset: 0x600,
+            actual_file_offset: 0x400,
+        })
+    ));
+    assert_eq!(project.verified_source_bytes(), Some(EXACT_PE));
+    assert_eq!(fs::read(source).expect("read unchanged source"), EXACT_PE);
 }
 
 #[test]

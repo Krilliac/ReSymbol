@@ -160,6 +160,44 @@ pub struct PeCodeViewInspection {
     rsds: PeCodeViewRsds,
 }
 
+/// Strict, byte-derived PE layout used for security-sensitive RVA mapping.
+///
+/// Unlike a serialized [`PeAnalysis`], this value can only be produced by
+/// reparsing the exact caller-supplied PE bytes. Inspection is limited to the
+/// bounded DOS, COFF, optional, and section headers and does not run imports,
+/// code recovery, RTTI discovery, or string recovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeLayoutInspection {
+    identity: BinaryIdentity,
+    size_of_image: u32,
+    size_of_headers: u32,
+    sections: Vec<PeSection>,
+}
+
+impl PeLayoutInspection {
+    /// Exact SHA-256, size, format, architecture, and preferred image base.
+    #[must_use]
+    pub const fn identity(&self) -> &BinaryIdentity {
+        &self.identity
+    }
+
+    #[must_use]
+    pub const fn size_of_image(&self) -> u32 {
+        self.size_of_image
+    }
+
+    #[must_use]
+    pub const fn size_of_headers(&self) -> u32 {
+        self.size_of_headers
+    }
+
+    /// Exact validated section-table records parsed from the supplied bytes.
+    #[must_use]
+    pub fn sections(&self) -> &[PeSection] {
+        &self.sections
+    }
+}
+
 impl PeCodeViewInspection {
     pub const fn identity(&self) -> &BinaryIdentity {
         &self.identity
@@ -477,6 +515,25 @@ pub fn inspect_pe_codeview(bytes: &[u8]) -> Result<PeCodeViewInspection, Analysi
         machine: headers.coff.machine,
         section_headers,
         rsds,
+    })
+}
+
+/// Inspect only the strict PE32+ x86-64 headers and section layout.
+///
+/// This bounded path is intended for consumers that must derive address
+/// mappings from exact source bytes instead of trusting a persisted analysis
+/// model. It computes the complete binary identity but intentionally skips all
+/// directory payload parsing and recovery passes.
+pub fn inspect_pe_layout(bytes: &[u8]) -> Result<PeLayoutInspection, AnalysisError> {
+    let reader = Reader::new(bytes);
+    let headers = parse_headers(&reader)?;
+    let identity = pe_binary_identity(bytes, headers.image_base)?;
+
+    Ok(PeLayoutInspection {
+        identity,
+        size_of_image: headers.size_of_image,
+        size_of_headers: headers.size_of_headers,
+        sections: headers.sections,
     })
 }
 

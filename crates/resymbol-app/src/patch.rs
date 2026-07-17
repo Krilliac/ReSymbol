@@ -8,7 +8,10 @@ use std::{
     sync::Arc,
 };
 
-use resymbol_analysis::{AnalysisError, BinaryAnalysis, PeSection};
+use resymbol_analysis::{
+    AnalysisError, BinaryAnalysis, ExactX64InstructionError, PeSection, inspect_pe_layout,
+    validate_exact_x64_instruction,
+};
 use resymbol_core::{BinaryFormat, BinaryId, BinaryIdentity, ClaimValidationError};
 use thiserror::Error;
 
@@ -26,7 +29,8 @@ pub const MAX_STATIC_PATCH_BYTES: usize = 1_024 * 1_024;
 /// Maximum UTF-8 byte length of a stable user-facing edit label.
 pub const MAX_STATIC_PATCH_LABEL_BYTES: usize = 256;
 /// Architectural maximum length of one x86/x86-64 instruction.
-pub const MAX_STATIC_PATCH_NOP_INSTRUCTION_BYTES: usize = 15;
+pub const MAX_STATIC_PATCH_NOP_INSTRUCTION_BYTES: usize =
+    resymbol_analysis::MAX_X64_INSTRUCTION_BYTES;
 
 /// Stable semantic classification for a same-size static binary edit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -160,6 +164,10 @@ impl StaticPatchEdit {
         self.rva
     }
 
+    /// Provisional offset derived from the supplied analysis model.
+    ///
+    /// This value is informational until application reparses the exact source
+    /// bytes and requires the fresh executable, file-backed mapping to match.
     #[must_use]
     pub const fn file_offset(&self) -> u64 {
         self.file_offset
@@ -199,8 +207,10 @@ impl StaticPatchEdit {
 /// Canonical immutable plan for patching one exact analyzed source image.
 ///
 /// Edits are sorted by RVA regardless of caller order. Every edit is resolved
-/// to one fully file-backed executable PE range and overlaps are rejected in
-/// both RVA and file-offset space before the plan is published.
+/// provisionally to one fully file-backed executable PE range and overlaps are
+/// rejected in both RVA and file-offset space before the plan is published.
+/// Applying the plan reparses the exact source bytes and requires every fresh
+/// mapping to match; serialized analysis metadata never authorizes a write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StaticPatchPlan {
     source_identity: BinaryIdentity,
@@ -328,12 +338,36 @@ impl StaticPatchPlan {
                 actual: actual_size,
             });
         }
-        let actual_id = BinaryId::digest(source_bytes);
-        if actual_id != self.source_identity.id {
+        let source_layout =
+            inspect_pe_layout(source_bytes).map_err(StaticPatchError::InvalidSourceLayout)?;
+        if source_layout.identity().id != self.source_identity.id {
             return Err(StaticPatchError::SourceIdentityMismatch {
                 expected: self.source_identity.id.clone(),
-                actual: actual_id,
+                actual: source_layout.identity().id.clone(),
             });
+        }
+        if source_layout.identity() != &self.source_identity {
+            return Err(StaticPatchError::SourceIdentityMetadataMismatch {
+                expected: self.source_identity.clone(),
+                actual: source_layout.identity().clone(),
+            });
+        }
+
+        for edit in &self.edits {
+            let fresh_file_offset = resolve_file_offset(
+                source_layout.size_of_image(),
+                source_layout.sections(),
+                edit.rva,
+                edit.len(),
+                actual_size,
+            )?;
+            if fresh_file_offset != edit.file_offset {
+                return Err(StaticPatchError::SourceLayoutMismatch {
+                    rva: edit.rva,
+                    planned_file_offset: edit.file_offset,
+                    actual_file_offset: fresh_file_offset,
+                });
+            }
         }
 
         for edit in &self.edits {
@@ -367,7 +401,7 @@ impl StaticPatchPlan {
             image_base: self.source_identity.image_base,
         };
         Ok(PatchedBinaryImage {
-            bytes: Arc::from(output),
+            bytes: Arc::new(output),
             source_identity: self.source_identity.clone(),
             output_identity,
             warnings: [
@@ -404,7 +438,7 @@ impl fmt::Display for StaticPatchWarning {
 /// Newly allocated patched bytes and their deterministic exact identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PatchedBinaryImage {
-    bytes: Arc<[u8]>,
+    bytes: Arc<Vec<u8>>,
     source_identity: BinaryIdentity,
     output_identity: BinaryIdentity,
     warnings: [StaticPatchWarning; 2],
@@ -413,11 +447,12 @@ pub struct PatchedBinaryImage {
 impl PatchedBinaryImage {
     #[must_use]
     pub fn bytes(&self) -> &[u8] {
-        self.bytes.as_ref()
+        self.bytes.as_slice()
     }
 
+    /// Clone the shared owning buffer without copying the patched image.
     #[must_use]
-    pub fn bytes_arc(&self) -> Arc<[u8]> {
+    pub fn bytes_arc(&self) -> Arc<Vec<u8>> {
         Arc::clone(&self.bytes)
     }
 
@@ -497,14 +532,16 @@ impl AppServices {
         plan.apply(source)
     }
 
-    /// Stage, flush, synchronize, and publish a patched binary at a new path.
+    /// Stage, flush, file-synchronize, and publish a patched binary at a new path.
     ///
     /// Threading: any thread. Competing publications to the same destination are
     /// race-safe because no-clobber publication permits at most one success.
     /// Publication uses same-directory staging; an existing target is never
-    /// replaced. A failed publication drops and removes its staging file. On
-    /// Unix, a parent-directory sync error can be reported after the new target
-    /// has become visible.
+    /// replaced. A failed staging operation drops and removes its staging file.
+    /// On Unix, the parent directory is synchronized after publication and an
+    /// error can therefore be reported after the target becomes visible. The
+    /// Windows path has no portable parent-directory synchronization here, so
+    /// success does not claim that the new directory entry survives power loss.
     pub fn publish_static_patch_new(
         &self,
         project: &ProjectSnapshot,
@@ -561,6 +598,10 @@ fn validate_request_shape(
         && replacement.iter().any(|byte| *byte != X86_NOP)
     {
         return Err(StaticPatchError::InvalidNopReplacement { rva });
+    }
+    if matches!(kind, StaticPatchKind::NopInstruction) {
+        validate_exact_x64_instruction(u64::from(rva), expected)
+            .map_err(|source| StaticPatchError::InvalidNopInstruction { rva, source })?;
     }
     Ok(())
 }
@@ -780,6 +821,9 @@ fn sync_parent_directory(parent: &Path, output: &Path) -> Result<(), StaticPatch
 
 #[cfg(not(unix))]
 fn sync_parent_directory(_parent: &Path, _output: &Path) -> Result<(), StaticPatchError> {
+    // `std::fs::File::open` cannot portably open a Windows directory for
+    // `sync_all`. The staged file itself was synchronized, but this no-op must
+    // not be described as a power-loss durability guarantee for the rename.
     Ok(())
 }
 
@@ -831,6 +875,12 @@ pub enum StaticPatchError {
     },
     #[error("NOP edit at RVA {rva:#x} contains a non-NOP replacement byte")]
     InvalidNopReplacement { rva: u32 },
+    #[error("NOP edit at RVA {rva:#x} is not exactly one complete x86-64 instruction: {source}")]
+    InvalidNopInstruction {
+        rva: u32,
+        #[source]
+        source: ExactX64InstructionError,
+    },
     #[error("the source binary identity is invalid: {0}")]
     InvalidSourceIdentity(ClaimValidationError),
     #[error("the analysis model is invalid: {0}")]
@@ -893,6 +943,23 @@ pub enum StaticPatchError {
     SourceIdentityMismatch {
         expected: BinaryId,
         actual: BinaryId,
+    },
+    #[error(
+        "source byte-derived PE identity metadata does not match the static patch plan: expected {expected:?}, found {actual:?}"
+    )]
+    SourceIdentityMetadataMismatch {
+        expected: BinaryIdentity,
+        actual: BinaryIdentity,
+    },
+    #[error("the exact source PE layout is invalid: {0}")]
+    InvalidSourceLayout(AnalysisError),
+    #[error(
+        "source byte-derived PE layout maps RVA {rva:#x} to file offset {actual_file_offset:#x}, not the plan's untrusted offset {planned_file_offset:#x}"
+    )]
+    SourceLayoutMismatch {
+        rva: u32,
+        planned_file_offset: u64,
+        actual_file_offset: u64,
     },
     #[error(
         "resolved static patch range RVA {rva:#x} at file offset {file_offset:#x}+{size} exceeds source size {source_size}"
@@ -1010,5 +1077,28 @@ mod tests {
                 maximum: MAX_STATIC_PATCH_NOP_INSTRUCTION_BYTES,
             })
         ));
+        assert!(matches!(
+            StaticPatchEditRequest::nop_instruction(0x1000, [0xcc, 0xcc], "two instructions"),
+            Err(StaticPatchError::InvalidNopInstruction {
+                source: ExactX64InstructionError::TrailingBytes { .. },
+                ..
+            })
+        ));
+        assert!(matches!(
+            StaticPatchEditRequest::nop_instruction(0x1000, [0x0f], "truncated escape"),
+            Err(StaticPatchError::InvalidNopInstruction {
+                source: ExactX64InstructionError::InvalidOrTruncated { .. },
+                ..
+            })
+        ));
+        assert!(matches!(
+            StaticPatchEditRequest::nop_instruction(0x1000, [0xe9, 0x00, 0x00], "truncated jump"),
+            Err(StaticPatchError::InvalidNopInstruction {
+                source: ExactX64InstructionError::InvalidOrTruncated { .. },
+                ..
+            })
+        ));
+        StaticPatchEditRequest::nop_instruction(0x1000, [0x74, 0x05], "complete branch")
+            .expect("one complete conditional branch");
     }
 }
