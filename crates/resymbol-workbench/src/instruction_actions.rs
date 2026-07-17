@@ -13,7 +13,8 @@ use resymbol_app::{
 };
 use resymbol_debugger::{
     BreakpointKind, BreakpointPersistence, CapabilityAvailability, CapabilityReport,
-    DebugCapability, MemoryAddress, SessionState, SessionStateKind, StepKind, StopToken, ThreadId,
+    DebugCapability, DebugCommand, MemoryAddress, SessionState, SessionStateKind, StepKind,
+    StopToken, ThreadId,
 };
 use thiserror::Error;
 
@@ -791,6 +792,9 @@ pub(crate) struct LiveDebuggerActionContext<'a> {
     stop_token: Option<StopToken>,
     capabilities: Option<&'a CapabilityReport>,
     exact_live_address: Option<MemoryAddress>,
+    authenticated_stopped_thread: Option<ThreadId>,
+    /// UI selection is an untrusted hint until it exactly matches the thread
+    /// carried by the authenticated stopped state.
     selected_thread: Option<ThreadId>,
 }
 
@@ -803,6 +807,7 @@ impl LiveDebuggerActionContext<'static> {
             stop_token: None,
             capabilities: None,
             exact_live_address: None,
+            authenticated_stopped_thread: None,
             selected_thread: None,
         }
     }
@@ -811,10 +816,11 @@ impl LiveDebuggerActionContext<'static> {
 impl<'a> LiveDebuggerActionContext<'a> {
     /// Production adapter seam for a future authenticated typed client. The
     /// caller must supply the complete validated reducer state, capability
-    /// report, exact module-address binding, and authenticated thread
-    /// selection. The concrete `StopToken` is derived only from the supplied
-    /// `SessionState::Stopped`; the current workbench deliberately has no such
-    /// client.
+    /// report, exact module-address binding, and current UI thread selection.
+    /// The concrete `StopToken` and sole trusted step-thread identity are
+    /// derived only from the supplied `SessionState::Stopped`. A UI selection
+    /// can enable a step route only when it exactly matches that authenticated
+    /// stopped thread; the current workbench deliberately has no such client.
     #[allow(
         dead_code,
         reason = "kept as the fail-closed production seam for the future authenticated client adapter"
@@ -825,9 +831,11 @@ impl<'a> LiveDebuggerActionContext<'a> {
         exact_live_address: Option<MemoryAddress>,
         selected_thread: Option<ThreadId>,
     ) -> Self {
-        let stop_token = match session_state {
-            SessionState::Stopped { token, .. } => Some(*token),
-            _ => None,
+        let (stop_token, authenticated_stopped_thread) = match session_state {
+            SessionState::Stopped {
+                token, thread_id, ..
+            } => (Some(*token), Some(*thread_id)),
+            _ => (None, None),
         };
         Self {
             authenticated: true,
@@ -835,8 +843,44 @@ impl<'a> LiveDebuggerActionContext<'a> {
             stop_token,
             capabilities: Some(capabilities),
             exact_live_address,
+            authenticated_stopped_thread,
             selected_thread,
         }
+    }
+
+    /// Returns the exact stop/thread pair an authenticated step route may use.
+    ///
+    /// The selected thread never becomes authority. It can only select the
+    /// thread identity already carried by the authenticated stopped state.
+    #[must_use]
+    fn matching_step_route_authority(self) -> Option<(StopToken, ThreadId)> {
+        let stop_token = self.stop_token?;
+        let stopped_thread = self.authenticated_stopped_thread?;
+        (self.authenticated
+            && self.session_state == Some(SessionStateKind::Stopped)
+            && self.selected_thread == Some(stopped_thread))
+        .then_some((stop_token, stopped_thread))
+    }
+
+    /// Builds a typed step command only after the same capability, stopped
+    /// state, and thread-authority checks used by the visible action policy.
+    #[allow(
+        dead_code,
+        reason = "kept as the fail-closed typed route for the future authenticated client adapter"
+    )]
+    pub(crate) fn authenticated_step_command(self, kind: StepKind) -> Option<DebugCommand> {
+        if !self
+            .availability(LiveInstructionAction::Step(kind), &[])
+            .is_enabled()
+        {
+            return None;
+        }
+        let (stop, thread_id) = self.matching_step_route_authority()?;
+        Some(DebugCommand::Step {
+            stop,
+            thread_id,
+            kind,
+        })
     }
 
     #[must_use]
@@ -899,10 +943,17 @@ impl<'a> LiveDebuggerActionContext<'a> {
                 "The static RVA is not bound to an exact address in the authenticated live module.",
             );
         }
-        if action.requires_selected_thread() && self.selected_thread.is_none() {
-            return ActionAvailability::disabled(
-                "No authenticated stopped thread is selected for the typed step command.",
-            );
+        if action.requires_selected_thread() {
+            if self.selected_thread.is_none() {
+                return ActionAvailability::disabled(
+                    "No thread is selected; a typed step command can use only the authenticated stopped thread.",
+                );
+            }
+            if self.matching_step_route_authority().is_none() {
+                return ActionAvailability::disabled(
+                    "The selected thread does not match the authenticated stopped thread.",
+                );
+            }
         }
         for capability in action.required_capabilities() {
             let status = report
@@ -1005,6 +1056,10 @@ mod tests {
 
     fn selected_thread() -> ThreadId {
         ThreadId::new(7).expect("thread id")
+    }
+
+    fn untrusted_selected_thread() -> ThreadId {
+        ThreadId::new(8).expect("untrusted selected thread id")
     }
 
     fn authenticated_stopped_state() -> SessionState {
@@ -1299,6 +1354,7 @@ mod tests {
             stop_token: Some(authenticated_stop_token()),
             capabilities: None,
             exact_live_address: Some(exact_live_address()),
+            authenticated_stopped_thread: Some(selected_thread()),
             selected_thread: Some(selected_thread()),
         };
         assert_eq!(
@@ -1441,6 +1497,112 @@ mod tests {
     }
 
     #[test]
+    fn matching_stopped_thread_is_the_only_step_route_authority() {
+        let all = capability_report(None);
+        let stopped_state = authenticated_stopped_state();
+        let context = LiveDebuggerActionContext::from_authenticated_session(
+            &stopped_state,
+            &all,
+            Some(exact_live_address()),
+            Some(selected_thread()),
+        );
+
+        assert_eq!(
+            context.authenticated_step_command(StepKind::Into),
+            Some(DebugCommand::Step {
+                stop: authenticated_stop_token(),
+                thread_id: selected_thread(),
+                kind: StepKind::Into,
+            })
+        );
+        for kind in [StepKind::Into, StepKind::Over, StepKind::Out] {
+            assert!(
+                context
+                    .availability(LiveInstructionAction::Step(kind), &[0xCC])
+                    .is_enabled(),
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn running_state_has_no_step_thread_authority() {
+        let all = capability_report(None);
+        let running_state = authenticated_running_state();
+        let context = LiveDebuggerActionContext::from_authenticated_session(
+            &running_state,
+            &all,
+            Some(exact_live_address()),
+            Some(selected_thread()),
+        );
+
+        assert_eq!(context.authenticated_step_command(StepKind::Into), None);
+        for kind in [StepKind::Into, StepKind::Over, StepKind::Out] {
+            assert_eq!(
+                context
+                    .availability(LiveInstructionAction::Step(kind), &[0xCC])
+                    .disabled_reason(),
+                Some("The live session must be stopped at an authenticated StopToken."),
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_thread_selection_never_enables_a_step_route() {
+        let all = capability_report(None);
+        let stopped_state = authenticated_stopped_state();
+        let context = LiveDebuggerActionContext::from_authenticated_session(
+            &stopped_state,
+            &all,
+            Some(exact_live_address()),
+            None,
+        );
+
+        assert_eq!(context.authenticated_step_command(StepKind::Into), None);
+        for kind in [StepKind::Into, StepKind::Over, StepKind::Out] {
+            assert_eq!(
+                context
+                    .availability(LiveInstructionAction::Step(kind), &[0xCC])
+                    .disabled_reason(),
+                Some(
+                    "No thread is selected; a typed step command can use only the authenticated stopped thread."
+                ),
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mismatched_ui_thread_never_becomes_step_route_authority() {
+        let all = capability_report(None);
+        let stopped_state = authenticated_stopped_state();
+        let context = LiveDebuggerActionContext::from_authenticated_session(
+            &stopped_state,
+            &all,
+            Some(exact_live_address()),
+            Some(untrusted_selected_thread()),
+        );
+
+        assert_eq!(context.authenticated_step_command(StepKind::Into), None);
+        for kind in [StepKind::Into, StepKind::Over, StepKind::Out] {
+            assert_eq!(
+                context
+                    .availability(LiveInstructionAction::Step(kind), &[0xCC])
+                    .disabled_reason(),
+                Some("The selected thread does not match the authenticated stopped thread."),
+                "{kind:?}"
+            );
+        }
+        assert!(
+            context
+                .availability(LiveInstructionAction::Continue, &[0xCC])
+                .is_enabled(),
+            "an untrusted thread selection must not mint step authority or disable thread-neutral Continue"
+        );
+    }
+
+    #[test]
     fn step_actions_require_matching_granular_capability() {
         let stopped_state = authenticated_stopped_state();
         let step_matrix = [
@@ -1476,6 +1638,7 @@ mod tests {
                     assert_eq!(availability.disabled_reason(), None);
                 }
             }
+            assert_eq!(context.authenticated_step_command(unavailable_kind), None);
 
             let mut missing_report = capability_report(None);
             missing_report
@@ -1495,6 +1658,10 @@ mod tests {
                     .availability(LiveInstructionAction::Step(unavailable_kind), &[0xCC])
                     .disabled_reason(),
                 Some(expected_missing_reason.as_str())
+            );
+            assert_eq!(
+                missing_context.authenticated_step_command(unavailable_kind),
+                None
             );
         }
 

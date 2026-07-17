@@ -138,7 +138,9 @@ prereleases; breaking changes remain explicit.
   same-size `ReplaceBytes` requests remain the explicit arbitrary-byte escape hatch. The separate live NOP,
   software-breakpoint, Run to Cursor, Step Into/Over/Out, and Continue actions expose their typed
   debugger routes but remain visibly disabled until an authenticated live provider supplies a
-  complete capability report plus current stop/address/thread bindings. Live NOP uses
+  complete capability report plus current stop/address bindings. Step routes additionally require
+  the UI selection to exactly match the thread carried by the authenticated stopped state; the
+  selection itself never grants thread authority. Live NOP uses
   compare-before-write with an equal-length `0x90` replacement; Run to Cursor composes a temporary
   software breakpoint with Continue. Static and live NOP actions reject instructions whose exact
   bytes are already entirely `0x90` instead of queuing an unpublishable no-op.
