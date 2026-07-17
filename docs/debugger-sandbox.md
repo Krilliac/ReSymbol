@@ -83,9 +83,14 @@ total deadline plus a count ceiling. It requires the first event to be the exact
 handles, conservatively passes unexpected exceptions as not handled, and retains the first-chance
 attach breakpoint. While that event remains pending it permits exact bounded reads and bounded,
 equal-length, changed exact compare-before-write mutations wholly inside the validated main image.
-Each write requires
-the caller's exact `PendingStopEvidence` and a logical `StopToken` already validated by an
-authenticated outer session; this worker does not store or validate that token and carries it only
+Each write requires the caller's exact `PendingStopEvidence` and consumes a move-only,
+non-serialized `ValidatedLiveMemoryWrite`. A host-local `SessionMachine` mints that ticket only after
+accepting the exact command for its current stopped token and matching the ticket's target process
+to an accepted debug-mode attach, with the expected-byte span inside that exact main image. The
+session worker separately retains the move-only
+`RemoteCommandCheckpoint`. The Windows worker requires that exact checkpoint, rejects a reducer
+allocation or command-ID mismatch before backend access, rechecks the ticket's complete
+`LiveTargetBinding` against its retained binding before mutation, and carries the accepted old stop
 into correlated protocol failure evidence. The long-lived access handle stays read-only, while
 mutation rights are opened only for the one exact transaction. A safe no-effect rejection or proved
 rollback preserves the stopped state. Invalid evidence, target-identity loss, or recovery without
@@ -97,7 +102,8 @@ are reported separately. Drop performs only best-effort cleanup and cannot be us
 This low-level method is named `attach_after_authorization` to make its prerequisite explicit, but a
 name and `LiveTargetBinding` are not authority. The crate neither authenticates a transport nor
 verifies or consumes a move-only host-risk lease. Only a future authenticated, host-local
-`SessionWorker` may place it behind the command reducer and exact one-use authorization flow. The
+`SessionWorker` may place attach and ticket minting behind the command reducer and exact one-use
+authorization flow. The
 current Workbench never invokes it; live-memory GUI wiring and Step Into/Over/Out controls remain
 unimplemented.
 

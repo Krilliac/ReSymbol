@@ -39,6 +39,17 @@ prereleases; breaking changes remain explicit.
   terminal `Failed` state. The host client rejects substituted, duplicate, contradictory,
   misordered, post-result, or success-labeled failure evidence. This is a provider contract, not a
   claim that live mutation ships or that an indeterminate target can safely be resumed or detached.
+- Added a non-cloneable, non-serialized `ValidatedLiveMemoryWrite` ticket for the future host-local
+  live `SessionWorker`. `SessionMachine::begin_live_memory_write` mints it only after an exact
+  `WriteMemory` command is accepted for the current stopped token, and only when the retained target
+  is a debug-mode attach whose exact `ProcessIdentity` matches the supplied `LiveTargetBinding`.
+  The exact expected-byte span must also lie inside that binding's main image before reducer state or
+  command-ID watermarks change. The ticket owns the accepted command ID, old stop, full target
+  binding, address, expected bytes, and replacement bytes; the separate move-only
+  `RemoteCommandCheckpoint` still controls reducer commit or rejection. The Windows provider now
+  requires that exact checkpoint alongside the consumed ticket and rejects a reducer-allocation or
+  command-ID mismatch before any backend access. This is an in-process authority boundary, not a
+  serialized credential, authenticated helper transport, or UI connection.
 - Added `resymbol-windows-debug-host`, a phase-one, same-thread Windows debug-attach foundation. Its
   low-level entry point repeats the exact PID/start-key/binary/base preflight, calls
   `DebugActiveProcess` and immediately requests detach-on-debug-thread-exit behavior, drains initial
@@ -46,10 +57,11 @@ prereleases; breaking changes remain explicit.
   `CREATE_PROCESS_DEBUG_EVENT`, closes only the documented create-process/load-DLL file handles,
   retains the first-chance attach breakpoint, and permits bounded exact main-image reads plus
   bounded, equal-length exact compare-before-write mutations only while that event remains pending.
-  The write API
-  requires the caller's exact pending-stop evidence and a logical `StopToken` already validated by
-  an authenticated outer session; this low-level worker carries that token into failure evidence but
-  neither stores nor validates it. Windows now advertises `LiveMemoryWrite` for this narrow primitive.
+  The public write API consumes one `ValidatedLiveMemoryWrite` by value, borrows its exact matching
+  `RemoteCommandCheckpoint`, requires the caller's exact pending-stop evidence, revalidates the
+  ticket's complete target binding against its retained worker binding, and carries the accepted old
+  stop into failure evidence. Windows now advertises
+  `LiveMemoryWrite` for this narrow primitive.
   Safe no-effect rejection and rollback-safe failure preserve the stopped state, while invalid
   evidence, target invalidation, or non-rollback-safe recovery enters `CleanupRequired` with the
   event retained for explicit teardown. Explicit detach continues the retained event before attempting

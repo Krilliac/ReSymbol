@@ -102,7 +102,7 @@ pub use sandbox::{
 };
 pub use session_machine::{
     MAX_REGISTERED_AUTHORIZATION_LEASES, RemoteCommandCheckpoint, SessionMachine,
-    SessionMachineError,
+    SessionMachineError, ValidatedLiveMemoryWrite,
 };
 pub use software_breakpoint::{
     INT3_OPCODE, MAX_SOFTWARE_BREAKPOINTS, SoftwareBreakpointAcknowledgement,

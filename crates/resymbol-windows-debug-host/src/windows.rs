@@ -6,7 +6,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use resymbol_debugger::{LiveTargetBinding, MemoryAddress, ProcessId, StopToken};
+use resymbol_debugger::{
+    LiveTargetBinding, MemoryAddress, ProcessId, RemoteCommandCheckpoint, StopToken,
+    ValidatedLiveMemoryWrite,
+};
 use resymbol_windows_live_access::{
     LiveAccessError, MutatingLiveProcessAccess, OpenLiveProcessRequest, ReadOnlyLiveProcessAccess,
 };
@@ -93,24 +96,23 @@ impl WindowsDebugHostWorker {
     }
 
     /// Performs one exact compare-before-write while the retained OS debug
-    /// event remains pending. The outer session worker must already have
-    /// validated `validated_protocol_stop`; this layer only carries it into
-    /// typed failure evidence and does not store or validate logical tokens.
+    /// event remains pending. The ticket is minted only after host-local
+    /// reducer acceptance and is consumed here exactly once. The separately
+    /// retained checkpoint must match the ticket's reducer allocation and
+    /// command ID. This worker also checks the ticket's exact target binding
+    /// and the caller's retained operating-system stop before opening mutation
+    /// rights.
     pub fn write_stopped_main_image_after_protocol_validation(
         &mut self,
         expected_pending_stop: &PendingStopEvidence,
-        validated_protocol_stop: StopToken,
-        address: MemoryAddress,
-        expected_bytes: &[u8],
-        replacement: &[u8],
+        checkpoint: &RemoteCommandCheckpoint,
+        write: ValidatedLiveMemoryWrite,
     ) -> Result<DebugHostMemoryWriteReceipt, DebugHostMemoryWriteError> {
         self.inner
             .write_stopped_main_image_after_protocol_validation(
                 expected_pending_stop,
-                validated_protocol_stop,
-                address,
-                expected_bytes,
-                replacement,
+                checkpoint,
+                write,
             )
     }
 
