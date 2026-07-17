@@ -9384,13 +9384,13 @@ mod tests {
             ),
             "[RANGE UNAVAILABLE:offline-range-unavailable] RVA 0x2000: span crosses exact file backing"
         );
-        let lifecycle = offline_lifecycle_status(true, 14, true, true, true, true);
+        let lifecycle = offline_lifecycle_status(true, 17, true, true, true, true);
         assert_eq!(
             lifecycle,
             "Lifecycle complete: 17 capabilities probed | opened=yes | closed=yes | released=yes | disconnected=yes"
         );
         assert_eq!(
-            offline_lifecycle_status(false, 14, true, false, true, false),
+            offline_lifecycle_status(false, 17, true, false, true, false),
             "Lifecycle incomplete; result is not safe to present: 17 capabilities probed | opened=yes | closed=no | released=yes | disconnected=no"
         );
         assert_eq!(
