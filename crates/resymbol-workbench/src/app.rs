@@ -8747,7 +8747,7 @@ mod tests {
         assert!(
             app.build_static_patch_requests()
                 .expect_err("multi-instruction NOP must fail")
-                .contains("exactly one complete valid x64 instruction")
+                .contains("exactly one complete x86-64 instruction")
         );
 
         app.pending_static_patch_drafts.clear();
