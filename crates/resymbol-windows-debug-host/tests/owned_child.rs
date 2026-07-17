@@ -10,13 +10,17 @@ use std::{
 };
 
 use resymbol_core::BinaryId;
-use resymbol_debugger::{MemoryAddress, ProcessId, ProcessStartKey};
+use resymbol_debugger::{
+    MemoryAddress, ProcessId, ProcessStartKey, SessionId, StateGeneration, StateToken, StopId,
+    StopToken,
+};
 use resymbol_windows_debug_host::{
     DebugAttachLimits, DebugHostWorkerState, WindowsDebugHostWorker,
 };
 use resymbol_windows_live_access::{OpenLiveProcessRequest, ReadOnlyLiveProcessAccess};
 
 const EXPECTED_BYTES: &[u8; 8] = b"RSYMHOST";
+const PATCHED_BYTES: &[u8; 8] = b"RSYMH0ST";
 const FIXTURE_WATCHDOG: Duration = Duration::from_secs(10);
 const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -141,6 +145,48 @@ fn owned_child_attach_stopped_read_continue_and_detach() {
             .expect("read exact bytes under retained attach stop"),
         EXPECTED_BYTES
     );
+    let write_address = MemoryAddress::new(read_address);
+    let protocol_stop = protocol_stop();
+    let receipt = worker
+        .write_stopped_main_image_after_protocol_validation(
+            &stop,
+            protocol_stop,
+            write_address,
+            EXPECTED_BYTES,
+            PATCHED_BYTES,
+        )
+        .expect("write exact bytes under retained attach stop");
+    assert_eq!(receipt.pending_stop(), &stop);
+    assert_eq!(receipt.binding(), &binding);
+    assert_eq!(receipt.address(), write_address);
+    assert_eq!(receipt.before(), EXPECTED_BYTES);
+    assert_eq!(receipt.after(), PATCHED_BYTES);
+    assert_eq!(
+        worker
+            .read_stopped_main_image(write_address, PATCHED_BYTES.len())
+            .expect("read patched bytes under retained attach stop"),
+        PATCHED_BYTES
+    );
+    let restore_receipt = worker
+        .write_stopped_main_image_after_protocol_validation(
+            &stop,
+            protocol_stop,
+            write_address,
+            PATCHED_BYTES,
+            EXPECTED_BYTES,
+        )
+        .expect("restore exact fixture bytes under retained attach stop");
+    assert_eq!(restore_receipt.pending_stop(), &stop);
+    assert_eq!(restore_receipt.binding(), &binding);
+    assert_eq!(restore_receipt.address(), write_address);
+    assert_eq!(restore_receipt.before(), PATCHED_BYTES);
+    assert_eq!(restore_receipt.after(), EXPECTED_BYTES);
+    assert_eq!(
+        worker
+            .read_stopped_main_image(write_address, EXPECTED_BYTES.len())
+            .expect("read restored bytes under retained attach stop"),
+        EXPECTED_BYTES
+    );
 
     worker
         .detach()
@@ -152,4 +198,14 @@ fn owned_child_attach_stopped_read_continue_and_detach() {
 fn parse_hex(field: Option<&str>, label: &str) -> u64 {
     u64::from_str_radix(field.unwrap_or_else(|| panic!("fixture emits {label}")), 16)
         .unwrap_or_else(|error| panic!("fixture {label} is hexadecimal: {error}"))
+}
+
+fn protocol_stop() -> StopToken {
+    StopToken {
+        state: StateToken {
+            session_id: SessionId::new(1).expect("nonzero test session"),
+            generation: StateGeneration::new(1).expect("nonzero test generation"),
+        },
+        stop_id: StopId::new(1).expect("nonzero test stop"),
+    }
 }

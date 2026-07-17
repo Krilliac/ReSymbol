@@ -1,6 +1,6 @@
 [package]
 name = "resymbol-windows-debug-host"
-description = "Thread-affine read-only Windows debug attach foundation for ReSymbol"
+description = "Thread-affine Windows debug attach and stopped-memory foundation for ReSymbol"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

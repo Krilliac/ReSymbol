@@ -44,15 +44,22 @@ prereleases; breaking changes remain explicit.
   `DebugActiveProcess` and immediately requests detach-on-debug-thread-exit behavior, drains initial
   events under one finite total deadline and event-count ceiling, validates the first
   `CREATE_PROCESS_DEBUG_EVENT`, closes only the documented create-process/load-DLL file handles,
-  retains the first-chance attach breakpoint, and permits bounded exact main-image reads only while
-  that event remains pending. Explicit detach continues the retained event before attempting
+  retains the first-chance attach breakpoint, and permits bounded exact main-image reads plus
+  bounded, equal-length exact compare-before-write mutations only while that event remains pending.
+  The write API
+  requires the caller's exact pending-stop evidence and a logical `StopToken` already validated by
+  an authenticated outer session; this low-level worker carries that token into failure evidence but
+  neither stores nor validates it. Windows now advertises `LiveMemoryWrite` for this narrow primitive.
+  Safe no-effect rejection and rollback-safe failure preserve the stopped state, while invalid
+  evidence, target invalidation, or non-rollback-safe recovery enters `CleanupRequired` with the
+  event retained for explicit teardown. Explicit detach continues the retained event before attempting
   `DebugActiveProcessStop`; kill-policy, continuation, and detach outcomes remain separate evidence,
   while `Drop` is only unproved best-effort cleanup. A watchdog-bounded, parent-owned Windows child
-  fixture covers the real attach/read/detach path, with deterministic fake-backend tests covering
-  ordering, handle closure, deadlines, and cleanup faults. This is not an authenticated debugger-host
-  process or transport: the method name records that authorization must already have happened but
-  cannot prove it, and no Workbench bridge, launch, write, register, stepping, breakpoint engine, or
-  sandbox provisioning is exposed.
+  fixture covers the real attach/read/write/restore/detach path, with deterministic fake-backend tests
+  covering ordering, handle closure, deadlines, and cleanup faults. This is not an authenticated
+  debugger-host process or transport: the method names record prerequisites that must already have
+  happened but cannot prove them, and no Workbench live-memory bridge, launch, register, stepping,
+  breakpoint engine, or sandbox provisioning is exposed.
 - Added schema-14, container-only intake for ELF32 little-endian `EM_MIPS` executables. Checked
   header and table parsing retains sparse non-empty `PT_LOAD` mappings and a deterministic
   identity-only graph without decoding or executing instructions. A source-built synthetic fixture
