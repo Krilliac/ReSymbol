@@ -515,7 +515,16 @@ process-group identifier reuse during normal cleanup. Windows creates the child 
 preconfigured Job through a narrow `STARTUPINFOEX` native boundary, explicitly terminates that Job
 during normal cleanup, retains kill-on-close as an abrupt-parent fallback when no out-of-scope
 process holds a duplicate, allows inheritance of only the exact standard-stream handles, verifies
-Job membership, and has no post-spawn assignment fallback. This does not defend against an active
+Job membership, and has no post-spawn assignment fallback. The low-level Windows launcher can
+optionally configure a validated active-process cap and independent per-process/whole-Job committed
+memory caps on the empty Job before process creation. The launcher requires an exact
+`QueryInformationJobObject` readback before creation and retains the verified requested values on
+the returned child. A requested configuration or verification error aborts the launch; no weaker
+launch is attempted. A containing parent Job may impose stricter effective limits. Explicit Job
+termination exposes only whether Windows accepted ReSymbol's termination request and the owned Job
+handle was released; it does not claim descendant reaping, foreign-handle closure, provider-storage
+deletion, or a complete sandbox cleanup receipt. Existing plugin runners do not opt into these caps,
+so their resource behavior is unchanged. Job resource limits do not defend against an active
 same-account process with sufficient process/handle rights: it can duplicate or remotely close
 ReSymbol's handles and terminate or tamper with the parent. That actor requires a separate OS
 authority boundary. A hostile POSIX plugin/helper or descendant can deliberately leave its process

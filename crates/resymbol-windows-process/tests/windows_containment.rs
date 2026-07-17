@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-use resymbol_windows_process::{ContainedCommand, Stdio};
+use resymbol_windows_process::{ContainedCommand, JobResourceLimits, JobTerminationStatus, Stdio};
 use tempfile::TempDir;
 use windows_sys::Win32::{
     Foundation::{FALSE, TRUE, WAIT_TIMEOUT},
@@ -19,6 +19,138 @@ use windows_sys::Win32::{
 };
 
 const FIXTURE: &str = env!("CARGO_BIN_EXE_resymbol-windows-process-fixture");
+
+#[test]
+fn opt_in_process_and_job_memory_limits_preserve_normal_launch() {
+    let limits = JobResourceLimits::new(Some(2), Some(512 * 1024 * 1024), Some(1024 * 1024 * 1024))
+        .expect("bounded valid Job resource limits");
+    let mut command = ContainedCommand::new(FIXTURE);
+    command
+        .arg("noop")
+        .job_resource_limits(limits)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    let mut child = command.spawn().expect("spawn memory-limited fixture");
+    assert_eq!(child.verified_job_resource_limits(), Some(limits));
+    assert_eq!(
+        child.job_termination_status(),
+        JobTerminationStatus::NotRequested
+    );
+    let status = child.wait().expect("wait for memory-limited fixture");
+    assert!(status.success(), "memory-limited fixture exited {status}");
+    assert_eq!(
+        child.job_termination_status(),
+        JobTerminationStatus::NotRequested,
+        "natural target exit fabricated Job-termination evidence"
+    );
+    child
+        .terminate_tree()
+        .expect("request memory-limited Job termination");
+    assert_eq!(
+        child.job_termination_status(),
+        JobTerminationStatus::Requested
+    );
+}
+
+#[test]
+fn per_process_memory_limit_denies_excess_native_commit() {
+    assert_memory_limit_denies_excess_commit(Some(64 * 1024 * 1024), None);
+}
+
+#[test]
+fn whole_job_memory_limit_denies_excess_native_commit() {
+    assert_memory_limit_denies_excess_commit(None, Some(64 * 1024 * 1024));
+}
+
+fn assert_memory_limit_denies_excess_commit(
+    process_memory_bytes: Option<u64>,
+    job_memory_bytes: Option<u64>,
+) {
+    let limits = JobResourceLimits::new(None, process_memory_bytes, job_memory_bytes)
+        .expect("valid memory limit");
+    let mut command = ContainedCommand::new(FIXTURE);
+    command
+        .arg("probe-memory-limit")
+        .arg((256_u64 * 1024 * 1024).to_string())
+        .job_resource_limits(limits)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+
+    let mut child = command.spawn().expect("spawn native memory-limit probe");
+    assert_eq!(child.verified_job_resource_limits(), Some(limits));
+    let status = child.wait().expect("wait for native memory-limit probe");
+    let mut diagnostics = String::new();
+    child
+        .take_stderr()
+        .expect("take native memory-limit probe stderr")
+        .read_to_string(&mut diagnostics)
+        .expect("read native memory-limit probe stderr");
+    assert!(
+        status.success(),
+        "native memory-limit probe failed: {status}: {diagnostics}"
+    );
+    assert_eq!(
+        child.job_termination_status(),
+        JobTerminationStatus::NotRequested,
+        "limit denial fabricated Job-termination evidence"
+    );
+    child
+        .terminate_tree()
+        .expect("request constrained Job termination");
+    assert_eq!(
+        child.job_termination_status(),
+        JobTerminationStatus::Requested
+    );
+}
+
+#[test]
+fn active_process_limit_denies_an_immediate_grandchild() {
+    let temporary = TempDir::new().expect("create temporary directory");
+    let marker = temporary.path().join("unexpected-grandchild.marker");
+    let limits =
+        JobResourceLimits::new(Some(1), None, None).expect("one-process Job resource limit");
+    let mut command = ContainedCommand::new(FIXTURE);
+    command
+        .arg("probe-active-process-limit")
+        .arg(&marker)
+        .job_resource_limits(limits)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+
+    let mut child = command.spawn().expect("spawn active-process probe");
+    assert_eq!(child.verified_job_resource_limits(), Some(limits));
+    let status = child.wait().expect("wait for active-process probe");
+    let mut diagnostics = String::new();
+    child
+        .take_stderr()
+        .expect("take active-process probe stderr")
+        .read_to_string(&mut diagnostics)
+        .expect("read active-process probe stderr");
+    assert!(
+        status.success(),
+        "active-process probe failed: {status}: {diagnostics}"
+    );
+    assert!(
+        !marker.exists(),
+        "grandchild executed despite JOB_OBJECT_LIMIT_ACTIVE_PROCESS"
+    );
+    assert_eq!(
+        child.job_termination_status(),
+        JobTerminationStatus::NotRequested,
+        "descendant denial fabricated Job-termination evidence"
+    );
+    child
+        .terminate_tree()
+        .expect("request process-limited Job termination");
+    assert_eq!(
+        child.job_termination_status(),
+        JobTerminationStatus::Requested
+    );
+}
 
 #[test]
 fn preserves_unicode_command_environment_cwd_and_pipes() {
@@ -96,6 +228,10 @@ fn immediate_grandchild_cannot_escape_kill_on_close_job() {
         child
             .terminate_tree()
             .expect("explicitly terminate contained Job");
+        assert_eq!(
+            child.job_termination_status(),
+            JobTerminationStatus::Requested
+        );
         markers.push(marker);
     }
     thread::sleep(Duration::from_millis(600));

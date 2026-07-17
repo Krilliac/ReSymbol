@@ -421,6 +421,19 @@ analysis. Its v1 contract is:
 - terminate-and-reap, handle closure, profile deletion, owned-path deletion, and a durable cleanup
   receipt/journal on every exit path.
 
+For debugger policy, `memory_bytes` is the aggregate committed-virtual-memory cap for the complete
+sandbox Job, and `active_process_limit` includes the primary target. The low-level Windows process
+launcher can map those two fields today to its whole-Job memory and active-process limits before
+process creation; its optional per-process memory cap has no corresponding debugger-policy field.
+The launcher rejects a mismatched native limit readback and lets a successful child report the exact
+requested limits that were verified, while acknowledging that a parent Job may be stricter. Its
+explicit-termination status proves only that `TerminateJobObject` returned success and its owned Job
+handle was released; it is not descendant-reap evidence or a sandbox cleanup receipt. It cannot map
+the total provider-owned session-storage cap, whole-Job hard CPU cap, or elapsed session wall-clock
+deadline. Therefore this primitive implements only a resource-control subset and must not claim the
+policy's `ResourceLimits` guarantee. It also does not create an AppContainer, restrict authority,
+attest a suspended target, or constitute this planned local provider.
+
 Unsupported targets fail with a typed reason. The provider never requests elevation and never falls
 back to direct host execution.
 
@@ -513,6 +526,11 @@ disk discard.
 - [FlushInstructionCache](https://learn.microsoft.com/windows/win32/api/processthreadsapi/nf-processthreadsapi-flushinstructioncache)
 - [Implementing an AppContainer](https://learn.microsoft.com/windows/win32/secauthz/implementing-an-appcontainer)
 - [Job Objects](https://learn.microsoft.com/windows/win32/procthread/job-objects)
+- [JOBOBJECT basic limits](https://learn.microsoft.com/windows/win32/api/winnt/ns-winnt-jobobject_basic_limit_information)
+- [JOBOBJECT extended limits](https://learn.microsoft.com/windows/win32/api/winnt/ns-winnt-jobobject_extended_limit_information)
+- [JOBOBJECT CPU rate control](https://learn.microsoft.com/windows/win32/api/winnt/ns-winnt-jobobject_cpu_rate_control_information)
+- [SetInformationJobObject](https://learn.microsoft.com/windows/win32/api/jobapi2/nf-jobapi2-setinformationjobobject)
+- [QueryInformationJobObject](https://learn.microsoft.com/windows/win32/api/jobapi2/nf-jobapi2-queryinformationjobobject)
 - [Process and thread attribute lists](https://learn.microsoft.com/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute)
 - [Process mitigation policies](https://learn.microsoft.com/windows/win32/api/processthreadsapi/nf-processthreadsapi-setprocessmitigationpolicy)
 - [Windows container isolation](https://learn.microsoft.com/virtualization/windowscontainers/manage-containers/container-security)

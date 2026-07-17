@@ -220,8 +220,16 @@ prereleases; breaking changes remain explicit.
   preconfigured Job, explicitly terminates the Job during normal cleanup, retains kill-on-close as
   an abrupt-parent fallback when no out-of-scope process holds a duplicate, restricts inheritance
   to the exact standard-stream handles, verifies membership before returning, and has no
-  spawn-then-assign fallback. An active same-account process with sufficient process/handle rights
-  can still manipulate ReSymbol or its handles; defending against that actor requires a separate OS
+  spawn-then-assign fallback. Its low-level Windows launcher also accepts validated, opt-in active
+  process-count and per-process/whole-Job committed-memory limits, all configured before process
+  creation, read back exactly through `QueryInformationJobObject`, and exposed on a successful child
+  as verified application evidence, with no weaker fallback. Native probes cover active-process,
+  per-process commit, and whole-Job commit denial. Explicit Job termination exposes only a narrow
+  accepted-request status and does not masquerade as a complete reap or cleanup receipt. Existing
+  plugin consumers retain their prior default of no Job resource cap until they opt in. These
+  resource limits are not AppContainer, filesystem, network, or authority isolation. An active
+  same-account process with sufficient process/handle rights can still manipulate ReSymbol or its
+  handles; defending against that actor requires a separate OS
   authority boundary. A hostile POSIX plugin/helper or descendant can still deliberately leave its
   process group or session.
 - Added bounded modern MSVC x64 Rev1 RTTI and vftable discovery, including validated stored type

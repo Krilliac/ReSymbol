@@ -478,10 +478,21 @@ pub enum Win32kProfile {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxResourceLimits {
+    /// Aggregate committed virtual memory across every process in the complete
+    /// sandbox Job, in bytes. This is neither working-set/RSS usage nor a
+    /// separate per-process allowance.
     pub memory_bytes: u64,
+    /// Total provider-owned storage for the complete sandbox session, in bytes,
+    /// including staged inputs, writable scratch/profile state, and disposable
+    /// provider backing storage.
     pub disk_bytes: u64,
+    /// Maximum simultaneously active processes in the sandbox Job, including
+    /// the primary target process.
     pub active_process_limit: u32,
+    /// Whole-Job hard CPU cap in basis points, where 10,000 is 100 percent.
     pub cpu_rate_basis_points: u16,
+    /// Maximum elapsed sandbox-session wall-clock time in milliseconds, not
+    /// accumulated process or Job CPU time.
     pub wall_clock_millis: u64,
 }
 
