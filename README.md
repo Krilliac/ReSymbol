@@ -84,8 +84,10 @@ The current alpha implements and tests an end-to-end, deliberately narrow analys
   projection as JSON, renders a bounded human-readable Markdown report, emits deterministic
   Microsoft-linker-style MAP text for compatible tools, creates an exact-RSDS public-symbol PDB
   from the exact original PE, or generates self-contained IDAPython and Ghidra Java import scripts
-  with exact-binary identity gates and RVA-aware rebasing; the projection correlates supported data
-  references with retained strings at exact or valid content-interior targets;
+  with exact-binary identity gates and RVA-aware rebasing; `--dry-run` performs the same validation,
+  loss assessment, exact-source gates, and in-memory rendering without publishing a destination;
+  the projection correlates supported data references with retained strings at exact or valid
+  content-interior targets;
 - versioned plugin manifests and health diagnostics for WASM, native, managed, external-process,
   and tool-adapter runtime families;
 - local plugin-directory discovery, manifest and entrypoint validation, API compatibility checks,
@@ -337,6 +339,7 @@ resymbol export application.resym --format map
 resymbol export application.resym --format pdb --binary application.exe
 resymbol export application.resym --format ida-python
 resymbol export application.resym --format ghidra-java
+resymbol export application.resym --format map --dry-run
 resymbol plugin list
 resymbol plugin doctor
 # After reviewing a dropped-in executable plugin:
@@ -390,7 +393,10 @@ become durable before the workbench exits.
 path. ReSymbol refuses to replace an existing package, so an earlier analysis cannot be lost by
 accident. `inspect` validates the package schema, payload, and embedded binary identity before
 displaying it. `export` stages and flushes a complete artifact before a no-clobber publish; use
-`--output` to choose a destination instead of replacing an existing export artifact.
+`--output` to choose a destination instead of replacing an existing export artifact. Add
+`--dry-run` to perform package validation, loss assessment, required PDB source verification, and
+complete in-memory rendering while leaving both the prospective destination and staging namespace
+untouched.
 
 Pass `inspect --binary EXACT_ORIGINAL_BINARY` to add an optional byte-identity gate. Before printing
 inspection data to stdout, ReSymbol validates the package and requires the supplied file's exact
