@@ -8740,11 +8740,11 @@ mod tests {
         let lifecycle = offline_lifecycle_status(true, 14, true, true, true, true);
         assert_eq!(
             lifecycle,
-            "Lifecycle complete: 14 capabilities probed | opened=yes | closed=yes | released=yes | disconnected=yes"
+            "Lifecycle complete: 17 capabilities probed | opened=yes | closed=yes | released=yes | disconnected=yes"
         );
         assert_eq!(
             offline_lifecycle_status(false, 14, true, false, true, false),
-            "Lifecycle incomplete; result is not safe to present: 14 capabilities probed | opened=yes | closed=no | released=yes | disconnected=no"
+            "Lifecycle incomplete; result is not safe to present: 17 capabilities probed | opened=yes | closed=no | released=yes | disconnected=no"
         );
         assert_eq!(
             offline_pipeline_failure_text("offline read", "host rejected the span"),
