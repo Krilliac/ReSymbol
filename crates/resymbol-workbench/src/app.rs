@@ -8907,7 +8907,7 @@ mod tests {
         assert!(app.static_nop_patchability(&executable.rows()[0]).is_ok());
         assert_eq!(
             app.static_nop_patchability(&non_executable.rows()[0]),
-            Err("Static NOP edits are limited to executable PE sections.")
+            Err("Static instruction edits are limited to executable PE sections.")
         );
         assert_eq!(
             app.static_nop_patchability(&already_nop.rows()[0]),

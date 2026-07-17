@@ -154,6 +154,7 @@ impl PublicationDestination {
         })
     }
 
+    #[cfg(test)]
     #[must_use]
     pub fn canonical_path(&self) -> &Path {
         &self.canonical_path
@@ -262,6 +263,7 @@ impl PublicationGate {
         self.current.as_ref().map(|current| current.kind)
     }
 
+    #[cfg(test)]
     #[must_use]
     pub fn destination(&self) -> Option<&Path> {
         self.current
