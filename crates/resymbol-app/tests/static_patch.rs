@@ -140,7 +140,9 @@ fn serialized_false_section_mapping_never_authorizes_a_patch() {
     let services = AppServices::default();
     let project = services.analyze_binary(&source).expect("analyze exact PE");
     let mut forged_analysis = project.session().base_analysis().clone();
-    let BinaryAnalysis::Pe(pe) = &mut forged_analysis;
+    let BinaryAnalysis::Pe(pe) = &mut forged_analysis else {
+        panic!("exact PE fixture must produce PE analysis");
+    };
 
     assert_eq!(pe.sections[0].raw_data_offset, 0x400);
     assert_eq!(pe.sections[4].raw_data_offset, 0x1200);
@@ -149,6 +151,11 @@ fn serialized_false_section_mapping_never_authorizes_a_patch() {
     }
     pe.sections[4].raw_data_offset = 0;
     pe.sections[4].raw_data_size = 0;
+    pe.strings.clear();
+    pe.data_references.clear();
+    pe.symbol_graph = pe
+        .rebuild_symbol_graph()
+        .expect("rebuild the crafted analysis graph");
     forged_analysis
         .validate()
         .expect("crafted package analysis remains internally valid");
