@@ -735,6 +735,23 @@ request or companion-console `quit` with unsaved review changes pauses for **Sav
 be durable. GUI plugin execution, arbitrary docking, synchronized disassembly/pseudocode views,
 editable or exhaustive control-flow graphs, and a live debugger bridge remain planned.
 
+Before create-new static patch publication, **Validate Drafts / Preview Output Hash** runs the same
+bounded plan construction and exact-source application entirely in memory. Its worker command has no
+destination field and returns only the exact source/output identities, deterministic output SHA-256,
+edit and changed-byte counts, integrity warnings, and a plan fingerprint; the allocated patched image
+is dropped without opening or writing a path. The binding fingerprint is a bounded,
+domain-separated, length-prefixed SHA-256 over the RVA, semantic kind, expected bytes, replacement
+bytes, and label of each canonical request. The worker independently derives the same encoding from
+the resolved StaticPatchPlan. The UI accepts success only when its operation, current project
+identity, complete canonical request snapshot, request/plan fingerprints, and output metadata all
+match; output size, format, architecture, and image base must equal the source metadata. A
+successful receipt must also report an output digest different from the exact source digest. A
+same-count/same-size alternate edit, unchanged-output receipt, changed draft, project replacement,
+stale operation, or uncorrelated worker receipt therefore cannot be presented as current.
+Patched-binary publication and patch-set save/load are disabled and rejected while validation is
+pending, while local draft changes remain available and make the eventual result stale. Successful
+validation never clears the unpublished draft queue.
+
 The companion console is an opt-in process rather than a second state owner. The GUI spawns the
 packaged console helper only after the user enables it and uses private redirected standard-I/O
 pipes for bounded command and activity transport. The helper owns the visible terminal while typed

@@ -525,7 +525,15 @@ The instruction action menu maintains three separate authority domains:
    always-taken same-size `ReplaceBytes` edit; the latter adjusts a near-branch displacement before
    adding its trailing NOP so the original target is preserved. Unsupported/prefixed encodings fail
    closed. No draft alters the open source file or a live process, and publication reports that the
-   output's Authenticode signature and PE checksum may be invalid.
+   output's Authenticode signature and PE checksum may be invalid. A separate no-write validation
+   button applies the exact canonical draft snapshot only to the retained verified source in memory
+   and reports the deterministic output SHA-256 before publication. A bounded canonical request
+   fingerprint must equal the fingerprint independently rebuilt from the resolved plan, and output
+   size, format, architecture, and image base must equal the source metadata while its digest must
+   differ. Its worker command accepts no destination path; stale operation, project, or draft
+   bindings, unchanged-output receipts, and plausible same-shape alternate results are rejected
+   before they can update the UI. Patched-binary publication and patch-set save/load are unavailable
+   while the preview is pending.
 3. Live actions are typed and visible but remain disabled until a real authenticated provider
    supplies a complete capability report, a current authenticated stop token, and the exact address
    or stopped-thread bindings required by the action. Live NOP requires `LiveMemoryWrite` and a
