@@ -4,10 +4,13 @@
 //! [`std::process::Command`]. It owns the security-sensitive Win32 process
 //! creation sequence needed by ReSymbol: a kill-on-close Job Object and an
 //! exact standard-I/O handle allow-list are attached through `STARTUPINFOEX`
-//! before the child's first instruction can execute.
+//! before the child's first instruction can execute. Callers may also opt into
+//! validated active-process and committed-memory Job limits; those limits are
+//! configured on the empty Job before `CreateProcessW` and never silently
+//! dropped when configuration fails.
 //!
 //! This is lifecycle containment, not authority sandboxing. Normal cleanup
-//! explicitly terminates the Job; kill-on-close is an abrupt-parent fallback
+//! explicitly requests Job termination; kill-on-close is an abrupt-parent fallback
 //! only while no out-of-scope process retains a duplicate handle. An active
 //! same-account process with sufficient process/handle rights remains outside
 //! this crate's threat model.
@@ -27,4 +30,7 @@ mod windows;
 pub use console::{Utf8ConsoleError, configure_utf8_console};
 
 #[cfg(windows)]
-pub use windows::{ContainedChild, ContainedCommand, Stdio};
+pub use windows::{
+    ContainedChild, ContainedCommand, JobResourceLimitError, JobResourceLimits,
+    JobTerminationStatus, Stdio,
+};

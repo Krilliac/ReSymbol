@@ -2,6 +2,7 @@ use std::{
     cmp::Ordering,
     env,
     ffi::{OsStr, OsString, c_void},
+    fmt,
     fs::File,
     io,
     mem::size_of,
@@ -32,9 +33,11 @@ use windows_sys::Win32::{
     System::{
         Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE},
         JobObjects::{
-            CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-            SetInformationJobObject, TerminateJobObject,
+            CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+            JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOB_OBJECT_LIMIT_PROCESS_MEMORY, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
+            TerminateJobObject,
         },
         Pipes::CreatePipe,
         Threading::{
@@ -51,6 +54,155 @@ use windows_sys::Win32::{
 const WINDOWS_MAX_COMMAND_LINE_UNITS: usize = 32_767;
 const FAIL_CLOSED_REAP_TIMEOUT: Duration = Duration::from_secs(2);
 const FAIL_CLOSED_POLL_INTERVAL: Duration = Duration::from_millis(10);
+// Match the validated memory/process-count ranges in the debugger sandbox
+// policy so a future provider can map accepted policy without weakening it.
+const MIN_JOB_MEMORY_LIMIT_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_JOB_MEMORY_LIMIT_BYTES: u64 = 128 * 1024 * 1024 * 1024;
+const MAX_ACTIVE_PROCESS_LIMIT: u32 = 128;
+
+/// Optional enforceable limits for one contained Windows Job Object.
+///
+/// The active-process count includes the direct child. The memory values cap
+/// committed virtual memory, not working-set/RSS usage: `process_memory_bytes`
+/// applies independently to each process, while `job_memory_bytes` applies to
+/// the sum for the complete Job. Windows rejects further process association
+/// or memory commitment when an enabled limit would be exceeded.
+///
+/// These limits are resource containment only. They do not restrict filesystem,
+/// network, token, credential, desktop, or process-handle authority and do not
+/// create an AppContainer or other security sandbox.
+///
+/// Microsoft documents the process-count field in
+/// [`JOBOBJECT_BASIC_LIMIT_INFORMATION`](https://learn.microsoft.com/windows/win32/api/winnt/ns-winnt-jobobject_basic_limit_information)
+/// and the committed-memory fields in
+/// [`JOBOBJECT_EXTENDED_LIMIT_INFORMATION`](https://learn.microsoft.com/windows/win32/api/winnt/ns-winnt-jobobject_extended_limit_information).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JobResourceLimits {
+    active_process_limit: Option<u32>,
+    process_memory_bytes: Option<usize>,
+    job_memory_bytes: Option<usize>,
+}
+
+impl JobResourceLimits {
+    /// Validates one nonempty opt-in limit set.
+    ///
+    /// Process counts are bounded to `1..=128`. Memory limits are bounded to
+    /// 32 MiB through 128 GiB and must also fit the current process architecture.
+    pub fn new(
+        active_process_limit: Option<u32>,
+        process_memory_bytes: Option<u64>,
+        job_memory_bytes: Option<u64>,
+    ) -> Result<Self, JobResourceLimitError> {
+        if active_process_limit.is_none()
+            && process_memory_bytes.is_none()
+            && job_memory_bytes.is_none()
+        {
+            return Err(JobResourceLimitError::NoLimitsConfigured);
+        }
+        if active_process_limit
+            .is_some_and(|limit| !(1..=MAX_ACTIVE_PROCESS_LIMIT).contains(&limit))
+        {
+            return Err(JobResourceLimitError::ActiveProcessLimit);
+        }
+        let process_memory_bytes = process_memory_bytes
+            .map(|bytes| validate_memory_limit(bytes, JobResourceLimitError::ProcessMemoryLimit))
+            .transpose()?;
+        let job_memory_bytes = job_memory_bytes
+            .map(|bytes| validate_memory_limit(bytes, JobResourceLimitError::JobMemoryLimit))
+            .transpose()?;
+        Ok(Self {
+            active_process_limit,
+            process_memory_bytes,
+            job_memory_bytes,
+        })
+    }
+
+    /// Returns this configuration's requested maximum number of simultaneously
+    /// active Job processes. A parent Job can impose a stricter effective cap.
+    #[must_use]
+    pub const fn active_process_limit(self) -> Option<u32> {
+        self.active_process_limit
+    }
+
+    /// Returns this configuration's requested committed-memory cap for each
+    /// process. A parent Job can impose a stricter effective cap.
+    #[must_use]
+    pub const fn process_memory_bytes(self) -> Option<usize> {
+        self.process_memory_bytes
+    }
+
+    /// Returns this configuration's requested aggregate committed-memory cap
+    /// for the complete Job. A parent Job can impose a stricter effective cap.
+    #[must_use]
+    pub const fn job_memory_bytes(self) -> Option<usize> {
+        self.job_memory_bytes
+    }
+}
+
+/// A validation failure for [`JobResourceLimits`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobResourceLimitError {
+    /// No active-process or memory limit was requested.
+    NoLimitsConfigured,
+    /// The requested active-process count is outside the supported safe range.
+    ActiveProcessLimit,
+    /// The per-process committed-memory limit is outside the supported safe range.
+    ProcessMemoryLimit,
+    /// The whole-Job committed-memory limit is outside the supported safe range.
+    JobMemoryLimit,
+}
+
+impl fmt::Display for JobResourceLimitError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoLimitsConfigured => {
+                formatter.write_str("at least one Job resource limit is required")
+            }
+            Self::ActiveProcessLimit => write!(
+                formatter,
+                "active-process limit must be between 1 and {MAX_ACTIVE_PROCESS_LIMIT}"
+            ),
+            Self::ProcessMemoryLimit => write!(
+                formatter,
+                "per-process committed-memory limit must be between {} and {} bytes and fit the platform",
+                MIN_JOB_MEMORY_LIMIT_BYTES, MAX_JOB_MEMORY_LIMIT_BYTES
+            ),
+            Self::JobMemoryLimit => write!(
+                formatter,
+                "Job committed-memory limit must be between {} and {} bytes and fit the platform",
+                MIN_JOB_MEMORY_LIMIT_BYTES, MAX_JOB_MEMORY_LIMIT_BYTES
+            ),
+        }
+    }
+}
+
+impl std::error::Error for JobResourceLimitError {}
+
+/// Observable state of this handle owner's explicit Job-termination request.
+///
+/// This is deliberately narrow cleanup evidence. [`Self::Requested`] means
+/// `TerminateJobObject` returned success and ReSymbol released its Job handle;
+/// it does not prove that every process has been reaped, that out-of-scope
+/// duplicate handles were closed, or that any provider-owned files were deleted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobTerminationStatus {
+    /// No successful explicit Job-termination request has been made through
+    /// this child owner; ReSymbol still retains the Job handle and can retry.
+    NotRequested,
+    /// Windows accepted the explicit Job-termination request and ReSymbol
+    /// released its Job handle. This is not a complete sandbox cleanup receipt.
+    Requested,
+}
+
+fn validate_memory_limit(
+    bytes: u64,
+    error: JobResourceLimitError,
+) -> Result<usize, JobResourceLimitError> {
+    if !(MIN_JOB_MEMORY_LIMIT_BYTES..=MAX_JOB_MEMORY_LIMIT_BYTES).contains(&bytes) {
+        return Err(error);
+    }
+    usize::try_from(bytes).map_err(|_| error)
+}
 
 /// Standard-stream behavior supported by the atomic contained launcher.
 ///
@@ -101,6 +253,7 @@ pub struct ContainedCommand {
     stdin: Stdio,
     stdout: Stdio,
     stderr: Stdio,
+    job_resource_limits: Option<JobResourceLimits>,
 }
 
 impl ContainedCommand {
@@ -114,6 +267,7 @@ impl ContainedCommand {
             stdin: Stdio::Inherit,
             stdout: Stdio::Inherit,
             stderr: Stdio::Inherit,
+            job_resource_limits: None,
         }
     }
 
@@ -165,6 +319,19 @@ impl ContainedCommand {
         self
     }
 
+    /// Opts this launch into enforceable Job process-count and/or memory caps.
+    ///
+    /// The validated limits are configured on the empty Job Object before
+    /// `CreateProcessW`, then read back exactly. Configuration or verification
+    /// failure aborts the launch; there is no fallback that silently drops or
+    /// weakens a requested limit.
+    /// See Microsoft's [`SetInformationJobObject`](https://learn.microsoft.com/windows/win32/api/jobapi2/nf-jobapi2-setinformationjobobject)
+    /// contract for the single-call limit update.
+    pub fn job_resource_limits(&mut self, limits: JobResourceLimits) -> &mut Self {
+        self.job_resource_limits = Some(limits);
+        self
+    }
+
     /// Creates the process with Job and handle-list attributes already applied.
     ///
     /// The returned child owns ReSymbol's anonymous Job handle. There
@@ -184,12 +351,39 @@ pub struct ContainedChild {
     stdin: Option<File>,
     stdout: Option<File>,
     stderr: Option<File>,
+    verified_job_resource_limits: Option<JobResourceLimits>,
 }
 
 impl ContainedChild {
     #[must_use]
     pub const fn id(&self) -> u32 {
         self.process_id
+    }
+
+    /// Returns the opt-in limits that were accepted by `SetInformationJobObject`
+    /// and matched an exact `QueryInformationJobObject` readback before this
+    /// process was created. A containing parent Job may impose stricter limits.
+    ///
+    /// `None` truthfully means the caller requested only the default
+    /// kill-on-close lifecycle limit; it does not mean the process is unlimited
+    /// by Windows, a parent Job, or another authority.
+    #[must_use]
+    pub const fn verified_job_resource_limits(&self) -> Option<JobResourceLimits> {
+        self.verified_job_resource_limits
+    }
+
+    /// Reports only whether this owner successfully requested Job termination.
+    /// See [`JobTerminationStatus`] for the intentionally limited guarantee.
+    #[must_use]
+    pub const fn job_termination_status(&self) -> JobTerminationStatus {
+        if self.job.is_some() {
+            JobTerminationStatus::NotRequested
+        } else {
+            // The Job is initialized before process creation and the only
+            // returned-child path that consumes it is a successful explicit
+            // termination request.
+            JobTerminationStatus::Requested
+        }
     }
 
     pub fn take_stdin(&mut self) -> Option<File> {
@@ -240,7 +434,7 @@ impl ContainedChild {
         }
     }
 
-    /// Explicitly terminates the Job and then closes ReSymbol's Job handle.
+    /// Explicitly requests Job termination and then closes ReSymbol's Job handle.
     ///
     /// Explicit termination keeps ordinary cleanup authoritative even if
     /// hostile same-account code duplicated the handle. `KILL_ON_JOB_CLOSE`
@@ -365,7 +559,7 @@ fn spawn_contained(command: &ContainedCommand) -> io::Result<ContainedChild> {
         .map(|directory| nul_terminated_wide(directory.as_os_str(), "current directory"))
         .transpose()?;
 
-    let job = create_kill_on_close_job()?;
+    let job = create_containment_job(command.job_resource_limits)?;
     let mut stdin = prepare_stdio(command.stdin, StreamDirection::Input, STD_INPUT_HANDLE)?;
     let mut stdout = prepare_stdio(command.stdout, StreamDirection::Output, STD_OUTPUT_HANDLE)?;
     let mut stderr = prepare_stdio(command.stderr, StreamDirection::Output, STD_ERROR_HANDLE)?;
@@ -455,6 +649,7 @@ fn spawn_contained(command: &ContainedCommand) -> io::Result<ContainedChild> {
         stdin: stdin.parent.take(),
         stdout: stdout.parent.take(),
         stderr: stderr.parent.take(),
+        verified_job_resource_limits: command.job_resource_limits,
     };
     match process_is_in_job(&child.process, child.job.as_ref().expect("job is present")) {
         Ok(true) => Ok(child),
@@ -519,18 +714,20 @@ fn wait_for_exit_bounded(child: &mut ContainedChild, timeout: Duration) -> io::R
     }
 }
 
-fn create_kill_on_close_job() -> io::Result<OwnedHandle> {
+fn create_containment_job(resource_limits: Option<JobResourceLimits>) -> io::Result<OwnedHandle> {
     // SAFETY: null security attributes and name request an unnamed, non-inheritable Job.
     let raw_job = unsafe { CreateJobObjectW(null(), null()) };
     let job = owned_handle(raw_job, "create process Job Object")?;
-    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    let limits = extended_job_limit_information(resource_limits);
     let size = u32::try_from(size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>()).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             "Job extended-limit structure size exceeds u32",
         )
     })?;
+    // Configure kill-on-close and every requested resource cap in one update
+    // while the Job is empty. Failure drops the Job and returns before any
+    // CreateProcessW call, so no partially configured launch is possible.
     // SAFETY: `job` is a live Job handle and `limits` is a correctly sized,
     // initialized JOBOBJECT_EXTENDED_LIMIT_INFORMATION value for the call.
     if unsafe {
@@ -542,9 +739,85 @@ fn create_kill_on_close_job() -> io::Result<OwnedHandle> {
         )
     } == FALSE
     {
-        return Err(last_error("configure kill-on-close process Job Object"));
+        return Err(last_error("configure contained process Job Object limits"));
     }
+    verify_extended_job_limit_information(&job, &limits)?;
     Ok(job)
+}
+
+fn verify_extended_job_limit_information(
+    job: &OwnedHandle,
+    expected: &JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+) -> io::Result<()> {
+    let mut observed = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    let size = u32::try_from(size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Job extended-limit structure size exceeds u32",
+        )
+    })?;
+    // SAFETY: `job` is a live Job handle and `observed` is writable storage of
+    // exactly the size declared to QueryInformationJobObject. Return length is
+    // optional for this fixed-size information class.
+    if unsafe {
+        QueryInformationJobObject(
+            raw_handle(job),
+            JobObjectExtendedLimitInformation,
+            (&raw mut observed).cast::<c_void>(),
+            size,
+            null_mut(),
+        )
+    } == FALSE
+    {
+        return Err(last_error("verify contained process Job Object limits"));
+    }
+
+    let expected_basic = &expected.BasicLimitInformation;
+    let observed_basic = &observed.BasicLimitInformation;
+    if observed_basic.LimitFlags != expected_basic.LimitFlags
+        || observed_basic.ActiveProcessLimit != expected_basic.ActiveProcessLimit
+        || observed.ProcessMemoryLimit != expected.ProcessMemoryLimit
+        || observed.JobMemoryLimit != expected.JobMemoryLimit
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "contained Job limit readback mismatch: expected flags {:#x}, active processes {}, process memory {}, Job memory {}; observed flags {:#x}, active processes {}, process memory {}, Job memory {}",
+                expected_basic.LimitFlags,
+                expected_basic.ActiveProcessLimit,
+                expected.ProcessMemoryLimit,
+                expected.JobMemoryLimit,
+                observed_basic.LimitFlags,
+                observed_basic.ActiveProcessLimit,
+                observed.ProcessMemoryLimit,
+                observed.JobMemoryLimit,
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn extended_job_limit_information(
+    resource_limits: Option<JobResourceLimits>,
+) -> JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+    let mut information = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    information.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    let Some(resource_limits) = resource_limits else {
+        return information;
+    };
+    if let Some(limit) = resource_limits.active_process_limit {
+        information.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+        information.BasicLimitInformation.ActiveProcessLimit = limit;
+    }
+    if let Some(bytes) = resource_limits.process_memory_bytes {
+        information.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+        information.ProcessMemoryLimit = bytes;
+    }
+    if let Some(bytes) = resource_limits.job_memory_bytes {
+        information.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_JOB_MEMORY;
+        information.JobMemoryLimit = bytes;
+    }
+    information
 }
 
 fn process_is_in_job(process: &OwnedHandle, job: &OwnedHandle) -> io::Result<bool> {
@@ -942,8 +1215,10 @@ fn last_error(context: &str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        ContainedChild, ContainedCommand, Stdio, command_line, owned_handle_from_created,
-        raw_handle, wait_for_exit_bounded,
+        ContainedChild, ContainedCommand, JobResourceLimitError, JobResourceLimits,
+        JobTerminationStatus, MAX_ACTIVE_PROCESS_LIMIT, MAX_JOB_MEMORY_LIMIT_BYTES,
+        MIN_JOB_MEMORY_LIMIT_BYTES, Stdio, command_line, extended_job_limit_information,
+        owned_handle_from_created, raw_handle, wait_for_exit_bounded,
     };
     use std::{
         ffi::OsString,
@@ -955,12 +1230,111 @@ mod tests {
         time::{Duration, Instant},
     };
     use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle, FALSE};
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    use windows_sys::Win32::System::{
+        JobObjects::{
+            JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_JOB_MEMORY,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+        },
+        Threading::GetCurrentProcess,
+    };
 
     const FIXTURE_MODE: &str = "RESYMBOL_WINDOWS_PROCESS_UNIT_FIXTURE";
     const LONG_RUNNING_FIXTURE: &str = "windows::tests::long_running_fixture";
     const NORMAL_EXIT_FIXTURE: &str = "windows::tests::normal_exit_fixture";
     const STDIN_EOF_FIXTURE: &str = "windows::tests::stdin_eof_fixture";
+
+    #[test]
+    fn job_resource_limits_reject_empty_zero_and_out_of_range_values() {
+        assert_eq!(
+            JobResourceLimits::new(None, None, None),
+            Err(JobResourceLimitError::NoLimitsConfigured)
+        );
+        assert_eq!(
+            JobResourceLimits::new(Some(0), None, None),
+            Err(JobResourceLimitError::ActiveProcessLimit)
+        );
+        assert_eq!(
+            JobResourceLimits::new(Some(129), None, None),
+            Err(JobResourceLimitError::ActiveProcessLimit)
+        );
+        assert_eq!(
+            JobResourceLimits::new(None, Some(MIN_JOB_MEMORY_LIMIT_BYTES - 1), None),
+            Err(JobResourceLimitError::ProcessMemoryLimit)
+        );
+        assert_eq!(
+            JobResourceLimits::new(None, Some(MAX_JOB_MEMORY_LIMIT_BYTES + 1), None),
+            Err(JobResourceLimitError::ProcessMemoryLimit)
+        );
+        assert_eq!(
+            JobResourceLimits::new(None, None, Some(MIN_JOB_MEMORY_LIMIT_BYTES - 1)),
+            Err(JobResourceLimitError::JobMemoryLimit)
+        );
+        assert_eq!(
+            JobResourceLimits::new(None, None, Some(MAX_JOB_MEMORY_LIMIT_BYTES + 1)),
+            Err(JobResourceLimitError::JobMemoryLimit)
+        );
+    }
+
+    #[test]
+    fn job_resource_limit_boundaries_respect_pointer_width() {
+        assert!(
+            JobResourceLimits::new(
+                Some(MAX_ACTIVE_PROCESS_LIMIT),
+                Some(MIN_JOB_MEMORY_LIMIT_BYTES),
+                Some(MIN_JOB_MEMORY_LIMIT_BYTES),
+            )
+            .is_ok()
+        );
+
+        #[cfg(target_pointer_width = "64")]
+        {
+            assert!(JobResourceLimits::new(None, Some(MAX_JOB_MEMORY_LIMIT_BYTES), None).is_ok());
+            assert!(JobResourceLimits::new(None, None, Some(MAX_JOB_MEMORY_LIMIT_BYTES)).is_ok());
+        }
+
+        #[cfg(target_pointer_width = "32")]
+        {
+            assert_eq!(
+                JobResourceLimits::new(None, Some(MAX_JOB_MEMORY_LIMIT_BYTES), None),
+                Err(JobResourceLimitError::ProcessMemoryLimit)
+            );
+            assert_eq!(
+                JobResourceLimits::new(None, None, Some(MAX_JOB_MEMORY_LIMIT_BYTES)),
+                Err(JobResourceLimitError::JobMemoryLimit)
+            );
+        }
+    }
+
+    #[test]
+    fn job_resource_limits_materialize_only_requested_enforceable_flags() {
+        let defaults = extended_job_limit_information(None);
+        assert_eq!(
+            defaults.BasicLimitInformation.LimitFlags,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        );
+        assert_eq!(defaults.BasicLimitInformation.ActiveProcessLimit, 0);
+        assert_eq!(defaults.ProcessMemoryLimit, 0);
+        assert_eq!(defaults.JobMemoryLimit, 0);
+
+        let limits =
+            JobResourceLimits::new(Some(3), Some(64 * 1024 * 1024), Some(256 * 1024 * 1024))
+                .expect("valid Job limits");
+        assert_eq!(limits.active_process_limit(), Some(3));
+        assert_eq!(limits.process_memory_bytes(), Some(64 * 1024 * 1024));
+        assert_eq!(limits.job_memory_bytes(), Some(256 * 1024 * 1024));
+
+        let information = extended_job_limit_information(Some(limits));
+        assert_eq!(
+            information.BasicLimitInformation.LimitFlags,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+                | JOB_OBJECT_LIMIT_ACTIVE_PROCESS
+                | JOB_OBJECT_LIMIT_PROCESS_MEMORY
+                | JOB_OBJECT_LIMIT_JOB_MEMORY
+        );
+        assert_eq!(information.BasicLimitInformation.ActiveProcessLimit, 3);
+        assert_eq!(information.ProcessMemoryLimit, 64 * 1024 * 1024);
+        assert_eq!(information.JobMemoryLimit, 256 * 1024 * 1024);
+    }
 
     #[test]
     fn embedded_argument_nul_is_rejected_before_process_creation() {
@@ -985,11 +1359,20 @@ mod tests {
     #[test]
     fn duplicated_job_handle_does_not_defeat_explicit_tree_termination() {
         let mut child = spawn_fixture(LONG_RUNNING_FIXTURE, "long-running", Stdio::null());
+        assert_eq!(child.verified_job_resource_limits(), None);
+        assert_eq!(
+            child.job_termination_status(),
+            JobTerminationStatus::NotRequested
+        );
         let duplicate = duplicate_job_handle(&child);
 
         child
             .terminate_tree()
             .expect("explicitly terminate Job while a duplicate handle survives");
+        assert_eq!(
+            child.job_termination_status(),
+            JobTerminationStatus::Requested
+        );
         let status = wait_for_exit_bounded(&mut child, Duration::from_secs(2))
             .expect("explicit Job termination must stop the long-running child");
         assert_eq!(status.code(), Some(1));
@@ -1012,7 +1395,15 @@ mod tests {
     fn explicit_tree_termination_is_idempotent() {
         let mut child = spawn_fixture(LONG_RUNNING_FIXTURE, "long-running", Stdio::null());
         child.terminate_tree().expect("first Job termination");
+        assert_eq!(
+            child.job_termination_status(),
+            JobTerminationStatus::Requested
+        );
         child.terminate_tree().expect("second Job termination");
+        assert_eq!(
+            child.job_termination_status(),
+            JobTerminationStatus::Requested
+        );
         let status = wait_for_exit_bounded(&mut child, Duration::from_secs(2))
             .expect("terminated child must become signaled");
         assert_eq!(status.code(), Some(1));
@@ -1037,6 +1428,11 @@ mod tests {
                 .terminate_tree()
                 .expect_err("query-only Job handle must not terminate the Job");
             assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(
+                child.job_termination_status(),
+                JobTerminationStatus::NotRequested,
+                "attempt {attempt} fabricated successful cleanup evidence"
+            );
             assert_eq!(
                 child.job.as_ref().map(raw_handle),
                 Some(restricted_raw),

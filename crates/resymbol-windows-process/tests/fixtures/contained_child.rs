@@ -18,13 +18,19 @@ mod fixture {
         os::windows::process::CommandExt as _,
         path::PathBuf,
         process::{self, Command, Stdio},
+        ptr::null,
         thread,
         time::Duration,
     };
 
     use windows_sys::Win32::{
         Foundation::ERROR_ACCESS_DENIED,
-        System::Threading::{CREATE_BREAKAWAY_FROM_JOB, SetEvent},
+        System::{
+            Memory::{
+                MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+            },
+            Threading::{CREATE_BREAKAWAY_FROM_JOB, SetEvent},
+        },
     };
 
     pub(super) fn main() {
@@ -47,6 +53,11 @@ mod fixture {
             Some("descendant") => run_descendant(arguments.collect()),
             Some("signal-handle") => run_handle_signal(arguments.collect()),
             Some("attempt-breakaway") => run_attempt_breakaway(arguments.collect()),
+            Some("probe-active-process-limit") => {
+                run_active_process_limit_probe(arguments.collect())
+            }
+            Some("write-marker") => run_write_marker(arguments.collect()),
+            Some("probe-memory-limit") => run_memory_limit_probe(arguments.collect()),
             Some("noop") => Ok(0),
             _ => Err(format!("unknown fixture mode {mode:?}")),
         }
@@ -122,6 +133,113 @@ mod fixture {
         fs::write(PathBuf::from(marker), b"escaped")
             .map_err(|error| format!("write descendant survival marker: {error}"))?;
         Ok(0)
+    }
+
+    fn run_active_process_limit_probe(arguments: Vec<OsString>) -> Result<i32, String> {
+        let [marker] = arguments.as_slice() else {
+            return Err("active-process probe expected one marker path".to_owned());
+        };
+        let marker = PathBuf::from(marker);
+        let spawned = Command::new(env::current_exe().map_err(|error| error.to_string())?)
+            .arg("write-marker")
+            .arg(&marker)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+
+        match spawned {
+            // Microsoft specifies termination plus failed Job association, but
+            // not which `Command::spawn` result exposes that implicit-assignment
+            // failure. Handle either result; the security property is that the
+            // new image never reaches its marker write.
+            Err(_) if !marker.exists() => Ok(0),
+            Err(error) => Err(format!(
+                "grandchild wrote its marker before creation failed: {error}"
+            )),
+            Ok(mut child) => {
+                let status = child
+                    .wait()
+                    .map_err(|error| format!("wait for denied grandchild: {error}"))?;
+                if marker.exists() {
+                    return Err(format!(
+                        "grandchild executed despite the active-process limit: {status}"
+                    ));
+                }
+                Ok(0)
+            }
+        }
+    }
+
+    fn run_write_marker(arguments: Vec<OsString>) -> Result<i32, String> {
+        let [marker] = arguments.as_slice() else {
+            return Err("marker writer expected one marker path".to_owned());
+        };
+        fs::write(PathBuf::from(marker), b"executed")
+            .map_err(|error| format!("write active-process marker: {error}"))?;
+        Ok(0)
+    }
+
+    fn run_memory_limit_probe(arguments: Vec<OsString>) -> Result<i32, String> {
+        let [attempted_bytes] = arguments.as_slice() else {
+            return Err("memory-limit probe expected one byte-count argument".to_owned());
+        };
+        let attempted_bytes = attempted_bytes
+            .to_str()
+            .ok_or_else(|| "memory-limit byte count was not Unicode".to_owned())?
+            .parse::<usize>()
+            .map_err(|error| format!("parse memory-limit byte count: {error}"))?;
+
+        // First prove that this process can make and release an ordinary commit
+        // so an unrelated total allocation failure cannot masquerade as limit
+        // enforcement. MEM_COMMIT charges commit for the complete region at the
+        // call boundary; touching pages is not required for this Job limit.
+        commit_then_release(8 * 1024 * 1024)
+            .map_err(|error| format!("baseline memory commit failed: {error}"))?;
+
+        // SAFETY: null requests a system-chosen region, the nonzero size came
+        // from the trusted parent test, and the flags describe one read/write
+        // reserved-and-committed region. A non-null result is caller-owned.
+        let region = unsafe {
+            VirtualAlloc(
+                null(),
+                attempted_bytes,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        };
+        if region.is_null() {
+            return Ok(0);
+        }
+
+        // Do not leak a surprising successful allocation while reporting the
+        // limit failure. Preserve the stronger diagnostic if release also fails.
+        // SAFETY: `region` is exactly the base returned by VirtualAlloc; zero
+        // size is required with MEM_RELEASE.
+        if unsafe { VirtualFree(region, 0, MEM_RELEASE) } == 0 {
+            return Err(format!(
+                "committed {attempted_bytes} bytes despite the configured Job limit and then failed to release the region: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        Err(format!(
+            "committed {attempted_bytes} bytes despite the configured Job limit"
+        ))
+    }
+
+    fn commit_then_release(bytes: usize) -> Result<(), io::Error> {
+        // SAFETY: same allocation contract as the constrained probe above.
+        let region =
+            unsafe { VirtualAlloc(null(), bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        if region.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `region` is exactly the base returned above and zero size is
+        // required when releasing the complete region with MEM_RELEASE.
+        if unsafe { VirtualFree(region, 0, MEM_RELEASE) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
 
     fn run_handle_signal(arguments: Vec<OsString>) -> Result<i32, String> {
