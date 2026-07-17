@@ -99,6 +99,7 @@ pub enum AccessRequestError {
     NoopWrite,
 }
 
+#[cfg(any(windows, test))]
 pub(crate) fn validate_read_size(size: usize) -> Result<(), AccessRequestError> {
     if size == 0 {
         return Err(AccessRequestError::EmptyRead);
@@ -112,6 +113,7 @@ pub(crate) fn validate_read_size(size: usize) -> Result<(), AccessRequestError> 
     Ok(())
 }
 
+#[cfg(any(windows, test))]
 pub(crate) fn validate_write_request(
     expected: &[u8],
     replacement: &[u8],
