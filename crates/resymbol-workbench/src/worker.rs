@@ -1079,7 +1079,7 @@ fn read_offline_image(
     let open = client
         .submit(DebugCommand::Open(DebugTargetRequest::Offline(target)))
         .map_err(|error| OfflineImageReadFailure::pipeline("offline open", error))?;
-    require_succeeded("offline open", &open.outcome)?;
+    require_succeeded("offline open", open.outcome())?;
     let SessionState::Offline { token } = client.session_state().ok_or_else(|| {
         OfflineImageReadFailure::pipeline("offline open", "host omitted the opened session state")
     })?
@@ -1108,7 +1108,7 @@ fn read_offline_image(
     let close = client
         .submit(DebugCommand::Close { state: close_state })
         .map_err(|error| OfflineImageReadFailure::pipeline("session close", error))?;
-    require_succeeded("session close", &close.outcome)?;
+    require_succeeded("session close", close.outcome())?;
     if client.session_state().map(SessionState::kind) != Some(SessionStateKind::Closed) {
         return Err(OfflineImageReadFailure::pipeline(
             "session close",
@@ -1199,10 +1199,11 @@ fn exact_read_availability(
     expected_view: ReadViewToken,
     span: OfflineImageReadSpan,
 ) -> Result<OfflineImageReadAvailability, OfflineImageReadFailure> {
-    match receipt.outcome {
+    let (_, outcome, events) = receipt.into_parts();
+    match outcome {
         CommandOutcome::Succeeded => {
             let mut exact_bytes = None;
-            for envelope in receipt.events {
+            for envelope in events {
                 if let DebugEvent::MemoryRead {
                     view,
                     address,
@@ -1230,8 +1231,7 @@ fn exact_read_availability(
             Ok(OfflineImageReadAvailability::Available { bytes })
         }
         CommandOutcome::Rejected { code, message } if code == OFFLINE_RANGE_UNAVAILABLE_CODE => {
-            if receipt
-                .events
+            if events
                 .iter()
                 .any(|event| matches!(&event.event, DebugEvent::MemoryRead { .. }))
             {

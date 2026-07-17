@@ -527,6 +527,23 @@ The instruction action menu maintains three separate authority domains:
    integration. Continue and `BreakpointPersistence::Persistent` breakpoint creation stay on the
    typed command path.
 
+Future live patch UI state must use the separate pure `LivePatchHistory` reducer rather than infer
+success from dispatch. The reducer accepts one immutable session and exact live binding, permits one
+pending compare-before-write operation, and separates reservation from a single-use dispatch
+transition. A reservation may be cancelled only before dispatch begins; a dispatched operation must
+resolve exact evidence or freeze on an unknown transport outcome. It commits only the exact
+`MemoryWritten`, refreshed `Stopped`, and successful command-result receipt already validated by
+`DebugHostClient`. Its undo is strict LIFO and uses the fresh current stop token; it expects the
+prior replacement and restores the prior original bytes. Safe rejection leaves the stack intact.
+Unknown transport outcome, indeterminate recovery, binding or session drift after dispatch, or
+malformed evidence freezes the stack for inspection instead of offering another mutation. Capacity
+is reserved before dispatch (256 entries and 1 MiB of retained before/after bytes), with neither
+eviction nor redo. This history is not connected to the Workbench and grants no attach, stop, write,
+cleanup, or sandbox authority.
+
+`CommandReceipt` construction is crate-sealed, so downstream UI/controller code can inspect or
+consume host-client receipts but cannot manufacture the evidence used by this reducer.
+
 Protection findings are bounded artifact evidence. They are neither malware signatures nor an
 authorization to execute. Offline opening should keep those findings reviewable without training the
 user to dismiss an execution warning. A blocking approval belongs at the live launch/attach boundary

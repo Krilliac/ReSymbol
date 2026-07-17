@@ -11,6 +11,7 @@ mod host_codec;
 mod host_response;
 pub mod host_wire;
 mod identity;
+mod live_patch_history;
 mod offline_image_host;
 mod protection;
 pub mod protocol;
@@ -47,6 +48,12 @@ pub use host_response::{
 pub use identity::{
     HostRiskLeaseId, HostRiskLeaseIdError, ProvisioningEpoch, ProvisioningEpochError,
     SandboxOwnershipLeaseId, SandboxOwnershipLeaseIdError, SessionIdError,
+};
+pub use live_patch_history::{
+    LivePatchEntry, LivePatchFreezeCause, LivePatchFreezeEvidence, LivePatchHistory,
+    LivePatchHistoryError, LivePatchOperationKind, LivePatchOperationPhase,
+    LivePatchReceiptMismatch, LivePatchResolution, MAX_LIVE_PATCH_HISTORY_ENTRIES,
+    MAX_LIVE_PATCH_HISTORY_STORED_BYTES, PendingLivePatchOperation,
 };
 pub use offline_image_host::{
     MAX_OFFLINE_IMAGE_BYTES, OfflineImageDebugHost, OfflineImageReadError, VerifiedOfflineImage,
