@@ -76,13 +76,27 @@ guarantees; a typed reason; and a deterministic set of unresolved requirements. 
 guarantees in a report are requirements, not claims about a created sandbox. Only
 `ready-for-provisioning-attempt` is available—there is deliberately no "sandbox guaranteed" state.
 
-`SystemSandboxProviderProbe` is intentionally conservative. It uses only the compile-time platform
-target. Off Windows it reports `unsupported-platform`. On Windows it reports
-`capabilities-unverified` plus exact AppContainer, optional-feature, virtualization, policy, helper,
-or sealed-image requirements. It does not trust environment variables, registry implementation
-details, localized command output, or paths found through the user `PATH`; it does not invoke DISM or
-PowerShell; and it never enables a feature or requests elevation. A future Windows adapter may
-return readiness only after non-mutating, stable operating-system capability checks.
+`SystemSandboxProviderProbe` is intentionally conservative. Off Windows it reports
+`unsupported-platform`. On Windows it uses the narrow `resymbol-windows-readiness` adapter to make
+three independent, read-only observations through stable operating-system APIs:
+
+- the required AppContainer profile entry points are present in the system32 `userenv.dll`;
+- `PF_VIRT_FIRMWARE_ENABLED` reports firmware virtualization enabled and available to Windows; and
+- `WHvCapabilityCodeHypervisorPresent` reports a running Windows hypervisor through the Windows
+  Hypervisor Platform API.
+
+These observations remove only their matching unresolved requirements. AppContainer exports do not
+prove that a profile can be created under current policy. Firmware virtualization and a running
+hypervisor do not prove that Windows Sandbox or Hyper-V optional features are enabled, that provider
+policy permits use, or that a sealed image or exact helper is available. A missing observed
+capability is reported unavailable; inability to load or call the stable query remains typed and
+indeterminate. No positive observation is promoted to provider readiness by itself.
+
+Optional-feature state, administrative policy approval, packaged provider-helper identity, and
+sealed-VM-image identity remain unresolved until equally bounded adapters exist. The probe does not
+trust environment variables, registry implementation details, localized command output, or paths
+found through the user `PATH`; it does not invoke DISM or PowerShell; and it never enables a feature
+or requests elevation.
 
 Deterministic fake backends exercise ready, unavailable, missing-capability, and provider-mismatch
 paths without touching the host. Production provisioning and runtime attestation remain separate
@@ -166,19 +180,25 @@ tests:
    the session, provisioning epoch, `BinaryId`, exact executable path, argument vector, working
    directory, host environment, and stop-before-entry mode. An attach lease binds PID, trusted
    process-start key, executable `BinaryId`, and attach mode. A wire payload cannot mint authority.
-4. A target is created suspended. Continue is impossible until the expected attestation is accepted
-   for that exact session, binary, policy, provider, build, and fresh 256-bit provisioning epoch.
+4. A target is created suspended, and `AwaitingAttestation` records its exact PID, trusted
+   process-start key, and executable identity. Continue is impossible until the provider's actual
+   attestation matches that retained process plus the exact session, binary, policy, provider,
+   build, and fresh 256-bit provisioning epoch.
 5. Memory writes are bounded equal-length compare-before-write operations with complete-write and
    readback verification.
 6. Events are ordered, command outcomes are correlated, replayed commands are rejected, and terminal
    states cannot return to a live state.
 7. A sandbox-owned attach requires a provider/host-registered one-use ownership lease bound to the
-   exact process identity, attach mode, provider, policy digest, session, and provisioning epoch. A PID or claimed
-   owner session in a command is never proof of ownership.
+   exact process identity, attach mode, provider, policy digest, session, and provisioning epoch. A
+   PID or claimed owner session in a command is never proof of ownership.
 8. Cleanup receipts carry the same provisioning epoch as attestation, so evidence from an otherwise
-   identical earlier provisioning instance is rejected. An inherited-sandbox attach also binds its
-   receipt to the exact process identity, provider, policy digest, and session retained from the
-   provider-issued ownership lease. Helper loss never implies cleanup succeeded.
+   identical earlier provisioning instance is rejected. Cleanup after a newly created target binds
+   the exact process identity retained at creation. A retained launch failure explicitly reports
+   `NotCreated` or `Created` with the exact PID/start-key/image identity. A processless receipt is
+   accepted only after the reducer validates and retains exact `NotCreated` evidence; omission of
+   `AwaitingAttestation` leaves creation unknown and fails closed. An inherited-sandbox attach
+   likewise binds its receipt to the exact process identity, provider, policy digest, and session
+   retained from the provider-issued ownership lease. Helper loss never implies cleanup succeeded.
 
 The pure reducers and typed client now exercise these ordering and binding rules. The client
 independently replays each command through its reducer and accepts only command-specific state and
@@ -190,8 +210,11 @@ provider, not evidence that such a provider exists.
 
 The current seam is intentionally narrow:
 
-- debugger wire and typed-command protocol 1.2 carries the lease identifiers, provisioning epoch,
-  exact failure operation context, and explicit incomplete cleanup-attempt evidence;
+- debugger wire and typed-command protocol 1.3 carries the lease identifiers, provisioning epoch,
+  exact suspended-target process identity through state and attestation, exact failure operation
+  context including the explicit target-creation outcome, and process-bound incomplete or complete
+  cleanup evidence. The wire supports exactly 1.3; a 1.2 Hello is rejected before negotiation
+  because it cannot represent the required process fields;
 - a four-byte length prefix is validated before allocating a bounded control buffer;
 - controller and host roles, directions, nonzero challenge nonce, expected plaintext build claims,
   offered protocol version, response kind, and independent frame sequences are correlated before
@@ -217,11 +240,12 @@ The current seam is intentionally narrow:
   evidence must match the request. Policy and discovery failures can roll back only before any
   command-state event or operation evidence is observed, from the exact accepted Opening or
   Provisioning post-state. A resource-retaining sandbox rejection must follow its exact
-  command-state transition, match the command/stage/kind/reducer phase, bind the full launch or
-  inherited-attach context, and end in one exact `Failed` state while cleanup ownership remains
-  held. A cleanup-stage retained rejection additionally requires exactly one validated
-  `CleanupAttemptFailed` event carrying its incomplete receipt. Every rejected command still
-  consumes its command identifier and any presented one-use authority;
+  command-state transition, match the command/stage/kind/reducer phase, bind the full launch and its
+  explicit `NotCreated` or exact `Created` process outcome (or the inherited-attach context), and end
+  in one exact `Failed` state while cleanup ownership remains held. A cleanup-stage retained
+  rejection additionally requires exactly one validated `CleanupAttemptFailed` event carrying its
+  incomplete receipt. Every rejected command
+  still consumes its command identifier and any presented one-use authority;
 - the audited controller and host-client path uses the public-but-opaque, move-only
   `RemoteCommandCheckpoint`, bound to the exact reducer instance, command ID, and post-accept state;
   future external helper or provider crates must preserve the same transaction boundary. Exactly one
@@ -233,8 +257,13 @@ The current seam is intentionally narrow:
   mismatched, already-resolved, and post-effect rollback attempts fail closed; command, run/stop, and
   one-use authorization watermarks remain consumed;
 - failure, attestation, and cleanup events are bound both to the outer event session and to the
-  reducer's exact binary or inherited process, policy, provider, helper build, provisioning epoch,
-  and cleanup expectation before failure can be retained or `Closed` can be accepted and released;
+  reducer's exact created or inherited process, binary, policy, provider, helper build,
+  provisioning epoch, and cleanup expectation before failure can be retained or `Closed` can be
+  accepted and released. The reducer retains the provider attestation it accepted rather than only
+  a Boolean gate. A trusted host path must record explicit `NotCreated` before binding a pre-target
+  launch failure; the binder rejects an unknown target-creation result. Missing target-creation
+  state is not treated as evidence. Raw expected-attestation and cleanup comparison helpers are
+  crate-private; public acceptance routes through reducer-held identity;
 - connection-level capability probing is explicit and complete: every protocol capability must
   appear exactly once as available or with a typed unavailability reason. The synthetic host
   reports every platform capability as unavailable, supports only offline open/close, and rejects
@@ -257,9 +286,11 @@ The current seam is intentionally narrow:
   non-cloneable. Pure lease IDs, exact launch/attach comparison records, and retained sandbox
   evidence remain cloneable value data without granting host authority;
 - only `Closed` sessions can be released, and both newly provisioned and inherited sandbox closure
-  require a complete receipt. Inherited cleanup is validated against the retained session,
-  provisioning epoch, provider, policy digest, and PID/start-key/image process identity before the
-  reducer can enter `Closed`. `CleanupAttemptFailed` is a separate cleanup-stage failure carrying an
+  require a complete receipt. Cleanup after target creation is validated against the retained
+  session, provisioning epoch, provider, policy digest, and PID/start-key/image process identity
+  before the reducer can enter `Closed`; a receipt without a process identity requires a previously
+  validated and retained exact `NotCreated` failure outcome. An unknown target-creation outcome
+  fails closed. `CleanupAttemptFailed` is a separate cleanup-stage failure carrying an
   exact `Incomplete` receipt with at least one bounded residual; its `retryable` flag is advisory and
   never weakens fail-closed ownership. It retains `Failed` state and sandbox ownership for another
   cleanup attempt, leaves cleanup unverified, and can never imply `Closed` or permit release.
@@ -357,8 +388,9 @@ No process-executing provider should merge until the project has evidence for:
 - legal session transitions, cross-target and replayed lease rejection, stale generation/stop
   rejection, provisioning-epoch-bound attestation and cleanup, attestation-gated resume,
   compare-write conflicts, sequence overflow, and terminal cleanup behavior;
-- strict wire decoding, Hello-first/once build-claim exchange, role/build/version/nonce correlation,
-  independent transport authentication, bounded allocation before payload reads, and crash recovery;
+- strict wire decoding, exact-1.3 Hello-first/once build-claim exchange including legacy-1.2
+  rejection, role/build/version/nonce correlation, independent transport authentication, bounded
+  allocation before payload reads, and crash recovery;
 - benign Windows probes showing allowed staged reads and scratch writes while profile sentinels,
   network, unlisted handles, inherited secrets, and forbidden child creation fail;
 - target code not reaching a safe TLS/CRT marker before explicit resume;

@@ -84,8 +84,9 @@ pub use sandbox::{
     SandboxFailureContext, SandboxFailureKind, SandboxFailureStage, SandboxFailureValidationError,
     SandboxGuarantee, SandboxLifecycleEvent, SandboxLifecycleState, SandboxMachine,
     SandboxMachineError, SandboxNetworkMode, SandboxPolicy, SandboxPolicyApprovalId,
-    SandboxProviderDescriptor, SandboxProviderSelection, SandboxResourceLimits, SealedImageDigest,
-    SealedImageDigestError, SealedImageId, VmIsolationIdentity, Win32kProfile,
+    SandboxProviderDescriptor, SandboxProviderSelection, SandboxResourceLimits,
+    SandboxTargetCreationOutcome, SealedImageDigest, SealedImageDigestError, SealedImageId,
+    VmIsolationIdentity, Win32kProfile,
 };
 pub use session_machine::{
     MAX_REGISTERED_AUTHORIZATION_LEASES, RemoteCommandCheckpoint, SessionMachine,

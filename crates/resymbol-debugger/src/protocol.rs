@@ -22,7 +22,7 @@ use crate::sandbox::{
 use resymbol_core::BinaryId;
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 2;
+pub const PROTOCOL_MINOR: u16 = 3;
 pub const MAX_LAUNCH_ARGUMENTS: usize = 128;
 pub const MAX_LAUNCH_ARGUMENT_BYTES: usize = 256 * 1024;
 pub const MAX_MEMORY_READ_BYTES: u32 = 1024 * 1024;
@@ -817,6 +817,9 @@ pub enum SessionState {
     },
     AwaitingAttestation {
         token: StateToken,
+        /// Exact suspended process created for this provisioning attempt.
+        /// Attestation and cleanup must retain this PID/start-key/image tuple.
+        process: ProcessIdentity,
     },
     AttestationAccepted {
         token: StateToken,
@@ -892,7 +895,7 @@ impl SessionState {
         match self {
             Self::Idle { token }
             | Self::Opening { token, .. }
-            | Self::AwaitingAttestation { token }
+            | Self::AwaitingAttestation { token, .. }
             | Self::AttestationAccepted { token }
             | Self::Offline { token }
             | Self::Dump { token }
@@ -1366,9 +1369,10 @@ mod tests {
     use crate::identity::ProvisioningEpoch;
     use crate::sandbox::{
         CleanupOutcome, CleanupReceiptId, CleanupResidual, CleanupResidualKind, DiagnosticText,
-        HelperBuildId, PolicyDigest, SandboxCleanupAttemptFailure, SandboxCleanupReceipt,
-        SandboxFailure, SandboxFailureContext, SandboxFailureKind, SandboxFailureStage,
-        SandboxProviderSelection,
+        HelperBuildId, IsolationBoundary, PolicyDigest, SandboxAttestation,
+        SandboxCleanupAttemptFailure, SandboxCleanupReceipt, SandboxFailure, SandboxFailureContext,
+        SandboxFailureKind, SandboxFailureStage, SandboxGuarantee, SandboxProviderSelection,
+        SandboxTargetCreationOutcome,
     };
 
     fn session(value: u64) -> SessionId {
@@ -1383,6 +1387,14 @@ mod tests {
         StateToken {
             session_id: session(session_value),
             generation: generation(generation_value),
+        }
+    }
+
+    fn process(binary_id: BinaryId) -> ProcessIdentity {
+        ProcessIdentity {
+            process_id: ProcessId::new(4100).expect("process id"),
+            start_key: ProcessStartKey::new(27).expect("process start key"),
+            binary_id,
         }
     }
 
@@ -1453,6 +1465,7 @@ mod tests {
                             binary_id: BinaryId::digest(b"cleanup-attempt binary"),
                             helper_build: HelperBuildId::new("cleanup-attempt-helper")
                                 .expect("helper build"),
+                            target_creation: SandboxTargetCreationOutcome::NotCreated,
                         },
                         stage: SandboxFailureStage::Cleanup,
                         kind: SandboxFailureKind::CleanupIncomplete,
@@ -1495,6 +1508,43 @@ mod tests {
         assert!(SessionId::new(0).is_err());
         assert!(serde_json::from_str::<CommandId>("0").is_err());
         assert_eq!(serde_json::from_str::<CommandId>("7").unwrap().get(), 7);
+    }
+
+    #[test]
+    fn created_process_identity_is_mandatory_in_state_and_attestation_payloads() {
+        let binary_id = BinaryId::digest(b"sandboxed protocol target");
+        let process = process(binary_id.clone());
+        let awaiting = SessionState::AwaitingAttestation {
+            token: state(1, 2),
+            process: process.clone(),
+        };
+        let mut state_value = serde_json::to_value(&awaiting).expect("serialize state");
+        state_value
+            .as_object_mut()
+            .expect("state object")
+            .remove("process");
+        assert!(serde_json::from_value::<SessionState>(state_value).is_err());
+
+        let attestation = SandboxAttestation {
+            binary_id,
+            process,
+            session_id: session(1),
+            provisioning_epoch: ProvisioningEpoch::new("a".repeat(64)).expect("epoch"),
+            policy_digest: PolicyDigest::new("b".repeat(64)).expect("policy digest"),
+            provider: SandboxProviderSelection::LocalAppContainer,
+            boundary: IsolationBoundary::UserMode,
+            guarantees: BTreeSet::from([SandboxGuarantee::JobAssignmentAtCreation]),
+            job_assigned_at_creation: true,
+            helper_build: HelperBuildId::new("protocol-test-helper").expect("helper build"),
+            vm_identity: None,
+        };
+        let mut attestation_value =
+            serde_json::to_value(&attestation).expect("serialize attestation");
+        attestation_value
+            .as_object_mut()
+            .expect("attestation object")
+            .remove("process");
+        assert!(serde_json::from_value::<SandboxAttestation>(attestation_value).is_err());
     }
 
     #[test]
@@ -1790,6 +1840,13 @@ mod tests {
         let decoded: EventEnvelope =
             serde_json::from_value(encoded.clone()).expect("deserialize cleanup attempt");
         assert_eq!(decoded, envelope);
+
+        let mut missing_outcome = encoded.clone();
+        missing_outcome["event"]["payload"]["failure"]["context"]
+            .as_object_mut()
+            .expect("launch failure context")
+            .remove("target_creation");
+        assert!(serde_json::from_value::<EventEnvelope>(missing_outcome).is_err());
 
         let mut unknown = encoded;
         unknown["event"]["payload"]

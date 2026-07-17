@@ -803,9 +803,16 @@ impl ExpectedSandboxAttestation {
         })
     }
 
-    pub fn validate_exact(&self, actual: &SandboxAttestation) -> Result<(), AttestationMismatch> {
+    pub(crate) fn validate_exact(
+        &self,
+        actual: &SandboxAttestation,
+        created_process: &ProcessIdentity,
+    ) -> Result<(), AttestationMismatch> {
         if self.binary_id != actual.binary_id {
             return Err(AttestationMismatch::BinaryIdentity);
+        }
+        if &actual.process != created_process || actual.process.binary_id != actual.binary_id {
+            return Err(AttestationMismatch::ProcessIdentity);
         }
         if self.session_id != actual.session_id {
             return Err(AttestationMismatch::Session);
@@ -842,6 +849,9 @@ impl ExpectedSandboxAttestation {
 #[serde(deny_unknown_fields)]
 pub struct SandboxAttestation {
     pub binary_id: BinaryId,
+    /// Exact suspended process measured by the provider. The lifecycle reducer
+    /// independently compares this with the process recorded at creation.
+    pub process: ProcessIdentity,
     pub session_id: SessionId,
     pub provisioning_epoch: ProvisioningEpoch,
     pub policy_digest: PolicyDigest,
@@ -858,6 +868,8 @@ pub struct SandboxAttestation {
 pub enum AttestationMismatch {
     #[error("binary identity attestation mismatch")]
     BinaryIdentity,
+    #[error("created process identity attestation mismatch")]
+    ProcessIdentity,
     #[error("sandbox session attestation mismatch")]
     Session,
     #[error("sandbox provisioning epoch attestation mismatch")]
@@ -952,18 +964,39 @@ pub enum SandboxFailureKind {
     ProtocolViolation,
 }
 
+/// Explicit target-creation result carried by retained launch failures.
+/// Absence of a state event is never interpreted as `NotCreated`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum SandboxTargetCreationOutcome {
+    /// The retained failure occurred before any target process was created.
+    NotCreated,
+    /// The provider created this exact suspended target before the failure.
+    Created { process: ProcessIdentity },
+}
+
+impl SandboxTargetCreationOutcome {
+    #[must_use]
+    pub const fn process(&self) -> Option<&ProcessIdentity> {
+        match self {
+            Self::NotCreated => None,
+            Self::Created { process } => Some(process),
+        }
+    }
+}
+
 /// Exact controller-held operation context for one sandbox failure.
 ///
-/// This is evidence, never authority. A launch binds the binary and helper
-/// build that produced the sandbox expectation, even if discovery failed
-/// before resources existed. An inherited attach binds the stable process
-/// identity and attach mode from the provider-issued ownership lease.
+/// This is evidence, never authority. A launch binds the binary, helper build,
+/// and explicit target-creation outcome. An inherited attach binds the stable
+/// process identity and attach mode from the provider-issued ownership lease.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum SandboxFailureContext {
     Launch {
         binary_id: BinaryId,
         helper_build: HelperBuildId,
+        target_creation: SandboxTargetCreationOutcome,
     },
     InheritedAttach {
         process: ProcessIdentity,
@@ -1043,6 +1076,7 @@ impl SandboxFailure {
     pub(crate) fn validate_against_expected(
         &self,
         expected: &ExpectedSandboxAttestation,
+        retained_target_creation: Option<&SandboxTargetCreationOutcome>,
     ) -> Result<(), SandboxFailureValidationError> {
         self.validate_stage_kind()?;
         if self.session_id != expected.session_id {
@@ -1061,8 +1095,13 @@ impl SandboxFailure {
             SandboxFailureContext::Launch {
                 binary_id,
                 helper_build,
+                target_creation,
             } if binary_id == &expected.binary_id && helper_build == &expected.helper_build => {
-                Ok(())
+                match retained_target_creation {
+                    Some(retained) if target_creation == retained => Ok(()),
+                    None if target_creation == &SandboxTargetCreationOutcome::NotCreated => Ok(()),
+                    _ => Err(SandboxFailureValidationError::TargetCreationOutcome),
+                }
             }
             SandboxFailureContext::Launch { binary_id, .. } if binary_id != &expected.binary_id => {
                 Err(SandboxFailureValidationError::BinaryIdentity)
@@ -1133,6 +1172,8 @@ pub enum SandboxFailureValidationError {
     BinaryIdentity,
     #[error("sandbox failure helper build mismatch")]
     HelperBuild,
+    #[error("sandbox failure target-creation outcome mismatch")]
+    TargetCreationOutcome,
     #[error("sandbox failure inherited process identity mismatch")]
     ProcessIdentity,
     #[error("sandbox failure inherited attach mode mismatch")]
@@ -1197,9 +1238,8 @@ pub struct SandboxCleanupReceipt {
     pub provisioning_epoch: ProvisioningEpoch,
     pub provider: SandboxProviderSelection,
     pub policy_digest: PolicyDigest,
-    /// Exact target identity for cleanup inherited from an existing sandbox.
-    /// Provider-created launch cleanup has no separately trusted process
-    /// binding and therefore leaves this field absent.
+    /// Exact target identity when a process was created or inherited. This is
+    /// absent only after a launch failure explicitly proves `NotCreated`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process: Option<ProcessIdentity>,
     pub outcome: CleanupOutcome,
@@ -1250,7 +1290,21 @@ impl SandboxCleanupAttemptFailure {
             return Err(CleanupAttemptFailureError::FailureReceiptMismatch);
         }
         let context_matches = match (&self.failure.context, &self.receipt.process) {
-            (SandboxFailureContext::Launch { .. }, None) => true,
+            (
+                SandboxFailureContext::Launch {
+                    target_creation: SandboxTargetCreationOutcome::NotCreated,
+                    ..
+                },
+                None,
+            ) => true,
+            (
+                SandboxFailureContext::Launch {
+                    binary_id,
+                    target_creation: SandboxTargetCreationOutcome::Created { process },
+                    ..
+                },
+                Some(receipt_process),
+            ) => process == receipt_process && &process.binary_id == binary_id,
             (SandboxFailureContext::InheritedAttach { process, .. }, Some(receipt_process)) => {
                 process == receipt_process
             }
@@ -1269,15 +1323,16 @@ impl SandboxCleanupAttemptFailure {
 }
 
 impl SandboxCleanupReceipt {
-    pub fn validate_against(
+    pub(crate) fn validate_against(
         &self,
         expected: &ExpectedSandboxAttestation,
+        created_process: Option<&ProcessIdentity>,
     ) -> Result<(), CleanupReceiptError> {
         if self.session_id != expected.session_id
             || self.provisioning_epoch != expected.provisioning_epoch
             || self.provider != expected.provider
             || self.policy_digest != expected.policy_digest
-            || self.process.is_some()
+            || self.process.as_ref() != created_process
         {
             return Err(CleanupReceiptError::BindingMismatch);
         }
@@ -1388,7 +1443,8 @@ pub enum SandboxLifecycleEvent {
 pub struct SandboxMachine {
     expected: ExpectedSandboxAttestation,
     state: SandboxLifecycleState,
-    attestation_accepted: bool,
+    target_creation: Option<SandboxTargetCreationOutcome>,
+    accepted_attestation: Option<SandboxAttestation>,
 }
 
 impl SandboxMachine {
@@ -1420,7 +1476,8 @@ impl SandboxMachine {
         Ok(Self {
             expected,
             state: SandboxLifecycleState::Requested,
-            attestation_accepted: false,
+            target_creation: None,
+            accepted_attestation: None,
         })
     }
 
@@ -1431,12 +1488,61 @@ impl SandboxMachine {
 
     #[must_use]
     pub const fn attestation_accepted(&self) -> bool {
-        self.attestation_accepted
+        self.accepted_attestation.is_some()
     }
 
     #[must_use]
     pub const fn expected_attestation(&self) -> &ExpectedSandboxAttestation {
         &self.expected
+    }
+
+    #[must_use]
+    pub const fn created_process(&self) -> Option<&ProcessIdentity> {
+        match &self.target_creation {
+            Some(SandboxTargetCreationOutcome::Created { process }) => Some(process),
+            Some(SandboxTargetCreationOutcome::NotCreated) | None => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn target_creation_outcome(&self) -> Option<&SandboxTargetCreationOutcome> {
+        self.target_creation.as_ref()
+    }
+
+    #[must_use]
+    pub(crate) fn failure_target_creation(
+        &self,
+    ) -> Result<&SandboxTargetCreationOutcome, SandboxMachineError> {
+        self.target_creation
+            .as_ref()
+            .ok_or(SandboxMachineError::TargetCreationOutcomeMissing)
+    }
+
+    pub(crate) fn record_target_not_created(&mut self) -> Result<(), SandboxMachineError> {
+        self.require_state(
+            "record target not created",
+            &[SandboxLifecycleState::Provisioning],
+        )?;
+        self.retain_failure_target_creation(&SandboxTargetCreationOutcome::NotCreated)
+    }
+
+    pub(crate) fn retain_failure_target_creation(
+        &mut self,
+        outcome: &SandboxTargetCreationOutcome,
+    ) -> Result<(), SandboxMachineError> {
+        match (&self.target_creation, outcome) {
+            (None, SandboxTargetCreationOutcome::NotCreated) => {
+                self.target_creation = Some(SandboxTargetCreationOutcome::NotCreated);
+                Ok(())
+            }
+            (Some(retained), claimed) if retained == claimed => Ok(()),
+            _ => Err(SandboxMachineError::TargetCreationOutcomeMismatch),
+        }
+    }
+
+    #[must_use]
+    pub const fn accepted_attestation(&self) -> Option<&SandboxAttestation> {
+        self.accepted_attestation.as_ref()
     }
 
     pub fn begin_provisioning(&mut self) -> Result<SandboxLifecycleState, SandboxMachineError> {
@@ -1449,12 +1555,21 @@ impl SandboxMachine {
 
     pub fn target_created_suspended(
         &mut self,
+        process: ProcessIdentity,
     ) -> Result<SandboxLifecycleState, SandboxMachineError> {
-        self.transition(
+        if self.target_creation.is_some() {
+            return Err(SandboxMachineError::TargetCreationOutcomeMismatch);
+        }
+        if process.binary_id != self.expected.binary_id {
+            return Err(SandboxMachineError::CreatedProcessIdentityMismatch);
+        }
+        let state = self.transition(
             "record suspended target",
             &[SandboxLifecycleState::Provisioning],
             SandboxLifecycleState::TargetCreatedSuspended,
-        )
+        )?;
+        self.target_creation = Some(SandboxTargetCreationOutcome::Created { process });
+        Ok(state)
     }
 
     pub fn accept_attestation(
@@ -1465,14 +1580,17 @@ impl SandboxMachine {
             "accept attestation",
             &[SandboxLifecycleState::TargetCreatedSuspended],
         )?;
-        self.expected.validate_exact(actual)?;
-        self.attestation_accepted = true;
+        let created_process = self
+            .created_process()
+            .ok_or(SandboxMachineError::CreatedProcessIdentityMissing)?;
+        self.expected.validate_exact(actual, created_process)?;
+        self.accepted_attestation = Some(actual.clone());
         self.state = SandboxLifecycleState::AttestationAccepted;
         Ok(self.state)
     }
 
     pub fn mark_running(&mut self) -> Result<SandboxLifecycleState, SandboxMachineError> {
-        if !self.attestation_accepted {
+        if self.accepted_attestation.is_none() {
             return Err(SandboxMachineError::AttestationNotAccepted);
         }
         self.transition(
@@ -1491,6 +1609,9 @@ impl SandboxMachine {
                 from: self.state,
                 action: "mark failed",
             });
+        }
+        if self.target_creation.is_none() {
+            return Err(SandboxMachineError::TargetCreationOutcomeMissing);
         }
         self.state = SandboxLifecycleState::Failed;
         Ok(self.state)
@@ -1515,12 +1636,24 @@ impl SandboxMachine {
         receipt: &SandboxCleanupReceipt,
     ) -> Result<SandboxLifecycleState, SandboxMachineError> {
         self.require_state("close", &[SandboxLifecycleState::Cleanup])?;
-        receipt.validate_against(&self.expected)?;
+        self.validate_cleanup_receipt(receipt)?;
         if receipt.outcome != CleanupOutcome::Complete {
             return Err(SandboxMachineError::CleanupIncomplete);
         }
         self.state = SandboxLifecycleState::Closed;
         Ok(self.state)
+    }
+
+    pub fn validate_cleanup_receipt(
+        &self,
+        receipt: &SandboxCleanupReceipt,
+    ) -> Result<(), SandboxMachineError> {
+        let target_creation = self
+            .target_creation
+            .as_ref()
+            .ok_or(SandboxMachineError::TargetCreationOutcomeMissing)?;
+        receipt.validate_against(&self.expected, target_creation.process())?;
+        Ok(())
     }
 
     fn transition(
@@ -1554,6 +1687,14 @@ impl SandboxMachine {
 pub enum SandboxMachineError {
     #[error("sandbox expected attestation is internally inconsistent")]
     InvalidExpectedAttestation,
+    #[error("created process identity does not match the expected launch binary")]
+    CreatedProcessIdentityMismatch,
+    #[error("sandbox target creation did not retain a process identity")]
+    CreatedProcessIdentityMissing,
+    #[error("sandbox operation lacks a retained target-creation outcome")]
+    TargetCreationOutcomeMissing,
+    #[error("sandbox failure target-creation outcome conflicts with retained state")]
+    TargetCreationOutcomeMismatch,
     #[error("sandbox attestation has not been accepted")]
     AttestationNotAccepted,
     #[error("cannot {action} from sandbox lifecycle state {from:?}")]
@@ -1722,6 +1863,7 @@ mod tests {
     fn actual_from(expected: &ExpectedSandboxAttestation) -> SandboxAttestation {
         SandboxAttestation {
             binary_id: expected.binary_id.clone(),
+            process: process_for(expected),
             session_id: expected.session_id,
             provisioning_epoch: expected.provisioning_epoch.clone(),
             policy_digest: expected.policy_digest.clone(),
@@ -1734,6 +1876,14 @@ mod tests {
         }
     }
 
+    fn process_for(expected: &ExpectedSandboxAttestation) -> ProcessIdentity {
+        ProcessIdentity {
+            process_id: crate::protocol::ProcessId::new(4242).expect("process id"),
+            start_key: crate::protocol::ProcessStartKey::new(73).expect("process start key"),
+            binary_id: expected.binary_id.clone(),
+        }
+    }
+
     fn complete_receipt(expected: &ExpectedSandboxAttestation) -> SandboxCleanupReceipt {
         SandboxCleanupReceipt {
             receipt_id: CleanupReceiptId::new("receipt-1").expect("receipt id"),
@@ -1741,7 +1891,7 @@ mod tests {
             provisioning_epoch: expected.provisioning_epoch.clone(),
             provider: expected.provider.clone(),
             policy_digest: expected.policy_digest.clone(),
-            process: None,
+            process: Some(process_for(expected)),
             outcome: CleanupOutcome::Complete,
             process_tree_terminated_and_reaped: true,
             handles_closed: true,
@@ -1781,6 +1931,7 @@ mod tests {
             context: SandboxFailureContext::Launch {
                 binary_id: expected.binary_id.clone(),
                 helper_build: expected.helper_build.clone(),
+                target_creation: SandboxTargetCreationOutcome::NotCreated,
             },
             stage,
             kind,
@@ -1839,12 +1990,21 @@ mod tests {
     fn attestation_requires_an_exact_contract_match() {
         let expected = expected_attestation();
         let actual = actual_from(&expected);
-        expected.validate_exact(&actual).expect("exact match");
+        let created_process = process_for(&expected);
+        expected
+            .validate_exact(&actual, &created_process)
+            .expect("exact match");
 
+        let mut changed = actual.clone();
+        changed.process.binary_id = BinaryId::digest(b"wrong process image");
+        assert_eq!(
+            expected.validate_exact(&changed, &created_process),
+            Err(AttestationMismatch::ProcessIdentity)
+        );
         let mut changed = actual.clone();
         changed.job_assigned_at_creation = false;
         assert_eq!(
-            expected.validate_exact(&changed),
+            expected.validate_exact(&changed, &created_process),
             Err(AttestationMismatch::JobAssignment)
         );
         let mut changed = actual.clone();
@@ -1852,13 +2012,13 @@ mod tests {
             .guarantees
             .remove(&SandboxGuarantee::NetworkDisabled);
         assert_eq!(
-            expected.validate_exact(&changed),
+            expected.validate_exact(&changed, &created_process),
             Err(AttestationMismatch::Guarantees)
         );
         let mut changed = actual;
         changed.helper_build = HelperBuildId::new("helper-other").expect("helper build");
         assert_eq!(
-            expected.validate_exact(&changed),
+            expected.validate_exact(&changed, &created_process),
             Err(AttestationMismatch::HelperBuild)
         );
     }
@@ -1886,31 +2046,71 @@ mod tests {
         )
         .expect("current expected attestation");
         assert_eq!(
-            current.validate_exact(&prior_attestation),
+            current.validate_exact(&prior_attestation, &process_for(&current)),
             Err(AttestationMismatch::ProvisioningEpoch)
         );
         assert_eq!(
-            prior_cleanup.validate_against(&current),
+            prior_cleanup.validate_against(&current, Some(&process_for(&prior))),
             Err(CleanupReceiptError::BindingMismatch)
+        );
+    }
+
+    #[test]
+    fn prior_process_instance_cannot_replay_attestation_or_cleanup() {
+        let expected = expected_attestation();
+        let prior_attestation = actual_from(&expected);
+        let prior_cleanup = complete_receipt(&expected);
+        let mut current_process = prior_attestation.process.clone();
+        current_process.start_key =
+            crate::protocol::ProcessStartKey::new(74).expect("current process start key");
+
+        let mut machine = SandboxMachine::new(expected).expect("machine");
+        machine.begin_provisioning().expect("provisioning");
+        machine
+            .target_created_suspended(current_process.clone())
+            .expect("current suspended target");
+
+        assert_eq!(
+            machine.accept_attestation(&prior_attestation),
+            Err(SandboxMachineError::Attestation(
+                AttestationMismatch::ProcessIdentity
+            ))
+        );
+        assert_eq!(machine.accepted_attestation(), None);
+
+        machine.begin_cleanup().expect("cleanup");
+        assert_eq!(
+            machine.close(&prior_cleanup),
+            Err(SandboxMachineError::Cleanup(
+                CleanupReceiptError::BindingMismatch
+            ))
+        );
+
+        let mut current_cleanup = prior_cleanup;
+        current_cleanup.process = Some(current_process);
+        assert_eq!(
+            machine.close(&current_cleanup).expect("current cleanup"),
+            SandboxLifecycleState::Closed
         );
     }
 
     #[test]
     fn cleanup_receipt_cannot_claim_false_completion() {
         let expected = expected_attestation();
+        let process = process_for(&expected);
         let mut receipt = complete_receipt(&expected);
         receipt
-            .validate_against(&expected)
+            .validate_against(&expected, Some(&process))
             .expect("complete cleanup");
 
         receipt.network_torn_down = false;
         assert_eq!(
-            receipt.validate_against(&expected),
+            receipt.validate_against(&expected, Some(&process)),
             Err(CleanupReceiptError::FalseComplete)
         );
         receipt.outcome = CleanupOutcome::Incomplete;
         assert_eq!(
-            receipt.validate_against(&expected),
+            receipt.validate_against(&expected, Some(&process)),
             Err(CleanupReceiptError::MissingResidual)
         );
         receipt.residuals.push(CleanupResidual {
@@ -1918,7 +2118,7 @@ mod tests {
             detail: DiagnosticText::new("isolated switch cleanup pending").expect("detail"),
         });
         receipt
-            .validate_against(&expected)
+            .validate_against(&expected, Some(&process))
             .expect("audited incomplete cleanup");
     }
 
@@ -1935,6 +2135,9 @@ mod tests {
                 context: SandboxFailureContext::Launch {
                     binary_id: expected.binary_id.clone(),
                     helper_build: expected.helper_build.clone(),
+                    target_creation: SandboxTargetCreationOutcome::Created {
+                        process: receipt.process.clone().expect("created process"),
+                    },
                 },
                 stage: SandboxFailureStage::Cleanup,
                 kind: SandboxFailureKind::CleanupIncomplete,
@@ -2085,31 +2288,31 @@ mod tests {
             SandboxFailureKind::HelperFailure,
         );
         failure
-            .validate_against_expected(&expected)
+            .validate_against_expected(&expected, None)
             .expect("exact failure binding");
 
         let mut changed = failure.clone();
         changed.session_id = SessionId::new(expected.session_id.get() + 1).expect("session");
         assert_eq!(
-            changed.validate_against_expected(&expected),
+            changed.validate_against_expected(&expected, None),
             Err(SandboxFailureValidationError::Session)
         );
         let mut changed = failure.clone();
         changed.provisioning_epoch = ProvisioningEpoch::new("f".repeat(64)).expect("epoch");
         assert_eq!(
-            changed.validate_against_expected(&expected),
+            changed.validate_against_expected(&expected, None),
             Err(SandboxFailureValidationError::ProvisioningEpoch)
         );
         let mut changed = failure.clone();
         changed.policy_digest = PolicyDigest::new("f".repeat(64)).expect("digest");
         assert_eq!(
-            changed.validate_against_expected(&expected),
+            changed.validate_against_expected(&expected, None),
             Err(SandboxFailureValidationError::PolicyDigest)
         );
         let mut changed = failure.clone();
         changed.provider = SandboxProviderSelection::HyperV;
         assert_eq!(
-            changed.validate_against_expected(&expected),
+            changed.validate_against_expected(&expected, None),
             Err(SandboxFailureValidationError::Provider)
         );
         let mut changed = failure.clone();
@@ -2118,7 +2321,7 @@ mod tests {
         };
         *binary_id = BinaryId::digest(b"another image");
         assert_eq!(
-            changed.validate_against_expected(&expected),
+            changed.validate_against_expected(&expected, None),
             Err(SandboxFailureValidationError::BinaryIdentity)
         );
         let mut changed = failure.clone();
@@ -2127,8 +2330,22 @@ mod tests {
         };
         *helper_build = HelperBuildId::new("another-helper").expect("helper");
         assert_eq!(
-            changed.validate_against_expected(&expected),
+            changed.validate_against_expected(&expected, None),
             Err(SandboxFailureValidationError::HelperBuild)
+        );
+        let mut changed = failure.clone();
+        let SandboxFailureContext::Launch {
+            target_creation, ..
+        } = &mut changed.context
+        else {
+            unreachable!("launch context")
+        };
+        *target_creation = SandboxTargetCreationOutcome::Created {
+            process: process_for(&expected),
+        };
+        assert_eq!(
+            changed.validate_against_expected(&expected, None),
+            Err(SandboxFailureValidationError::TargetCreationOutcome)
         );
         let mut changed = failure;
         changed.context = SandboxFailureContext::InheritedAttach {
@@ -2140,7 +2357,7 @@ mod tests {
             mode: AttachMode::Debug,
         };
         assert_eq!(
-            changed.validate_against_expected(&expected),
+            changed.validate_against_expected(&expected, None),
             Err(SandboxFailureValidationError::ContextKind)
         );
     }
@@ -2228,7 +2445,7 @@ mod tests {
             .expect("VM identity")
             .channel_nonce = AuthenticatedChannelNonce::new("d".repeat(64)).expect("nonce");
         assert_eq!(
-            expected.validate_exact(&actual),
+            expected.validate_exact(&actual, &process_for(&expected)),
             Err(AttestationMismatch::VmIdentity)
         );
     }
@@ -2245,28 +2462,73 @@ mod tests {
             Err(SandboxMachineError::AttestationNotAccepted)
         );
         assert!(matches!(
-            machine.target_created_suspended(),
+            machine.target_created_suspended(actual.process.clone()),
             Err(SandboxMachineError::InvalidTransition { .. })
         ));
         assert_eq!(
             machine.begin_provisioning().expect("provisioning"),
             SandboxLifecycleState::Provisioning
         );
+        let mut wrong_created_process = actual.process.clone();
+        wrong_created_process.binary_id = BinaryId::digest(b"different launch image");
+        assert_eq!(
+            machine.target_created_suspended(wrong_created_process),
+            Err(SandboxMachineError::CreatedProcessIdentityMismatch)
+        );
+        assert_eq!(machine.state(), SandboxLifecycleState::Provisioning);
+        assert_eq!(machine.created_process(), None);
         assert_eq!(
             machine
-                .target_created_suspended()
+                .target_created_suspended(actual.process.clone())
                 .expect("suspended target"),
+            SandboxLifecycleState::TargetCreatedSuspended
+        );
+        let mut wrong_attestation = actual.clone();
+        wrong_attestation.process.start_key =
+            crate::protocol::ProcessStartKey::new(74).expect("wrong process start key");
+        assert_eq!(
+            machine.accept_attestation(&wrong_attestation),
+            Err(SandboxMachineError::Attestation(
+                AttestationMismatch::ProcessIdentity
+            ))
+        );
+        assert_eq!(machine.accepted_attestation(), None);
+        assert_eq!(
+            machine.state(),
             SandboxLifecycleState::TargetCreatedSuspended
         );
         assert_eq!(
             machine.accept_attestation(&actual).expect("attestation"),
             SandboxLifecycleState::AttestationAccepted
         );
+        assert_eq!(machine.created_process(), Some(&actual.process));
+        assert_eq!(machine.accepted_attestation(), Some(&actual));
         assert_eq!(
             machine.mark_running().expect("running"),
             SandboxLifecycleState::Running
         );
         machine.begin_cleanup().expect("cleanup");
+        let mut missing_process = receipt.clone();
+        missing_process.process = None;
+        assert_eq!(
+            machine.close(&missing_process),
+            Err(SandboxMachineError::Cleanup(
+                CleanupReceiptError::BindingMismatch
+            ))
+        );
+        let mut wrong_process = receipt.clone();
+        wrong_process
+            .process
+            .as_mut()
+            .expect("created process identity")
+            .process_id = crate::protocol::ProcessId::new(4243).expect("wrong process id");
+        assert_eq!(
+            machine.close(&wrong_process),
+            Err(SandboxMachineError::Cleanup(
+                CleanupReceiptError::BindingMismatch
+            ))
+        );
+        assert_eq!(machine.state(), SandboxLifecycleState::Cleanup);
         assert_eq!(
             machine.close(&receipt).expect("closed"),
             SandboxLifecycleState::Closed
@@ -2275,6 +2537,45 @@ mod tests {
             machine.begin_cleanup(),
             Err(SandboxMachineError::InvalidTransition { .. })
         ));
+    }
+
+    #[test]
+    fn processless_cleanup_requires_a_retained_not_created_outcome() {
+        let expected = expected_attestation();
+        let mut receipt = complete_receipt(&expected);
+        receipt.process = None;
+        let mut unknown = SandboxMachine::new(expected.clone()).expect("unknown machine");
+        unknown.begin_provisioning().expect("provisioning");
+
+        assert_eq!(
+            unknown.mark_failed(),
+            Err(SandboxMachineError::TargetCreationOutcomeMissing)
+        );
+        unknown.begin_cleanup().expect("cleanup without outcome");
+        assert_eq!(
+            unknown.close(&receipt),
+            Err(SandboxMachineError::TargetCreationOutcomeMissing)
+        );
+
+        let mut machine = SandboxMachine::new(expected.clone()).expect("not-created machine");
+        machine.begin_provisioning().expect("provisioning");
+        machine
+            .record_target_not_created()
+            .expect("record trusted not-created outcome");
+        assert_eq!(
+            machine.target_created_suspended(process_for(&expected)),
+            Err(SandboxMachineError::TargetCreationOutcomeMismatch)
+        );
+        machine.mark_failed().expect("retain pre-target failure");
+        assert_eq!(
+            machine.target_creation_outcome(),
+            Some(&SandboxTargetCreationOutcome::NotCreated)
+        );
+        machine.begin_cleanup().expect("cleanup retained failure");
+        assert_eq!(
+            machine.close(&receipt).expect("processless cleanup"),
+            SandboxLifecycleState::Closed
+        );
     }
 
     #[test]

@@ -266,6 +266,15 @@ prereleases; breaking changes remain explicit.
 
 ### Changed
 
+- Bumped the debugger wire and typed-command protocol to 1.3. A sandboxed launch now carries the
+  exact created PID, trusted process-start key, and executable identity through
+  `AwaitingAttestation`, provider attestation, and cleanup. The reducer retains both the created
+  identity and the accepted attestation. Launch failures now carry explicit `NotCreated` or exact
+  `Created` process evidence bound from retained reducer state; binding an unknown outcome fails.
+  Processless cleanup requires a retained `NotCreated` result instead of inferring success from a
+  missing state transition. Missing, mismatched, and replayed evidence fails closed, and the wire
+  rejects legacy 1.2 negotiation because that schema lacks the required process fields. These remain
+  contracts for a future execution provider; no process-executing sandbox provider is shipped.
 - Debugger capability probes must now report every protocol capability exactly once. Unsupported
   capabilities remain explicit typed `Unavailable` entries instead of becoming ambiguous through
   omission; duplicate and partial reports fail protocol validation.
