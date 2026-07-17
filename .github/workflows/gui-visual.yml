@@ -11,6 +11,9 @@ on:
       - "crates/resymbol-export/**"
       - "crates/resymbol-package/**"
       - "crates/resymbol-workbench/**"
+      - "docs/visual-regression.md"
+      - "docs/images/capture-manifest.json"
+      - "docs/images/workbench-*.png"
       - "fixtures/pe-x64-msvc/**"
       - "tools/capture-workbench.ps1"
       - "Cargo.toml"
@@ -26,6 +29,9 @@ on:
       - "crates/resymbol-export/**"
       - "crates/resymbol-package/**"
       - "crates/resymbol-workbench/**"
+      - "docs/visual-regression.md"
+      - "docs/images/capture-manifest.json"
+      - "docs/images/workbench-*.png"
       - "fixtures/pe-x64-msvc/**"
       - "tools/capture-workbench.ps1"
       - "Cargo.toml"
@@ -121,6 +127,75 @@ jobs:
             -CaptureWidth 1024 `
             -CaptureHeight 680 `
             -CaptureTabs functions-focused
+
+      - name: Verify capture and checked-in reference manifests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          function Assert-ExactArtifactSet {
+            param(
+              [string]$Label,
+              [string[]]$Expected,
+              [string[]]$Actual
+            )
+            $difference = @(Compare-Object -ReferenceObject $Expected -DifferenceObject $Actual)
+            if ($difference.Count -ne 0 -or $Expected.Count -ne $Actual.Count) {
+              throw "$Label is incomplete: expected '$($Expected -join ', ')', got '$($Actual -join ', ')'"
+            }
+          }
+
+          $standardViews = @(
+            "open-empty",
+            "overview",
+            "functions",
+            "graph",
+            "address-space",
+            "disassembly",
+            "disassembly-actions",
+            "binary-switch-confirmation",
+            "debugger-sandbox",
+            "debugger-readiness-result",
+            "exports"
+          )
+          $standardArtifacts = @($standardViews | ForEach-Object { "workbench-$_.png" })
+          $standardDirectory = "${{ runner.temp }}/workbench-captures/standard"
+          $standardManifest = Get-Content -LiteralPath (Join-Path $standardDirectory "capture-manifest.json") -Raw | ConvertFrom-Json
+          if ($standardManifest.schema_version -ne 2 -or $standardManifest.capture_set -ne "standard") {
+            throw "Standard capture manifest does not identify schema 2 / standard"
+          }
+          Assert-ExactArtifactSet "Standard requested views" $standardViews @($standardManifest.requested_views)
+          Assert-ExactArtifactSet "Standard expected artifacts" $standardArtifacts @($standardManifest.expected_artifacts)
+          Assert-ExactArtifactSet "Standard manifest captures" $standardArtifacts @($standardManifest.captures.file)
+          Assert-ExactArtifactSet "Standard files" $standardArtifacts @(
+            Get-ChildItem -LiteralPath $standardDirectory -Filter "workbench-*.png" -File |
+              ForEach-Object Name
+          )
+
+          $minimumDirectory = "${{ runner.temp }}/workbench-captures/keyboard-minimum"
+          $minimumManifest = Get-Content -LiteralPath (Join-Path $minimumDirectory "capture-manifest.json") -Raw | ConvertFrom-Json
+          if ($minimumManifest.schema_version -ne 2 -or $minimumManifest.capture_set -ne "keyboard-minimum") {
+            throw "Keyboard-minimum capture manifest does not identify schema 2 / keyboard-minimum"
+          }
+          Assert-ExactArtifactSet "Keyboard-minimum captures" @("workbench-functions-focused.png") @($minimumManifest.captures.file)
+
+          $referenceDirectory = "docs/images"
+          $referenceManifest = Get-Content -LiteralPath (Join-Path $referenceDirectory "capture-manifest.json") -Raw | ConvertFrom-Json
+          $referenceArtifacts = @($referenceManifest.captures.file)
+          if ($referenceManifest.schema_version -ne 2) {
+            throw "Checked-in reference manifest must use schema 2"
+          }
+          Assert-ExactArtifactSet "Checked-in requested views" @($referenceManifest.requested_views) @($referenceManifest.captures.view)
+          Assert-ExactArtifactSet "Checked-in expected artifacts" @($referenceManifest.expected_artifacts) $referenceArtifacts
+          foreach ($capture in $referenceManifest.captures) {
+            if ($capture.file -cne "workbench-$($capture.view).png") {
+              throw "Checked-in reference '$($capture.view)' has unexpected artifact name '$($capture.file)'"
+            }
+          }
+          Assert-ExactArtifactSet "Checked-in reference files" $referenceArtifacts @(
+            Get-ChildItem -LiteralPath $referenceDirectory -Filter "workbench-*.png" -File |
+              ForEach-Object Name
+          )
 
       # Human-reviewed references live under docs/images. CI regenerates review artifacts and
       # validates format, dimensions, completeness, and manifest metadata. The additional minimum-

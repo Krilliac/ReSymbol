@@ -1,5 +1,20 @@
 {
-    "schema_version":  1,
+    "schema_version":  2,
+    "capture_set":  "checked-in-reference",
+    "requested_views":  [
+                            "overview",
+                            "functions",
+                            "graph",
+                            "address-space",
+                            "debugger-sandbox"
+                        ],
+    "expected_artifacts":  [
+                               "workbench-overview.png",
+                               "workbench-functions.png",
+                               "workbench-graph.png",
+                               "workbench-address-space.png",
+                               "workbench-debugger-sandbox.png"
+                           ],
     "fixture":  {
                     "file":  "milestone2-symbolized.exe",
                     "sha256":  "f7f221b4de7c6e4f6f2e4e227840ffa8ecc3d92a3553d8763755a3fafadc1a5e"

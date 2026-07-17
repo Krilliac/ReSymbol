@@ -76,6 +76,10 @@ const OFFLINE_READ_SIZES: [u32; 5] = [16, 32, 64, 128, MAX_OFFLINE_IMAGE_UI_READ
 const OFFLINE_HEX_ROW_BYTES: usize = 16;
 const OFFLINE_DISASSEMBLY_INSTRUCTION_LIMIT: usize = 64;
 const FUNCTION_KEYBOARD_PAGE_ROWS: usize = 10;
+#[cfg(any(test, feature = "screenshot"))]
+const SCREENSHOT_CANONICAL_JCC_RVA: u64 = 0x0000_116E;
+#[cfg(any(test, feature = "screenshot"))]
+const SCREENSHOT_CANONICAL_JCC_READ_BYTES: u32 = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BinaryPickerPurpose {
@@ -140,6 +144,69 @@ enum MainTab {
     AddressSpace,
     DebuggerSandbox,
     Exports,
+}
+
+#[cfg(any(test, feature = "screenshot"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScreenshotScenario {
+    OpenEmpty,
+    Overview,
+    Functions,
+    FunctionsFocused,
+    Graph,
+    AddressSpace,
+    Disassembly,
+    DisassemblyActions,
+    BinarySwitchConfirmation,
+    DebuggerSandbox,
+    DebuggerReadinessResult,
+    Exports,
+}
+
+#[cfg(any(test, feature = "screenshot"))]
+impl ScreenshotScenario {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "open-empty" => Some(Self::OpenEmpty),
+            "overview" => Some(Self::Overview),
+            "functions" => Some(Self::Functions),
+            "functions-focused" => Some(Self::FunctionsFocused),
+            "graph" => Some(Self::Graph),
+            "address-space" | "memory-map" => Some(Self::AddressSpace),
+            "disassembly" => Some(Self::Disassembly),
+            "disassembly-actions" => Some(Self::DisassemblyActions),
+            "binary-switch-confirmation" => Some(Self::BinarySwitchConfirmation),
+            "debugger-sandbox" | "readiness" => Some(Self::DebuggerSandbox),
+            "debugger-readiness-result" => Some(Self::DebuggerReadinessResult),
+            "exports" => Some(Self::Exports),
+            _ => None,
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::OpenEmpty => "open-empty",
+            Self::Overview => "overview",
+            Self::Functions => "functions",
+            Self::FunctionsFocused => "functions-focused",
+            Self::Graph => "graph",
+            Self::AddressSpace => "address-space",
+            Self::Disassembly => "disassembly",
+            Self::DisassemblyActions => "disassembly-actions",
+            Self::BinarySwitchConfirmation => "binary-switch-confirmation",
+            Self::DebuggerSandbox => "debugger-sandbox",
+            Self::DebuggerReadinessResult => "debugger-readiness-result",
+            Self::Exports => "exports",
+        }
+    }
+
+    const fn needs_offline_read(self) -> bool {
+        matches!(self, Self::Disassembly | Self::DisassemblyActions)
+    }
+
+    const fn needs_readiness_result(self) -> bool {
+        matches!(self, Self::DebuggerSandbox | Self::DebuggerReadinessResult)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -566,6 +633,8 @@ pub struct WorkbenchApp {
     export_destination: String,
     export_result: Option<Result<String, String>>,
     #[cfg(feature = "screenshot")]
+    screenshot_scenario: Option<ScreenshotScenario>,
+    #[cfg(feature = "screenshot")]
     screenshot_destination: Option<PathBuf>,
     #[cfg(feature = "screenshot")]
     screenshot_frame_count: u8,
@@ -618,6 +687,14 @@ impl WorkbenchApp {
             );
             creation_context.egui_ctx.set_zoom_factor(zoom);
         }
+        #[cfg(feature = "screenshot")]
+        let screenshot_scenario =
+            std::env::var("RESYMBOL_WORKBENCH_SCREENSHOT_TAB")
+                .ok()
+                .map(|value| {
+                    ScreenshotScenario::parse(&value)
+                        .unwrap_or_else(|| panic!("unsupported screenshot scenario {value:?}"))
+                });
         let mut preferences: Preferences = if cfg!(feature = "screenshot") {
             Preferences::default()
         } else {
@@ -681,6 +758,8 @@ impl WorkbenchApp {
             export_destination: String::new(),
             export_result: None,
             #[cfg(feature = "screenshot")]
+            screenshot_scenario,
+            #[cfg(feature = "screenshot")]
             screenshot_destination: std::env::var_os("RESYMBOL_WORKBENCH_SCREENSHOT_TO")
                 .map(PathBuf::from),
             #[cfg(feature = "screenshot")]
@@ -718,7 +797,15 @@ impl WorkbenchApp {
         );
 
         #[cfg(feature = "screenshot")]
-        if let Ok(tab) = std::env::var("RESYMBOL_WORKBENCH_SCREENSHOT_TAB") {
+        if let Some(scenario) = app.screenshot_scenario {
+            if scenario == ScreenshotScenario::OpenEmpty {
+                app.log(
+                    ActivityLevel::Info,
+                    "Prepared empty Open Binary visual regression scenario",
+                );
+                app.begin_initial_plugin_catalog_refresh();
+                return app;
+            }
             let path = startup_path
                 .as_ref()
                 .expect("screenshot mode requires an input binary path");
@@ -731,7 +818,7 @@ impl WorkbenchApp {
                 .map(|function| function.projection_index);
             let reconstruction_graph = ReconstructionGraph::from_project(&project);
             app.graph_root_rva = reconstruction_graph.default_root().map(|root| root.rva);
-            if tab == "graph" {
+            if scenario == ScreenshotScenario::Graph {
                 app.selected_projection_index = app.graph_root_rva.and_then(|root_rva| {
                     project
                         .functions
@@ -751,47 +838,71 @@ impl WorkbenchApp {
             );
             app.analysis_path = Some(path.clone());
             app.stage = WorkflowStage::Review;
-            app.main_tab = match tab.as_str() {
-                "overview" => MainTab::Overview,
-                "functions" | "functions-focused" => MainTab::Functions,
-                "graph" => MainTab::Graph,
-                "address-space" | "memory-map" | "disassembly" => MainTab::AddressSpace,
-                "debugger-sandbox" | "readiness" => MainTab::DebuggerSandbox,
-                "exports" => {
+            app.main_tab = match scenario {
+                ScreenshotScenario::Overview | ScreenshotScenario::BinarySwitchConfirmation => {
+                    MainTab::Overview
+                }
+                ScreenshotScenario::Functions | ScreenshotScenario::FunctionsFocused => {
+                    MainTab::Functions
+                }
+                ScreenshotScenario::Graph => MainTab::Graph,
+                ScreenshotScenario::AddressSpace
+                | ScreenshotScenario::Disassembly
+                | ScreenshotScenario::DisassemblyActions => MainTab::AddressSpace,
+                ScreenshotScenario::DebuggerSandbox
+                | ScreenshotScenario::DebuggerReadinessResult => MainTab::DebuggerSandbox,
+                ScreenshotScenario::Exports => {
                     app.stage = WorkflowStage::Export;
                     MainTab::Exports
                 }
-                _ => panic!("unsupported screenshot tab {tab:?}"),
+                ScreenshotScenario::OpenEmpty => unreachable!("handled before project load"),
             };
             app.project = Some(project);
-            if tab == "disassembly" {
-                let entry_rva = app
-                    .project
-                    .as_ref()
-                    .and_then(|project| match project.session().base_analysis() {
-                        BinaryAnalysis::Pe(analysis) => Some(u64::from(analysis.entry_point_rva)),
-                        _ => None,
-                    })
-                    .filter(|rva| *rva != 0)
-                    .or_else(|| app.project.as_ref()?.functions.first().map(|row| row.rva))
-                    .expect("screenshot fixture needs a disassembly seed");
-                app.offline_read_rva_input = format!("0x{entry_rva:08X}");
-                app.offline_read_size = 128;
+            if scenario.needs_offline_read() {
+                let (start_rva, read_size) = if scenario == ScreenshotScenario::DisassemblyActions {
+                    (
+                        SCREENSHOT_CANONICAL_JCC_RVA,
+                        SCREENSHOT_CANONICAL_JCC_READ_BYTES,
+                    )
+                } else {
+                    let entry_rva = app
+                        .project
+                        .as_ref()
+                        .and_then(|project| match project.session().base_analysis() {
+                            BinaryAnalysis::Pe(analysis) => {
+                                Some(u64::from(analysis.entry_point_rva))
+                            }
+                            _ => None,
+                        })
+                        .filter(|rva| *rva != 0)
+                        .or_else(|| app.project.as_ref()?.functions.first().map(|row| row.rva))
+                        .expect("screenshot fixture needs a disassembly seed");
+                    (entry_rva, 128)
+                };
+                app.offline_read_rva_input = format!("0x{start_rva:08X}");
+                app.offline_read_size = read_size;
                 app.offline_byte_view = OfflineByteView::Disassembly;
                 app.selected_disassembly_instruction = Some(0);
                 app.queue_offline_image_read()
                     .unwrap_or_else(|error| panic!("cannot queue disassembly capture: {error}"));
             }
-            if tab == "functions-focused" {
+            if scenario == ScreenshotScenario::FunctionsFocused {
                 app.function_row_focus_target = app.selected_projection_index;
             }
-            if app.main_tab == MainTab::DebuggerSandbox {
+            if scenario.needs_readiness_result() {
                 app.queue_sandbox_readiness_probe()
                     .unwrap_or_else(|error| panic!("cannot queue readiness capture: {error}"));
             }
+            if scenario == ScreenshotScenario::BinarySwitchConfirmation {
+                app.prepare_screenshot_binary_switch_confirmation();
+            }
             app.log(
                 ActivityLevel::Success,
-                format!("Loaded {} for visual regression capture", path.display()),
+                format!(
+                    "Loaded {} for {} visual regression capture",
+                    path.display(),
+                    scenario.name()
+                ),
             );
             app.begin_initial_plugin_catalog_refresh();
             return app;
@@ -830,6 +941,40 @@ impl WorkbenchApp {
     }
 
     #[cfg(feature = "screenshot")]
+    fn prepare_screenshot_binary_switch_confirmation(&mut self) {
+        let subject = self
+            .project
+            .as_ref()
+            .and_then(|project| {
+                project.functions.iter().find_map(|row| {
+                    project
+                        .function_detail(row.projection_index)
+                        .and_then(|detail| {
+                            detail
+                                .claims
+                                .iter()
+                                .find_map(|claim| claim.review_subject().cloned())
+                        })
+                })
+            })
+            .expect("screenshot fixture needs a reviewable exact name claim");
+        self.review
+            .as_mut()
+            .expect("screenshot project has a bound review ledger")
+            .apply_disposition(
+                &subject,
+                DecisionAction::Reject,
+                "visual-regression",
+                "Deterministic unsaved decision for binary-switch confirmation",
+            )
+            .expect("screenshot fixture accepts a deterministic review decision");
+        self.pending_binary_open = Some(PathBuf::from(
+            r"C:\visual-regression\replacement-candidate.exe",
+        ));
+        self.open_after_review_save = false;
+    }
+
+    #[cfg(feature = "screenshot")]
     fn advance_screenshot_capture(&mut self, context: &egui::Context) {
         const SETTLE_FRAMES: u8 = 12;
         if self.screenshot_destination.is_none() {
@@ -857,7 +1002,11 @@ impl WorkbenchApp {
             return;
         }
 
-        if self.main_tab == MainTab::DebuggerSandbox && self.readiness_operation.is_pending() {
+        let scenario_work_is_pending = self.screenshot_scenario.is_some_and(|scenario| {
+            (scenario.needs_readiness_result() && self.readiness_operation.is_pending())
+                || (scenario.needs_offline_read() && self.offline_read.is_pending())
+        });
+        if scenario_work_is_pending {
             self.screenshot_frame_count = 0;
             context.request_repaint();
             return;
@@ -2311,8 +2460,9 @@ impl WorkbenchApp {
                         ),
                         OfflineReadEventDisposition::Available { byte_count } => {
                             #[cfg(feature = "screenshot")]
-                            if std::env::var("RESYMBOL_WORKBENCH_SCREENSHOT_TAB")
-                                .is_ok_and(|tab| tab == "disassembly")
+                            if self
+                                .screenshot_scenario
+                                .is_some_and(ScreenshotScenario::needs_offline_read)
                             {
                                 self.offline_byte_view = OfflineByteView::Disassembly;
                                 self.selected_disassembly_instruction = Some(0);
@@ -5564,6 +5714,57 @@ impl WorkbenchApp {
         }
     }
 
+    #[cfg(feature = "screenshot")]
+    fn screenshot_disassembly_action_row(&self) -> Option<LinearInstructionRow> {
+        let OfflineReadPresentation::Outcome(outcome) = self.offline_read.presentation.as_ref()?
+        else {
+            return None;
+        };
+        let bytes = outcome.availability().bytes()?;
+        let limits =
+            LinearDisassemblyLimits::new(bytes.len().max(1), OFFLINE_DISASSEMBLY_INSTRUCTION_LIMIT)
+                .ok()?;
+        let preview = disassemble_x64_linear(bytes, outcome.span().rva(), limits);
+        let row = preview.rows().first()?.clone();
+        (row.rva() == SCREENSHOT_CANONICAL_JCC_RVA
+            && ConditionalBranchPatch::InvertCondition
+                .replacement(row.bytes())
+                .is_some())
+        .then_some(row)
+    }
+
+    #[cfg(feature = "screenshot")]
+    fn show_screenshot_scenario_overlay(&mut self, context: &egui::Context) {
+        if self.screenshot_scenario != Some(ScreenshotScenario::DisassemblyActions) {
+            return;
+        }
+        if self.offline_read.is_pending() {
+            return;
+        }
+        let row = self.screenshot_disassembly_action_row().unwrap_or_else(|| {
+            panic!(
+                "disassembly-actions scenario requires canonical Jcc bytes at fixture RVA 0x{SCREENSHOT_CANONICAL_JCC_RVA:08X}"
+            )
+        });
+        let colors = self.preferences.theme.semantic_colors();
+        let screen = context.screen_rect();
+        let popup_width = 430.0;
+        let position = egui::pos2(
+            (screen.center().x - popup_width / 2.0).max(screen.left() + 8.0),
+            screen.top() + 128.0,
+        );
+        egui::Area::new(egui::Id::new("screenshot_disassembly_action_menu"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(position)
+            .movable(false)
+            .show(context, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_min_width(popup_width);
+                    self.show_instruction_action_menu(ui, &row, colors);
+                });
+            });
+    }
+
     fn static_rva_has_readable_file_backing(&self, rva: u64) -> bool {
         let address = RelativeAddress::new(rva);
         self.project
@@ -6967,7 +7168,13 @@ impl WorkbenchApp {
 
             ui.add_space(12.0);
             if let Some(outcome) = &self.readiness_outcome {
-                show_sandbox_readiness_outcome(ui, outcome, colors);
+                let response = show_sandbox_readiness_outcome(ui, outcome, colors);
+                #[cfg(feature = "screenshot")]
+                if self.screenshot_scenario
+                    == Some(ScreenshotScenario::DebuggerReadinessResult)
+                {
+                    response.scroll_to_me(Some(Align::Center));
+                }
             } else if !self.readiness_operation.is_pending() && self.readiness_error.is_none() {
                 ui.label(
                     RichText::new(
@@ -7230,6 +7437,8 @@ impl eframe::App for WorkbenchApp {
         self.show_activity_panel(context);
         self.show_central(context);
         self.show_binary_drop_target(context);
+        #[cfg(feature = "screenshot")]
+        self.show_screenshot_scenario_overlay(context);
         self.show_binary_switch_confirmation(context);
         self.show_close_confirmation(context);
 
@@ -7265,7 +7474,7 @@ fn show_sandbox_readiness_outcome(
     ui: &mut egui::Ui,
     outcome: &DebuggerReadinessOutcome,
     colors: SemanticColors,
-) {
+) -> egui::Response {
     let report = outcome.report();
     let (status, status_color) = match report.readiness() {
         SandboxProviderReadiness::ReadyForProvisioningAttempt => {
@@ -7347,7 +7556,8 @@ fn show_sandbox_readiness_outcome(
                 .strong()
                 .color(colors.warning_conflict),
             );
-        });
+        })
+        .response
 }
 
 fn provider_selection_label(provider: &SandboxProviderSelection) -> String {
@@ -8684,6 +8894,70 @@ mod tests {
         )
         .expect("name claim");
         ReviewSubject::from_name_claim(&claim).expect("review subject")
+    }
+
+    #[test]
+    fn screenshot_scenario_names_are_stable_and_complete() {
+        let scenarios = [
+            ScreenshotScenario::OpenEmpty,
+            ScreenshotScenario::Overview,
+            ScreenshotScenario::Functions,
+            ScreenshotScenario::FunctionsFocused,
+            ScreenshotScenario::Graph,
+            ScreenshotScenario::AddressSpace,
+            ScreenshotScenario::Disassembly,
+            ScreenshotScenario::DisassemblyActions,
+            ScreenshotScenario::BinarySwitchConfirmation,
+            ScreenshotScenario::DebuggerSandbox,
+            ScreenshotScenario::DebuggerReadinessResult,
+            ScreenshotScenario::Exports,
+        ];
+        for scenario in scenarios {
+            assert_eq!(ScreenshotScenario::parse(scenario.name()), Some(scenario));
+        }
+        assert!(ScreenshotScenario::parse("unknown-scenario").is_none());
+        assert!(ScreenshotScenario::DisassemblyActions.needs_offline_read());
+        assert!(ScreenshotScenario::DebuggerReadinessResult.needs_readiness_result());
+        assert!(!ScreenshotScenario::OpenEmpty.needs_offline_read());
+    }
+
+    #[test]
+    fn screenshot_fixture_retains_the_canonical_conditional_branch() {
+        let (_source, project) = loaded_project_with_bytes(SYMBOLIZED_FIXTURE);
+        let address = RelativeAddress::new(SCREENSHOT_CANONICAL_JCC_RVA);
+        let region = project
+            .static_address_space
+            .region_at(address)
+            .expect("capture Jcc is mapped");
+        let file_offset = usize::try_from(
+            region
+                .file_offset_at(address)
+                .expect("capture Jcc is file backed"),
+        )
+        .expect("capture Jcc offset fits usize");
+        let read_size = usize::try_from(SCREENSHOT_CANONICAL_JCC_READ_BYTES)
+            .expect("capture read size fits usize");
+        let bytes = &SYMBOLIZED_FIXTURE[file_offset..file_offset + read_size];
+        let preview = disassemble_x64_linear(
+            bytes,
+            SCREENSHOT_CANONICAL_JCC_RVA,
+            LinearDisassemblyLimits::new(read_size, OFFLINE_DISASSEMBLY_INSTRUCTION_LIMIT)
+                .expect("capture disassembly limits"),
+        );
+        let row = preview.rows().first().expect("capture Jcc row");
+
+        assert_eq!(row.rva(), SCREENSHOT_CANONICAL_JCC_RVA);
+        assert_eq!(row.bytes(), &[0x74, 0x0A]);
+        assert!(
+            ConditionalBranchPatch::InvertCondition
+                .replacement(row.bytes())
+                .is_some()
+        );
+        assert!(
+            ConditionalBranchPatch::AlwaysTaken
+                .replacement(row.bytes())
+                .is_some()
+        );
     }
 
     #[test]
