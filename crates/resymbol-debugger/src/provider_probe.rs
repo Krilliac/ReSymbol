@@ -394,18 +394,18 @@ where
 
 /// Conservative system backend with no mutating behavior.
 ///
-/// It uses only Rust's compile-time target platform. Off Windows it reports a
-/// definitive platform mismatch. On Windows it reports typed requirements as
-/// indeterminate because this backend intentionally does not trust environment
-/// variables, registry implementation details, localized command output, or
-/// feature activation side effects.
+/// Off Windows it reports a definitive platform mismatch. On Windows a narrow
+/// platform adapter observes only stable, read-only AppContainer API presence,
+/// firmware-virtualization state, and hypervisor presence. Every stronger
+/// provider prerequisite remains explicit and unresolved.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemSandboxProviderProbe;
 
 impl SandboxProviderProbeBackend for SystemSandboxProviderProbe {
     fn probe(&self, request: &SandboxProviderProbeRequest) -> ProviderProbeObservation {
-        if !cfg!(target_os = "windows") {
-            return ProviderProbeObservation::unavailable(
+        #[cfg(not(target_os = "windows"))]
+        {
+            ProviderProbeObservation::unavailable(
                 request.provider().clone(),
                 SandboxProviderReadinessReason::UnsupportedPlatform,
                 BTreeSet::from([SandboxProviderRequirement::WindowsOperatingSystem]),
@@ -413,21 +413,210 @@ impl SandboxProviderProbeBackend for SystemSandboxProviderProbe {
                     "Built-in ReSymbol sandbox providers require Windows; no capability was assumed.",
                 ),
             )
-            .expect("static system observation is valid");
+            .expect("static system observation is valid")
         }
 
-        ProviderProbeObservation::indeterminate(
-            request.provider().clone(),
-            SandboxProviderReadinessReason::CapabilitiesUnverified,
-            windows_requirements(request.provider()),
-            diagnostic(
-                "Windows was detected, but provider prerequisites require a stable read-only platform adapter before provisioning.",
-            ),
-        )
-        .expect("static system observation is valid")
+        #[cfg(target_os = "windows")]
+        {
+            observe_windows_provider(request, &NativeWindowsCapabilityBackend)
+        }
     }
 }
 
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowsCapabilityObservation {
+    Present,
+    Absent,
+    QueryUnavailable,
+}
+
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WindowsCapabilitySnapshot {
+    app_container_apis: WindowsCapabilityObservation,
+    firmware_virtualization: WindowsCapabilityObservation,
+    hypervisor: WindowsCapabilityObservation,
+}
+
+#[cfg(any(target_os = "windows", test))]
+trait WindowsCapabilityBackend: Send + Sync {
+    fn observe(&self) -> WindowsCapabilitySnapshot;
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone, Copy, Default)]
+struct NativeWindowsCapabilityBackend;
+
+#[cfg(target_os = "windows")]
+impl WindowsCapabilityBackend for NativeWindowsCapabilityBackend {
+    fn observe(&self) -> WindowsCapabilitySnapshot {
+        use resymbol_windows_readiness::{
+            CapabilityObservation as NativeObservation, observe_sandbox_capabilities,
+        };
+
+        let observed = observe_sandbox_capabilities();
+        let translate = |value| match value {
+            NativeObservation::Present => WindowsCapabilityObservation::Present,
+            NativeObservation::Absent => WindowsCapabilityObservation::Absent,
+            NativeObservation::QueryUnavailable => WindowsCapabilityObservation::QueryUnavailable,
+        };
+        WindowsCapabilitySnapshot {
+            app_container_apis: translate(observed.app_container_apis),
+            firmware_virtualization: translate(observed.firmware_virtualization),
+            hypervisor: translate(observed.hypervisor),
+        }
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn observe_windows_provider<B>(
+    request: &SandboxProviderProbeRequest,
+    backend: &B,
+) -> ProviderProbeObservation
+where
+    B: WindowsCapabilityBackend,
+{
+    if matches!(
+        request.provider(),
+        SandboxProviderSelection::Registered { .. }
+    ) {
+        return indeterminate_windows_observation(
+            request,
+            SandboxProviderReadinessReason::CapabilitiesUnverified,
+            windows_requirements(request.provider()),
+            "Registered providers require their exact registered probe, helper, and administrative policy approval.",
+        );
+    }
+
+    let observed = backend.observe();
+    match request.provider() {
+        SandboxProviderSelection::LocalAppContainer => {
+            observe_local_app_container(request, observed)
+        }
+        SandboxProviderSelection::WindowsSandbox | SandboxProviderSelection::HyperV => {
+            observe_hypervisor_provider(request, observed)
+        }
+        SandboxProviderSelection::Registered { .. } => {
+            unreachable!("registered providers return before native observation")
+        }
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn observe_local_app_container(
+    request: &SandboxProviderProbeRequest,
+    observed: WindowsCapabilitySnapshot,
+) -> ProviderProbeObservation {
+    match observed.app_container_apis {
+        WindowsCapabilityObservation::Absent => ProviderProbeObservation::unavailable(
+            request.provider().clone(),
+            SandboxProviderReadinessReason::ResourceUnavailable,
+            BTreeSet::from([SandboxProviderRequirement::AppContainerApiAvailability]),
+            diagnostic(
+                "The required AppContainer profile entry points were absent from the system userenv library.",
+            ),
+        )
+        .expect("bounded AppContainer-unavailable observation is valid"),
+        WindowsCapabilityObservation::QueryUnavailable => indeterminate_windows_observation(
+            request,
+            SandboxProviderReadinessReason::ProbeBackendUnavailable,
+            BTreeSet::from([
+                SandboxProviderRequirement::StableReadOnlyCapabilityProbe,
+                SandboxProviderRequirement::AppContainerApiAvailability,
+            ]),
+            "The system AppContainer API surface could not be observed through the bounded read-only adapter.",
+        ),
+        WindowsCapabilityObservation::Present => {
+            let mut requirements = windows_requirements(request.provider());
+            requirements.remove(&SandboxProviderRequirement::StableReadOnlyCapabilityProbe);
+            requirements.remove(&SandboxProviderRequirement::AppContainerApiAvailability);
+            indeterminate_windows_observation(
+                request,
+                SandboxProviderReadinessReason::CapabilitiesUnverified,
+                requirements,
+                "The AppContainer API surface is present; policy approval, a provider helper, and runtime containment attestation remain unresolved.",
+            )
+        }
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn observe_hypervisor_provider(
+    request: &SandboxProviderProbeRequest,
+    observed: WindowsCapabilitySnapshot,
+) -> ProviderProbeObservation {
+    if observed.firmware_virtualization == WindowsCapabilityObservation::Absent {
+        return ProviderProbeObservation::unavailable(
+            request.provider().clone(),
+            SandboxProviderReadinessReason::FeatureDisabled,
+            BTreeSet::from([SandboxProviderRequirement::HardwareVirtualization]),
+            diagnostic(
+                "Windows did not report firmware virtualization enabled and available to the operating system.",
+            ),
+        )
+        .expect("bounded firmware-virtualization observation is valid");
+    }
+    if observed.hypervisor == WindowsCapabilityObservation::Absent {
+        return ProviderProbeObservation::unavailable(
+            request.provider().clone(),
+            SandboxProviderReadinessReason::FeatureDisabled,
+            BTreeSet::from([SandboxProviderRequirement::HypervisorActive]),
+            diagnostic(
+                "The Windows Hypervisor Platform capability query reported that the hypervisor is not present.",
+            ),
+        )
+        .expect("bounded hypervisor-unavailable observation is valid");
+    }
+
+    let mut unresolved = windows_requirements(request.provider());
+    unresolved.remove(&SandboxProviderRequirement::StableReadOnlyCapabilityProbe);
+    if observed.firmware_virtualization == WindowsCapabilityObservation::Present {
+        unresolved.remove(&SandboxProviderRequirement::HardwareVirtualization);
+    }
+    if observed.hypervisor == WindowsCapabilityObservation::Present {
+        unresolved.remove(&SandboxProviderRequirement::HypervisorActive);
+    }
+
+    let query_unavailable = observed.firmware_virtualization
+        == WindowsCapabilityObservation::QueryUnavailable
+        || observed.hypervisor == WindowsCapabilityObservation::QueryUnavailable;
+    if query_unavailable {
+        unresolved.insert(SandboxProviderRequirement::StableReadOnlyCapabilityProbe);
+    }
+    indeterminate_windows_observation(
+        request,
+        if query_unavailable {
+            SandboxProviderReadinessReason::ProbeBackendUnavailable
+        } else {
+            SandboxProviderReadinessReason::CapabilitiesUnverified
+        },
+        unresolved,
+        if query_unavailable {
+            "At least one virtualization capability could not be observed through the bounded read-only adapter."
+        } else {
+            "Firmware virtualization and a running Windows hypervisor were observed; optional-feature state, policy, helper, and image prerequisites remain unresolved."
+        },
+    )
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn indeterminate_windows_observation(
+    request: &SandboxProviderProbeRequest,
+    reason: SandboxProviderReadinessReason,
+    requirements: BTreeSet<SandboxProviderRequirement>,
+    detail: &'static str,
+) -> ProviderProbeObservation {
+    ProviderProbeObservation::indeterminate(
+        request.provider().clone(),
+        reason,
+        requirements,
+        diagnostic(detail),
+    )
+    .expect("bounded Windows system observation is valid")
+}
+
+#[cfg(any(target_os = "windows", test))]
 fn windows_requirements(
     provider: &SandboxProviderSelection,
 ) -> BTreeSet<SandboxProviderRequirement> {
@@ -668,6 +857,17 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, Copy)]
+    struct FakeWindowsCapabilityBackend {
+        snapshot: WindowsCapabilitySnapshot,
+    }
+
+    impl WindowsCapabilityBackend for FakeWindowsCapabilityBackend {
+        fn observe(&self) -> WindowsCapabilitySnapshot {
+            self.snapshot
+        }
+    }
+
     fn local_request() -> SandboxProviderProbeRequest {
         SandboxProviderProbeRequest::new(
             SandboxProviderSelection::LocalAppContainer,
@@ -678,6 +878,27 @@ mod tests {
             ]),
         )
         .expect("valid request")
+    }
+
+    fn windows_sandbox_request() -> SandboxProviderProbeRequest {
+        SandboxProviderProbeRequest::new(
+            SandboxProviderSelection::WindowsSandbox,
+            IsolationBoundary::Hypervisor,
+            BTreeSet::from([SandboxGuarantee::HypervisorBoundary]),
+        )
+        .expect("valid Windows Sandbox request")
+    }
+
+    const fn windows_snapshot(
+        app_container_apis: WindowsCapabilityObservation,
+        firmware_virtualization: WindowsCapabilityObservation,
+        hypervisor: WindowsCapabilityObservation,
+    ) -> WindowsCapabilitySnapshot {
+        WindowsCapabilitySnapshot {
+            app_container_apis,
+            firmware_virtualization,
+            hypervisor,
+        }
     }
 
     fn ready_observation(provider: SandboxProviderSelection) -> ProviderProbeObservation {
@@ -786,21 +1007,201 @@ mod tests {
             SandboxProviderReadiness::ReadyForProvisioningAttempt
         );
         if cfg!(target_os = "windows") {
-            assert_eq!(
+            assert!(matches!(
                 report.reason(),
                 SandboxProviderReadinessReason::CapabilitiesUnverified
-            );
-            assert!(
-                report
-                    .requirements()
-                    .contains(&SandboxProviderRequirement::AppContainerApiAvailability)
-            );
+                    | SandboxProviderReadinessReason::ProbeBackendUnavailable
+                    | SandboxProviderReadinessReason::ResourceUnavailable
+            ));
         } else {
             assert_eq!(
                 report.reason(),
                 SandboxProviderReadinessReason::UnsupportedPlatform
             );
         }
+    }
+
+    #[test]
+    fn injected_app_container_api_presence_reduces_only_the_observed_requirements() {
+        let observation = observe_windows_provider(
+            &local_request(),
+            &FakeWindowsCapabilityBackend {
+                snapshot: windows_snapshot(
+                    WindowsCapabilityObservation::Present,
+                    WindowsCapabilityObservation::QueryUnavailable,
+                    WindowsCapabilityObservation::QueryUnavailable,
+                ),
+            },
+        );
+
+        assert_eq!(
+            observation.disposition,
+            ProviderProbeDisposition::Indeterminate
+        );
+        assert_eq!(
+            observation.reason,
+            SandboxProviderReadinessReason::CapabilitiesUnverified
+        );
+        assert!(
+            !observation
+                .requirements
+                .contains(&SandboxProviderRequirement::AppContainerApiAvailability)
+        );
+        assert!(
+            !observation
+                .requirements
+                .contains(&SandboxProviderRequirement::StableReadOnlyCapabilityProbe)
+        );
+        assert!(
+            observation
+                .requirements
+                .contains(&SandboxProviderRequirement::AdministrativePolicyApproval)
+        );
+        assert!(
+            observation
+                .requirements
+                .contains(&SandboxProviderRequirement::ProviderHelperAvailable)
+        );
+    }
+
+    #[test]
+    fn injected_missing_app_container_exports_are_definitively_unavailable() {
+        let observation = observe_windows_provider(
+            &local_request(),
+            &FakeWindowsCapabilityBackend {
+                snapshot: windows_snapshot(
+                    WindowsCapabilityObservation::Absent,
+                    WindowsCapabilityObservation::Present,
+                    WindowsCapabilityObservation::Present,
+                ),
+            },
+        );
+
+        assert_eq!(
+            observation.disposition,
+            ProviderProbeDisposition::Unavailable
+        );
+        assert_eq!(
+            observation.reason,
+            SandboxProviderReadinessReason::ResourceUnavailable
+        );
+        assert_eq!(
+            observation.requirements,
+            BTreeSet::from([SandboxProviderRequirement::AppContainerApiAvailability])
+        );
+    }
+
+    #[test]
+    fn injected_firmware_virtualization_absence_fails_closed() {
+        let observation = observe_windows_provider(
+            &windows_sandbox_request(),
+            &FakeWindowsCapabilityBackend {
+                snapshot: windows_snapshot(
+                    WindowsCapabilityObservation::Present,
+                    WindowsCapabilityObservation::Absent,
+                    WindowsCapabilityObservation::Present,
+                ),
+            },
+        );
+
+        assert_eq!(
+            observation.disposition,
+            ProviderProbeDisposition::Unavailable
+        );
+        assert_eq!(
+            observation.reason,
+            SandboxProviderReadinessReason::FeatureDisabled
+        );
+        assert_eq!(
+            observation.requirements,
+            BTreeSet::from([SandboxProviderRequirement::HardwareVirtualization])
+        );
+    }
+
+    #[test]
+    fn injected_hypervisor_query_failure_remains_typed_and_indeterminate() {
+        let observation = observe_windows_provider(
+            &windows_sandbox_request(),
+            &FakeWindowsCapabilityBackend {
+                snapshot: windows_snapshot(
+                    WindowsCapabilityObservation::Present,
+                    WindowsCapabilityObservation::Present,
+                    WindowsCapabilityObservation::QueryUnavailable,
+                ),
+            },
+        );
+
+        assert_eq!(
+            observation.disposition,
+            ProviderProbeDisposition::Indeterminate
+        );
+        assert_eq!(
+            observation.reason,
+            SandboxProviderReadinessReason::ProbeBackendUnavailable
+        );
+        assert!(
+            observation
+                .requirements
+                .contains(&SandboxProviderRequirement::HypervisorActive)
+        );
+        assert!(
+            observation
+                .requirements
+                .contains(&SandboxProviderRequirement::StableReadOnlyCapabilityProbe)
+        );
+    }
+
+    #[test]
+    fn injected_virtualization_positives_do_not_claim_provider_readiness() {
+        let observation = observe_windows_provider(
+            &windows_sandbox_request(),
+            &FakeWindowsCapabilityBackend {
+                snapshot: windows_snapshot(
+                    WindowsCapabilityObservation::Present,
+                    WindowsCapabilityObservation::Present,
+                    WindowsCapabilityObservation::Present,
+                ),
+            },
+        );
+
+        assert_eq!(
+            observation.disposition,
+            ProviderProbeDisposition::Indeterminate
+        );
+        assert_eq!(
+            observation.reason,
+            SandboxProviderReadinessReason::CapabilitiesUnverified
+        );
+        assert!(
+            !observation
+                .requirements
+                .contains(&SandboxProviderRequirement::HardwareVirtualization)
+        );
+        assert!(
+            !observation
+                .requirements
+                .contains(&SandboxProviderRequirement::HypervisorActive)
+        );
+        assert!(
+            !observation
+                .requirements
+                .contains(&SandboxProviderRequirement::StableReadOnlyCapabilityProbe)
+        );
+        assert!(observation.requirements.contains(
+            &SandboxProviderRequirement::WindowsOptionalFeature {
+                feature: WindowsOptionalFeature::ContainersDisposableClientVm,
+            }
+        ));
+        assert!(
+            observation
+                .requirements
+                .contains(&SandboxProviderRequirement::AdministrativePolicyApproval)
+        );
+        assert!(
+            observation
+                .requirements
+                .contains(&SandboxProviderRequirement::ProviderHelperAvailable)
+        );
     }
 
     #[test]
