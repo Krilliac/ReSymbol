@@ -185,24 +185,33 @@ impl<Mode> LiveProcessAccess<Mode> {
         &self,
         expected: &LiveTargetBinding,
     ) -> Result<LiveTargetBinding, LiveAccessError> {
-        if expected != &self.binding {
-            return Err(LiveAccessError::BindingMismatch);
-        }
-        let observed = observe_live_target(
-            &self.process,
-            self.binding.process().process_id,
-            self.binding.actual_image_base(),
-            self.binding.main_module_binary_id(),
-            &self.executable,
-        )?;
-        if observed.process().start_key != self.binding.process().start_key {
-            return Err(LiveAccessError::ProcessStartIdentityChanged);
-        }
-        if observed != self.binding {
-            return Err(LiveAccessError::BindingMismatch);
-        }
-        Ok(observed)
+        ensure_exact_binding_parts(&self.process, &self.binding, &self.executable, expected)
     }
+}
+
+fn ensure_exact_binding_parts(
+    process: &OwnedHandle,
+    retained: &LiveTargetBinding,
+    executable: &ExactExecutable,
+    expected: &LiveTargetBinding,
+) -> Result<LiveTargetBinding, LiveAccessError> {
+    if expected != retained {
+        return Err(LiveAccessError::BindingMismatch);
+    }
+    let observed = observe_live_target(
+        process,
+        retained.process().process_id,
+        retained.actual_image_base(),
+        retained.main_module_binary_id(),
+        executable,
+    )?;
+    if observed.process().start_key != retained.process().start_key {
+        return Err(LiveAccessError::ProcessStartIdentityChanged);
+    }
+    if &observed != retained {
+        return Err(LiveAccessError::BindingMismatch);
+    }
+    Ok(observed)
 }
 
 impl LiveProcessAccess<MutationAccess> {
@@ -226,251 +235,25 @@ impl LiveProcessAccess<MutationAccess> {
         let size = usize_to_u64(expected.len());
         let binding = self.ensure_exact_binding(expected_binding)?;
         let address = binding.address_for_rva_span(rva, size)?.get();
-        let actual = read_raw_exact(&self.process, address, expected.len())?;
-        if actual != expected {
-            return Err(LiveAccessError::CompareMismatch {
-                rva,
-                size: expected.len(),
-            });
-        }
-
-        // Close the potentially expensive identity-to-mutation window as much
-        // as this non-suspending foundation can. A provider must still stop the
-        // process before granting authority to call this method.
-        self.ensure_exact_binding(expected_binding)?;
-        let region =
-            writable_code_region(&self.process, expected_binding, address, expected.len())?;
-        let original_protection = protect_raw(
-            &self.process,
+        let mut operations = WindowsMutationOperations {
+            process: &self.process,
+            retained_binding: &self.binding,
+            executable: &self.executable,
+        };
+        compare_before_write_transaction(
+            &mut operations,
+            expected_binding,
+            rva,
             address,
-            expected.len(),
-            PAGE_EXECUTE_READWRITE,
+            expected,
+            replacement,
         )?;
-        if original_protection != region.protection {
-            // `VirtualProtectEx` changed protection, but ReSymbol has not
-            // written any bytes. Abort without calling byte recovery: doing so
-            // could overwrite a concurrent target-side change with the stale
-            // compare buffer. Only undo our protection change.
-            let protection_restored = self.restore_prewrite_protection(
-                expected_binding,
-                address,
-                expected.len(),
-                original_protection,
-            );
-            return Err(LiveAccessError::MutationFailed {
-                stage: MutationStage::ProtectionRace,
-                failure: format!(
-                    "queried protection {:#x} changed to {original_protection:#x}",
-                    region.protection
-                ),
-                recovery: MutationRecovery::NoWriteAttempted {
-                    protection_restored,
-                },
-            });
-        }
-
-        match read_raw_exact(&self.process, address, expected.len()) {
-            Ok(actual) if actual == expected => {}
-            Ok(_) => {
-                let protection_restored = self.restore_prewrite_protection(
-                    expected_binding,
-                    address,
-                    expected.len(),
-                    original_protection,
-                );
-                return Err(LiveAccessError::MutationFailed {
-                    stage: MutationStage::RevalidateExpectedBytes,
-                    failure: "live bytes changed after the initial comparison".to_owned(),
-                    recovery: MutationRecovery::NoWriteAttempted {
-                        protection_restored,
-                    },
-                });
-            }
-            Err(error) => {
-                let protection_restored = self.restore_prewrite_protection(
-                    expected_binding,
-                    address,
-                    expected.len(),
-                    original_protection,
-                );
-                return Err(LiveAccessError::MutationFailed {
-                    stage: MutationStage::RevalidateExpectedBytes,
-                    failure: error.to_string(),
-                    recovery: MutationRecovery::NoWriteAttempted {
-                        protection_restored,
-                    },
-                });
-            }
-        }
-
-        if let Err(error) = write_raw_exact(&self.process, address, replacement) {
-            return Err(mutation_failure(
-                MutationStage::WriteReplacement,
-                error,
-                self.recover_original_bytes(
-                    expected_binding,
-                    address,
-                    expected,
-                    original_protection,
-                    true,
-                ),
-            ));
-        }
-        if let Err(error) = flush_raw(&self.process, address, replacement.len()) {
-            return Err(mutation_failure(
-                MutationStage::FlushReplacement,
-                error,
-                self.recover_original_bytes(
-                    expected_binding,
-                    address,
-                    expected,
-                    original_protection,
-                    true,
-                ),
-            ));
-        }
-        if let Err(error) = restore_raw(
-            &self.process,
-            address,
-            replacement.len(),
-            original_protection,
-        ) {
-            return Err(mutation_failure(
-                MutationStage::RestoreProtection,
-                error,
-                self.recover_original_bytes(
-                    expected_binding,
-                    address,
-                    expected,
-                    original_protection,
-                    true,
-                ),
-            ));
-        }
-
-        match read_raw_exact(&self.process, address, replacement.len()) {
-            Ok(readback) if readback == replacement => {}
-            Ok(_) => {
-                return Err(LiveAccessError::MutationFailed {
-                    stage: MutationStage::VerifyReplacement,
-                    failure: "replacement readback did not match".to_owned(),
-                    recovery: self.recover_original_bytes(
-                        expected_binding,
-                        address,
-                        expected,
-                        original_protection,
-                        false,
-                    ),
-                });
-            }
-            Err(error) => {
-                return Err(mutation_failure(
-                    MutationStage::VerifyReplacement,
-                    error,
-                    self.recover_original_bytes(
-                        expected_binding,
-                        address,
-                        expected,
-                        original_protection,
-                        false,
-                    ),
-                ));
-            }
-        }
-
-        if let Err(error) = self.ensure_exact_binding(expected_binding) {
-            return Err(mutation_failure(
-                MutationStage::ValidateFinalBinding,
-                error,
-                self.recover_original_bytes(
-                    expected_binding,
-                    address,
-                    expected,
-                    original_protection,
-                    false,
-                ),
-            ));
-        }
 
         Ok(WriteReceipt {
             binding: binding.clone(),
             rva,
             bytes_written: replacement.len(),
         })
-    }
-
-    fn recover_original_bytes(
-        &self,
-        expected_binding: &LiveTargetBinding,
-        address: u64,
-        expected: &[u8],
-        original_protection: PAGE_PROTECTION_FLAGS,
-        protection_may_be_changed: bool,
-    ) -> MutationRecovery {
-        if self.ensure_exact_binding(expected_binding).is_err() {
-            return MutationRecovery::Indeterminate {
-                bytes_restored: false,
-                instruction_cache_flushed: false,
-                protection_restored: false,
-            };
-        }
-        let Ok(region) =
-            writable_code_region(&self.process, expected_binding, address, expected.len())
-        else {
-            return MutationRecovery::Indeterminate {
-                bytes_restored: false,
-                instruction_cache_flushed: false,
-                protection_restored: false,
-            };
-        };
-        let protection_is_changed = if protection_may_be_changed {
-            if region.protection == PAGE_EXECUTE_READWRITE {
-                true
-            } else if region.protection == original_protection {
-                false
-            } else {
-                return MutationRecovery::Indeterminate {
-                    bytes_restored: false,
-                    instruction_cache_flushed: false,
-                    protection_restored: false,
-                };
-            }
-        } else if region.protection == original_protection {
-            false
-        } else {
-            return MutationRecovery::Indeterminate {
-                bytes_restored: false,
-                instruction_cache_flushed: false,
-                protection_restored: false,
-            };
-        };
-        recover_original_bytes_unchecked(
-            &self.process,
-            address,
-            expected,
-            original_protection,
-            protection_is_changed,
-        )
-    }
-
-    fn restore_prewrite_protection(
-        &self,
-        expected_binding: &LiveTargetBinding,
-        address: u64,
-        size: usize,
-        original_protection: PAGE_PROTECTION_FLAGS,
-    ) -> bool {
-        if self.ensure_exact_binding(expected_binding).is_err() {
-            return false;
-        }
-        let Ok(region) = writable_code_region(&self.process, expected_binding, address, size)
-        else {
-            return false;
-        };
-        if region.protection != PAGE_EXECUTE_READWRITE {
-            return false;
-        }
-        restore_raw(&self.process, address, size, original_protection).is_ok()
     }
 }
 
@@ -680,6 +463,103 @@ struct MainModule {
 #[derive(Debug, Clone, Copy)]
 struct WritableCodeRegion {
     protection: PAGE_PROTECTION_FLAGS,
+}
+
+/// Private operation boundary for one mutation transaction.
+///
+/// Production uses one instance bound to one owned process handle. Tests use a
+/// per-test in-memory instance so faults remain deterministic and cannot leak
+/// between concurrent tests or weaken the Win32 validation path.
+trait MutationOperations {
+    fn ensure_exact_binding(&mut self, expected: &LiveTargetBinding)
+    -> Result<(), LiveAccessError>;
+
+    fn read_exact(&mut self, address: u64, size: usize) -> Result<Vec<u8>, LiveAccessError>;
+
+    fn writable_code_region(
+        &mut self,
+        expected_binding: &LiveTargetBinding,
+        address: u64,
+        size: usize,
+    ) -> Result<WritableCodeRegion, LiveAccessError>;
+
+    fn protect(
+        &mut self,
+        address: u64,
+        size: usize,
+        protection: PAGE_PROTECTION_FLAGS,
+    ) -> Result<PAGE_PROTECTION_FLAGS, LiveAccessError>;
+
+    fn write_exact(&mut self, address: u64, bytes: &[u8]) -> Result<(), LiveAccessError>;
+
+    fn flush(&mut self, address: u64, size: usize) -> Result<(), LiveAccessError>;
+
+    fn restore(
+        &mut self,
+        address: u64,
+        size: usize,
+        protection: PAGE_PROTECTION_FLAGS,
+    ) -> Result<(), LiveAccessError>;
+}
+
+struct WindowsMutationOperations<'a> {
+    process: &'a OwnedHandle,
+    retained_binding: &'a LiveTargetBinding,
+    executable: &'a ExactExecutable,
+}
+
+impl MutationOperations for WindowsMutationOperations<'_> {
+    fn ensure_exact_binding(
+        &mut self,
+        expected: &LiveTargetBinding,
+    ) -> Result<(), LiveAccessError> {
+        ensure_exact_binding_parts(
+            self.process,
+            self.retained_binding,
+            self.executable,
+            expected,
+        )
+        .map(|_| ())
+    }
+
+    fn read_exact(&mut self, address: u64, size: usize) -> Result<Vec<u8>, LiveAccessError> {
+        read_raw_exact(self.process, address, size)
+    }
+
+    fn writable_code_region(
+        &mut self,
+        expected_binding: &LiveTargetBinding,
+        address: u64,
+        size: usize,
+    ) -> Result<WritableCodeRegion, LiveAccessError> {
+        writable_code_region(self.process, expected_binding, address, size)
+    }
+
+    fn protect(
+        &mut self,
+        address: u64,
+        size: usize,
+        protection: PAGE_PROTECTION_FLAGS,
+    ) -> Result<PAGE_PROTECTION_FLAGS, LiveAccessError> {
+        protect_raw(self.process, address, size, protection)
+    }
+
+    fn write_exact(&mut self, address: u64, bytes: &[u8]) -> Result<(), LiveAccessError> {
+        write_raw_exact(self.process, address, bytes)
+    }
+
+    fn flush(&mut self, address: u64, size: usize) -> Result<(), LiveAccessError> {
+        flush_raw(self.process, address, size)
+    }
+
+    fn restore(
+        &mut self,
+        address: u64,
+        size: usize,
+        protection: PAGE_PROTECTION_FLAGS,
+    ) -> Result<(), LiveAccessError> {
+        restore_raw(self.process, address, size, protection)
+    }
 }
 
 fn observe_live_target(
@@ -1385,52 +1265,330 @@ fn flush_raw(process: &OwnedHandle, address: u64, size: usize) -> Result<(), Liv
     }
 }
 
-fn recover_original_bytes_unchecked(
-    process: &OwnedHandle,
+fn compare_before_write_transaction<O: MutationOperations>(
+    operations: &mut O,
+    expected_binding: &LiveTargetBinding,
+    rva: u64,
+    address: u64,
+    expected: &[u8],
+    replacement: &[u8],
+) -> Result<(), LiveAccessError> {
+    let actual = operations.read_exact(address, expected.len())?;
+    if actual != expected {
+        return Err(LiveAccessError::CompareMismatch {
+            rva,
+            size: expected.len(),
+        });
+    }
+
+    // Close the potentially expensive identity-to-mutation window as much as
+    // this non-suspending foundation can. A provider must still stop the
+    // process before granting authority to call this method.
+    operations.ensure_exact_binding(expected_binding)?;
+    let region = operations.writable_code_region(expected_binding, address, expected.len())?;
+    let original_protection =
+        operations.protect(address, expected.len(), PAGE_EXECUTE_READWRITE)?;
+    if original_protection != region.protection {
+        // Protection changed, but no byte write was attempted. Do not run byte
+        // recovery with a stale compare buffer; only undo our protection
+        // change after revalidating the exact target.
+        let protection_restored = restore_prewrite_protection(
+            operations,
+            expected_binding,
+            address,
+            expected.len(),
+            original_protection,
+        );
+        return Err(LiveAccessError::MutationFailed {
+            stage: MutationStage::ProtectionRace,
+            failure: format!(
+                "queried protection {:#x} changed to {original_protection:#x}",
+                region.protection
+            ),
+            recovery: MutationRecovery::NoWriteAttempted {
+                protection_restored,
+            },
+        });
+    }
+
+    match operations.read_exact(address, expected.len()) {
+        Ok(actual) if actual == expected => {}
+        Ok(_) => {
+            let protection_restored = restore_prewrite_protection(
+                operations,
+                expected_binding,
+                address,
+                expected.len(),
+                original_protection,
+            );
+            return Err(LiveAccessError::MutationFailed {
+                stage: MutationStage::RevalidateExpectedBytes,
+                failure: "live bytes changed after the initial comparison".to_owned(),
+                recovery: MutationRecovery::NoWriteAttempted {
+                    protection_restored,
+                },
+            });
+        }
+        Err(error) => {
+            let protection_restored = restore_prewrite_protection(
+                operations,
+                expected_binding,
+                address,
+                expected.len(),
+                original_protection,
+            );
+            return Err(LiveAccessError::MutationFailed {
+                stage: MutationStage::RevalidateExpectedBytes,
+                failure: error.to_string(),
+                recovery: MutationRecovery::NoWriteAttempted {
+                    protection_restored,
+                },
+            });
+        }
+    }
+
+    if let Err(error) = operations.write_exact(address, replacement) {
+        let recovery = recover_original_bytes(
+            operations,
+            expected_binding,
+            address,
+            expected,
+            original_protection,
+            true,
+        );
+        return Err(mutation_failure(
+            MutationStage::WriteReplacement,
+            error,
+            recovery,
+        ));
+    }
+    if let Err(error) = operations.flush(address, replacement.len()) {
+        let recovery = recover_original_bytes(
+            operations,
+            expected_binding,
+            address,
+            expected,
+            original_protection,
+            true,
+        );
+        return Err(mutation_failure(
+            MutationStage::FlushReplacement,
+            error,
+            recovery,
+        ));
+    }
+    if let Err(error) = operations.restore(address, replacement.len(), original_protection) {
+        let recovery = recover_original_bytes(
+            operations,
+            expected_binding,
+            address,
+            expected,
+            original_protection,
+            true,
+        );
+        return Err(mutation_failure(
+            MutationStage::RestoreProtection,
+            error,
+            recovery,
+        ));
+    }
+
+    match operations.read_exact(address, replacement.len()) {
+        Ok(readback) if readback == replacement => {}
+        Ok(_) => {
+            let recovery = recover_original_bytes(
+                operations,
+                expected_binding,
+                address,
+                expected,
+                original_protection,
+                false,
+            );
+            return Err(LiveAccessError::MutationFailed {
+                stage: MutationStage::VerifyReplacement,
+                failure: "replacement readback did not match".to_owned(),
+                recovery,
+            });
+        }
+        Err(error) => {
+            let recovery = recover_original_bytes(
+                operations,
+                expected_binding,
+                address,
+                expected,
+                original_protection,
+                false,
+            );
+            return Err(mutation_failure(
+                MutationStage::VerifyReplacement,
+                error,
+                recovery,
+            ));
+        }
+    }
+
+    if let Err(error) = operations.ensure_exact_binding(expected_binding) {
+        let recovery = recover_original_bytes(
+            operations,
+            expected_binding,
+            address,
+            expected,
+            original_protection,
+            false,
+        );
+        return Err(mutation_failure(
+            MutationStage::ValidateFinalBinding,
+            error,
+            recovery,
+        ));
+    }
+
+    Ok(())
+}
+
+fn restore_prewrite_protection<O: MutationOperations>(
+    operations: &mut O,
+    expected_binding: &LiveTargetBinding,
+    address: u64,
+    size: usize,
+    original_protection: PAGE_PROTECTION_FLAGS,
+) -> bool {
+    if operations.ensure_exact_binding(expected_binding).is_err() {
+        return false;
+    }
+    let Ok(region) = operations.writable_code_region(expected_binding, address, size) else {
+        return false;
+    };
+    if region.protection != PAGE_EXECUTE_READWRITE {
+        return false;
+    }
+    if operations
+        .restore(address, size, original_protection)
+        .is_err()
+    {
+        return false;
+    }
+    operations.ensure_exact_binding(expected_binding).is_ok()
+        && operations
+            .writable_code_region(expected_binding, address, size)
+            .is_ok_and(|region| region.protection == original_protection)
+}
+
+fn recover_original_bytes<O: MutationOperations>(
+    operations: &mut O,
+    expected_binding: &LiveTargetBinding,
+    address: u64,
+    expected: &[u8],
+    original_protection: PAGE_PROTECTION_FLAGS,
+    protection_may_be_changed: bool,
+) -> MutationRecovery {
+    if operations.ensure_exact_binding(expected_binding).is_err() {
+        return indeterminate_recovery();
+    }
+    let Ok(region) = operations.writable_code_region(expected_binding, address, expected.len())
+    else {
+        return indeterminate_recovery();
+    };
+    let protection_is_changed = if protection_may_be_changed {
+        if region.protection == PAGE_EXECUTE_READWRITE {
+            true
+        } else if region.protection == original_protection {
+            false
+        } else {
+            return indeterminate_recovery();
+        }
+    } else if region.protection == original_protection {
+        false
+    } else {
+        return indeterminate_recovery();
+    };
+
+    recover_original_bytes_checked(
+        operations,
+        expected_binding,
+        address,
+        expected,
+        original_protection,
+        protection_is_changed,
+    )
+}
+
+fn recover_original_bytes_checked<O: MutationOperations>(
+    operations: &mut O,
+    expected_binding: &LiveTargetBinding,
     address: u64,
     expected: &[u8],
     original_protection: PAGE_PROTECTION_FLAGS,
     protection_is_changed: bool,
 ) -> MutationRecovery {
     let mut writable = protection_is_changed;
-    let mut protection_restored = false;
     if !writable {
-        match protect_raw(process, address, expected.len(), PAGE_EXECUTE_READWRITE) {
+        match operations.protect(address, expected.len(), PAGE_EXECUTE_READWRITE) {
             Ok(observed) if observed == original_protection => writable = true,
             Ok(observed) => {
-                let _ = restore_raw(process, address, expected.len(), observed);
-                return MutationRecovery::Indeterminate {
-                    bytes_restored: false,
-                    instruction_cache_flushed: false,
-                    protection_restored: false,
-                };
+                let _ = operations.restore(address, expected.len(), observed);
+                return indeterminate_recovery();
             }
             Err(_) => {
-                return MutationRecovery::Indeterminate {
-                    bytes_restored: false,
-                    instruction_cache_flushed: false,
-                    protection_restored: false,
-                };
+                return indeterminate_recovery();
             }
         }
     }
 
-    let wrote = writable && write_raw_exact(process, address, expected).is_ok();
-    let flushed = wrote && flush_raw(process, address, expected.len()).is_ok();
-    if writable {
-        protection_restored =
-            restore_raw(process, address, expected.len(), original_protection).is_ok();
+    // Recheck both process identity and allocation immediately before rollback.
+    // If either changed, do not write, flush, or adjust protection on a
+    // replacement mapping.
+    if !writable
+        || operations.ensure_exact_binding(expected_binding).is_err()
+        || !operations
+            .writable_code_region(expected_binding, address, expected.len())
+            .is_ok_and(|region| region.protection == PAGE_EXECUTE_READWRITE)
+    {
+        return indeterminate_recovery();
     }
-    let verified = protection_restored
-        && read_raw_exact(process, address, expected.len()).is_ok_and(|bytes| bytes == expected);
-    if verified && flushed {
+
+    let wrote = operations.write_exact(address, expected).is_ok();
+    let flushed = wrote
+        && operations.ensure_exact_binding(expected_binding).is_ok()
+        && operations
+            .writable_code_region(expected_binding, address, expected.len())
+            .is_ok_and(|region| region.protection == PAGE_EXECUTE_READWRITE)
+        && operations.flush(address, expected.len()).is_ok();
+    let protection_restored = operations.ensure_exact_binding(expected_binding).is_ok()
+        && operations
+            .writable_code_region(expected_binding, address, expected.len())
+            .is_ok_and(|region| region.protection == PAGE_EXECUTE_READWRITE)
+        && operations
+            .restore(address, expected.len(), original_protection)
+            .is_ok()
+        && operations.ensure_exact_binding(expected_binding).is_ok()
+        && operations
+            .writable_code_region(expected_binding, address, expected.len())
+            .is_ok_and(|region| region.protection == original_protection);
+    let bytes_restored = wrote
+        && operations.ensure_exact_binding(expected_binding).is_ok()
+        && operations
+            .writable_code_region(expected_binding, address, expected.len())
+            .is_ok()
+        && operations
+            .read_exact(address, expected.len())
+            .is_ok_and(|bytes| bytes == expected);
+    if bytes_restored && flushed && protection_restored {
         MutationRecovery::Restored
     } else {
         MutationRecovery::Indeterminate {
-            bytes_restored: verified,
+            bytes_restored,
             instruction_cache_flushed: flushed,
             protection_restored,
         }
+    }
+}
+
+const fn indeterminate_recovery() -> MutationRecovery {
+    MutationRecovery::Indeterminate {
+        bytes_restored: false,
+        instruction_cache_flushed: false,
+        protection_restored: false,
     }
 }
 
@@ -1483,16 +1641,25 @@ fn last_win32(operation: &'static str) -> LiveAccessError {
 
 #[cfg(test)]
 mod tests {
-    use std::{os::windows::ffi::OsStrExt as _, path::Path};
+    use std::{io, os::windows::ffi::OsStrExt as _, path::Path};
+
+    use resymbol_core::BinaryId;
+    use resymbol_debugger::protocol::{
+        LiveTargetBinding, MemoryAddress, ProcessId, ProcessIdentity, ProcessStartKey,
+    };
 
     use windows_sys::Win32::System::{
         Diagnostics::ToolHelp::MODULEENTRY32W,
-        Memory::{MEM_COMMIT, MEM_IMAGE},
+        Memory::{
+            MEM_COMMIT, MEM_IMAGE, PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+            PAGE_PROTECTION_FLAGS,
+        },
     };
 
     use super::{
-        DOS_HEADER_BYTES, IMAGE_DOS_SIGNATURE, LiveAccessError, MainModule, MutationRecovery,
-        NT_HEADER_PREFIX_BYTES, PE_SIGNATURE_BYTES, PE32_PLUS_MAGIC, module_entry_path,
+        DOS_HEADER_BYTES, IMAGE_DOS_SIGNATURE, LiveAccessError, MainModule, MutationOperations,
+        MutationRecovery, MutationStage, NT_HEADER_PREFIX_BYTES, PE_SIGNATURE_BYTES,
+        PE32_PLUS_MAGIC, WritableCodeRegion, compare_before_write_transaction, module_entry_path,
         next_main_image_cursor, nt_size_of_image, pe_offset, span_fits_single_page,
     };
 
@@ -1507,6 +1674,514 @@ mod tests {
         nt[24..26].copy_from_slice(&PE32_PLUS_MAGIC.to_le_bytes());
         nt[80..84].copy_from_slice(&0x7000_u32.to_le_bytes());
         (dos, nt)
+    }
+
+    const TEST_ADDRESS: u64 = 0x1_1000;
+    const TEST_RVA: u64 = 0x1_000;
+    const ORIGINAL_BYTES: &[u8; 8] = b"RSYMLIVE";
+    const REPLACEMENT_BYTES: &[u8; 8] = b"R5YML1VE";
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum RecordedMutationOperation {
+        EnsureBinding,
+        Read,
+        QueryRegion,
+        Protect,
+        Write,
+        Flush,
+        Restore,
+    }
+
+    struct FaultMutationOperations {
+        binding: LiveTargetBinding,
+        bytes: Vec<u8>,
+        protection: PAGE_PROTECTION_FLAGS,
+        retained_allocation: u64,
+        current_allocation: u64,
+        identity_valid: bool,
+        operations: Vec<RecordedMutationOperation>,
+        binding_calls: usize,
+        protect_calls: usize,
+        write_calls: usize,
+        flush_calls: usize,
+        restore_calls: usize,
+        fail_binding_calls: Vec<usize>,
+        fail_write_before_calls: Vec<usize>,
+        fail_write_after_calls: Vec<usize>,
+        fail_flush_calls: Vec<usize>,
+        fail_restore_calls: Vec<usize>,
+        invalidate_identity_on_binding_failure: bool,
+        replace_allocation_on_flush_failure: bool,
+        protect_observed_once: Option<PAGE_PROTECTION_FLAGS>,
+        bytes_after_first_protect: Option<Vec<u8>>,
+        bytes_after_first_flush: Option<Vec<u8>>,
+    }
+
+    impl FaultMutationOperations {
+        fn new() -> Self {
+            Self {
+                binding: test_binding(),
+                bytes: ORIGINAL_BYTES.to_vec(),
+                protection: PAGE_EXECUTE_READ,
+                retained_allocation: 1,
+                current_allocation: 1,
+                identity_valid: true,
+                operations: Vec::new(),
+                binding_calls: 0,
+                protect_calls: 0,
+                write_calls: 0,
+                flush_calls: 0,
+                restore_calls: 0,
+                fail_binding_calls: Vec::new(),
+                fail_write_before_calls: Vec::new(),
+                fail_write_after_calls: Vec::new(),
+                fail_flush_calls: Vec::new(),
+                fail_restore_calls: Vec::new(),
+                invalidate_identity_on_binding_failure: false,
+                replace_allocation_on_flush_failure: false,
+                protect_observed_once: None,
+                bytes_after_first_protect: None,
+                bytes_after_first_flush: None,
+            }
+        }
+
+        fn count(&self, operation: RecordedMutationOperation) -> usize {
+            self.operations
+                .iter()
+                .filter(|recorded| **recorded == operation)
+                .count()
+        }
+    }
+
+    impl MutationOperations for FaultMutationOperations {
+        fn ensure_exact_binding(
+            &mut self,
+            expected: &LiveTargetBinding,
+        ) -> Result<(), LiveAccessError> {
+            self.operations
+                .push(RecordedMutationOperation::EnsureBinding);
+            self.binding_calls += 1;
+            let injected = self.fail_binding_calls.contains(&self.binding_calls);
+            if injected && self.invalidate_identity_on_binding_failure {
+                self.identity_valid = false;
+            }
+            if injected
+                || !self.identity_valid
+                || self.current_allocation != self.retained_allocation
+                || expected != &self.binding
+            {
+                Err(LiveAccessError::BindingMismatch)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn read_exact(&mut self, address: u64, size: usize) -> Result<Vec<u8>, LiveAccessError> {
+            self.operations.push(RecordedMutationOperation::Read);
+            assert_eq!(address, TEST_ADDRESS);
+            assert_eq!(size, self.bytes.len());
+            Ok(self.bytes.clone())
+        }
+
+        fn writable_code_region(
+            &mut self,
+            expected_binding: &LiveTargetBinding,
+            address: u64,
+            size: usize,
+        ) -> Result<WritableCodeRegion, LiveAccessError> {
+            self.operations.push(RecordedMutationOperation::QueryRegion);
+            assert_eq!(address, TEST_ADDRESS);
+            assert_eq!(size, self.bytes.len());
+            if !self.identity_valid
+                || self.current_allocation != self.retained_allocation
+                || expected_binding != &self.binding
+            {
+                return Err(LiveAccessError::UnsafeWriteRegion);
+            }
+            Ok(WritableCodeRegion {
+                protection: self.protection,
+            })
+        }
+
+        fn protect(
+            &mut self,
+            address: u64,
+            size: usize,
+            protection: PAGE_PROTECTION_FLAGS,
+        ) -> Result<PAGE_PROTECTION_FLAGS, LiveAccessError> {
+            self.operations.push(RecordedMutationOperation::Protect);
+            self.protect_calls += 1;
+            assert_eq!(address, TEST_ADDRESS);
+            assert_eq!(size, self.bytes.len());
+            let observed = self.protect_observed_once.take().unwrap_or(self.protection);
+            self.protection = protection;
+            if self.protect_calls == 1 {
+                if let Some(bytes) = self.bytes_after_first_protect.take() {
+                    self.bytes = bytes;
+                }
+            }
+            Ok(observed)
+        }
+
+        fn write_exact(&mut self, address: u64, bytes: &[u8]) -> Result<(), LiveAccessError> {
+            self.operations.push(RecordedMutationOperation::Write);
+            self.write_calls += 1;
+            assert_eq!(address, TEST_ADDRESS);
+            assert_eq!(bytes.len(), self.bytes.len());
+            if self.fail_write_before_calls.contains(&self.write_calls) {
+                return Err(injected_error("write exact bytes"));
+            }
+            self.bytes.copy_from_slice(bytes);
+            if self.fail_write_after_calls.contains(&self.write_calls) {
+                Err(injected_error("write exact bytes after side effect"))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn flush(&mut self, address: u64, size: usize) -> Result<(), LiveAccessError> {
+            self.operations.push(RecordedMutationOperation::Flush);
+            self.flush_calls += 1;
+            assert_eq!(address, TEST_ADDRESS);
+            assert_eq!(size, self.bytes.len());
+            if self.fail_flush_calls.contains(&self.flush_calls) {
+                if self.replace_allocation_on_flush_failure {
+                    self.current_allocation += 1;
+                }
+                Err(injected_error("flush exact bytes"))
+            } else {
+                if self.flush_calls == 1 {
+                    if let Some(bytes) = self.bytes_after_first_flush.take() {
+                        self.bytes = bytes;
+                    }
+                }
+                Ok(())
+            }
+        }
+
+        fn restore(
+            &mut self,
+            address: u64,
+            size: usize,
+            protection: PAGE_PROTECTION_FLAGS,
+        ) -> Result<(), LiveAccessError> {
+            self.operations.push(RecordedMutationOperation::Restore);
+            self.restore_calls += 1;
+            assert_eq!(address, TEST_ADDRESS);
+            assert_eq!(size, self.bytes.len());
+            if self.fail_restore_calls.contains(&self.restore_calls) {
+                return Err(injected_error("restore exact protection"));
+            }
+            self.protection = protection;
+            Ok(())
+        }
+    }
+
+    fn test_binding() -> LiveTargetBinding {
+        let binary_id = BinaryId::digest(b"fault-injection-live-target");
+        LiveTargetBinding::new(
+            ProcessIdentity {
+                process_id: ProcessId::new(7).expect("nonzero test PID"),
+                start_key: ProcessStartKey::new(11).expect("nonzero test start key"),
+                binary_id: binary_id.clone(),
+            },
+            binary_id,
+            MemoryAddress::new(TEST_ADDRESS - TEST_RVA),
+            0x4_000,
+        )
+        .expect("valid deterministic live binding")
+    }
+
+    fn injected_error(operation: &'static str) -> LiveAccessError {
+        LiveAccessError::Win32 {
+            operation,
+            source: io::Error::other("deterministic injected failure"),
+        }
+    }
+
+    fn run_fault_transaction(
+        operations: &mut FaultMutationOperations,
+    ) -> Result<(), LiveAccessError> {
+        let binding = operations.binding.clone();
+        compare_before_write_transaction(
+            operations,
+            &binding,
+            TEST_RVA,
+            TEST_ADDRESS,
+            ORIGINAL_BYTES,
+            REPLACEMENT_BYTES,
+        )
+    }
+
+    fn mutation_failure_parts(
+        result: Result<(), LiveAccessError>,
+    ) -> (MutationStage, MutationRecovery) {
+        match result {
+            Err(LiveAccessError::MutationFailed {
+                stage, recovery, ..
+            }) => (stage, recovery),
+            other => panic!("expected mutation failure, received {other:?}"),
+        }
+    }
+
+    #[test]
+    fn successful_transaction_preserves_exact_operation_order() {
+        let mut operations = FaultMutationOperations::new();
+
+        run_fault_transaction(&mut operations).expect("deterministic mutation succeeds");
+
+        assert_eq!(
+            operations.operations,
+            [
+                RecordedMutationOperation::Read,
+                RecordedMutationOperation::EnsureBinding,
+                RecordedMutationOperation::QueryRegion,
+                RecordedMutationOperation::Protect,
+                RecordedMutationOperation::Read,
+                RecordedMutationOperation::Write,
+                RecordedMutationOperation::Flush,
+                RecordedMutationOperation::Restore,
+                RecordedMutationOperation::Read,
+                RecordedMutationOperation::EnsureBinding,
+            ]
+        );
+        assert_eq!(operations.bytes, REPLACEMENT_BYTES);
+        assert_eq!(operations.protection, PAGE_EXECUTE_READ);
+    }
+
+    #[test]
+    fn protection_race_restores_only_protection_without_attempting_a_byte_write() {
+        let mut operations = FaultMutationOperations::new();
+        operations.protect_observed_once = Some(PAGE_EXECUTE);
+
+        let (stage, recovery) = mutation_failure_parts(run_fault_transaction(&mut operations));
+
+        assert_eq!(stage, MutationStage::ProtectionRace);
+        assert_eq!(
+            recovery,
+            MutationRecovery::NoWriteAttempted {
+                protection_restored: true,
+            }
+        );
+        assert_eq!(operations.count(RecordedMutationOperation::Write), 0);
+        assert_eq!(operations.bytes, ORIGINAL_BYTES);
+        assert_eq!(operations.protection, PAGE_EXECUTE);
+    }
+
+    #[test]
+    fn unverified_prewrite_protection_restore_makes_no_success_claim() {
+        let mut operations = FaultMutationOperations::new();
+        operations.protect_observed_once = Some(PAGE_EXECUTE);
+        operations.fail_binding_calls.push(3);
+
+        let (stage, recovery) = mutation_failure_parts(run_fault_transaction(&mut operations));
+
+        assert_eq!(stage, MutationStage::ProtectionRace);
+        assert_eq!(
+            recovery,
+            MutationRecovery::NoWriteAttempted {
+                protection_restored: false,
+            }
+        );
+        assert_eq!(operations.count(RecordedMutationOperation::Write), 0);
+        assert_eq!(operations.bytes, ORIGINAL_BYTES);
+        assert_eq!(operations.protection, PAGE_EXECUTE);
+    }
+
+    #[test]
+    fn post_protect_compare_mismatch_never_overwrites_concurrent_bytes() {
+        let mut operations = FaultMutationOperations::new();
+        let concurrent = b"CONCURNT".to_vec();
+        operations.bytes_after_first_protect = Some(concurrent.clone());
+
+        let (stage, recovery) = mutation_failure_parts(run_fault_transaction(&mut operations));
+
+        assert_eq!(stage, MutationStage::RevalidateExpectedBytes);
+        assert_eq!(
+            recovery,
+            MutationRecovery::NoWriteAttempted {
+                protection_restored: true,
+            }
+        );
+        assert_eq!(operations.count(RecordedMutationOperation::Write), 0);
+        assert_eq!(operations.bytes, concurrent);
+        assert_eq!(operations.protection, PAGE_EXECUTE_READ);
+    }
+
+    #[test]
+    fn write_failure_after_a_side_effect_reports_complete_recovery() {
+        let mut operations = FaultMutationOperations::new();
+        operations.fail_write_after_calls.push(1);
+
+        let (stage, recovery) = mutation_failure_parts(run_fault_transaction(&mut operations));
+
+        assert_eq!(stage, MutationStage::WriteReplacement);
+        assert_eq!(recovery, MutationRecovery::Restored);
+        assert_eq!(operations.count(RecordedMutationOperation::Write), 2);
+        assert_eq!(operations.bytes, ORIGINAL_BYTES);
+        assert_eq!(operations.protection, PAGE_EXECUTE_READ);
+    }
+
+    #[test]
+    fn replacement_flush_failure_reports_complete_recovery() {
+        let mut operations = FaultMutationOperations::new();
+        operations.fail_flush_calls.push(1);
+
+        let (stage, recovery) = mutation_failure_parts(run_fault_transaction(&mut operations));
+
+        assert_eq!(stage, MutationStage::FlushReplacement);
+        assert_eq!(recovery, MutationRecovery::Restored);
+        assert_eq!(operations.bytes, ORIGINAL_BYTES);
+        assert_eq!(operations.protection, PAGE_EXECUTE_READ);
+    }
+
+    #[test]
+    fn replacement_protection_restore_failure_reports_complete_recovery() {
+        let mut operations = FaultMutationOperations::new();
+        operations.fail_restore_calls.push(1);
+
+        let (stage, recovery) = mutation_failure_parts(run_fault_transaction(&mut operations));
+
+        assert_eq!(stage, MutationStage::RestoreProtection);
+        assert_eq!(recovery, MutationRecovery::Restored);
+        assert_eq!(operations.bytes, ORIGINAL_BYTES);
+        assert_eq!(operations.protection, PAGE_EXECUTE_READ);
+    }
+
+    #[test]
+    fn replacement_readback_mismatch_reports_complete_recovery() {
+        let mut operations = FaultMutationOperations::new();
+        operations.bytes_after_first_flush = Some(b"CORRUPTD".to_vec());
+
+        let (stage, recovery) = mutation_failure_parts(run_fault_transaction(&mut operations));
+
+        assert_eq!(stage, MutationStage::VerifyReplacement);
+        assert_eq!(recovery, MutationRecovery::Restored);
+        assert_eq!(operations.bytes, ORIGINAL_BYTES);
+        assert_eq!(operations.protection, PAGE_EXECUTE_READ);
+    }
+
+    #[test]
+    fn transient_final_binding_failure_reports_complete_recovery() {
+        let mut operations = FaultMutationOperations::new();
+        operations.fail_binding_calls.push(2);
+
+        let (stage, recovery) = mutation_failure_parts(run_fault_transaction(&mut operations));
+
+        assert_eq!(stage, MutationStage::ValidateFinalBinding);
+        assert_eq!(recovery, MutationRecovery::Restored);
+        assert_eq!(operations.bytes, ORIGINAL_BYTES);
+        assert_eq!(operations.protection, PAGE_EXECUTE_READ);
+    }
+
+    #[test]
+    fn failed_recovery_write_reports_only_restored_protection() {
+        let mut operations = FaultMutationOperations::new();
+        operations.fail_flush_calls.push(1);
+        operations.fail_write_before_calls.push(2);
+
+        let (stage, recovery) = mutation_failure_parts(run_fault_transaction(&mut operations));
+
+        assert_eq!(stage, MutationStage::FlushReplacement);
+        assert_eq!(
+            recovery,
+            MutationRecovery::Indeterminate {
+                bytes_restored: false,
+                instruction_cache_flushed: false,
+                protection_restored: true,
+            }
+        );
+        assert_eq!(operations.bytes, REPLACEMENT_BYTES);
+        assert_eq!(operations.protection, PAGE_EXECUTE_READ);
+    }
+
+    #[test]
+    fn failed_recovery_flush_reports_verified_bytes_and_protection() {
+        let mut operations = FaultMutationOperations::new();
+        operations.fail_flush_calls.extend([1, 2]);
+
+        let (stage, recovery) = mutation_failure_parts(run_fault_transaction(&mut operations));
+
+        assert_eq!(stage, MutationStage::FlushReplacement);
+        assert_eq!(
+            recovery,
+            MutationRecovery::Indeterminate {
+                bytes_restored: true,
+                instruction_cache_flushed: false,
+                protection_restored: true,
+            }
+        );
+        assert_eq!(operations.bytes, ORIGINAL_BYTES);
+        assert_eq!(operations.protection, PAGE_EXECUTE_READ);
+    }
+
+    #[test]
+    fn failed_recovery_restore_reports_verified_bytes_and_cache_flush() {
+        let mut operations = FaultMutationOperations::new();
+        operations.fail_flush_calls.push(1);
+        operations.fail_restore_calls.push(1);
+
+        let (stage, recovery) = mutation_failure_parts(run_fault_transaction(&mut operations));
+
+        assert_eq!(stage, MutationStage::FlushReplacement);
+        assert_eq!(
+            recovery,
+            MutationRecovery::Indeterminate {
+                bytes_restored: true,
+                instruction_cache_flushed: true,
+                protection_restored: false,
+            }
+        );
+        assert_eq!(operations.bytes, ORIGINAL_BYTES);
+        assert_eq!(operations.protection, PAGE_EXECUTE_READWRITE);
+    }
+
+    #[test]
+    fn stale_identity_after_final_validation_failure_prevents_rollback_write() {
+        let mut operations = FaultMutationOperations::new();
+        operations.fail_binding_calls.push(2);
+        operations.invalidate_identity_on_binding_failure = true;
+
+        let (stage, recovery) = mutation_failure_parts(run_fault_transaction(&mut operations));
+
+        assert_eq!(stage, MutationStage::ValidateFinalBinding);
+        assert_eq!(
+            recovery,
+            MutationRecovery::Indeterminate {
+                bytes_restored: false,
+                instruction_cache_flushed: false,
+                protection_restored: false,
+            }
+        );
+        assert_eq!(operations.count(RecordedMutationOperation::Write), 1);
+        assert_eq!(operations.bytes, REPLACEMENT_BYTES);
+    }
+
+    #[test]
+    fn recovery_never_touches_a_replacement_allocation() {
+        let mut operations = FaultMutationOperations::new();
+        operations.fail_flush_calls.push(1);
+        operations.replace_allocation_on_flush_failure = true;
+
+        let (stage, recovery) = mutation_failure_parts(run_fault_transaction(&mut operations));
+
+        assert_eq!(stage, MutationStage::FlushReplacement);
+        assert_eq!(
+            recovery,
+            MutationRecovery::Indeterminate {
+                bytes_restored: false,
+                instruction_cache_flushed: false,
+                protection_restored: false,
+            }
+        );
+        assert_ne!(
+            operations.current_allocation,
+            operations.retained_allocation
+        );
+        assert_eq!(operations.count(RecordedMutationOperation::Write), 1);
+        assert_eq!(operations.count(RecordedMutationOperation::Restore), 0);
+        assert_eq!(operations.bytes, REPLACEMENT_BYTES);
+        assert_eq!(operations.protection, PAGE_EXECUTE_READWRITE);
     }
 
     #[test]
