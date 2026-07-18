@@ -9,16 +9,16 @@ pub enum AnalysisError {
     UnsupportedBinaryFormat { magic: String },
     #[error("invalid ELF signature: expected 7f 45 4c 46")]
     InvalidElfSignature,
-    #[error("unsupported ELF class {class}; only ELF32 ({expected}) is supported")]
-    UnsupportedElfClass { class: u8, expected: u8 },
-    #[error("unsupported ELF data encoding {data}; only little-endian ({expected}) is supported")]
-    UnsupportedElfDataEncoding { data: u8, expected: u8 },
+    #[error("invalid ELF class {class}; expected 1 (ELF32) or 2 (ELF64)")]
+    UnsupportedElfClass { class: u8 },
+    #[error("invalid ELF data encoding {data}; expected 1 (little-endian) or 2 (big-endian)")]
+    UnsupportedElfDataEncoding { data: u8 },
     #[error("unsupported ELF {context} version {version}; only version 1 is supported")]
     UnsupportedElfVersion { version: u32, context: &'static str },
-    #[error("unsupported ELF type {elf_type:#06x}; only ET_EXEC ({expected:#06x}) is supported")]
-    UnsupportedElfType { elf_type: u16, expected: u16 },
-    #[error("unsupported ELF machine {machine:#06x}; only EM_MIPS ({expected:#06x}) is supported")]
-    UnsupportedElfMachine { machine: u16, expected: u16 },
+    #[error(
+        "unsupported ELF type {elf_type:#06x}; only ET_EXEC (0x0002) and ET_DYN (0x0003) are supported"
+    )]
+    UnsupportedElfType { elf_type: u16 },
     #[error("invalid DOS signature: expected MZ, found {found}")]
     InvalidDosSignature { found: String },
     #[error("invalid PE signature at file offset {offset:#x}")]
@@ -76,6 +76,10 @@ pub enum AnalysisError {
         second: usize,
         space: &'static str,
     },
+    #[error("invalid Mach-O magic (first bytes: {magic})")]
+    InvalidMachOMagic { magic: String },
+    #[error("Mach-O fat slice {index} is not a supported thin Mach-O image")]
+    InvalidMachOSlice { index: u32 },
     #[error("failed to construct a validated symbol claim: {0}")]
     Claim(#[from] ClaimValidationError),
     #[error("failed to construct the symbol graph: {0}")]

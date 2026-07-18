@@ -9,6 +9,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+capstone = { version = "0.13", optional = true }
 iced-x86 = { version = "=1.21.0", default-features = false, features = ["std", "decoder", "instr_info", "intel"] }
 msvc-demangler = "=0.11.0"
 resymbol-core = { path = "../resymbol-core" }
@@ -16,6 +17,9 @@ resymbol-package = { path = "../resymbol-package" }
 semver = "1.0.26"
 serde = { version = "1.0.219", features = ["derive"] }
 thiserror = "2.0.12"
+
+[features]
+capstone = ["dep:capstone"]
 
 [dev-dependencies]
 serde_json = "1.0.140"

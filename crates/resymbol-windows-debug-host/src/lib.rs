@@ -21,12 +21,14 @@ use std::{marker::PhantomData, rc::Rc};
 use resymbol_debugger::{
     CapabilityAvailability, CapabilityReport, CapabilityStatus, CapabilityUnavailableCode,
     CommandId, DebugCapability, LiveTargetBinding, LiveTargetBindingError, MemoryAddress,
-    MemoryWriteFailure, ProcessId, RemoteCommandCheckpoint, StopToken, ThreadId,
+    MemoryWriteFailure, ProcessId, StopToken, ThreadId,
 };
 use thiserror::Error;
 
 #[cfg(any(windows, test))]
-use resymbol_debugger::{MAX_MEMORY_WRITE_BYTES, ValidatedLiveMemoryWrite};
+use resymbol_debugger::{
+    MAX_MEMORY_WRITE_BYTES, RemoteCommandCheckpoint, ValidatedLiveMemoryWrite,
+};
 
 #[cfg(windows)]
 mod windows;

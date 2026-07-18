@@ -24,7 +24,7 @@ use resymbol_core::{
     },
 };
 use resymbol_export::{
-    ExportLossReport, ExportProjection, ExportTarget, MAX_MAP_MODULE_NAME_BYTES,
+    ExportLossReport, ExportProjection, ExportTarget, MAX_MAP_MODULE_NAME_BYTES, render_dwarf,
     render_ghidra_java, render_ida_python, render_map, render_markdown, render_pdb,
     validate_ghidra_java_class_name,
 };
@@ -90,6 +90,8 @@ enum Command {
     Patch(PatchArgs),
     /// Inspect and manage discovered plugins.
     Plugin(PluginArgs),
+    /// Serve a live process (Linux) or an ELF core dump over the GDB Remote Serial Protocol.
+    Gdbserver(GdbserverArgs),
 }
 
 #[derive(Debug, Args)]
@@ -183,6 +185,8 @@ enum ExportFormat {
     IdaPython,
     #[value(name = "ghidra-java")]
     GhidraJava,
+    #[value(name = "dwarf")]
+    Dwarf,
 }
 
 impl ExportFormat {
@@ -194,6 +198,7 @@ impl ExportFormat {
             Self::Pdb => "exact-RSDS public-symbol PDB",
             Self::IdaPython => "IDA Python",
             Self::GhidraJava => "Ghidra Java",
+            Self::Dwarf => "DWARF ELF debug companion",
         }
     }
 
@@ -205,6 +210,7 @@ impl ExportFormat {
             Self::Pdb => ExportTarget::Pdb,
             Self::IdaPython => ExportTarget::IdaPython,
             Self::GhidraJava => ExportTarget::GhidraJava,
+            Self::Dwarf => ExportTarget::Dwarf,
         }
     }
 }
@@ -238,6 +244,229 @@ enum PluginCommand {
     Reset { id: String },
 }
 
+/// Default TCP address served when neither `--tcp` nor `--serial` is given.
+const DEFAULT_GDBSERVER_TCP_ADDR: &str = "127.0.0.1:1234";
+
+#[derive(Debug, Args)]
+struct GdbserverArgs {
+    /// Program to launch under the ptrace host (mutually exclusive with `--attach`).
+    #[arg(
+        value_name = "PROGRAM",
+        conflicts_with = "attach",
+        conflicts_with = "core"
+    )]
+    program: Option<String>,
+
+    /// Arguments passed to the launched program (everything after PROGRAM).
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    program_args: Vec<String>,
+
+    /// Attach to an already-running process by PID instead of launching one.
+    #[arg(long, value_name = "PID", conflicts_with = "core")]
+    attach: Option<i32>,
+
+    /// Serve a read-only, post-mortem view of an ELF core dump (all platforms).
+    #[arg(long, value_name = "FILE")]
+    core: Option<String>,
+
+    /// Serve over TCP at this address (e.g. 127.0.0.1:1234).
+    #[arg(long, value_name = "ADDR", conflicts_with = "serial")]
+    tcp: Option<String>,
+
+    /// Serve over this serial device (e.g. /dev/ttyS0).
+    #[arg(long, value_name = "DEVICE")]
+    serial: Option<String>,
+
+    /// Baud rate for `--serial`.
+    #[arg(long, value_name = "BAUD", default_value_t = 115_200)]
+    baud: u32,
+
+    /// Keep address-space layout randomization enabled (disabled by default for stable RVAs).
+    #[arg(long)]
+    aslr: bool,
+}
+
+/// What the `gdbserver` command should attach the RSP server to.
+enum GdbserverTarget {
+    /// Launch `program` with `arguments` (already including `argv[0]`).
+    Launch {
+        program: String,
+        arguments: Vec<String>,
+        disable_aslr: bool,
+    },
+    /// Attach to an already-running process by PID.
+    Attach(i32),
+}
+
+/// The link the `gdbserver` command should serve the RSP over.
+enum GdbserverTransport {
+    Tcp(String),
+    Serial { device: String, baud: u32 },
+}
+
+/// Resolve the mutually-exclusive target selector from the parsed arguments.
+fn resolve_gdbserver_target(args: &GdbserverArgs) -> Result<GdbserverTarget> {
+    match (&args.program, args.attach) {
+        (Some(program), None) => {
+            let mut arguments = Vec::with_capacity(args.program_args.len() + 1);
+            arguments.push(program.clone());
+            arguments.extend(args.program_args.iter().cloned());
+            Ok(GdbserverTarget::Launch {
+                program: program.clone(),
+                arguments,
+                disable_aslr: !args.aslr,
+            })
+        }
+        (None, Some(pid)) => Ok(GdbserverTarget::Attach(pid)),
+        (Some(_), Some(_)) => {
+            bail!("provide either a PROGRAM to launch or --attach <PID>, not both")
+        }
+        (None, None) => bail!("provide a PROGRAM to launch or --attach <PID>"),
+    }
+}
+
+/// Resolve the transport, defaulting to TCP on [`DEFAULT_GDBSERVER_TCP_ADDR`].
+fn resolve_gdbserver_transport(args: &GdbserverArgs) -> Result<GdbserverTransport> {
+    match (&args.tcp, &args.serial) {
+        (Some(_), Some(_)) => bail!("provide either --tcp or --serial, not both"),
+        (Some(addr), None) => Ok(GdbserverTransport::Tcp(addr.clone())),
+        (None, Some(device)) => Ok(GdbserverTransport::Serial {
+            device: device.clone(),
+            baud: args.baud,
+        }),
+        // Neither given: default to a local TCP endpoint.
+        (None, None) => Ok(GdbserverTransport::Tcp(
+            DEFAULT_GDBSERVER_TCP_ADDR.to_owned(),
+        )),
+    }
+}
+
+/// Serve `remote` over the resolved [`GdbserverTransport`].
+///
+/// Platform-independent for TCP; the serial branch is Unix-only (delegated to
+/// [`serve_serial`]).
+fn serve_target_over_transport<R>(remote: &mut R, transport: GdbserverTransport) -> Result<()>
+where
+    R: resymbol_gdb_remote::RemoteTarget,
+{
+    use resymbol_gdb_remote::{GdbStubServer, TcpServerListener};
+
+    match transport {
+        GdbserverTransport::Tcp(addr) => {
+            let listener = TcpServerListener::bind(&addr)
+                .with_context(|| format!("cannot bind TCP listener on {addr}"))?;
+            let bound = listener
+                .local_addr()
+                .with_context(|| format!("cannot query local address for {addr}"))?;
+            eprintln!("listening on {bound}; connect with: gdb -ex 'target remote {bound}'");
+            let connection = listener
+                .accept()
+                .with_context(|| format!("cannot accept a connection on {bound}"))?;
+            GdbStubServer::new(connection)
+                .serve(remote)
+                .context("gdb remote session failed")?;
+        }
+        GdbserverTransport::Serial { device, baud } => {
+            serve_serial(remote, &device, baud)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn serve_serial<R>(remote: &mut R, device: &str, baud: u32) -> Result<()>
+where
+    R: resymbol_gdb_remote::RemoteTarget,
+{
+    use resymbol_gdb_remote::{GdbStubServer, SerialTransport};
+
+    let connection = SerialTransport::open(device, baud)
+        .with_context(|| format!("cannot open serial device {device} at {baud} baud"))?;
+    eprintln!(
+        "serving on {device} at {baud} baud; connect with: \
+         gdb -ex 'set serial baud {baud}' -ex 'target remote {device}'"
+    );
+    GdbStubServer::new(connection)
+        .serve(remote)
+        .context("gdb remote session failed")?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn serve_serial<R>(_remote: &mut R, _device: &str, _baud: u32) -> Result<()>
+where
+    R: resymbol_gdb_remote::RemoteTarget,
+{
+    bail!("the serial transport is only supported on Unix; use --tcp instead")
+}
+
+/// Serve a read-only, post-mortem view of an ELF core dump. Platform-independent
+/// (pure parsing plus the shared transport path); no ptrace is involved.
+fn serve_core_dump(args: &GdbserverArgs, core_path: &str) -> Result<()> {
+    use resymbol_gdb_remote::{CoreDump, CoreDumpTarget};
+
+    let transport = resolve_gdbserver_transport(args)?;
+    let bytes =
+        fs::read(core_path).with_context(|| format!("cannot read core dump `{core_path}`"))?;
+    let core =
+        CoreDump::parse(&bytes).with_context(|| format!("cannot parse core dump `{core_path}`"))?;
+    eprintln!(
+        "serving read-only core dump `{core_path}` ({} PT_LOAD regions, stop signal {})",
+        core.regions().len(),
+        core.signal()
+    );
+    let mut remote = CoreDumpTarget::new(core);
+    serve_target_over_transport(&mut remote, transport)
+}
+
+fn gdbserver(args: GdbserverArgs) -> Result<()> {
+    // The core-dump path is pure parsing and works on every platform.
+    if let Some(core_path) = args.core.clone() {
+        return serve_core_dump(&args, &core_path);
+    }
+    gdbserver_live(args)
+}
+
+#[cfg(target_os = "linux")]
+fn gdbserver_live(args: GdbserverArgs) -> Result<()> {
+    use resymbol_gdb_remote::PtraceRemoteTarget;
+    use resymbol_linux_debug_host::{LaunchSpec, attach, launch};
+
+    let target = resolve_gdbserver_target(&args)?;
+    let transport = resolve_gdbserver_transport(&args)?;
+
+    let session = match target {
+        GdbserverTarget::Launch {
+            program,
+            arguments,
+            disable_aslr,
+        } => {
+            let mut spec = LaunchSpec::new(program.clone());
+            spec.arguments = arguments;
+            spec.disable_aslr = disable_aslr;
+            launch(&spec).with_context(|| format!("cannot launch program `{program}`"))?
+        }
+        GdbserverTarget::Attach(pid) => {
+            attach(pid).with_context(|| format!("cannot attach to process {pid}"))?
+        }
+    };
+
+    let mut remote = PtraceRemoteTarget::new(session);
+    serve_target_over_transport(&mut remote, transport)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn gdbserver_live(args: GdbserverArgs) -> Result<()> {
+    // Validate the argument shape so misuse is still reported off Linux, then
+    // report that live launch/attach is unsupported here. Core dumps
+    // (`--core`) are handled before this on every platform.
+    let _ = resolve_gdbserver_target(&args)?;
+    let _ = resolve_gdbserver_transport(&args)?;
+    bail!(
+        "live `resymbol gdbserver` launch/attach is only supported on Linux; use --core <FILE> to serve a core dump"
+    )
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -247,6 +476,7 @@ fn main() -> Result<()> {
         Command::Export(args) => export(args),
         Command::Patch(args) => patch_binary(args),
         Command::Plugin(args) => plugins(args, cli.safe_mode, cli.plugin_dir),
+        Command::Gdbserver(args) => gdbserver(args),
     }
 }
 
@@ -898,7 +1128,9 @@ fn read_analysis_package(
         11 => serde_json::from_value(payload).context("cannot decode schema-v11 analysis payload"),
         12 => serde_json::from_value(payload).context("cannot decode schema-v12 analysis payload"),
         13 => serde_json::from_value(payload).context("cannot decode schema-v13 analysis payload"),
-        14 => serde_json::from_value(payload).context("cannot decode current analysis payload"),
+        14 => serde_json::from_value(payload).context("cannot decode schema-v14 analysis payload"),
+        15 => serde_json::from_value(payload).context("cannot decode schema-v15 analysis payload"),
+        16 => serde_json::from_value(payload).context("cannot decode current analysis payload"),
         _ => bail!("unsupported analysis package schema {schema_version}"),
     })?;
     if (2..TRANSITIVE_THUNK_CHAIN_SCHEMA_VERSION).contains(&schema_version) {
@@ -1610,6 +1842,8 @@ impl SchemaV1PeAnalysis {
             strings: Vec::new(),
             data_reference_scan_truncated: false,
             data_references: Vec::new(),
+            cfg_scan_truncated: false,
+            control_flow_graphs: Vec::new(),
             msvc_rtti_scan_truncated: self.msvc_rtti_scan_truncated,
             msvc_rtti_vftables: self.msvc_rtti_vftables,
             symbol_graph: self.symbol_graph,
@@ -1716,6 +1950,9 @@ fn export(args: ExportArgs) -> Result<()> {
                 .context("cannot render Ghidra Java import script")?
                 .into_bytes()
         }
+        ExportFormat::Dwarf => render_dwarf(&projection)
+            .context("cannot render DWARF ELF debug companion")?
+            .into_bytes(),
     };
     if !dry_run {
         write_export_new(&output, &rendered)?;
@@ -1840,6 +2077,9 @@ fn export(args: ExportArgs) -> Result<()> {
         ExportFormat::IdaPython | ExportFormat::GhidraJava => println!(
             "identity gate: importer verifies the loaded program SHA-256 before any mutation"
         ),
+        ExportFormat::Dwarf => println!(
+            "identity notice: the DWARF companion addresses the image at its preferred base but carries no binary hash; load it only against the exact analyzed image"
+        ),
     }
 
     Ok(())
@@ -1865,6 +2105,7 @@ fn default_export_path(package: &Path, format: ExportFormat, binary_sha256: &str
         ExportFormat::Map => package.with_extension("map"),
         ExportFormat::Pdb => package.with_extension("pdb"),
         ExportFormat::IdaPython => package.with_extension("ida.py"),
+        ExportFormat::Dwarf => package.with_extension("debug"),
         ExportFormat::GhidraJava => {
             let prefix = binary_sha256
                 .get(..12)
@@ -4394,6 +4635,157 @@ entrypoint = "Plugin.dll"
     }
 
     #[test]
+    fn command_line_accepts_gdbserver_launch_over_tcp() {
+        let cli = Cli::try_parse_from([
+            "resymbol",
+            "gdbserver",
+            "--tcp",
+            "127.0.0.1:1234",
+            "/bin/true",
+        ])
+        .expect("gdbserver launch arguments parse");
+        let Command::Gdbserver(args) = cli.command else {
+            panic!("gdbserver command expected");
+        };
+        assert_eq!(args.program.as_deref(), Some("/bin/true"));
+        assert_eq!(args.attach, None);
+        assert_eq!(args.tcp.as_deref(), Some("127.0.0.1:1234"));
+        assert_eq!(args.serial, None);
+        assert_eq!(args.baud, 115_200);
+        // ASLR stays disabled by default (the flag keeps it on).
+        assert!(!args.aslr);
+
+        let GdbserverTarget::Launch {
+            program,
+            arguments,
+            disable_aslr,
+        } = resolve_gdbserver_target(&args).expect("target resolves")
+        else {
+            panic!("launch target expected");
+        };
+        assert_eq!(program, "/bin/true");
+        assert_eq!(arguments, ["/bin/true".to_owned()]);
+        assert!(disable_aslr);
+        assert!(matches!(
+            resolve_gdbserver_transport(&args).expect("transport resolves"),
+            GdbserverTransport::Tcp(addr) if addr == "127.0.0.1:1234"
+        ));
+    }
+
+    #[test]
+    fn command_line_accepts_gdbserver_attach_over_serial() {
+        let cli = Cli::try_parse_from([
+            "resymbol",
+            "gdbserver",
+            "--attach",
+            "123",
+            "--serial",
+            "/dev/ttyS0",
+        ])
+        .expect("gdbserver attach arguments parse");
+        let Command::Gdbserver(args) = cli.command else {
+            panic!("gdbserver command expected");
+        };
+        assert_eq!(args.program, None);
+        assert_eq!(args.attach, Some(123));
+        assert_eq!(args.tcp, None);
+        assert_eq!(args.serial.as_deref(), Some("/dev/ttyS0"));
+
+        assert!(matches!(
+            resolve_gdbserver_target(&args).expect("target resolves"),
+            GdbserverTarget::Attach(123)
+        ));
+        assert!(matches!(
+            resolve_gdbserver_transport(&args).expect("transport resolves"),
+            GdbserverTransport::Serial { device, baud } if device == "/dev/ttyS0" && baud == 115_200
+        ));
+    }
+
+    #[test]
+    fn gdbserver_rejects_both_program_and_attach() {
+        // clap's `conflicts_with` rejects supplying both selectors at parse time.
+        let error = Cli::try_parse_from(["resymbol", "gdbserver", "--attach", "1", "/bin/true"])
+            .expect_err("program and --attach are mutually exclusive");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn gdbserver_requires_a_target() {
+        let cli = Cli::try_parse_from(["resymbol", "gdbserver", "--tcp", "127.0.0.1:1234"])
+            .expect("arguments parse without a target selector");
+        let Command::Gdbserver(args) = cli.command else {
+            panic!("gdbserver command expected");
+        };
+        assert!(resolve_gdbserver_target(&args).is_err());
+    }
+
+    #[test]
+    fn gdbserver_defaults_to_local_tcp() {
+        let cli = Cli::try_parse_from(["resymbol", "gdbserver", "/bin/true"])
+            .expect("arguments parse without a transport selector");
+        let Command::Gdbserver(args) = cli.command else {
+            panic!("gdbserver command expected");
+        };
+        assert!(matches!(
+            resolve_gdbserver_transport(&args).expect("transport resolves"),
+            GdbserverTransport::Tcp(addr) if addr == DEFAULT_GDBSERVER_TCP_ADDR
+        ));
+    }
+
+    #[test]
+    fn command_line_accepts_gdbserver_core_over_tcp() {
+        let cli = Cli::try_parse_from([
+            "resymbol",
+            "gdbserver",
+            "--core",
+            "/tmp/x.core",
+            "--tcp",
+            "127.0.0.1:1234",
+        ])
+        .expect("gdbserver core arguments parse");
+        let Command::Gdbserver(args) = cli.command else {
+            panic!("gdbserver command expected");
+        };
+        assert_eq!(args.core.as_deref(), Some("/tmp/x.core"));
+        assert_eq!(args.program, None);
+        assert_eq!(args.attach, None);
+        assert_eq!(args.tcp.as_deref(), Some("127.0.0.1:1234"));
+        // A core is served over the resolved transport like any other target.
+        assert!(matches!(
+            resolve_gdbserver_transport(&args).expect("transport resolves"),
+            GdbserverTransport::Tcp(addr) if addr == "127.0.0.1:1234"
+        ));
+    }
+
+    #[test]
+    fn gdbserver_core_conflicts_with_a_program() {
+        // clap's `conflicts_with` rejects supplying both a core and a program.
+        let error = Cli::try_parse_from([
+            "resymbol",
+            "gdbserver",
+            "--core",
+            "/tmp/x.core",
+            "/bin/true",
+        ])
+        .expect_err("core and a positional program are mutually exclusive");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn gdbserver_core_conflicts_with_attach() {
+        let error = Cli::try_parse_from([
+            "resymbol",
+            "gdbserver",
+            "--core",
+            "/tmp/x.core",
+            "--attach",
+            "1",
+        ])
+        .expect_err("core and --attach are mutually exclusive");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
     fn command_line_accepts_all_export_formats() {
         for (value, expected) in [
             ("json", ExportFormat::Json),
@@ -5652,7 +6044,7 @@ entrypoint = "Plugin.dll"
 
         let package: ResymPackage<AnalysisSession> =
             read_file_bound(&output).expect("read bound package");
-        assert_eq!(CURRENT_SCHEMA_VERSION, 14);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 16);
         assert_eq!(package.schema_version(), CURRENT_SCHEMA_VERSION);
         assert_eq!(
             package.binary_sha256(),
@@ -5894,6 +6286,8 @@ entrypoint = "Plugin.dll"
             "strings",
             "data_reference_scan_truncated",
             "data_references",
+            "cfg_scan_truncated",
+            "control_flow_graphs",
         ] {
             pe.remove(field);
         }
@@ -6305,6 +6699,8 @@ entrypoint = "Plugin.dll"
         pe.remove("strings");
         pe.remove("data_reference_scan_truncated");
         pe.remove("data_references");
+        pe.remove("cfg_scan_truncated");
+        pe.remove("control_flow_graphs");
         let claims = pe
             .get_mut("symbol_graph")
             .and_then(|graph| graph.get_mut("claims"))
@@ -6489,6 +6885,8 @@ entrypoint = "Plugin.dll"
         pe.remove("strings");
         pe.remove("data_reference_scan_truncated");
         pe.remove("data_references");
+        pe.remove("cfg_scan_truncated");
+        pe.remove("control_flow_graphs");
         let claims = pe
             .get_mut("symbol_graph")
             .and_then(|graph| graph.get_mut("claims"))
@@ -6998,16 +7396,16 @@ entrypoint = "Plugin.dll"
     }
 
     #[test]
-    fn cli_rejects_schema_v15_before_decoding_the_analysis_payload() {
+    fn cli_rejects_schema_v17_before_decoding_the_analysis_payload() {
         let temp = tempfile::tempdir().expect("create temporary directory");
-        let path = temp.path().join("schema-v15.resym");
+        let path = temp.path().join("schema-v17.resym");
         let base_analysis = analyze_bytes(&pe_fixture()).expect("analyze PE fixture");
         let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
             .expect("create base-only session");
         let package = ResymPackage::from_bound_payload("0.1.0-future", session)
             .expect("create current package value");
         let mut value = serde_json::to_value(package).expect("serialize package value");
-        value["schema_version"] = serde_json::json!(15);
+        value["schema_version"] = serde_json::json!(17);
         value["payload"] = serde_json::json!("not an analysis session");
         fs::write(
             &path,
@@ -7016,12 +7414,12 @@ entrypoint = "Plugin.dll"
         .expect("write future package");
 
         let error = match read_analysis_package(&path, false) {
-            Ok(_) => panic!("schema 15 must be rejected"),
+            Ok(_) => panic!("schema 17 must be rejected"),
             Err(error) => error,
         };
         let diagnostic = format!("{error:#}");
-        assert!(diagnostic.contains("unsupported package schema 15"));
-        assert!(diagnostic.contains("schemas 1 through 14"));
+        assert!(diagnostic.contains("unsupported package schema 17"));
+        assert!(diagnostic.contains("schemas 1 through 16"));
         assert!(!diagnostic.contains("analysis payload"));
     }
 
@@ -7164,7 +7562,7 @@ entrypoint = "Plugin.dll"
                 Err(error) => error,
             };
             let diagnostic = format!("{error:#}");
-            assert!(diagnostic.contains("package schema 14 requires an explicit"));
+            assert!(diagnostic.contains("package schema 16 requires an explicit"));
             assert!(diagnostic.contains("load_config_guard_memcpy_anchor object"));
             assert!(diagnostic.contains("cannot be migrated by changing only its envelope label"));
             assert!(!diagnostic.contains("schema-12"));
@@ -7340,7 +7738,7 @@ entrypoint = "Plugin.dll"
             Err(error) => error,
         };
         let diagnostic = format!("{error:#}");
-        assert!(diagnostic.contains("package schema 14 requires an explicit"));
+        assert!(diagnostic.contains("package schema 16 requires an explicit"));
         assert!(diagnostic.contains("load_config_xfg_anchors object"));
         assert!(!diagnostic.contains("load_config_guard_memcpy_anchor object"));
     }
@@ -7546,7 +7944,7 @@ entrypoint = "Plugin.dll"
             Err(error) => error,
         };
         let diagnostic = format!("{error:#}");
-        assert!(diagnostic.contains("package schema 14 requires an explicit"));
+        assert!(diagnostic.contains("package schema 16 requires an explicit"));
         assert!(diagnostic.contains("load_config_security_anchors object"));
         assert!(!diagnostic.contains("load_config_guard_memcpy_anchor object"));
         assert!(!diagnostic.contains("load_config_xfg_anchors object"));

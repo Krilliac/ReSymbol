@@ -29,6 +29,7 @@ pub enum ExportTarget {
     Pdb,
     IdaPython,
     GhidraJava,
+    Dwarf,
 }
 
 impl ExportTarget {
@@ -41,6 +42,7 @@ impl ExportTarget {
             Self::Pdb => "pdb",
             Self::IdaPython => "ida-python",
             Self::GhidraJava => "ghidra-java",
+            Self::Dwarf => "dwarf",
         }
     }
 }
@@ -200,6 +202,7 @@ impl ExportLossReport {
             ExportTarget::IdaPython | ExportTarget::GhidraJava => {
                 mutation_losses(projection, &mut losses)
             }
+            ExportTarget::Dwarf => dwarf_losses(projection, &mut losses),
         }
         Ok(Self {
             target,
@@ -406,6 +409,108 @@ fn mutation_losses(projection: &ExportProjection, losses: &mut LossAccumulator) 
         }
     }
     common_non_json_losses(projection, losses);
+}
+
+fn dwarf_losses(projection: &ExportProjection, losses: &mut LossAccumulator) {
+    // The DWARF companion embeds the target architecture (as the ELF machine)
+    // and the virtual image span (as the compile unit's low/high PC). The
+    // remaining neutral identity fields have no honest DWARF home: the exact
+    // binary SHA-256, the file size, the container format, and the projection
+    // schema version.
+    losses.add(ExportLossCode::ProjectionMetadataOmitted, 4);
+
+    // Every function becomes a subprogram (named exactly, sized via high_pc when
+    // known), so no function or function size is dropped. Globals need a name to
+    // be useful as a variable DIE; an unnamed global has no target record. A
+    // global's byte extent is never represented, because the writer does not
+    // synthesize a type for the variable.
+    for global in &projection.globals {
+        if global.selected_name.is_none() {
+            losses.add(ExportLossCode::GlobalOmitted, 1);
+        }
+        if global.size.is_some() {
+            losses.add(ExportLossCode::GlobalSizeOmitted, 1);
+        }
+    }
+
+    // Named types become class DIEs; unnamed types cannot.
+    losses.add_usize(
+        ExportLossCode::TypeOmitted,
+        projection
+            .types
+            .iter()
+            .filter(|value| value.selected_name.is_none())
+            .count(),
+    );
+
+    // The remaining neutral relationships have no DWARF representation here.
+    // Alternate names, prototypes, provenance, and confidence are all dropped;
+    // class memberships are consumed to build class shells and inheritance, but
+    // the function->method binding itself is never emitted, so each membership
+    // is still counted as a loss. Type definitions contribute only the class
+    // name, never their member layout.
+    losses.add_usize(
+        ExportLossCode::AlternateNameOmitted,
+        projection
+            .functions
+            .iter()
+            .map(|value| value.alternate_names.len())
+            .chain(
+                projection
+                    .globals
+                    .iter()
+                    .map(|value| value.alternate_names.len()),
+            )
+            .chain(
+                projection
+                    .types
+                    .iter()
+                    .map(|value| value.alternate_names.len()),
+            )
+            .sum(),
+    );
+    losses.add_usize(
+        ExportLossCode::PrototypeOmitted,
+        projection
+            .functions
+            .iter()
+            .map(|value| value.prototypes.len())
+            .sum(),
+    );
+    losses.add_usize(
+        ExportLossCode::ClassMembershipOmitted,
+        projection
+            .functions
+            .iter()
+            .map(|value| value.class_memberships.len())
+            .sum(),
+    );
+    losses.add_usize(
+        ExportLossCode::TypeDefinitionOmitted,
+        projection
+            .types
+            .iter()
+            .map(|value| value.definitions.len())
+            .sum(),
+    );
+    losses.add_usize(
+        ExportLossCode::DirectCallOmitted,
+        projection.direct_calls.len(),
+    );
+    losses.add_usize(ExportLossCode::ThunkOmitted, projection.thunks.len());
+    losses.add_usize(ExportLossCode::StringOmitted, projection.strings.len());
+    losses.add_usize(
+        ExportLossCode::DataReferenceOmitted,
+        projection.data_references.len(),
+    );
+    losses.add_usize(
+        ExportLossCode::ProjectionWarningOmitted,
+        projection.warnings.len(),
+    );
+    losses.add_usize(
+        ExportLossCode::AttributionOmitted,
+        attribution_count(projection),
+    );
 }
 
 fn common_non_json_losses(projection: &ExportProjection, losses: &mut LossAccumulator) {

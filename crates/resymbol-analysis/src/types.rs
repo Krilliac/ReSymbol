@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 pub enum BinaryAnalysis {
     Pe(PeAnalysis),
     Elf(ElfAnalysis),
+    MachO(MachOAnalysis),
 }
 
 impl BinaryAnalysis {
@@ -17,6 +18,7 @@ impl BinaryAnalysis {
         match self {
             Self::Pe(analysis) => &analysis.identity,
             Self::Elf(analysis) => &analysis.identity,
+            Self::MachO(analysis) => &analysis.identity,
         }
     }
 
@@ -26,6 +28,7 @@ impl BinaryAnalysis {
         match self {
             Self::Pe(analysis) => &analysis.symbol_graph,
             Self::Elf(analysis) => &analysis.symbol_graph,
+            Self::MachO(analysis) => &analysis.symbol_graph,
         }
     }
 
@@ -34,6 +37,7 @@ impl BinaryAnalysis {
         match self {
             Self::Pe(analysis) => analysis.validate(),
             Self::Elf(analysis) => analysis.validate(),
+            Self::MachO(analysis) => analysis.validate(),
         }
     }
 
@@ -43,32 +47,53 @@ impl BinaryAnalysis {
         match self {
             Self::Pe(analysis) => analysis.size_of_image as u64,
             Self::Elf(analysis) => analysis.image_size,
+            Self::MachO(analysis) => analysis.image_size,
         }
     }
 }
 
-/// Deterministic, container-only analysis of an ELF32 little-endian `EM_MIPS` image.
+/// ELF file class read from `e_ident[EI_CLASS]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ElfClass {
+    Elf32,
+    Elf64,
+}
+
+/// ELF byte order read from `e_ident[EI_DATA]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ElfEndian {
+    Little,
+    Big,
+}
+
+/// Deterministic, container-only analysis of a bounded ELF image.
 ///
-/// This model deliberately makes no instruction-set or ABI claim beyond the exact
-/// ELF container fields. In particular, `EM_MIPS` does not imply that a generic
-/// MIPS32 decoder is correct for a PlayStation 2 Emotion Engine executable.
+/// Both ELF32 and ELF64, either byte order, and any `e_machine` value are
+/// accepted; container parsing is machine-independent. This model deliberately
+/// makes no instruction-set or ABI claim beyond the exact ELF container fields.
+/// In particular, `EM_MIPS` does not imply that a generic MIPS32 decoder is
+/// correct for a PlayStation 2 Emotion Engine executable.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "UncheckedElfAnalysis")]
 pub struct ElfAnalysis {
     pub identity: BinaryIdentity,
+    pub class: ElfClass,
+    pub endian: ElfEndian,
     pub os_abi: u8,
     pub abi_version: u8,
     pub elf_type: u16,
     pub machine: u16,
     pub elf_version: u32,
-    pub entry_va: u32,
-    pub entry_rva: u32,
+    pub entry_va: u64,
+    pub entry_rva: u64,
     pub flags: u32,
     pub header_size: u16,
-    pub program_header_offset: u32,
+    pub program_header_offset: u64,
     pub program_header_entry_size: u16,
     pub program_headers: Vec<ElfProgramHeader>,
-    pub section_header_offset: u32,
+    pub section_header_offset: u64,
     pub section_header_entry_size: u16,
     pub section_name_table_index: u16,
     pub section_headers: Vec<ElfSectionHeader>,
@@ -76,19 +101,25 @@ pub struct ElfAnalysis {
     pub load_segments: Vec<ElfLoadSegment>,
     /// Half-open RVA extent from the lowest mapped VA to the highest mapped end.
     pub image_size: u64,
-    /// Container intake contributes the exact binary identity and no symbol claims.
+    /// Bounded symbols recovered from `SHT_SYMTAB`/`SHT_DYNSYM` tables.
+    #[serde(default)]
+    pub symbols: Vec<ElfSymbol>,
+    /// Whether the symbol scan hit its fixed retention cap before finishing.
+    #[serde(default)]
+    pub symbol_scan_truncated: bool,
+    /// Exact binary identity plus deterministic function/global name claims.
     pub symbol_graph: SymbolGraph,
 }
 
 impl ElfAnalysis {
-    /// Validate cross-field invariants and the deterministic empty base graph.
+    /// Validate cross-field invariants and the deterministic base graph.
     pub fn validate(&self) -> Result<(), crate::AnalysisError> {
         crate::elf::validate_elf_analysis(self)
     }
 
-    /// Rebuild the base graph from exact container identity only.
+    /// Rebuild the base graph deterministically from stored container fields.
     pub fn rebuild_symbol_graph(&self) -> Result<SymbolGraph, crate::AnalysisError> {
-        crate::elf::build_symbol_graph(&self.identity)
+        crate::elf::build_symbol_graph(&self.identity, &self.symbols, &self.load_segments)
     }
 }
 
@@ -96,24 +127,30 @@ impl ElfAnalysis {
 #[serde(deny_unknown_fields)]
 struct UncheckedElfAnalysis {
     identity: BinaryIdentity,
+    class: ElfClass,
+    endian: ElfEndian,
     os_abi: u8,
     abi_version: u8,
     elf_type: u16,
     machine: u16,
     elf_version: u32,
-    entry_va: u32,
-    entry_rva: u32,
+    entry_va: u64,
+    entry_rva: u64,
     flags: u32,
     header_size: u16,
-    program_header_offset: u32,
+    program_header_offset: u64,
     program_header_entry_size: u16,
     program_headers: Vec<ElfProgramHeader>,
-    section_header_offset: u32,
+    section_header_offset: u64,
     section_header_entry_size: u16,
     section_name_table_index: u16,
     section_headers: Vec<ElfSectionHeader>,
     load_segments: Vec<ElfLoadSegment>,
     image_size: u64,
+    #[serde(default)]
+    symbols: Vec<ElfSymbol>,
+    #[serde(default)]
+    symbol_scan_truncated: bool,
     symbol_graph: SymbolGraph,
 }
 
@@ -123,6 +160,8 @@ impl TryFrom<UncheckedElfAnalysis> for ElfAnalysis {
     fn try_from(value: UncheckedElfAnalysis) -> Result<Self, Self::Error> {
         let analysis = Self {
             identity: value.identity,
+            class: value.class,
+            endian: value.endian,
             os_abi: value.os_abi,
             abi_version: value.abi_version,
             elf_type: value.elf_type,
@@ -141,6 +180,8 @@ impl TryFrom<UncheckedElfAnalysis> for ElfAnalysis {
             section_headers: value.section_headers,
             load_segments: value.load_segments,
             image_size: value.image_size,
+            symbols: value.symbols,
+            symbol_scan_truncated: value.symbol_scan_truncated,
             symbol_graph: value.symbol_graph,
         };
         analysis.validate()?;
@@ -148,22 +189,22 @@ impl TryFrom<UncheckedElfAnalysis> for ElfAnalysis {
     }
 }
 
-/// One exact 32-byte ELF32 program-header record.
+/// One exact ELF program-header record, widened to hold ELF64 fields.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ElfProgramHeader {
     pub table_index: u16,
     pub segment_type: u32,
-    pub file_offset: u32,
-    pub virtual_address: u32,
-    pub physical_address: u32,
-    pub file_size: u32,
-    pub memory_size: u32,
+    pub file_offset: u64,
+    pub virtual_address: u64,
+    pub physical_address: u64,
+    pub file_size: u64,
+    pub memory_size: u64,
     pub flags: u32,
     pub alignment: u32,
 }
 
-/// One exact 40-byte ELF32 section-header record.
+/// One exact ELF section-header record, widened to hold ELF64 fields.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ElfSectionHeader {
@@ -171,13 +212,13 @@ pub struct ElfSectionHeader {
     pub name_offset: u32,
     pub section_type: u32,
     pub flags: u32,
-    pub virtual_address: u32,
-    pub file_offset: u32,
-    pub size: u32,
+    pub virtual_address: u64,
+    pub file_offset: u64,
+    pub size: u64,
     pub link: u32,
     pub info: u32,
-    pub address_alignment: u32,
-    pub entry_size: u32,
+    pub address_alignment: u64,
+    pub entry_size: u64,
 }
 
 /// One non-empty sparse `PT_LOAD` mapping, sorted by virtual address.
@@ -185,12 +226,27 @@ pub struct ElfSectionHeader {
 #[serde(deny_unknown_fields)]
 pub struct ElfLoadSegment {
     pub program_header_index: u16,
-    pub file_offset: u32,
-    pub file_size: u32,
-    pub virtual_address: u32,
-    pub memory_size: u32,
+    pub file_offset: u64,
+    pub file_size: u64,
+    pub virtual_address: u64,
+    pub memory_size: u64,
     pub flags: u32,
     pub alignment: u32,
+}
+
+/// One bounded symbol recovered from an ELF `SHT_SYMTAB`/`SHT_DYNSYM` table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ElfSymbol {
+    /// Zero-based position within its source symbol table.
+    pub table_index: u32,
+    /// Non-empty name resolved from the linked string table.
+    pub name: String,
+    pub value: u64,
+    pub size: u64,
+    pub info: u8,
+    pub other: u8,
+    pub section_index: u16,
 }
 
 impl ElfLoadSegment {
@@ -208,6 +264,213 @@ impl ElfLoadSegment {
     pub const fn executable(&self) -> bool {
         self.flags & 1 != 0
     }
+}
+
+/// Mach-O byte order carried by a thin image's magic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MachOEndian {
+    Little,
+    Big,
+}
+
+/// Deterministic, container-only analysis of a bounded Mach-O image.
+///
+/// Thin images (32- or 64-bit, either byte order, any `cputype`) contribute
+/// exact segment, section, and symbol metadata plus deterministic
+/// function/global name claims. Fat/universal images retain every architecture
+/// slice's container metadata but deliberately keep an identity-only symbol
+/// graph: a single whole-file binary id cannot host per-architecture RVA claims
+/// without collisions across slices, so no per-symbol claim is emitted.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "UncheckedMachOAnalysis")]
+pub struct MachOAnalysis {
+    pub identity: BinaryIdentity,
+    /// Half-open virtual image extent. For a fat container this is the maximum
+    /// slice image size, since one identity must expose a single `image_size`.
+    pub image_size: u64,
+    pub container: MachOContainer,
+    /// Exact identity plus deterministic name claims (thin) or identity-only (fat).
+    pub symbol_graph: SymbolGraph,
+}
+
+impl MachOAnalysis {
+    /// Validate cross-field invariants and the deterministic base graph.
+    pub fn validate(&self) -> Result<(), crate::AnalysisError> {
+        crate::macho::validate_macho_analysis(self)
+    }
+
+    /// Rebuild the base graph deterministically from stored container fields.
+    pub fn rebuild_symbol_graph(&self) -> Result<SymbolGraph, crate::AnalysisError> {
+        crate::macho::build_symbol_graph(&self.identity, &self.container)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UncheckedMachOAnalysis {
+    identity: BinaryIdentity,
+    image_size: u64,
+    container: MachOContainer,
+    symbol_graph: SymbolGraph,
+}
+
+impl TryFrom<UncheckedMachOAnalysis> for MachOAnalysis {
+    type Error = crate::AnalysisError;
+
+    fn try_from(value: UncheckedMachOAnalysis) -> Result<Self, Self::Error> {
+        let analysis = Self {
+            identity: value.identity,
+            image_size: value.image_size,
+            container: value.container,
+            symbol_graph: value.symbol_graph,
+        };
+        analysis.validate()?;
+        Ok(analysis)
+    }
+}
+
+/// A thin single-architecture image or a fat/universal container of slices.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "body", rename_all = "kebab-case")]
+pub enum MachOContainer {
+    Thin(MachOImage),
+    Fat(MachOFat),
+}
+
+/// One parsed thin Mach-O image: header facts plus bounded container tables.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MachOImage {
+    pub endian: MachOEndian,
+    /// Whether the container magic selected the 64-bit header and record widths.
+    pub is_64: bool,
+    pub cputype: i32,
+    pub cpusubtype: i32,
+    pub filetype: u32,
+    pub ncmds: u32,
+    pub flags: u32,
+    /// Lowest non-`__PAGEZERO` segment virtual address.
+    pub image_base: u64,
+    /// Half-open virtual extent from `image_base` to the highest mapped end.
+    pub image_size: u64,
+    /// `LC_MAIN` entry file offset, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_offset: Option<u64>,
+    /// Whether an `LC_UNIXTHREAD` entry-state command was present.
+    #[serde(default)]
+    pub has_unixthread: bool,
+    pub segments: Vec<MachOSegment>,
+    /// Sections flattened in load order; a symbol's `n_sect` is a 1-based index.
+    pub sections: Vec<MachOSection>,
+    #[serde(default)]
+    pub symbols: Vec<MachOSymbol>,
+    /// Whether the symbol scan hit its fixed retention cap before finishing.
+    #[serde(default)]
+    pub symbol_scan_truncated: bool,
+}
+
+/// A fat/universal container's architecture slices.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MachOFat {
+    /// Whether the fat header used the 64-bit (`FAT_MAGIC_64`) arch records.
+    pub is_64: bool,
+    pub slices: Vec<MachOArchSlice>,
+}
+
+/// One architecture slice of a fat/universal container.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MachOArchSlice {
+    /// Zero-based position in the fat architecture table.
+    pub index: u32,
+    pub cputype: i32,
+    pub cpusubtype: i32,
+    /// Byte offset of this slice within the whole fat file.
+    pub offset: u64,
+    /// Byte length of this slice within the whole fat file.
+    pub size: u64,
+    /// Power-of-two alignment exponent declared by the fat record.
+    pub align: u32,
+    /// Canonical architecture string for this slice's image.
+    pub architecture: String,
+    /// The thin image parsed from this slice's sub-range.
+    pub image: MachOImage,
+}
+
+/// One Mach-O segment load command, widened to hold 64-bit fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MachOSegment {
+    /// Zero-based position among the image's segment load commands.
+    pub index: u32,
+    /// Printable, escaped representation of the fixed-width segment name.
+    pub name: String,
+    /// The exact sixteen bytes of the segment name field.
+    pub raw_name: [u8; 16],
+    pub vmaddr: u64,
+    pub vmsize: u64,
+    pub fileoff: u64,
+    pub filesize: u64,
+    pub maxprot: i32,
+    pub initprot: i32,
+    pub nsects: u32,
+    pub flags: u32,
+    /// Index of this segment's first section in the flat `sections` list.
+    pub first_section: u32,
+}
+
+impl MachOSegment {
+    #[must_use]
+    pub const fn readable(&self) -> bool {
+        self.initprot & 0x1 != 0
+    }
+
+    #[must_use]
+    pub const fn writable(&self) -> bool {
+        self.initprot & 0x2 != 0
+    }
+
+    #[must_use]
+    pub const fn executable(&self) -> bool {
+        self.initprot & 0x4 != 0
+    }
+}
+
+/// One Mach-O section record, widened to hold 64-bit fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MachOSection {
+    /// Zero-based position in the flat, load-ordered section list.
+    pub index: u32,
+    /// Index of the owning segment in the image's `segments` list.
+    pub segment_index: u32,
+    pub name: String,
+    pub raw_name: [u8; 16],
+    pub segment_name: String,
+    pub raw_segment_name: [u8; 16],
+    pub addr: u64,
+    pub size: u64,
+    pub offset: u32,
+    pub align: u32,
+    pub reloff: u32,
+    pub nreloc: u32,
+    pub flags: u32,
+}
+
+/// One bounded symbol recovered from a Mach-O `LC_SYMTAB` string/nlist table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MachOSymbol {
+    /// Zero-based position within the symbol table.
+    pub table_index: u32,
+    /// Non-empty name resolved from the linked string table.
+    pub name: String,
+    pub n_type: u8,
+    pub n_sect: u8,
+    pub n_desc: u16,
+    pub n_value: u64,
 }
 
 /// Deterministic analysis of one PE32+ x86-64 image.
@@ -326,6 +589,15 @@ pub struct PeAnalysis {
     /// Canonical x64 RIP-relative references from runtime-function code to PE data.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub data_references: Vec<PeDataReference>,
+    /// Whether bounded control-flow reconstruction stopped before every reachable
+    /// basic block was retained.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cfg_scan_truncated: bool,
+    /// Per-function basic-block control-flow graphs derived from the same bounded
+    /// control-flow-guided sweep that produces the direct-call and data-reference
+    /// inventories. Ordered by `entry_rva`; empty for schema<=15 packages.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub control_flow_graphs: Vec<FunctionCfg>,
     /// Whether RTTI discovery stopped after its fixed read-only-data scan budget.
     #[serde(default, skip_serializing_if = "is_false")]
     pub msvc_rtti_scan_truncated: bool,
@@ -441,6 +713,10 @@ struct UncheckedPeAnalysis {
     #[serde(default)]
     data_references: Vec<PeDataReference>,
     #[serde(default)]
+    cfg_scan_truncated: bool,
+    #[serde(default)]
+    control_flow_graphs: Vec<FunctionCfg>,
+    #[serde(default)]
     msvc_rtti_scan_truncated: bool,
     #[serde(default)]
     msvc_rtti_vftables: Vec<MsvcRttiVftable>,
@@ -492,6 +768,8 @@ impl TryFrom<UncheckedPeAnalysis> for PeAnalysis {
             strings: value.strings,
             data_reference_scan_truncated: value.data_reference_scan_truncated,
             data_references: value.data_references,
+            cfg_scan_truncated: value.cfg_scan_truncated,
+            control_flow_graphs: value.control_flow_graphs,
             msvc_rtti_scan_truncated: value.msvc_rtti_scan_truncated,
             msvc_rtti_vftables: value.msvc_rtti_vftables,
             symbol_graph: value.symbol_graph,
@@ -860,6 +1138,80 @@ pub struct PeDataReference {
     pub instruction_rva: u32,
     pub instruction_size: u8,
     pub target_rva: u32,
+}
+
+/// How the last instruction of a basic block transfers control.
+///
+/// Derived from the architecture-neutral flow classification of the block's
+/// terminating instruction. `Call` is reserved for callers that choose to split
+/// blocks after a call; the bounded PE sweep treats calls as fall-through within
+/// a block and therefore never emits it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CfgTerminator {
+    /// The block ends because its successor is a branch target; control falls
+    /// through into the next block.
+    FallThrough,
+    /// The block ends with a return.
+    Return,
+    /// The block ends with an unconditional near branch.
+    UnconditionalBranch,
+    /// The block ends with a conditional near branch.
+    ConditionalBranch,
+    /// The block ends with an indirect branch whose targets are not resolved.
+    IndirectBranch,
+    /// The block ends with a call treated as a terminator.
+    Call,
+    /// The block ends at an interrupt, privileged, undefined, or otherwise
+    /// non-continuing instruction with no invented successors.
+    Invalid,
+}
+
+/// How one basic-block successor edge is reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CfgEdgeKind {
+    /// Sequential fall-through into the next block.
+    FallThrough,
+    /// The single successor of an unconditional branch.
+    Branch,
+    /// The taken side of a conditional branch.
+    BranchTaken,
+    /// The not-taken (fall-through) side of a conditional branch.
+    BranchNotTaken,
+    /// A call edge, reserved for callers that split blocks after a call.
+    Call,
+}
+
+/// One successor edge of a basic block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CfgEdge {
+    pub kind: CfgEdgeKind,
+    /// Resolved in-image destination RVA, or `None` for an unresolved indirect edge.
+    pub target_rva: Option<u32>,
+}
+
+/// One basic block: a maximal straight-line instruction run with a single
+/// terminator. `end_rva` is the half-open end, i.e. the first RVA after the block.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BasicBlock {
+    pub start_rva: u32,
+    pub end_rva: u32,
+    pub terminator: CfgTerminator,
+    pub successors: Vec<CfgEdge>,
+}
+
+/// A per-function control-flow graph reconstructed from the bounded sweep.
+///
+/// Blocks are strictly sorted by `start_rva` and never overlap; the first block
+/// begins at `entry_rva`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FunctionCfg {
+    pub entry_rva: u32,
+    pub blocks: Vec<BasicBlock>,
 }
 
 /// One validated MSVC x64 vftable and its Rev1 RTTI metadata.

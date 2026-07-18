@@ -11,6 +11,8 @@ authors.workspace = true
 [dependencies]
 resymbol-analysis = { path = "../resymbol-analysis" }
 resymbol-core = { path = "../resymbol-core" }
+gimli = { version = "0.32.3", default-features = false, features = ["read", "write", "std"] }
+object = { version = "0.37.3", default-features = false, features = ["read", "write", "std"] }
 serde = { version = "1.0.219", features = ["derive"] }
 thiserror = "2.0.12"
 

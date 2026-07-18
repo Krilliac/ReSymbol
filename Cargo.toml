@@ -6,6 +6,8 @@ members = [
     "crates/resymbol-core",
     "crates/resymbol-debugger",
     "crates/resymbol-export",
+    "crates/resymbol-gdb-remote",
+    "crates/resymbol-linux-debug-host",
     "crates/resymbol-native-host",
     "crates/resymbol-package",
     "crates/resymbol-plugin-api",

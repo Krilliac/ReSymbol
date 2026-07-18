@@ -555,9 +555,12 @@ impl SessionMachine {
                 self.transition_to(SessionState::Pausing { token: next })?;
             }
             DebugCommand::WriteMemory { .. }
+            | DebugCommand::WriteRegisters { .. }
             | DebugCommand::SetBreakpoint { .. }
             | DebugCommand::RemoveBreakpoint { .. } => self.refresh_stopped_token()?,
-            DebugCommand::ReadMemory { .. } | DebugCommand::CaptureSnapshot { .. } => {}
+            DebugCommand::ReadMemory { .. }
+            | DebugCommand::ReadRegisters { .. }
+            | DebugCommand::CaptureSnapshot { .. } => {}
             DebugCommand::Detach { .. } => {
                 if matches!(
                     self.execution_gate,

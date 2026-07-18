@@ -1,0 +1,51 @@
+[package]
+name = "resymbol-gdb-remote"
+description = "GDB Remote Serial Protocol server and client for ReSymbol, over TCP and serial"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[features]
+# Builds the checked-in child fixture and enables the ignored end-to-end test
+# that serves a real ptrace target over a localhost TCP socket. Off by default;
+# enabled by `--all-features`.
+gdb-remote-e2e = []
+
+[dependencies]
+thiserror = "2.0.12"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+resymbol-linux-debug-host = { path = "../resymbol-linux-debug-host" }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+resymbol-linux-debug-host = { path = "../resymbol-linux-debug-host" }
+
+[[bin]]
+name = "resymbol-gdb-remote-fixture"
+path = "tests/fixtures/gdb_remote_child.rs"
+required-features = ["gdb-remote-e2e"]
+test = false
+bench = false
+
+# This crate is a deliberately narrow exception to the workspace's blanket
+# unsafe-code prohibition. All FFI is confined to `serial.rs`, where libc
+# termios calls configure a tty into raw mode; every block carries a
+# `// SAFETY:` justification. The protocol codec, transports, server, and
+# client remain entirely safe. The crate intentionally does NOT inherit
+# `[lints] workspace = true`, so the workspace `unsafe_code = "forbid"` does
+# not apply here.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+undocumented_unsafe_blocks = "deny"

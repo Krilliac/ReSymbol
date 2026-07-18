@@ -239,7 +239,7 @@ impl StaticAddressSpace {
         let mut regions = Vec::with_capacity(analysis.load_segments.len());
         let mut cursor = 0_u64;
         for segment in &analysis.load_segments {
-            let virtual_address = u64::from(segment.virtual_address);
+            let virtual_address = segment.virtual_address;
             let start = virtual_address.checked_sub(image_base).ok_or(
                 StaticAddressSpaceError::SegmentBelowImageBase {
                     program_header_index: segment.program_header_index,
@@ -247,7 +247,7 @@ impl StaticAddressSpace {
                     image_base,
                 },
             )?;
-            let size = u64::from(segment.memory_size);
+            let size = segment.memory_size;
             let range = AddressRange::checked(start, size)?;
             let end = range.end();
             if start < cursor {
@@ -261,8 +261,8 @@ impl StaticAddressSpace {
                 });
             }
 
-            let initialized_size = u64::from(segment.file_size);
-            let file_offset = u64::from(segment.file_offset);
+            let initialized_size = segment.file_size;
+            let file_offset = segment.file_offset;
             let file_end = file_offset.checked_add(initialized_size).ok_or(
                 StaticAddressSpaceError::FileBackingOverflow {
                     offset: file_offset,
@@ -303,7 +303,7 @@ impl StaticAddressSpace {
             preferred_image_base: image_base,
             image_size,
             layout: StaticImageLayout::Elf,
-            entry_point: Some(RelativeAddress::new(u64::from(analysis.entry_rva))),
+            entry_point: Some(RelativeAddress::new(analysis.entry_rva)),
             regions,
         })
     }

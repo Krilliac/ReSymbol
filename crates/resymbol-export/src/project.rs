@@ -140,6 +140,7 @@ impl ExportProjection {
         let image_size = match session.base_analysis() {
             BinaryAnalysis::Pe(analysis) => u64::from(analysis.size_of_image),
             BinaryAnalysis::Elf(analysis) => analysis.image_size,
+            BinaryAnalysis::MachO(analysis) => analysis.image_size,
             _ => return Err(ExportError::UnsupportedAnalysisFormat),
         };
         let graph = session

@@ -384,6 +384,16 @@ pub enum SessionValidationError {
     ElfFunctionNotExecutable { index: usize },
     #[error("plugin claim {index} global subject is not in a readable ELF PT_LOAD mapping")]
     ElfGlobalNotReadable { index: usize },
+    #[error(
+        "plugin claim {index} uses an x86-64 recovery assertion that is unavailable for container-only Mach-O analysis"
+    )]
+    UnsupportedMachOContainerAssertion { index: usize },
+    #[error("plugin claim {index} subject is not wholly contained in one Mach-O segment")]
+    MachOSubjectOutsideSegment { index: usize },
+    #[error("plugin claim {index} function subject is not in an executable Mach-O segment")]
+    MachOFunctionNotExecutable { index: usize },
+    #[error("plugin claim {index} global subject is not in a readable Mach-O segment")]
+    MachOGlobalNotReadable { index: usize },
     #[error("plugin claim {index} has a function-boundary assertion on a non-function subject")]
     FunctionBoundaryRequiresFunction { index: usize },
     #[error("plugin claim {index} has a function-entry assertion on a non-function subject")]
@@ -765,19 +775,33 @@ fn validate_claim_section_policy(
     analysis: &BinaryAnalysis,
 ) -> Result<(), SessionValidationError> {
     let BinaryAnalysis::Pe(analysis) = analysis else {
-        let BinaryAnalysis::Elf(analysis) = analysis else {
-            unreachable!("all current binary-analysis variants are handled");
-        };
-        validate_elf_subject_mapping(index, claim, analysis)?;
-        return match claim.assertion() {
-            SymbolAssertion::DirectCall { .. }
-            | SymbolAssertion::ThunkTarget { .. }
-            | SymbolAssertion::StringLiteral { .. }
-            | SymbolAssertion::DataReference { .. } => {
-                Err(SessionValidationError::UnsupportedElfContainerAssertion { index })
+        match analysis {
+            BinaryAnalysis::Elf(analysis) => {
+                validate_elf_subject_mapping(index, claim, analysis)?;
+                return match claim.assertion() {
+                    SymbolAssertion::DirectCall { .. }
+                    | SymbolAssertion::ThunkTarget { .. }
+                    | SymbolAssertion::StringLiteral { .. }
+                    | SymbolAssertion::DataReference { .. } => {
+                        Err(SessionValidationError::UnsupportedElfContainerAssertion { index })
+                    }
+                    _ => Ok(()),
+                };
             }
-            _ => Ok(()),
-        };
+            BinaryAnalysis::MachO(analysis) => {
+                validate_macho_subject_mapping(index, claim, analysis)?;
+                return match claim.assertion() {
+                    SymbolAssertion::DirectCall { .. }
+                    | SymbolAssertion::ThunkTarget { .. }
+                    | SymbolAssertion::StringLiteral { .. }
+                    | SymbolAssertion::DataReference { .. } => {
+                        Err(SessionValidationError::UnsupportedMachOContainerAssertion { index })
+                    }
+                    _ => Ok(()),
+                };
+            }
+            BinaryAnalysis::Pe(_) => unreachable!("the outer binding excludes PE analyses"),
+        }
     };
     match claim.assertion() {
         SymbolAssertion::DirectCall {
@@ -885,8 +909,8 @@ fn validate_elf_subject_mapping(
         .checked_add(size)
         .ok_or(SessionValidationError::ElfSubjectOutsideLoadSegment { index })?;
     let segment = analysis.load_segments.iter().find(|segment| {
-        let segment_start = u64::from(segment.virtual_address) - analysis.identity.image_base;
-        let segment_end = segment_start + u64::from(segment.memory_size);
+        let segment_start = segment.virtual_address - analysis.identity.image_base;
+        let segment_end = segment_start + segment.memory_size;
         rva >= segment_start && end <= segment_end
     });
     let Some(segment) = segment else {
@@ -897,6 +921,53 @@ fn validate_elf_subject_mapping(
     }
     if !function && !segment.readable() {
         return Err(SessionValidationError::ElfGlobalNotReadable { index });
+    }
+    Ok(())
+}
+
+fn validate_macho_subject_mapping(
+    index: usize,
+    claim: &SymbolClaim,
+    analysis: &crate::MachOAnalysis,
+) -> Result<(), SessionValidationError> {
+    let (rva, size, function) = match claim.subject() {
+        SymbolSubject::Function { rva, size, .. } => {
+            let effective_size = (*size).unwrap_or_else(|| match claim.assertion() {
+                SymbolAssertion::FunctionBoundary { size } => *size,
+                _ => 1,
+            });
+            (*rva, effective_size, true)
+        }
+        SymbolSubject::Global { rva, size, .. } => (*rva, size.unwrap_or(1), false),
+        SymbolSubject::Type { .. } => return Ok(()),
+        _ => return Err(SessionValidationError::UnsupportedSubject { index }),
+    };
+    // Fat containers keep an identity-only graph and expose no top-level
+    // segments, so any address-bearing claim fails closed here.
+    let crate::MachOContainer::Thin(image) = &analysis.container else {
+        return Err(SessionValidationError::MachOSubjectOutsideSegment { index });
+    };
+    let end = rva
+        .checked_add(size)
+        .ok_or(SessionValidationError::MachOSubjectOutsideSegment { index })?;
+    let image_base = analysis.identity.image_base;
+    let segment = image.segments.iter().find(|segment| {
+        let Some(segment_start) = segment.vmaddr.checked_sub(image_base) else {
+            return false;
+        };
+        let Some(segment_end) = segment_start.checked_add(segment.vmsize) else {
+            return false;
+        };
+        rva >= segment_start && end <= segment_end
+    });
+    let Some(segment) = segment else {
+        return Err(SessionValidationError::MachOSubjectOutsideSegment { index });
+    };
+    if function && !segment.executable() {
+        return Err(SessionValidationError::MachOFunctionNotExecutable { index });
+    }
+    if !function && !segment.readable() {
+        return Err(SessionValidationError::MachOGlobalNotReadable { index });
     }
     Ok(())
 }
@@ -995,7 +1066,7 @@ fn import_iat_rvas(analysis: &BinaryAnalysis) -> BTreeSet<u64> {
             )
             .map(|entry| u64::from(entry.iat_rva))
             .collect(),
-        BinaryAnalysis::Elf(_) => BTreeSet::new(),
+        BinaryAnalysis::Elf(_) | BinaryAnalysis::MachO(_) => BTreeSet::new(),
     }
 }
 

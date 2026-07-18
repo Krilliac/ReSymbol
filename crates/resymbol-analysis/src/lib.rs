@@ -4,18 +4,24 @@
 //! binaries, and each container parser uses checked arithmetic and explicit
 //! collection limits throughout.
 
+mod arch;
 mod code_recovery;
 mod elf;
 mod error;
 mod instruction;
 mod linear_disassembly;
+mod macho;
 mod msvc_rtti;
 mod pe;
 mod session;
 mod string_recovery;
 mod types;
 
-pub use elf::analyze_elf;
+pub use arch::{
+    DecodeOutcome, DecodedInstruction, FlowKind, InstructionDecoder, TargetArch,
+    UnsupportedArchError, decoder_for, target_arch_for_identity,
+};
+pub use elf::{ElfMachine, analyze_elf};
 pub use error::AnalysisError;
 pub use instruction::{
     ExactX64InstructionError, MAX_X64_INSTRUCTION_BYTES, validate_exact_x64_instruction,
@@ -24,34 +30,46 @@ pub use linear_disassembly::{
     LinearDisassemblyError, LinearDisassemblyLimits, LinearDisassemblyPreview,
     LinearDisassemblyStopReason, LinearFlowControlCategory, LinearInstructionRow,
     LinearTruncationBoundary, MAX_LINEAR_DISASSEMBLY_BYTES, MAX_LINEAR_DISASSEMBLY_INSTRUCTIONS,
-    disassemble_x64_linear,
+    disassemble_linear, disassemble_x64_linear,
 };
+pub use macho::{MachOKind, analyze_macho, detect_macho};
 pub use pe::{
     PeCodeViewInspection, PeCodeViewRsds, PeLayoutInspection, analyze_pe, inspect_pe_codeview,
     inspect_pe_layout,
 };
 pub use session::{AnalysisSession, PluginRunRecord, PluginRunStatus, SessionValidationError};
 pub use types::{
-    BinaryAnalysis, CoffHeader, DataDirectory, ElfAnalysis, ElfLoadSegment, ElfProgramHeader,
-    ElfSectionHeader, ImportTarget, MsvcRttiBaseClass, MsvcRttiVftable, PeAnalysis,
-    PeControlFlowTarget, PeDataDirectories, PeDataReference, PeDelayImportLibrary, PeDirectCall,
-    PeExport, PeExportName, PeGuardAddressTakenIatEntry, PeGuardCfFunction,
-    PeGuardEhContinuationTarget, PeGuardLongJumpTarget, PeImport, PeImportLibrary,
-    PeLoadConfigGuardMemcpyAnchor, PeLoadConfigSecurityAnchors, PeLoadConfigXfgAnchors,
-    PeRecoveredString, PeSection, PeStringEncoding, PeThunk, PeTlsCallback, RuntimeFunction,
+    BasicBlock, BinaryAnalysis, CfgEdge, CfgEdgeKind, CfgTerminator, CoffHeader, DataDirectory,
+    ElfAnalysis, ElfClass, ElfEndian, ElfLoadSegment, ElfProgramHeader, ElfSectionHeader,
+    ElfSymbol, FunctionCfg, ImportTarget, MachOAnalysis, MachOArchSlice, MachOContainer,
+    MachOEndian, MachOFat, MachOImage, MachOSection, MachOSegment, MachOSymbol, MsvcRttiBaseClass,
+    MsvcRttiVftable, PeAnalysis, PeControlFlowTarget, PeDataDirectories, PeDataReference,
+    PeDelayImportLibrary, PeDirectCall, PeExport, PeExportName, PeGuardAddressTakenIatEntry,
+    PeGuardCfFunction, PeGuardEhContinuationTarget, PeGuardLongJumpTarget, PeImport,
+    PeImportLibrary, PeLoadConfigGuardMemcpyAnchor, PeLoadConfigSecurityAnchors,
+    PeLoadConfigXfgAnchors, PeRecoveredString, PeSection, PeStringEncoding, PeThunk, PeTlsCallback,
+    RuntimeFunction,
 };
 
 /// Detect and analyze a supported binary container.
 ///
-/// PE32+ x86-64 images and bounded container-only ELF32 little-endian
-/// `EM_MIPS` images are accepted. Unsupported formats are reported explicitly
-/// rather than guessed from a filename.
+/// PE32+ x86-64 images, bounded ELF containers, and bounded Mach-O containers
+/// are accepted. ELF ingestion covers ELF32 and ELF64, either byte order, and
+/// any `e_machine` value. Mach-O ingestion covers thin 32/64-bit images in
+/// either byte order and fat/universal containers, dispatched only after PE and
+/// ELF so the `0xCAFEBABE` fat magic cannot shadow those formats. Container
+/// parsing is machine-independent and records only bounded metadata and
+/// symbol-table name claims. Unsupported formats are reported explicitly rather
+/// than guessed from a filename.
 pub fn analyze_bytes(bytes: &[u8]) -> Result<BinaryAnalysis, AnalysisError> {
     if bytes.starts_with(b"MZ") {
         return analyze_pe(bytes).map(BinaryAnalysis::Pe);
     }
     if bytes.starts_with(b"\x7fELF") {
         return analyze_elf(bytes).map(BinaryAnalysis::Elf);
+    }
+    if detect_macho(bytes).is_some() {
+        return analyze_macho(bytes).map(BinaryAnalysis::MachO);
     }
 
     let magic = bytes

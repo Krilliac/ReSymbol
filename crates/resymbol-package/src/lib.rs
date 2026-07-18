@@ -26,7 +26,7 @@ use thiserror::Error;
 pub use resymbol_core::{BinaryId, ClaimValidationError};
 
 /// The package schema written by this crate.
-pub const CURRENT_SCHEMA_VERSION: u32 = 14;
+pub const CURRENT_SCHEMA_VERSION: u32 = 16;
 
 /// Default maximum encoded or decoded package size: 64 MiB.
 pub const DEFAULT_MAX_PACKAGE_BYTES: usize = 64 * 1024 * 1024;
@@ -730,7 +730,7 @@ mod tests {
                 "\"generator_version\":\"0.1.0-test\",",
                 "\"payload\":{\"label\":\"fixture\",",
                 "\"metadata\":{\"alpha\":\"first\",\"zeta\":\"last\"},",
-                "\"values\":[1,2,3]},\"schema_version\":14}"
+                "\"values\":[1,2,3]},\"schema_version\":16}"
             )
         );
 
@@ -742,13 +742,13 @@ mod tests {
     #[test]
     fn unsupported_schema_is_reported_before_payload_decoding() {
         let bytes = format!(
-            "{{\"schema_version\":15,\"generator_version\":\"0.1.0\",\"binary_sha256\":\"{DIGEST_A}\",\"payload\":\"not the requested type\"}}"
+            "{{\"schema_version\":17,\"generator_version\":\"0.1.0\",\"binary_sha256\":\"{DIGEST_A}\",\"payload\":\"not the requested type\"}}"
         );
         let error = from_slice::<TestPayload>(bytes.as_bytes()).expect_err("schema is unsupported");
         assert!(matches!(
             error,
             PackageError::UnsupportedSchema {
-                found: 15,
+                found: 17,
                 minimum: CURRENT_SCHEMA_VERSION,
                 maximum: CURRENT_SCHEMA_VERSION,
             }
@@ -792,7 +792,7 @@ mod tests {
     #[test]
     fn invalid_binary_identity_is_actionable() {
         let bytes = br#"{
-            "schema_version": 14,
+            "schema_version": 16,
             "generator_version": "0.1.0",
             "binary_sha256": "not-a-sha256",
             "payload": null
@@ -1222,7 +1222,7 @@ mod tests {
     #[test]
     fn bound_decode_rejects_envelope_payload_identity_mismatch() {
         let bytes = format!(
-            "{{\"schema_version\":14,\"generator_version\":\"0.1.0\",\"binary_sha256\":\"{DIGEST_A}\",\"payload\":{{\"binary_id\":\"{DIGEST_B}\",\"value\":7}}}}"
+            "{{\"schema_version\":16,\"generator_version\":\"0.1.0\",\"binary_sha256\":\"{DIGEST_A}\",\"payload\":{{\"binary_id\":\"{DIGEST_B}\",\"value\":7}}}}"
         );
         let error =
             from_slice_bound::<BoundPayload>(bytes.as_bytes()).expect_err("binding must fail");

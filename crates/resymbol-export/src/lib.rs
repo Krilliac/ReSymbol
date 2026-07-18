@@ -7,6 +7,7 @@
 //! function-to-class relationships remain available to richer consumers, and
 //! claims that cannot be represented become structured warnings.
 
+mod dwarf;
 mod error;
 mod ghidra_java;
 mod ida_python;
@@ -18,6 +19,7 @@ mod pdb;
 mod project;
 mod selection;
 
+pub use dwarf::{DwarfArtifact, DwarfError, MAX_DWARF_DIES, render_dwarf};
 pub use error::{ExportError, ProjectionValidationError};
 pub use ghidra_java::{GhidraJavaError, render_ghidra_java, validate_ghidra_java_class_name};
 pub use ida_python::{IdaPythonError, render_ida_python};
