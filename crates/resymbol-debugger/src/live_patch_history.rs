@@ -991,6 +991,8 @@ impl<'a> ReceiptScan<'a> {
                 DebugEvent::Capabilities(_)
                 | DebugEvent::LiveTargetBound { .. }
                 | DebugEvent::MemoryRead { .. }
+                | DebugEvent::RegistersRead { .. }
+                | DebugEvent::RegistersWritten { .. }
                 | DebugEvent::BreakpointChanged { .. }
                 | DebugEvent::SandboxAttested(_)
                 | DebugEvent::SandboxLifecycle(_) => unexpected_effect = true,

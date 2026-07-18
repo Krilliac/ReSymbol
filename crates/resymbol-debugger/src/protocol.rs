@@ -11,7 +11,7 @@ use std::{
 };
 
 use serde::de::Error as _;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
 pub use crate::identity::{HostRiskLeaseId, SandboxOwnershipLeaseId, SessionId};
@@ -22,13 +22,15 @@ use crate::sandbox::{
 use resymbol_core::BinaryId;
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 6;
+pub const PROTOCOL_MINOR: u16 = 7;
 pub const MAX_LAUNCH_ARGUMENTS: usize = 128;
 pub const MAX_LAUNCH_ARGUMENT_BYTES: usize = 256 * 1024;
 pub const MAX_MEMORY_READ_BYTES: u32 = 1024 * 1024;
 pub const MAX_MEMORY_WRITE_BYTES: usize = 64 * 1024;
 pub const MAX_REASON_BYTES: usize = 1024;
 pub const MAX_CAPABILITY_STATUSES: usize = 64;
+pub const MAX_REGISTERS: usize = 256;
+pub const MAX_REGISTER_NAME_BYTES: usize = 32;
 pub const MEMORY_WRITE_FAILURE_REJECTION_CODE: &str = "memory-write-failed";
 
 macro_rules! nonzero_id {
@@ -813,6 +815,132 @@ pub enum StepKind {
     Out,
 }
 
+/// Self-describing target architecture that tags every register payload so a
+/// register set or write can be interpreted without out-of-band context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum RegisterArch {
+    #[serde(rename = "x86")]
+    X86,
+    #[serde(rename = "x86-64")]
+    X86_64,
+    #[serde(rename = "aarch64")]
+    Aarch64,
+    #[serde(rename = "arm")]
+    Arm,
+    #[serde(rename = "mips32")]
+    Mips32,
+    #[serde(rename = "mips64")]
+    Mips64,
+    #[serde(rename = "riscv32")]
+    Riscv32,
+    #[serde(rename = "riscv64")]
+    Riscv64,
+    #[serde(rename = "powerpc32")]
+    PowerPc32,
+    #[serde(rename = "powerpc64")]
+    PowerPc64,
+}
+
+/// Bounded, validated register identifier newtype.
+///
+/// Names are nonempty, at most [`MAX_REGISTER_NAME_BYTES`] bytes, and restricted
+/// to ASCII alphanumerics plus `_` and `.` so a set is deterministic on the wire.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RegisterName(String);
+
+impl RegisterName {
+    pub fn new(value: impl Into<String>) -> Result<Self, ProtocolValidationError> {
+        let value = value.into();
+        if value.is_empty()
+            || value.len() > MAX_REGISTER_NAME_BYTES
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.'))
+        {
+            return Err(ProtocolValidationError::InvalidRegisterName);
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Serialize for RegisterName {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for RegisterName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(D::Error::custom)
+    }
+}
+
+/// One register name bound to its exact 64-bit value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegisterValue {
+    pub name: RegisterName,
+    pub value: u64,
+}
+
+fn validate_register_list(registers: &[RegisterValue]) -> Result<(), ProtocolValidationError> {
+    if registers.len() > MAX_REGISTERS {
+        return Err(ProtocolValidationError::TooManyRegisters {
+            actual: registers.len(),
+            maximum: MAX_REGISTERS,
+        });
+    }
+    let mut seen = BTreeSet::new();
+    for register in registers {
+        if !seen.insert(register.name.as_str()) {
+            return Err(ProtocolValidationError::DuplicateRegisterName {
+                name: register.name.as_str().to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Arch-tagged snapshot of register values reported by a backend.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegisterSet {
+    pub arch: RegisterArch,
+    pub registers: Vec<RegisterValue>,
+}
+
+impl RegisterSet {
+    pub fn validate(&self) -> Result<(), ProtocolValidationError> {
+        validate_register_list(&self.registers)
+    }
+}
+
+/// Arch-tagged subset of registers a controller intends to overwrite.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegisterWrite {
+    pub arch: RegisterArch,
+    pub registers: Vec<RegisterValue>,
+}
+
+impl RegisterWrite {
+    pub fn validate(&self) -> Result<(), ProtocolValidationError> {
+        validate_register_list(&self.registers)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     tag = "command",
@@ -844,6 +972,15 @@ pub enum DebugCommand {
         address: MemoryAddress,
         expected: Vec<u8>,
         replacement: Vec<u8>,
+    },
+    ReadRegisters {
+        view: ReadViewToken,
+        thread_id: ThreadId,
+    },
+    WriteRegisters {
+        stop: StopToken,
+        thread_id: ThreadId,
+        registers: RegisterWrite,
     },
     SetBreakpoint {
         stop: StopToken,
@@ -893,11 +1030,13 @@ impl DebugCommand {
                 replacement,
                 ..
             } => validate_memory_write(*address, expected, replacement),
+            Self::WriteRegisters { registers, .. } => registers.validate(),
             Self::SetBreakpoint { breakpoint, .. } => breakpoint.validate(),
             Self::ProbeCapabilities
             | Self::Continue { .. }
             | Self::Pause { .. }
             | Self::Step { .. }
+            | Self::ReadRegisters { .. }
             | Self::RemoveBreakpoint { .. }
             | Self::CaptureSnapshot { .. }
             | Self::Detach { .. }
@@ -912,10 +1051,11 @@ impl DebugCommand {
             Self::Continue { stop }
             | Self::Step { stop, .. }
             | Self::WriteMemory { stop, .. }
+            | Self::WriteRegisters { stop, .. }
             | Self::SetBreakpoint { stop, .. }
             | Self::RemoveBreakpoint { stop, .. } => Some(stop.state),
             Self::Pause { run } => Some(run.state),
-            Self::ReadMemory { view, .. } => Some(view.state()),
+            Self::ReadMemory { view, .. } | Self::ReadRegisters { view, .. } => Some(view.state()),
             Self::CaptureSnapshot { live } | Self::Detach { live } => Some(live.state()),
             Self::Terminate { execution } => Some(execution.state()),
             Self::Close { state } => Some(*state),
@@ -1013,12 +1153,14 @@ impl CommandEnvelope {
             (DebugCommand::Continue { stop }, SessionState::Stopped { token, .. })
             | (DebugCommand::Step { stop, .. }, SessionState::Stopped { token, .. })
             | (DebugCommand::WriteMemory { stop, .. }, SessionState::Stopped { token, .. })
+            | (DebugCommand::WriteRegisters { stop, .. }, SessionState::Stopped { token, .. })
             | (DebugCommand::SetBreakpoint { stop, .. }, SessionState::Stopped { token, .. })
             | (DebugCommand::RemoveBreakpoint { stop, .. }, SessionState::Stopped { token, .. }) => {
                 stop == token
             }
             (DebugCommand::Pause { run }, SessionState::Running { token }) => run == token,
-            (DebugCommand::ReadMemory { view, .. }, _) => state.matches_read_view(*view),
+            (DebugCommand::ReadMemory { view, .. }, _)
+            | (DebugCommand::ReadRegisters { view, .. }, _) => state.matches_read_view(*view),
             (DebugCommand::CaptureSnapshot { live }, _) | (DebugCommand::Detach { live }, _) => {
                 state.matches_live(*live)
             }
@@ -1485,6 +1627,17 @@ pub enum DebugEvent {
         before: Vec<u8>,
         after: Vec<u8>,
     },
+    RegistersRead {
+        view: ReadViewToken,
+        thread_id: ThreadId,
+        registers: RegisterSet,
+    },
+    RegistersWritten {
+        stop: StopToken,
+        thread_id: ThreadId,
+        before: RegisterSet,
+        after: RegisterSet,
+    },
     MemoryWriteFailed(MemoryWriteFailure),
     BreakpointChanged {
         stop: StopToken,
@@ -1530,6 +1683,11 @@ impl DebugEvent {
                 after,
                 ..
             } => validate_memory_write(*address, before, after),
+            Self::RegistersRead { registers, .. } => registers.validate(),
+            Self::RegistersWritten { before, after, .. } => {
+                before.validate()?;
+                after.validate()
+            }
             Self::MemoryWriteFailed(failure) => failure.validate(),
             Self::BreakpointChanged { breakpoint, .. } => breakpoint.validate(),
             Self::CommandResult { outcome, .. } => outcome.validate(),
@@ -1544,10 +1702,10 @@ impl DebugEvent {
         match self {
             Self::StateChanged(state) => Some(state.state_token()),
             Self::LiveTargetBound { state, .. } => Some(*state),
-            Self::MemoryRead { view, .. } => Some(view.state()),
-            Self::MemoryWritten { stop, .. } | Self::BreakpointChanged { stop, .. } => {
-                Some(stop.state)
-            }
+            Self::MemoryRead { view, .. } | Self::RegistersRead { view, .. } => Some(view.state()),
+            Self::MemoryWritten { stop, .. }
+            | Self::RegistersWritten { stop, .. }
+            | Self::BreakpointChanged { stop, .. } => Some(stop.state),
             Self::MemoryWriteFailed(failure) => Some(failure.stop.state),
             Self::SandboxAttested(_) | Self::SandboxLifecycle(_) => None,
             Self::Capabilities(_) | Self::CommandResult { .. } | Self::Warning { .. } => None,
@@ -1712,6 +1870,12 @@ pub enum ProtocolValidationError {
     },
     #[error("command is not a memory-write command")]
     NotMemoryWriteCommand,
+    #[error("register name is empty, too long, or contains disallowed characters")]
+    InvalidRegisterName,
+    #[error("register payload has {actual} registers; maximum is {maximum}")]
+    TooManyRegisters { actual: usize, maximum: usize },
+    #[error("duplicate register name {name}")]
+    DuplicateRegisterName { name: String },
     #[error("hardware breakpoint size {size} is not 1, 2, 4, or 8")]
     InvalidHardwareBreakpointSize { size: u8 },
     #[error("execute hardware breakpoint size must be one, not {size}")]
@@ -2751,5 +2915,248 @@ mod tests {
             .unwrap()
             .insert("unexpected".to_owned(), serde_json::Value::Bool(true));
         assert!(serde_json::from_value::<CommandEnvelope>(value).is_err());
+    }
+
+    fn register_value(name: &str, value: u64) -> RegisterValue {
+        RegisterValue {
+            name: RegisterName::new(name).expect("valid register name"),
+            value,
+        }
+    }
+
+    #[test]
+    fn register_payloads_validate_bounds_uniqueness_and_names() {
+        RegisterSet {
+            arch: RegisterArch::X86_64,
+            registers: vec![],
+        }
+        .validate()
+        .expect("empty register set is valid");
+
+        RegisterSet {
+            arch: RegisterArch::Aarch64,
+            registers: vec![register_value("x0", 1), register_value("x1", 2)],
+        }
+        .validate()
+        .expect("distinct registers are valid");
+
+        assert_eq!(
+            RegisterWrite {
+                arch: RegisterArch::X86_64,
+                registers: vec![register_value("rax", 1), register_value("rax", 2)],
+            }
+            .validate(),
+            Err(ProtocolValidationError::DuplicateRegisterName {
+                name: "rax".to_owned(),
+            })
+        );
+
+        assert_eq!(
+            RegisterSet {
+                arch: RegisterArch::X86_64,
+                registers: (0..=MAX_REGISTERS)
+                    .map(|index| register_value(&format!("r{index}"), index as u64))
+                    .collect(),
+            }
+            .validate(),
+            Err(ProtocolValidationError::TooManyRegisters {
+                actual: MAX_REGISTERS + 1,
+                maximum: MAX_REGISTERS,
+            })
+        );
+
+        assert!(RegisterName::new("").is_err());
+        assert!(RegisterName::new("bad name").is_err());
+        assert!(RegisterName::new("a".repeat(MAX_REGISTER_NAME_BYTES + 1)).is_err());
+        RegisterName::new("a".repeat(MAX_REGISTER_NAME_BYTES)).expect("max-length name is valid");
+    }
+
+    #[test]
+    fn read_registers_is_gated_by_the_exact_read_view() {
+        let offline_token = state(1, 2);
+        let offline = SessionState::Offline {
+            token: offline_token,
+        };
+        let read = command(
+            DebugCommand::ReadRegisters {
+                view: ReadViewToken::Offline {
+                    state: offline_token,
+                },
+                thread_id: ThreadId::new(7).unwrap(),
+            },
+            offline_token,
+        );
+        read.validate_against(&offline).unwrap();
+
+        let wrong_view = command(
+            DebugCommand::ReadRegisters {
+                view: ReadViewToken::Observing {
+                    state: offline_token,
+                },
+                thread_id: ThreadId::new(7).unwrap(),
+            },
+            offline_token,
+        );
+        assert_eq!(
+            wrong_view.validate_against(&offline),
+            Err(ProtocolValidationError::StaleExecutionToken)
+        );
+    }
+
+    #[test]
+    fn write_registers_requires_stopped_state_with_matching_stop() {
+        let current_stop = stop(1, 4, 20);
+        let current = stopped_state(current_stop);
+        let registers = RegisterWrite {
+            arch: RegisterArch::X86_64,
+            registers: vec![register_value("rax", 0x1234)],
+        };
+        let valid = command(
+            DebugCommand::WriteRegisters {
+                stop: current_stop,
+                thread_id: ThreadId::new(3).unwrap(),
+                registers: registers.clone(),
+            },
+            current_stop.state,
+        );
+        valid.validate_against(&current).unwrap();
+
+        let stale = command(
+            DebugCommand::WriteRegisters {
+                stop: stop(1, 4, 19),
+                thread_id: ThreadId::new(3).unwrap(),
+                registers: registers.clone(),
+            },
+            state(1, 4),
+        );
+        assert_eq!(
+            stale.validate_against(&current),
+            Err(ProtocolValidationError::StaleExecutionToken)
+        );
+
+        let running_token = RunToken {
+            state: state(2, 5),
+            run_id: RunId::new(9).unwrap(),
+        };
+        let running = SessionState::Running {
+            token: running_token,
+        };
+        let against_running = command(
+            DebugCommand::WriteRegisters {
+                stop: stop(2, 5, 8),
+                thread_id: ThreadId::new(3).unwrap(),
+                registers,
+            },
+            state(2, 5),
+        );
+        assert_eq!(
+            against_running.validate_against(&running),
+            Err(ProtocolValidationError::StaleExecutionToken)
+        );
+
+        let invalid = DebugCommand::WriteRegisters {
+            stop: current_stop,
+            thread_id: ThreadId::new(3).unwrap(),
+            registers: RegisterWrite {
+                arch: RegisterArch::X86_64,
+                registers: vec![register_value("rax", 1), register_value("rax", 2)],
+            },
+        };
+        assert_eq!(
+            invalid.validate(),
+            Err(ProtocolValidationError::DuplicateRegisterName {
+                name: "rax".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn register_commands_and_events_round_trip_and_reject_unknown_fields() {
+        let stop = stop(1, 2, 3);
+        let write_command = command(
+            DebugCommand::WriteRegisters {
+                stop,
+                thread_id: ThreadId::new(4).unwrap(),
+                registers: RegisterWrite {
+                    arch: RegisterArch::Aarch64,
+                    registers: vec![register_value("x0", 42)],
+                },
+            },
+            stop.state,
+        );
+        let encoded = serde_json::to_value(&write_command).expect("serialize write-registers");
+        assert_eq!(
+            serde_json::from_value::<CommandEnvelope>(encoded.clone()).expect("round-trip command"),
+            write_command
+        );
+        let mut unknown = encoded;
+        unknown["command"]["parameters"]["registers"]["registers"][0]
+            .as_object_mut()
+            .expect("register value object")
+            .insert("unexpected".to_owned(), serde_json::Value::Bool(true));
+        assert!(serde_json::from_value::<CommandEnvelope>(unknown).is_err());
+
+        let read_event = EventEnvelope {
+            version: ProtocolVersion::current(),
+            sequence: EventSequence::new(1).unwrap(),
+            session_id: Some(stop.state.session_id),
+            state: Some(stop.state),
+            caused_by: Some(CommandId::new(9).unwrap()),
+            event: DebugEvent::RegistersRead {
+                view: ReadViewToken::Stopped { stop },
+                thread_id: ThreadId::new(4).unwrap(),
+                registers: RegisterSet {
+                    arch: RegisterArch::X86_64,
+                    registers: vec![register_value("rip", 0xdead_beef)],
+                },
+            },
+        };
+        read_event.validate().expect("valid registers-read event");
+        let encoded = serde_json::to_value(&read_event).expect("serialize registers-read");
+        assert_eq!(
+            serde_json::from_value::<EventEnvelope>(encoded).expect("round-trip read event"),
+            read_event
+        );
+
+        let written_event = EventEnvelope {
+            version: ProtocolVersion::current(),
+            sequence: EventSequence::new(1).unwrap(),
+            session_id: Some(stop.state.session_id),
+            state: Some(stop.state),
+            caused_by: Some(CommandId::new(9).unwrap()),
+            event: DebugEvent::RegistersWritten {
+                stop,
+                thread_id: ThreadId::new(4).unwrap(),
+                before: RegisterSet {
+                    arch: RegisterArch::X86_64,
+                    registers: vec![register_value("rax", 1)],
+                },
+                after: RegisterSet {
+                    arch: RegisterArch::X86_64,
+                    registers: vec![register_value("rax", 2)],
+                },
+            },
+        };
+        written_event
+            .validate()
+            .expect("valid registers-written event");
+        let encoded = serde_json::to_value(&written_event).expect("serialize registers-written");
+        assert_eq!(
+            serde_json::from_value::<EventEnvelope>(encoded).expect("round-trip written event"),
+            written_event
+        );
+    }
+
+    #[test]
+    fn protocol_minor_is_seven_and_register_arch_wire_names_are_stable() {
+        assert_eq!(PROTOCOL_MINOR, 7);
+        assert_eq!(
+            serde_json::to_value(RegisterArch::X86_64).unwrap(),
+            serde_json::json!("x86-64")
+        );
+        assert_eq!(
+            serde_json::to_value(RegisterArch::PowerPc64).unwrap(),
+            serde_json::json!("powerpc64")
+        );
     }
 }

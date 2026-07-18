@@ -25,8 +25,8 @@ use crate::protocol::{
     BreakpointChange, CapabilityReport, CommandEnvelope, CommandId, CommandOutcome, DebugCommand,
     DebugEvent, DebugTargetRequest, EventEnvelope, EventSequenceCursor, LiveTargetBinding,
     MEMORY_WRITE_FAILURE_REJECTION_CODE, MemoryWriteFailure, ProcessIdentity,
-    ProtocolValidationError, ProtocolVersion, SessionId, SessionState, SessionStateKind,
-    StateToken,
+    ProtocolValidationError, ProtocolVersion, RegisterSet, RegisterWrite, SessionId, SessionState,
+    SessionStateKind, StateToken,
 };
 use crate::sandbox::{
     AttestationMismatch, CleanupAttemptFailureError, CleanupReceiptError, DiagnosticText,
@@ -216,6 +216,8 @@ struct ResponseEvidence {
     incomplete_cleanup_receipt: Option<SandboxCleanupReceipt>,
     memory_read: bool,
     memory_written: bool,
+    registers_read: bool,
+    registers_written: bool,
     memory_write_failure: Option<MemoryWriteFailure>,
     breakpoint_changed: bool,
     live_target_bound: bool,
@@ -232,6 +234,8 @@ impl ResponseEvidence {
             || self.incomplete_cleanup_receipt.is_some()
             || self.memory_read
             || self.memory_written
+            || self.registers_read
+            || self.registers_written
             || self.breakpoint_changed
             || self.live_target_bound
             || self.sandbox_event
@@ -1203,6 +1207,54 @@ impl<T: HostFrameExchange> DebugHostClient<T> {
                         }
                     }
                 }
+                DebugEvent::RegistersRead {
+                    view,
+                    thread_id,
+                    registers,
+                } => match &envelope.command {
+                    DebugCommand::ReadRegisters {
+                        view: expected_view,
+                        thread_id: expected_thread,
+                    } if view == expected_view
+                        && thread_id == expected_thread
+                        && registers.validate().is_ok() =>
+                    {
+                        require_unique_evidence(&mut evidence.registers_read, "registers-read")?;
+                    }
+                    _ => {
+                        return Err(DebugHostClientError::UnexpectedCommandEvidence {
+                            command_id,
+                            evidence: "registers-read",
+                        });
+                    }
+                },
+                DebugEvent::RegistersWritten {
+                    stop,
+                    thread_id,
+                    before,
+                    after,
+                } => match &envelope.command {
+                    DebugCommand::WriteRegisters {
+                        stop: expected_stop,
+                        thread_id: expected_thread,
+                        registers,
+                    } if stop == expected_stop
+                        && thread_id == expected_thread
+                        && before.arch == registers.arch
+                        && register_write_applied(after, registers) =>
+                    {
+                        require_unique_evidence(
+                            &mut evidence.registers_written,
+                            "registers-written",
+                        )?;
+                    }
+                    _ => {
+                        return Err(DebugHostClientError::UnexpectedCommandEvidence {
+                            command_id,
+                            evidence: "registers-written",
+                        });
+                    }
+                },
                 DebugEvent::MemoryWriteFailed(failure) => {
                     accept_memory_write_failure(envelope, failure, &mut evidence)?;
                 }
@@ -1503,6 +1555,18 @@ fn require_live_target_process(
             actual: binding.process().clone(),
         })
     }
+}
+
+/// Confirms a register-write event reflects every requested value under the
+/// exact architecture the controller asked to write.
+fn register_write_applied(after: &RegisterSet, requested: &RegisterWrite) -> bool {
+    after.arch == requested.arch
+        && requested.registers.iter().all(|write| {
+            after
+                .registers
+                .iter()
+                .any(|value| value.name == write.name && value.value == write.value)
+        })
 }
 
 fn accept_memory_write_failure(
@@ -1892,6 +1956,8 @@ fn command_allows_failure_stage(command: &DebugCommand, stage: SandboxFailureSta
         | DebugCommand::Open(_)
         | DebugCommand::ReadMemory { .. }
         | DebugCommand::WriteMemory { .. }
+        | DebugCommand::ReadRegisters { .. }
+        | DebugCommand::WriteRegisters { .. }
         | DebugCommand::SetBreakpoint { .. }
         | DebugCommand::RemoveBreakpoint { .. }
         | DebugCommand::CaptureSnapshot { .. }
@@ -2245,6 +2311,10 @@ fn validate_success_evidence(
         DebugCommand::WriteMemory { .. } => {
             evidence.memory_written && final_state == SessionStateKind::Stopped
         }
+        DebugCommand::ReadRegisters { .. } => evidence.registers_read,
+        DebugCommand::WriteRegisters { .. } => {
+            evidence.registers_written && final_state == SessionStateKind::Stopped
+        }
         DebugCommand::SetBreakpoint { .. } | DebugCommand::RemoveBreakpoint { .. } => {
             evidence.breakpoint_changed && final_state == SessionStateKind::Stopped
         }
@@ -2313,6 +2383,8 @@ fn command_name(command: &DebugCommand) -> &'static str {
         DebugCommand::Step { .. } => "step",
         DebugCommand::ReadMemory { .. } => "read-memory",
         DebugCommand::WriteMemory { .. } => "write-memory",
+        DebugCommand::ReadRegisters { .. } => "read-registers",
+        DebugCommand::WriteRegisters { .. } => "write-registers",
         DebugCommand::SetBreakpoint { .. } => "set-breakpoint",
         DebugCommand::RemoveBreakpoint { .. } => "remove-breakpoint",
         DebugCommand::CaptureSnapshot { .. } => "capture-snapshot",

@@ -745,6 +745,8 @@ impl OfflineImageDebugHost {
             | DebugCommand::Pause { .. }
             | DebugCommand::Step { .. }
             | DebugCommand::WriteMemory { .. }
+            | DebugCommand::ReadRegisters { .. }
+            | DebugCommand::WriteRegisters { .. }
             | DebugCommand::SetBreakpoint { .. }
             | DebugCommand::RemoveBreakpoint { .. }
             | DebugCommand::CaptureSnapshot { .. }
