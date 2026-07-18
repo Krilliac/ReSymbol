@@ -3049,6 +3049,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "resymbol-gdb-remote"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "libc",
+ "resymbol-linux-debug-host",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "resymbol-linux-debug-host"
 version = "0.1.0-alpha.1"
 dependencies = [
