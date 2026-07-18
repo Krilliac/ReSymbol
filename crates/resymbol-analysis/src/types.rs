@@ -589,6 +589,15 @@ pub struct PeAnalysis {
     /// Canonical x64 RIP-relative references from runtime-function code to PE data.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub data_references: Vec<PeDataReference>,
+    /// Whether bounded control-flow reconstruction stopped before every reachable
+    /// basic block was retained.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cfg_scan_truncated: bool,
+    /// Per-function basic-block control-flow graphs derived from the same bounded
+    /// control-flow-guided sweep that produces the direct-call and data-reference
+    /// inventories. Ordered by `entry_rva`; empty for schema<=15 packages.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub control_flow_graphs: Vec<FunctionCfg>,
     /// Whether RTTI discovery stopped after its fixed read-only-data scan budget.
     #[serde(default, skip_serializing_if = "is_false")]
     pub msvc_rtti_scan_truncated: bool,
@@ -704,6 +713,10 @@ struct UncheckedPeAnalysis {
     #[serde(default)]
     data_references: Vec<PeDataReference>,
     #[serde(default)]
+    cfg_scan_truncated: bool,
+    #[serde(default)]
+    control_flow_graphs: Vec<FunctionCfg>,
+    #[serde(default)]
     msvc_rtti_scan_truncated: bool,
     #[serde(default)]
     msvc_rtti_vftables: Vec<MsvcRttiVftable>,
@@ -755,6 +768,8 @@ impl TryFrom<UncheckedPeAnalysis> for PeAnalysis {
             strings: value.strings,
             data_reference_scan_truncated: value.data_reference_scan_truncated,
             data_references: value.data_references,
+            cfg_scan_truncated: value.cfg_scan_truncated,
+            control_flow_graphs: value.control_flow_graphs,
             msvc_rtti_scan_truncated: value.msvc_rtti_scan_truncated,
             msvc_rtti_vftables: value.msvc_rtti_vftables,
             symbol_graph: value.symbol_graph,
@@ -1123,6 +1138,80 @@ pub struct PeDataReference {
     pub instruction_rva: u32,
     pub instruction_size: u8,
     pub target_rva: u32,
+}
+
+/// How the last instruction of a basic block transfers control.
+///
+/// Derived from the architecture-neutral flow classification of the block's
+/// terminating instruction. `Call` is reserved for callers that choose to split
+/// blocks after a call; the bounded PE sweep treats calls as fall-through within
+/// a block and therefore never emits it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CfgTerminator {
+    /// The block ends because its successor is a branch target; control falls
+    /// through into the next block.
+    FallThrough,
+    /// The block ends with a return.
+    Return,
+    /// The block ends with an unconditional near branch.
+    UnconditionalBranch,
+    /// The block ends with a conditional near branch.
+    ConditionalBranch,
+    /// The block ends with an indirect branch whose targets are not resolved.
+    IndirectBranch,
+    /// The block ends with a call treated as a terminator.
+    Call,
+    /// The block ends at an interrupt, privileged, undefined, or otherwise
+    /// non-continuing instruction with no invented successors.
+    Invalid,
+}
+
+/// How one basic-block successor edge is reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CfgEdgeKind {
+    /// Sequential fall-through into the next block.
+    FallThrough,
+    /// The single successor of an unconditional branch.
+    Branch,
+    /// The taken side of a conditional branch.
+    BranchTaken,
+    /// The not-taken (fall-through) side of a conditional branch.
+    BranchNotTaken,
+    /// A call edge, reserved for callers that split blocks after a call.
+    Call,
+}
+
+/// One successor edge of a basic block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CfgEdge {
+    pub kind: CfgEdgeKind,
+    /// Resolved in-image destination RVA, or `None` for an unresolved indirect edge.
+    pub target_rva: Option<u32>,
+}
+
+/// One basic block: a maximal straight-line instruction run with a single
+/// terminator. `end_rva` is the half-open end, i.e. the first RVA after the block.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BasicBlock {
+    pub start_rva: u32,
+    pub end_rva: u32,
+    pub terminator: CfgTerminator,
+    pub successors: Vec<CfgEdge>,
+}
+
+/// A per-function control-flow graph reconstructed from the bounded sweep.
+///
+/// Blocks are strictly sorted by `start_rva` and never overlap; the first block
+/// begins at `entry_rva`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FunctionCfg {
+    pub entry_rva: u32,
+    pub blocks: Vec<BasicBlock>,
 }
 
 /// One validated MSVC x64 vftable and its Rev1 RTTI metadata.

@@ -39,15 +39,16 @@ pub use pe::{
 };
 pub use session::{AnalysisSession, PluginRunRecord, PluginRunStatus, SessionValidationError};
 pub use types::{
-    BinaryAnalysis, CoffHeader, DataDirectory, ElfAnalysis, ElfClass, ElfEndian, ElfLoadSegment,
-    ElfProgramHeader, ElfSectionHeader, ElfSymbol, ImportTarget, MachOAnalysis, MachOArchSlice,
-    MachOContainer, MachOEndian, MachOFat, MachOImage, MachOSection, MachOSegment, MachOSymbol,
-    MsvcRttiBaseClass, MsvcRttiVftable, PeAnalysis, PeControlFlowTarget, PeDataDirectories,
-    PeDataReference, PeDelayImportLibrary, PeDirectCall, PeExport, PeExportName,
-    PeGuardAddressTakenIatEntry, PeGuardCfFunction, PeGuardEhContinuationTarget,
-    PeGuardLongJumpTarget, PeImport, PeImportLibrary, PeLoadConfigGuardMemcpyAnchor,
-    PeLoadConfigSecurityAnchors, PeLoadConfigXfgAnchors, PeRecoveredString, PeSection,
-    PeStringEncoding, PeThunk, PeTlsCallback, RuntimeFunction,
+    BasicBlock, BinaryAnalysis, CfgEdge, CfgEdgeKind, CfgTerminator, CoffHeader, DataDirectory,
+    ElfAnalysis, ElfClass, ElfEndian, ElfLoadSegment, ElfProgramHeader, ElfSectionHeader,
+    ElfSymbol, FunctionCfg, ImportTarget, MachOAnalysis, MachOArchSlice, MachOContainer,
+    MachOEndian, MachOFat, MachOImage, MachOSection, MachOSegment, MachOSymbol, MsvcRttiBaseClass,
+    MsvcRttiVftable, PeAnalysis, PeControlFlowTarget, PeDataDirectories, PeDataReference,
+    PeDelayImportLibrary, PeDirectCall, PeExport, PeExportName, PeGuardAddressTakenIatEntry,
+    PeGuardCfFunction, PeGuardEhContinuationTarget, PeGuardLongJumpTarget, PeImport,
+    PeImportLibrary, PeLoadConfigGuardMemcpyAnchor, PeLoadConfigSecurityAnchors,
+    PeLoadConfigXfgAnchors, PeRecoveredString, PeSection, PeStringEncoding, PeThunk, PeTlsCallback,
+    RuntimeFunction,
 };
 
 /// Detect and analyze a supported binary container.

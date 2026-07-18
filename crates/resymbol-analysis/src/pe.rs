@@ -17,7 +17,8 @@ use crate::{
     PeLoadConfigGuardMemcpyAnchor, PeLoadConfigSecurityAnchors, PeLoadConfigXfgAnchors,
     PeRecoveredString, PeSection, PeThunk, PeTlsCallback, RuntimeFunction,
     code_recovery::{
-        CodeRecoveryInput, recover_code, validate_code_recovery, validate_data_references,
+        CodeRecoveryInput, recover_code, validate_code_recovery, validate_control_flow_graphs,
+        validate_data_references,
     },
     msvc_rtti::{parse_msvc_rtti, validate_msvc_rtti},
     string_recovery::{recover_strings, validate_recovered_strings},
@@ -485,6 +486,8 @@ pub fn analyze_pe(bytes: &[u8]) -> Result<PeAnalysis, AnalysisError> {
         strings: string_recovery.strings,
         data_reference_scan_truncated: code_recovery.data_reference_scan_truncated,
         data_references: code_recovery.data_references,
+        cfg_scan_truncated: code_recovery.cfg_scan_truncated,
+        control_flow_graphs: code_recovery.control_flow_graphs,
         msvc_rtti_scan_truncated,
         msvc_rtti_vftables,
         symbol_graph,
@@ -1280,6 +1283,7 @@ pub(crate) fn validate_pe_analysis(analysis: &PeAnalysis) -> Result<(), Analysis
         &analysis.strings,
     )?;
     validate_data_references(analysis, &analysis.data_references)?;
+    validate_control_flow_graphs(analysis)?;
 
     analysis.symbol_graph.validate()?;
     let rebuilt = build_symbol_graph(SymbolGraphInput {

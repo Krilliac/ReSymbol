@@ -1,16 +1,19 @@
 use resymbol_analysis::{
-    AnalysisError, AnalysisSession, BinaryAnalysis, ImportTarget, PeControlFlowTarget,
-    PeDataReference, PeDirectCall, PeGuardAddressTakenIatEntry, PeGuardCfFunction,
-    PeGuardEhContinuationTarget, PeGuardLongJumpTarget, PeLoadConfigGuardMemcpyAnchor,
-    PeLoadConfigSecurityAnchors, PeLoadConfigXfgAnchors, PeRecoveredString, PeStringEncoding,
-    PeThunk, PeTlsCallback, PluginRunRecord, PluginRunStatus, SessionValidationError,
-    analyze_bytes, analyze_pe,
+    AnalysisError, AnalysisSession, BasicBlock, BinaryAnalysis, CfgTerminator, FunctionCfg,
+    ImportTarget, PeControlFlowTarget, PeDataReference, PeDirectCall, PeGuardAddressTakenIatEntry,
+    PeGuardCfFunction, PeGuardEhContinuationTarget, PeGuardLongJumpTarget,
+    PeLoadConfigGuardMemcpyAnchor, PeLoadConfigSecurityAnchors, PeLoadConfigXfgAnchors,
+    PeRecoveredString, PeStringEncoding, PeThunk, PeTlsCallback, PluginRunRecord, PluginRunStatus,
+    SessionValidationError, analyze_bytes, analyze_pe,
 };
 use resymbol_core::{
     BinaryId, ClaimProducer, ClaimProvenance, Confidence, ControlFlowTarget, Evidence,
     EvidenceKind, SymbolAssertion, SymbolClaim, SymbolSubject, plugin_api::PluginId,
 };
-use resymbol_package::{BinaryBoundPayload, DEFAULT_MAX_PACKAGE_BYTES, ResymPackage, to_vec_bound};
+use resymbol_package::{
+    BinaryBoundPayload, CURRENT_SCHEMA_VERSION, DEFAULT_MAX_PACKAGE_BYTES, ResymPackage,
+    from_slice_bound, to_vec_bound,
+};
 
 const PE_OFFSET: usize = 0x80;
 const COFF_OFFSET: usize = PE_OFFSET + 4;
@@ -5298,6 +5301,78 @@ fn connected_transitive_thunk_cycles_terminate_and_retain_each_exact_edge() {
             .expect("rebuild cyclic graph"),
         analysis.symbol_graph
     );
+}
+
+#[test]
+fn recovers_per_function_control_flow_graphs() {
+    let analysis =
+        analyze_pe(&code_recovery_fixture()).expect("valid PE with recoverable control flow");
+
+    // The single runtime function [0x1000, 0x1020) is a straight-line block of
+    // calls terminated by the RET at 0x101b (half-open end 0x101c).
+    assert!(!analysis.cfg_scan_truncated);
+    assert_eq!(
+        analysis.control_flow_graphs,
+        [FunctionCfg {
+            entry_rva: 0x1000,
+            blocks: vec![BasicBlock {
+                start_rva: 0x1000,
+                end_rva: 0x101c,
+                terminator: CfgTerminator::Return,
+                successors: Vec::new(),
+            }],
+        }]
+    );
+
+    // The CFG survives a serde round-trip and re-validates on deserialization.
+    let encoded = serde_json::to_string(&analysis).expect("serialize analysis with CFG");
+    let decoded = serde_json::from_str::<resymbol_analysis::PeAnalysis>(&encoded)
+        .expect("deserialize analysis with CFG");
+    assert_eq!(decoded.control_flow_graphs, analysis.control_flow_graphs);
+    assert_eq!(decoded, analysis);
+}
+
+#[test]
+fn control_flow_graphs_round_trip_through_a_schema_16_package() {
+    let analysis =
+        analyze_pe(&code_recovery_fixture()).expect("valid PE with recoverable control flow");
+    assert!(!analysis.control_flow_graphs.is_empty());
+
+    let session =
+        AnalysisSession::new(BinaryAnalysis::Pe(analysis.clone()), Vec::new(), Vec::new())
+            .expect("valid analysis session");
+    let package = ResymPackage::from_bound_payload(env!("CARGO_PKG_VERSION"), session)
+        .expect("valid bound analysis package");
+    assert_eq!(CURRENT_SCHEMA_VERSION, 16);
+    assert_eq!(package.schema_version(), CURRENT_SCHEMA_VERSION);
+
+    let bytes = to_vec_bound(&package).expect("encode schema-16 package");
+    let decoded =
+        from_slice_bound::<AnalysisSession>(&bytes).expect("decode schema-16 analysis package");
+    assert_eq!(decoded.schema_version(), 16);
+    let BinaryAnalysis::Pe(decoded_pe) = decoded.payload().base_analysis() else {
+        panic!("expected a PE analysis payload");
+    };
+    assert_eq!(decoded_pe.control_flow_graphs, analysis.control_flow_graphs);
+}
+
+#[test]
+fn schema_15_pe_payload_without_cfg_fields_deserializes_to_empty_cfg() {
+    let analysis =
+        analyze_pe(&code_recovery_fixture()).expect("valid PE with recoverable control flow");
+    let mut value = serde_json::to_value(&analysis).expect("serialize analysis");
+    let object = value
+        .as_object_mut()
+        .expect("analysis serializes as a JSON object");
+    // A schema<=15 PE payload predates the CFG fields entirely: the graph list is
+    // absent and the boolean truncation flag is never serialized when false.
+    assert!(object.remove("control_flow_graphs").is_some());
+    assert!(!object.contains_key("cfg_scan_truncated"));
+
+    let decoded = serde_json::from_value::<resymbol_analysis::PeAnalysis>(value)
+        .expect("older PE payload without CFG fields still deserializes and validates");
+    assert!(decoded.control_flow_graphs.is_empty());
+    assert!(!decoded.cfg_scan_truncated);
 }
 
 #[test]

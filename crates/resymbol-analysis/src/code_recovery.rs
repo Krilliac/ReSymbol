@@ -6,9 +6,9 @@ use std::{
 use iced_x86::{Code, Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
 
 use crate::{
-    AnalysisError, MsvcRttiVftable, PeAnalysis, PeControlFlowTarget, PeDataReference,
-    PeDelayImportLibrary, PeDirectCall, PeExport, PeGuardCfFunction, PeImportLibrary, PeSection,
-    PeThunk, PeTlsCallback, RuntimeFunction,
+    AnalysisError, BasicBlock, CfgEdge, CfgEdgeKind, CfgTerminator, FunctionCfg, MsvcRttiVftable,
+    PeAnalysis, PeControlFlowTarget, PeDataReference, PeDelayImportLibrary, PeDirectCall, PeExport,
+    PeGuardCfFunction, PeImportLibrary, PeSection, PeThunk, PeTlsCallback, RuntimeFunction,
     arch::{FlowKind, TargetArch, iced_direct_target, iced_flow_kind},
     pe::{RvaMap, section_for_rva},
 };
@@ -19,6 +19,7 @@ const MAX_CONTROL_FLOW_BLOCK_STARTS: usize = 262_144;
 const MAX_DIRECT_CALLS: usize = 8_192;
 const MAX_DATA_REFERENCES: usize = 32_768;
 const MAX_THUNKS: usize = 4_096;
+const MAX_BASIC_BLOCKS: usize = 1_048_576;
 const MAX_X86_INSTRUCTION_BYTES: usize = 15;
 
 const IMAGE_SCN_CNT_INITIALIZED_DATA: u32 = 0x0000_0040;
@@ -29,8 +30,10 @@ const IMAGE_SCN_MEM_WRITE: u32 = 0x8000_0000;
 pub(crate) struct CodeRecovery {
     pub scan_truncated: bool,
     pub data_reference_scan_truncated: bool,
+    pub cfg_scan_truncated: bool,
     pub direct_calls: Vec<PeDirectCall>,
     pub data_references: Vec<PeDataReference>,
+    pub control_flow_graphs: Vec<FunctionCfg>,
     pub thunks: Vec<PeThunk>,
 }
 
@@ -369,6 +372,233 @@ struct RelationshipRetention {
     data_reference_scan_truncated: bool,
 }
 
+/// Control-flow classification recorded for one decoded instruction while the
+/// bounded sweep runs. This mirrors the sweep's own `TraversalAction` decisions
+/// (so the block structure never disagrees with which edges the sweep followed)
+/// and refines the terminal cases with the architecture-neutral [`FlowKind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordedFlow {
+    /// Sequential, call, or indirect-call flow; the block continues.
+    Continue,
+    /// A conditional near branch with its resolved in-image target, if any.
+    Conditional { target_rva: Option<u32> },
+    /// An unconditional near branch with its resolved in-image target, if any.
+    Unconditional { target_rva: Option<u32> },
+    /// A return.
+    Return,
+    /// An indirect or unresolved branch whose targets are not modeled.
+    Indirect,
+    /// An interrupt, privileged, undefined, or otherwise non-continuing stop.
+    Terminal,
+}
+
+impl RecordedFlow {
+    /// Whether this instruction terminates its basic block.
+    const fn ends_block(self) -> bool {
+        !matches!(self, Self::Continue)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RecordedInstruction {
+    end_rva: u32,
+    flow: RecordedFlow,
+}
+
+/// Per-function accumulation of the exact instruction stream and branch-target
+/// leaders that the bounded sweep already visits, kept so the basic-block
+/// structure can be recovered without a second decode pass.
+#[derive(Default)]
+struct FunctionCfgRecorder {
+    instructions: BTreeMap<u32, RecordedInstruction>,
+    branch_targets: BTreeSet<u32>,
+}
+
+/// Map one instruction's sweep action onto its recorded control-flow class,
+/// resolving direct near-branch targets to in-image RVAs.
+fn recorded_flow(
+    action: TraversalAction,
+    instruction: &Instruction,
+    image_base: u64,
+    size_of_image: u32,
+) -> RecordedFlow {
+    match action {
+        TraversalAction::ConditionalBranch { target } => RecordedFlow::Conditional {
+            target_rva: va_to_rva(target, image_base, size_of_image),
+        },
+        TraversalAction::UnconditionalBranch { target } => RecordedFlow::Unconditional {
+            target_rva: va_to_rva(target, image_base, size_of_image),
+        },
+        TraversalAction::Continue => RecordedFlow::Continue,
+        TraversalAction::Stop => match iced_flow_kind(instruction) {
+            FlowKind::Return => RecordedFlow::Return,
+            FlowKind::IndirectBranch | FlowKind::UnconditionalBranch => RecordedFlow::Indirect,
+            _ => RecordedFlow::Terminal,
+        },
+    }
+}
+
+impl FunctionCfgRecorder {
+    fn record(
+        &mut self,
+        function_range: (u32, u32),
+        instruction_rva: u32,
+        instruction_end: u32,
+        flow: RecordedFlow,
+    ) {
+        let (begin_rva, end_rva) = function_range;
+        if let RecordedFlow::Conditional {
+            target_rva: Some(target),
+        }
+        | RecordedFlow::Unconditional {
+            target_rva: Some(target),
+        } = flow
+        {
+            if (begin_rva..end_rva).contains(&target) {
+                self.branch_targets.insert(target);
+            }
+        }
+        self.instructions.insert(
+            instruction_rva,
+            RecordedInstruction {
+                end_rva: instruction_end,
+                flow,
+            },
+        );
+    }
+
+    /// Split the recorded instruction stream into basic blocks.
+    ///
+    /// Leaders are the function entry, every in-range branch target that lands on
+    /// a decoded instruction boundary, and the instruction following any
+    /// terminator. Calls are treated as fall-through within a block, so a block
+    /// is split only at a branch target or immediately after a control-flow
+    /// terminator. Indirect and out-of-image edges keep an unresolved (`None`)
+    /// target and never invent successors.
+    fn finish(self, begin_rva: u32) -> Option<FunctionCfg> {
+        if !self.instructions.contains_key(&begin_rva) {
+            return None;
+        }
+        let mut leaders = BTreeSet::new();
+        leaders.insert(begin_rva);
+        for target in &self.branch_targets {
+            if self.instructions.contains_key(target) {
+                leaders.insert(*target);
+            }
+        }
+        for instruction in self.instructions.values() {
+            if instruction.flow.ends_block() && self.instructions.contains_key(&instruction.end_rva)
+            {
+                leaders.insert(instruction.end_rva);
+            }
+        }
+
+        let mut blocks = Vec::new();
+        for &leader in &leaders {
+            let mut cursor = leader;
+            loop {
+                let Some(instruction) = self.instructions.get(&cursor) else {
+                    // The block runs off the decoded stream without a terminator;
+                    // it falls through to the next RVA honestly.
+                    blocks.push(fall_through_block(leader, cursor));
+                    break;
+                };
+                if instruction.flow.ends_block() {
+                    blocks.push(terminated_block(leader, instruction));
+                    break;
+                }
+                let next = instruction.end_rva;
+                if leaders.contains(&next) {
+                    blocks.push(fall_through_block(leader, next));
+                    break;
+                }
+                if next <= cursor {
+                    // Defensive: a non-advancing stream cannot continue.
+                    blocks.push(fall_through_block(leader, next));
+                    break;
+                }
+                cursor = next;
+            }
+        }
+        Some(FunctionCfg {
+            entry_rva: begin_rva,
+            blocks,
+        })
+    }
+}
+
+fn fall_through_block(start_rva: u32, end_rva: u32) -> BasicBlock {
+    BasicBlock {
+        start_rva,
+        end_rva,
+        terminator: CfgTerminator::FallThrough,
+        successors: vec![CfgEdge {
+            kind: CfgEdgeKind::FallThrough,
+            target_rva: Some(end_rva),
+        }],
+    }
+}
+
+fn terminated_block(start_rva: u32, instruction: &RecordedInstruction) -> BasicBlock {
+    let end_rva = instruction.end_rva;
+    let (terminator, successors) = match instruction.flow {
+        RecordedFlow::Conditional { target_rva } => (
+            CfgTerminator::ConditionalBranch,
+            vec![
+                CfgEdge {
+                    kind: CfgEdgeKind::BranchTaken,
+                    target_rva,
+                },
+                CfgEdge {
+                    kind: CfgEdgeKind::BranchNotTaken,
+                    target_rva: Some(end_rva),
+                },
+            ],
+        ),
+        RecordedFlow::Unconditional { target_rva } => (
+            CfgTerminator::UnconditionalBranch,
+            vec![CfgEdge {
+                kind: CfgEdgeKind::Branch,
+                target_rva,
+            }],
+        ),
+        RecordedFlow::Return => (CfgTerminator::Return, Vec::new()),
+        RecordedFlow::Indirect => (CfgTerminator::IndirectBranch, Vec::new()),
+        RecordedFlow::Terminal => (CfgTerminator::Invalid, Vec::new()),
+        RecordedFlow::Continue => (CfgTerminator::FallThrough, Vec::new()),
+    };
+    BasicBlock {
+        start_rva,
+        end_rva,
+        terminator,
+        successors,
+    }
+}
+
+/// Deterministic, bounded collection of per-function control-flow graphs.
+#[derive(Default)]
+struct CfgAccumulator {
+    graphs: Vec<FunctionCfg>,
+    entries: BTreeSet<u32>,
+    total_blocks: usize,
+    truncated: bool,
+}
+
+impl CfgAccumulator {
+    fn push(&mut self, graph: FunctionCfg) {
+        if graph.blocks.is_empty() || !self.entries.insert(graph.entry_rva) {
+            return;
+        }
+        if self.total_blocks.saturating_add(graph.blocks.len()) > MAX_BASIC_BLOCKS {
+            self.truncated = true;
+            self.entries.remove(&graph.entry_rva);
+            return;
+        }
+        self.total_blocks += graph.blocks.len();
+        self.graphs.push(graph);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn scan_runtime_function(
     arch: TargetArch,
@@ -380,6 +610,7 @@ fn scan_runtime_function(
     block_budget: &mut BlockBudget,
     direct_calls: &mut BTreeSet<PeDirectCall>,
     data_references: &mut BTreeSet<PeDataReference>,
+    cfg: &mut FunctionCfgRecorder,
     scan_truncated: &mut bool,
     data_reference_scan_truncated: &mut bool,
 ) -> RuntimeScanResult {
@@ -528,7 +759,15 @@ fn scan_runtime_function(
                 }
                 traversal.queue(target_rva, block_budget)
             };
-            let queue_result = match traversal_action(&instruction) {
+            let action = traversal_action(&instruction);
+            let flow = recorded_flow(
+                action,
+                &instruction,
+                context.image_base,
+                context.size_of_image,
+            );
+            cfg.record((begin_rva, end_rva), instruction_rva, instruction_end, flow);
+            let queue_result = match action {
                 TraversalAction::Continue => continue,
                 TraversalAction::ConditionalBranch { target } => {
                     Some((queue_target(target, &mut traversal, block_budget), false))
@@ -603,6 +842,7 @@ pub(crate) fn recover_code(input: CodeRecoveryInput<'_, '_>) -> CodeRecovery {
     }
 
     let mut block_budget = BlockBudget::default();
+    let mut cfg_accumulator = CfgAccumulator::default();
     'runtime_functions: for (begin_rva, end_rva) in ranges {
         let Some(size) = end_rva.checked_sub(begin_rva) else {
             continue;
@@ -619,7 +859,8 @@ pub(crate) fn recover_code(input: CodeRecoveryInput<'_, '_>) -> CodeRecovery {
         else {
             continue;
         };
-        match scan_runtime_function(
+        let mut cfg_recorder = FunctionCfgRecorder::default();
+        let result = scan_runtime_function(
             arch,
             begin_rva,
             end_rva,
@@ -629,13 +870,19 @@ pub(crate) fn recover_code(input: CodeRecoveryInput<'_, '_>) -> CodeRecovery {
             &mut block_budget,
             &mut direct_calls,
             &mut data_references,
+            &mut cfg_recorder,
             &mut scan_truncated,
             &mut data_reference_scan_truncated,
-        ) {
+        );
+        if let Some(graph) = cfg_recorder.finish(begin_rva) {
+            cfg_accumulator.push(graph);
+        }
+        match result {
             RuntimeScanResult::Complete => {}
             RuntimeScanResult::AllocationFailed | RuntimeScanResult::DecodeBudgetExceeded => {
                 scan_truncated = true;
                 data_reference_scan_truncated = true;
+                cfg_accumulator.truncated = true;
                 break 'runtime_functions;
             }
         }
@@ -709,8 +956,10 @@ pub(crate) fn recover_code(input: CodeRecoveryInput<'_, '_>) -> CodeRecovery {
     CodeRecovery {
         scan_truncated,
         data_reference_scan_truncated,
+        cfg_scan_truncated: cfg_accumulator.truncated,
         direct_calls,
         data_references,
+        control_flow_graphs: cfg_accumulator.graphs,
         thunks: thunks.into_iter().collect(),
     }
 }
@@ -1186,6 +1435,148 @@ pub(crate) fn validate_data_references(
                 "data-reference target",
                 "is not fully backed readable initialized non-executable data in the image",
             );
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_control_flow_graphs(analysis: &PeAnalysis) -> Result<(), AnalysisError> {
+    // The persisted graphs are range- and structure-checked against the exact
+    // metadata, mirroring how `direct_calls` is validated: the edges are not
+    // recomputed from a fresh decode, but every block must lie in a backed
+    // executable runtime-function range and every resolved edge must stay in the
+    // image, with a terminator/successor shape the bounded sweep can honestly
+    // produce.
+    let runtime_starts: BTreeSet<u32> = analysis
+        .runtime_functions
+        .iter()
+        .map(|function| function.begin_rva)
+        .collect();
+
+    let mut total_blocks = 0_usize;
+    let mut previous_entry = None;
+    for cfg in &analysis.control_flow_graphs {
+        if let Some(previous) = previous_entry {
+            if cfg.entry_rva <= previous {
+                return invalid(
+                    "control-flow graphs",
+                    "must be strictly sorted and unique by entry RVA",
+                );
+            }
+        }
+        previous_entry = Some(cfg.entry_rva);
+
+        if cfg.blocks.is_empty() {
+            return invalid("control-flow graph", "has no basic blocks");
+        }
+        total_blocks = total_blocks.saturating_add(cfg.blocks.len());
+        if total_blocks > MAX_BASIC_BLOCKS {
+            return invalid(
+                "control-flow graph blocks",
+                "exceed the retained record cap",
+            );
+        }
+        if !runtime_starts.contains(&cfg.entry_rva) {
+            return invalid(
+                "control-flow graph entry",
+                "does not match an authoritative runtime-function start",
+            );
+        }
+        if cfg.blocks[0].start_rva != cfg.entry_rva {
+            return invalid(
+                "control-flow graph",
+                "first basic block does not begin at the entry RVA",
+            );
+        }
+
+        let mut previous_end = None;
+        for block in &cfg.blocks {
+            if block.end_rva <= block.start_rva {
+                return invalid(
+                    "basic block",
+                    "end RVA must be strictly greater than its start RVA",
+                );
+            }
+            if let Some(previous_end) = previous_end {
+                if block.start_rva < previous_end {
+                    return invalid("basic blocks", "must be sorted and non-overlapping");
+                }
+            }
+            previous_end = Some(block.end_rva);
+
+            let size = block.end_rva - block.start_rva;
+            if !model_range_is_backed_executable(analysis, block.start_rva, size) {
+                return invalid("basic block", "is not a fully file-backed executable range");
+            }
+            validate_block_terminator(analysis, block)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_block_terminator(
+    analysis: &PeAnalysis,
+    block: &BasicBlock,
+) -> Result<(), AnalysisError> {
+    for edge in &block.successors {
+        if let Some(target) = edge.target_rva {
+            if target > analysis.size_of_image {
+                return invalid(
+                    "basic-block successor",
+                    "resolved edge target lies outside the declared image",
+                );
+            }
+        }
+    }
+    let kinds: Vec<CfgEdgeKind> = block.successors.iter().map(|edge| edge.kind).collect();
+    let not_taken_target =
+        |index: usize| block.successors.get(index).and_then(|edge| edge.target_rva);
+    match block.terminator {
+        CfgTerminator::Return | CfgTerminator::IndirectBranch | CfgTerminator::Invalid => {
+            if !block.successors.is_empty() {
+                return invalid(
+                    "basic-block terminator",
+                    "return, indirect-branch, and invalid terminators carry no successors",
+                );
+            }
+        }
+        CfgTerminator::UnconditionalBranch => {
+            if kinds != [CfgEdgeKind::Branch] {
+                return invalid(
+                    "basic-block terminator",
+                    "an unconditional branch has exactly one branch successor",
+                );
+            }
+        }
+        CfgTerminator::ConditionalBranch => {
+            if kinds != [CfgEdgeKind::BranchTaken, CfgEdgeKind::BranchNotTaken]
+                || not_taken_target(1) != Some(block.end_rva)
+            {
+                return invalid(
+                    "basic-block terminator",
+                    "a conditional branch has a taken successor and a not-taken fall-through to its end RVA",
+                );
+            }
+        }
+        CfgTerminator::FallThrough => {
+            if kinds != [CfgEdgeKind::FallThrough] || not_taken_target(0) != Some(block.end_rva) {
+                return invalid(
+                    "basic-block terminator",
+                    "a fall-through block has exactly one fall-through successor to its end RVA",
+                );
+            }
+        }
+        CfgTerminator::Call => {
+            if block
+                .successors
+                .iter()
+                .any(|edge| edge.kind != CfgEdgeKind::Call)
+            {
+                return invalid(
+                    "basic-block terminator",
+                    "a call terminator carries only call successors",
+                );
+            }
         }
     }
     Ok(())
@@ -1890,5 +2281,188 @@ mod tests {
         );
         assert_eq!(va_to_rva(image_base - 1, image_base, 0x2000), None);
         assert_eq!(va_to_rva(image_base + 0x2000, image_base, 0x2000), None);
+    }
+
+    const CFG_TEST_IMAGE_SIZE: u32 = 0x1_0000;
+
+    /// Record a fully contiguous, linearly decodable synthetic function into a
+    /// [`FunctionCfgRecorder`], mirroring the sweep's per-instruction recording.
+    fn record_linear(bytes: &[u8], entry_rva: u32, end_rva: u32) -> FunctionCfgRecorder {
+        let mut recorder = FunctionCfgRecorder::default();
+        let ip = TEST_IMAGE_BASE + u64::from(entry_rva);
+        let mut decoder = Decoder::with_ip(64, bytes, ip, DecoderOptions::NONE);
+        while decoder.can_decode() {
+            let position = u32::try_from(decoder.position()).expect("small test offset");
+            let instruction_rva = entry_rva + position;
+            if instruction_rva >= end_rva {
+                break;
+            }
+            let instruction = decoder.decode();
+            if instruction.is_invalid() || instruction.len() == 0 {
+                break;
+            }
+            let instruction_end = instruction_rva + u32::try_from(instruction.len()).expect("len");
+            if instruction_end > end_rva {
+                break;
+            }
+            let action = traversal_action(&instruction);
+            let flow = recorded_flow(action, &instruction, TEST_IMAGE_BASE, CFG_TEST_IMAGE_SIZE);
+            recorder.record((entry_rva, end_rva), instruction_rva, instruction_end, flow);
+        }
+        recorder
+    }
+
+    #[test]
+    fn conditional_branch_splits_into_taken_not_taken_and_target_blocks() {
+        // test eax,eax; je +2; xor eax,eax; ret
+        let bytes = [0x85, 0xc0, 0x74, 0x02, 0x31, 0xc0, 0xc3];
+        let cfg = record_linear(&bytes, 0x1000, 0x1007)
+            .finish(0x1000)
+            .expect("entry is recorded");
+        assert_eq!(cfg.entry_rva, 0x1000);
+        assert_eq!(cfg.blocks.len(), 3);
+
+        let conditional = &cfg.blocks[0];
+        assert_eq!(conditional.start_rva, 0x1000);
+        assert_eq!(conditional.end_rva, 0x1004);
+        assert_eq!(conditional.terminator, CfgTerminator::ConditionalBranch);
+        assert_eq!(
+            conditional.successors,
+            vec![
+                CfgEdge {
+                    kind: CfgEdgeKind::BranchTaken,
+                    target_rva: Some(0x1006),
+                },
+                CfgEdge {
+                    kind: CfgEdgeKind::BranchNotTaken,
+                    target_rva: Some(0x1004),
+                },
+            ]
+        );
+
+        let fall_through = &cfg.blocks[1];
+        assert_eq!(fall_through.start_rva, 0x1004);
+        assert_eq!(fall_through.end_rva, 0x1006);
+        assert_eq!(fall_through.terminator, CfgTerminator::FallThrough);
+        assert_eq!(
+            fall_through.successors,
+            vec![CfgEdge {
+                kind: CfgEdgeKind::FallThrough,
+                target_rva: Some(0x1006),
+            }]
+        );
+
+        let ret = &cfg.blocks[2];
+        assert_eq!(ret.start_rva, 0x1006);
+        assert_eq!(ret.end_rva, 0x1007);
+        assert_eq!(ret.terminator, CfgTerminator::Return);
+        assert!(ret.successors.is_empty());
+    }
+
+    #[test]
+    fn unconditional_branch_yields_a_single_resolved_successor() {
+        // jmp +0 (to the next instruction); ret
+        let bytes = [0xeb, 0x00, 0xc3];
+        let cfg = record_linear(&bytes, 0x2000, 0x2003)
+            .finish(0x2000)
+            .expect("entry is recorded");
+        assert_eq!(cfg.blocks.len(), 2);
+        assert_eq!(cfg.blocks[0].terminator, CfgTerminator::UnconditionalBranch);
+        assert_eq!(
+            cfg.blocks[0].successors,
+            vec![CfgEdge {
+                kind: CfgEdgeKind::Branch,
+                target_rva: Some(0x2002),
+            }]
+        );
+        assert_eq!(cfg.blocks[1].terminator, CfgTerminator::Return);
+    }
+
+    #[test]
+    fn out_of_image_branch_keeps_an_unresolved_successor() {
+        // jmp rel32 with a displacement that lands outside the declared image.
+        let bytes = [0xe9, 0xfb, 0xff, 0xff, 0x7f];
+        let cfg = record_linear(&bytes, 0x5000, 0x5005)
+            .finish(0x5000)
+            .expect("entry is recorded");
+        assert_eq!(cfg.blocks.len(), 1);
+        assert_eq!(cfg.blocks[0].terminator, CfgTerminator::UnconditionalBranch);
+        assert_eq!(
+            cfg.blocks[0].successors,
+            vec![CfgEdge {
+                kind: CfgEdgeKind::Branch,
+                target_rva: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn indirect_branch_terminates_without_inventing_successors() {
+        // jmp rax
+        let bytes = [0xff, 0xe0];
+        let cfg = record_linear(&bytes, 0x4000, 0x4002)
+            .finish(0x4000)
+            .expect("entry is recorded");
+        assert_eq!(cfg.blocks.len(), 1);
+        assert_eq!(cfg.blocks[0].terminator, CfgTerminator::IndirectBranch);
+        assert!(cfg.blocks[0].successors.is_empty());
+    }
+
+    #[test]
+    fn a_call_does_not_split_its_block() {
+        // call +0; ret -- the call is fall-through within the block.
+        let bytes = [0xe8, 0x00, 0x00, 0x00, 0x00, 0xc3];
+        let cfg = record_linear(&bytes, 0x6000, 0x6006)
+            .finish(0x6000)
+            .expect("entry is recorded");
+        assert_eq!(cfg.blocks.len(), 1);
+        assert_eq!(cfg.blocks[0].start_rva, 0x6000);
+        assert_eq!(cfg.blocks[0].end_rva, 0x6006);
+        assert_eq!(cfg.blocks[0].terminator, CfgTerminator::Return);
+        assert!(cfg.blocks[0].successors.is_empty());
+    }
+
+    fn cfg_with_blocks(entry_rva: u32, block_count: u32) -> FunctionCfg {
+        let blocks = (0..block_count)
+            .map(|index| {
+                let start = entry_rva + index * 2;
+                BasicBlock {
+                    start_rva: start,
+                    end_rva: start + 1,
+                    terminator: CfgTerminator::Return,
+                    successors: Vec::new(),
+                }
+            })
+            .collect();
+        FunctionCfg { entry_rva, blocks }
+    }
+
+    #[test]
+    fn cfg_accumulator_bounds_total_blocks_and_deduplicates_entries() {
+        let mut accumulator = CfgAccumulator {
+            graphs: Vec::new(),
+            entries: BTreeSet::new(),
+            total_blocks: MAX_BASIC_BLOCKS - 1,
+            truncated: false,
+        };
+        // Exactly reaching the cap is retained.
+        accumulator.push(cfg_with_blocks(0x100, 1));
+        assert_eq!(accumulator.total_blocks, MAX_BASIC_BLOCKS);
+        assert!(!accumulator.truncated);
+        assert_eq!(accumulator.graphs.len(), 1);
+
+        // The next block exceeds the cap and is dropped with the flag set.
+        accumulator.push(cfg_with_blocks(0x200, 1));
+        assert!(accumulator.truncated);
+        assert_eq!(accumulator.graphs.len(), 1);
+
+        // Empty graphs and duplicate entries are ignored without effect.
+        let mut fresh = CfgAccumulator::default();
+        fresh.push(cfg_with_blocks(0x300, 0));
+        fresh.push(cfg_with_blocks(0x400, 2));
+        fresh.push(cfg_with_blocks(0x400, 3));
+        assert_eq!(fresh.graphs.len(), 1);
+        assert_eq!(fresh.total_blocks, 2);
+        assert!(!fresh.truncated);
     }
 }

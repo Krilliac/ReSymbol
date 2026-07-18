@@ -376,7 +376,7 @@ fn macho_analysis_round_trips_through_serde_and_a_package() {
         AnalysisSession::new(analysis, Vec::new(), Vec::new()).expect("Mach-O session is valid");
     let package = ResymPackage::from_bound_payload("0.1.0-test", session)
         .expect("Mach-O session binds to a package");
-    assert_eq!(CURRENT_SCHEMA_VERSION, 15);
+    assert_eq!(CURRENT_SCHEMA_VERSION, 16);
     let encoded = to_vec(&package).expect("package serializes");
     assert!(
         std::str::from_utf8(&encoded)

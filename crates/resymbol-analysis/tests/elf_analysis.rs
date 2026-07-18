@@ -134,7 +134,7 @@ fn elf32_mips_container_intake_is_sparse_and_claim_free() {
         .expect("container-only session is valid");
     let package = ResymPackage::from_bound_payload("0.1.0-test", session)
         .expect("ELF session binds to a package");
-    assert_eq!(CURRENT_SCHEMA_VERSION, 15);
+    assert_eq!(CURRENT_SCHEMA_VERSION, 16);
     let first = to_vec(&package).expect("package serializes");
     let second = to_vec(&package).expect("package serializes deterministically");
     assert_eq!(first, second);

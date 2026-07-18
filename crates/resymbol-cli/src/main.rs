@@ -899,7 +899,8 @@ fn read_analysis_package(
         12 => serde_json::from_value(payload).context("cannot decode schema-v12 analysis payload"),
         13 => serde_json::from_value(payload).context("cannot decode schema-v13 analysis payload"),
         14 => serde_json::from_value(payload).context("cannot decode schema-v14 analysis payload"),
-        15 => serde_json::from_value(payload).context("cannot decode current analysis payload"),
+        15 => serde_json::from_value(payload).context("cannot decode schema-v15 analysis payload"),
+        16 => serde_json::from_value(payload).context("cannot decode current analysis payload"),
         _ => bail!("unsupported analysis package schema {schema_version}"),
     })?;
     if (2..TRANSITIVE_THUNK_CHAIN_SCHEMA_VERSION).contains(&schema_version) {
@@ -1611,6 +1612,8 @@ impl SchemaV1PeAnalysis {
             strings: Vec::new(),
             data_reference_scan_truncated: false,
             data_references: Vec::new(),
+            cfg_scan_truncated: false,
+            control_flow_graphs: Vec::new(),
             msvc_rtti_scan_truncated: self.msvc_rtti_scan_truncated,
             msvc_rtti_vftables: self.msvc_rtti_vftables,
             symbol_graph: self.symbol_graph,
@@ -5653,7 +5656,7 @@ entrypoint = "Plugin.dll"
 
         let package: ResymPackage<AnalysisSession> =
             read_file_bound(&output).expect("read bound package");
-        assert_eq!(CURRENT_SCHEMA_VERSION, 15);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 16);
         assert_eq!(package.schema_version(), CURRENT_SCHEMA_VERSION);
         assert_eq!(
             package.binary_sha256(),
@@ -5895,6 +5898,8 @@ entrypoint = "Plugin.dll"
             "strings",
             "data_reference_scan_truncated",
             "data_references",
+            "cfg_scan_truncated",
+            "control_flow_graphs",
         ] {
             pe.remove(field);
         }
@@ -6306,6 +6311,8 @@ entrypoint = "Plugin.dll"
         pe.remove("strings");
         pe.remove("data_reference_scan_truncated");
         pe.remove("data_references");
+        pe.remove("cfg_scan_truncated");
+        pe.remove("control_flow_graphs");
         let claims = pe
             .get_mut("symbol_graph")
             .and_then(|graph| graph.get_mut("claims"))
@@ -6490,6 +6497,8 @@ entrypoint = "Plugin.dll"
         pe.remove("strings");
         pe.remove("data_reference_scan_truncated");
         pe.remove("data_references");
+        pe.remove("cfg_scan_truncated");
+        pe.remove("control_flow_graphs");
         let claims = pe
             .get_mut("symbol_graph")
             .and_then(|graph| graph.get_mut("claims"))
@@ -6999,16 +7008,16 @@ entrypoint = "Plugin.dll"
     }
 
     #[test]
-    fn cli_rejects_schema_v16_before_decoding_the_analysis_payload() {
+    fn cli_rejects_schema_v17_before_decoding_the_analysis_payload() {
         let temp = tempfile::tempdir().expect("create temporary directory");
-        let path = temp.path().join("schema-v16.resym");
+        let path = temp.path().join("schema-v17.resym");
         let base_analysis = analyze_bytes(&pe_fixture()).expect("analyze PE fixture");
         let session = AnalysisSession::new(base_analysis, Vec::new(), Vec::new())
             .expect("create base-only session");
         let package = ResymPackage::from_bound_payload("0.1.0-future", session)
             .expect("create current package value");
         let mut value = serde_json::to_value(package).expect("serialize package value");
-        value["schema_version"] = serde_json::json!(16);
+        value["schema_version"] = serde_json::json!(17);
         value["payload"] = serde_json::json!("not an analysis session");
         fs::write(
             &path,
@@ -7017,12 +7026,12 @@ entrypoint = "Plugin.dll"
         .expect("write future package");
 
         let error = match read_analysis_package(&path, false) {
-            Ok(_) => panic!("schema 16 must be rejected"),
+            Ok(_) => panic!("schema 17 must be rejected"),
             Err(error) => error,
         };
         let diagnostic = format!("{error:#}");
-        assert!(diagnostic.contains("unsupported package schema 16"));
-        assert!(diagnostic.contains("schemas 1 through 15"));
+        assert!(diagnostic.contains("unsupported package schema 17"));
+        assert!(diagnostic.contains("schemas 1 through 16"));
         assert!(!diagnostic.contains("analysis payload"));
     }
 
@@ -7165,7 +7174,7 @@ entrypoint = "Plugin.dll"
                 Err(error) => error,
             };
             let diagnostic = format!("{error:#}");
-            assert!(diagnostic.contains("package schema 15 requires an explicit"));
+            assert!(diagnostic.contains("package schema 16 requires an explicit"));
             assert!(diagnostic.contains("load_config_guard_memcpy_anchor object"));
             assert!(diagnostic.contains("cannot be migrated by changing only its envelope label"));
             assert!(!diagnostic.contains("schema-12"));
@@ -7341,7 +7350,7 @@ entrypoint = "Plugin.dll"
             Err(error) => error,
         };
         let diagnostic = format!("{error:#}");
-        assert!(diagnostic.contains("package schema 15 requires an explicit"));
+        assert!(diagnostic.contains("package schema 16 requires an explicit"));
         assert!(diagnostic.contains("load_config_xfg_anchors object"));
         assert!(!diagnostic.contains("load_config_guard_memcpy_anchor object"));
     }
@@ -7547,7 +7556,7 @@ entrypoint = "Plugin.dll"
             Err(error) => error,
         };
         let diagnostic = format!("{error:#}");
-        assert!(diagnostic.contains("package schema 15 requires an explicit"));
+        assert!(diagnostic.contains("package schema 16 requires an explicit"));
         assert!(diagnostic.contains("load_config_security_anchors object"));
         assert!(!diagnostic.contains("load_config_guard_memcpy_anchor object"));
         assert!(!diagnostic.contains("load_config_xfg_anchors object"));
