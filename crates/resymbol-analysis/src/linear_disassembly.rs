@@ -5,11 +5,9 @@
 //! execute target code. Callers must provide bytes already verified by their
 //! own source-binding policy.
 
-use iced_x86::{
-    Decoder, DecoderError, DecoderOptions, FlowControl, Formatter, Instruction, IntelFormatter,
-    OpKind,
-};
 use thiserror::Error;
+
+use crate::arch::{DecodeOutcome, FlowKind, IcedX64Decoder, InstructionDecoder};
 
 /// Hard ceiling for source bytes considered by one preview.
 pub const MAX_LINEAR_DISASSEMBLY_BYTES: usize = 64 * 1024;
@@ -142,19 +140,23 @@ impl LinearFlowControlCategory {
     }
 }
 
-impl From<FlowControl> for LinearFlowControlCategory {
-    fn from(flow: FlowControl) -> Self {
+impl From<FlowKind> for LinearFlowControlCategory {
+    fn from(flow: FlowKind) -> Self {
         match flow {
-            FlowControl::Next => Self::Sequential,
-            FlowControl::ConditionalBranch => Self::ConditionalBranch,
-            FlowControl::UnconditionalBranch => Self::UnconditionalBranch,
-            FlowControl::IndirectBranch => Self::IndirectBranch,
-            FlowControl::Call => Self::Call,
-            FlowControl::IndirectCall => Self::IndirectCall,
-            FlowControl::Return => Self::Return,
-            FlowControl::Interrupt => Self::Interrupt,
-            FlowControl::XbeginXabortXend => Self::Transaction,
-            FlowControl::Exception => Self::Exception,
+            FlowKind::Sequential => Self::Sequential,
+            FlowKind::ConditionalBranch => Self::ConditionalBranch,
+            FlowKind::UnconditionalBranch => Self::UnconditionalBranch,
+            FlowKind::IndirectBranch => Self::IndirectBranch,
+            FlowKind::Call => Self::Call,
+            FlowKind::IndirectCall => Self::IndirectCall,
+            FlowKind::Return => Self::Return,
+            FlowKind::Interrupt => Self::Interrupt,
+            // The x86 backend routes `iced-x86`'s transactional group through
+            // `FlowKind::Privileged` and its exception-generating group through
+            // `FlowKind::Invalid`, so the linear preview reconstructs its
+            // original `transaction`/`exception` categories byte-for-byte.
+            FlowKind::Privileged => Self::Transaction,
+            FlowKind::Invalid => Self::Exception,
         }
     }
 }
@@ -270,8 +272,28 @@ impl LinearDisassemblyPreview {
 /// Decode a verified byte span as a deterministic x64 linear preview.
 ///
 /// This function is thread-safe and has no side effects. The caller retains
-/// ownership of source verification and RVA-to-file/live mapping policy.
+/// ownership of source verification and RVA-to-file/live mapping policy. It is a
+/// thin wrapper over [`disassemble_linear`] using the `iced-x86` x86-64 backend,
+/// preserving the original public signature and behavior exactly.
 pub fn disassemble_x64_linear(
+    verified_bytes: &[u8],
+    start_rva: u64,
+    limits: LinearDisassemblyLimits,
+) -> LinearDisassemblyPreview {
+    let mut decoder = IcedX64Decoder::new_x86_64();
+    disassemble_linear(&mut decoder, verified_bytes, start_rva, limits)
+}
+
+/// Decode a verified byte span as a deterministic bounded linear preview using
+/// any [`InstructionDecoder`] backend.
+///
+/// The sweep is a pure value transformer: it advances instruction-by-instruction
+/// through the caller-supplied window under independent byte and instruction
+/// budgets, retaining one owned row per successfully decoded instruction and
+/// recording the exact deterministic reason it stopped. It does not follow
+/// control flow, discover function boundaries, read files, or execute code.
+pub fn disassemble_linear(
+    decoder: &mut dyn InstructionDecoder,
     verified_bytes: &[u8],
     start_rva: u64,
     limits: LinearDisassemblyLimits,
@@ -288,8 +310,6 @@ pub fn disassemble_x64_linear(
     let considered_bytes = verified_bytes.len().min(limits.maximum_bytes);
     let window = &verified_bytes[..considered_bytes];
     let byte_limited = considered_bytes < verified_bytes.len();
-    let mut decoder = Decoder::with_ip(64, window, start_rva, DecoderOptions::NONE);
-    let mut formatter = IntelFormatter::new();
     let mut rows = Vec::with_capacity(
         limits
             .maximum_instructions
@@ -297,8 +317,8 @@ pub fn disassemble_x64_linear(
             .min(MAX_LINEAR_DISASSEMBLY_INSTRUCTIONS),
     );
 
+    let mut offset = 0_usize;
     let stop_reason = loop {
-        let offset = decoder.position();
         if offset == window.len() {
             break if byte_limited {
                 LinearDisassemblyStopReason::ByteLimitReached {
@@ -320,25 +340,25 @@ pub fn disassemble_x64_linear(
             };
         };
 
-        let instruction = decoder.decode();
-        let length = instruction.len();
-        if instruction.is_invalid() {
-            break match decoder.last_error() {
-                DecoderError::NoMoreBytes => LinearDisassemblyStopReason::TruncatedInstruction {
+        let instruction = match decoder.decode_one(&window[offset..], rva) {
+            DecodeOutcome::Decoded(instruction) => instruction,
+            DecodeOutcome::Truncated { available } => {
+                break LinearDisassemblyStopReason::TruncatedInstruction {
                     rva,
-                    available_bytes: window.len() - offset,
+                    available_bytes: available,
                     boundary: if byte_limited {
                         LinearTruncationBoundary::ByteLimit
                     } else {
                         LinearTruncationBoundary::InputEnd
                     },
-                },
-                DecoderError::InvalidInstruction | DecoderError::None => {
-                    LinearDisassemblyStopReason::InvalidInstruction { rva, offset }
-                }
-                _ => LinearDisassemblyStopReason::InvalidInstruction { rva, offset },
-            };
-        }
+                };
+            }
+            DecodeOutcome::Invalid => {
+                break LinearDisassemblyStopReason::InvalidInstruction { rva, offset };
+            }
+        };
+
+        let length = usize::from(instruction.length);
         if rva.checked_add(length as u64).is_none() {
             break LinearDisassemblyStopReason::AddressOverflow {
                 rva,
@@ -347,17 +367,15 @@ pub fn disassemble_x64_linear(
         }
         let end = offset + length;
         let exact_bytes = window[offset..end].to_vec();
-        let length = u8::try_from(length).expect("x64 instructions are at most 15 bytes");
-        let mut text = String::new();
-        formatter.format(&instruction, &mut text);
         rows.push(LinearInstructionRow {
             rva,
             bytes: exact_bytes,
-            text,
-            flow_control: instruction.flow_control().into(),
-            direct_target_rva: direct_target_rva(&instruction),
-            length,
+            text: instruction.text,
+            flow_control: instruction.flow.into(),
+            direct_target_rva: instruction.direct_target,
+            length: instruction.length,
         });
+        offset = end;
     };
 
     LinearDisassemblyPreview {
@@ -366,20 +384,6 @@ pub fn disassemble_x64_linear(
         rows,
         stop_reason,
     }
-}
-
-fn direct_target_rva(instruction: &Instruction) -> Option<u64> {
-    if !matches!(
-        instruction.flow_control(),
-        FlowControl::ConditionalBranch | FlowControl::UnconditionalBranch | FlowControl::Call
-    ) {
-        return None;
-    }
-    matches!(
-        instruction.op0_kind(),
-        OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64
-    )
-    .then(|| instruction.near_branch_target())
 }
 
 /// Invalid caller-selected preview limits.
@@ -429,6 +433,24 @@ mod tests {
             first.stop_reason(),
             &LinearDisassemblyStopReason::EndOfInput
         );
+    }
+
+    #[test]
+    fn trait_driven_x86_64_path_matches_the_wrapper() {
+        let bytes = [0x55, 0x48, 0x89, 0xE5, 0x75, 0x02, 0xC3];
+        let wrapper = disassemble_x64_linear(&bytes, 0x1000, limits(bytes.len(), 16));
+
+        let mut decoder = crate::arch::decoder_for(crate::arch::TargetArch::X86_64)
+            .expect("x86-64 decoder is always available");
+        let via_trait =
+            disassemble_linear(decoder.as_mut(), &bytes, 0x1000, limits(bytes.len(), 16));
+
+        assert_eq!(wrapper, via_trait);
+        assert_eq!(
+            via_trait.rows()[2].flow_control(),
+            LinearFlowControlCategory::ConditionalBranch
+        );
+        assert_eq!(via_trait.rows()[2].direct_target_rva(), Some(0x1008));
     }
 
     #[test]

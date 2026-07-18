@@ -1,0 +1,292 @@
+//! Architecture-neutral single-instruction decoding.
+//!
+//! This module introduces a thin decoder abstraction so the higher-level
+//! disassembly passes (linear preview, control-flow block sweep) can be driven
+//! by more than one instruction decoder. The always-available backend wraps the
+//! pure-Rust `iced-x86` decoder for x86/x86-64. When the optional `capstone`
+//! feature is enabled, a Capstone-based backend covers a broad set of other
+//! architectures.
+//!
+//! The abstraction is deliberately minimal and total: every decode attempt maps
+//! to exactly one [`DecodeOutcome`], and no method reads files, maps images, or
+//! executes target code.
+
+use thiserror::Error;
+
+mod iced_x86;
+pub(crate) use iced_x86::{
+    IcedX64Decoder, direct_target as iced_direct_target, flow_kind as iced_flow_kind,
+};
+
+#[cfg(feature = "capstone")]
+mod capstone;
+
+/// A concrete target architecture a decoder can be requested for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetArch {
+    X86,
+    X86_64,
+    Aarch64,
+    Arm,
+    ArmThumb,
+    Mips32,
+    Mips64,
+    Riscv32,
+    Riscv64,
+    PowerPc32,
+    PowerPc64,
+}
+
+impl TargetArch {
+    /// Stable human-readable identifier used in diagnostics.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::X86 => "x86",
+            Self::X86_64 => "x86-64",
+            Self::Aarch64 => "aarch64",
+            Self::Arm => "arm",
+            Self::ArmThumb => "arm-thumb",
+            Self::Mips32 => "mips32",
+            Self::Mips64 => "mips64",
+            Self::Riscv32 => "riscv32",
+            Self::Riscv64 => "riscv64",
+            Self::PowerPc32 => "powerpc32",
+            Self::PowerPc64 => "powerpc64",
+        }
+    }
+}
+
+/// Architecture-neutral control-flow classification of one decoded instruction.
+///
+/// The x86/x86-64 backend maps `iced-x86`'s `FlowControl` onto this enum. Two of
+/// `iced-x86`'s categories have no dedicated variant here: its transactional
+/// group (`XBEGIN`/`XABORT`/`XEND`) reuses [`FlowKind::Privileged`] and its
+/// exception-generating group (`UD0`/`UD1`/`UD2`) reuses [`FlowKind::Invalid`].
+/// `iced-x86` never reports either slot for any other instruction, so the x86
+/// linear preview reproduces its original `transaction`/`exception` categories
+/// exactly (see `impl From<FlowKind> for LinearFlowControlCategory`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlowKind {
+    Sequential,
+    ConditionalBranch,
+    UnconditionalBranch,
+    IndirectBranch,
+    Call,
+    IndirectCall,
+    Return,
+    Interrupt,
+    Privileged,
+    Invalid,
+}
+
+/// One successfully decoded instruction, described architecture-neutrally.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedInstruction {
+    pub address: u64,
+    pub length: u8,
+    pub text: String,
+    pub flow: FlowKind,
+    pub direct_target: Option<u64>,
+}
+
+/// Total result of a single-instruction decode attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecodeOutcome {
+    Decoded(DecodedInstruction),
+    Invalid,
+    Truncated { available: usize },
+}
+
+/// A stateless-per-call single-instruction decoder for one architecture.
+pub trait InstructionDecoder {
+    /// The architecture this decoder decodes.
+    fn arch(&self) -> TargetArch;
+
+    /// Decode exactly one instruction from the start of `bytes`, treating the
+    /// first byte as located at `address`. Trailing bytes beyond the first
+    /// instruction are ignored. Insufficient bytes yield
+    /// [`DecodeOutcome::Truncated`]; an undecodable encoding yields
+    /// [`DecodeOutcome::Invalid`].
+    fn decode_one(&mut self, bytes: &[u8], address: u64) -> DecodeOutcome;
+}
+
+/// No decoder is available for the requested architecture.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum UnsupportedArchError {
+    #[error(
+        "no decoder is available for {arch}; enable the `capstone` feature to decode this architecture"
+    )]
+    FeatureRequired { arch: &'static str },
+    #[error("the Capstone backend could not be initialized for {arch}: {reason}")]
+    BackendUnavailable { arch: &'static str, reason: String },
+}
+
+/// Construct a boxed decoder for `arch`.
+///
+/// `X86` and `X86_64` always return the pure-Rust `iced-x86` backend. Every
+/// other architecture is served by the Capstone backend when the `capstone`
+/// feature is enabled, and otherwise reports [`UnsupportedArchError`].
+pub fn decoder_for(arch: TargetArch) -> Result<Box<dyn InstructionDecoder>, UnsupportedArchError> {
+    match arch {
+        TargetArch::X86 => Ok(Box::new(IcedX64Decoder::new_x86())),
+        TargetArch::X86_64 => Ok(Box::new(IcedX64Decoder::new_x86_64())),
+        other => decoder_for_non_x86(other),
+    }
+}
+
+#[cfg(feature = "capstone")]
+fn decoder_for_non_x86(
+    arch: TargetArch,
+) -> Result<Box<dyn InstructionDecoder>, UnsupportedArchError> {
+    capstone::CapstoneDecoder::new(arch)
+        .map(|decoder| Box::new(decoder) as Box<dyn InstructionDecoder>)
+}
+
+#[cfg(not(feature = "capstone"))]
+fn decoder_for_non_x86(
+    arch: TargetArch,
+) -> Result<Box<dyn InstructionDecoder>, UnsupportedArchError> {
+    Err(UnsupportedArchError::FeatureRequired { arch: arch.name() })
+}
+
+/// Map an analysis `architecture` identity string to a [`TargetArch`].
+///
+/// The accepted strings are exactly those produced by the ELF, Mach-O, and PE
+/// parsers. Unknown or unmodeled strings return `None` so callers never guess a
+/// decoder for an architecture the toolchain does not recognize.
+#[must_use]
+pub fn target_arch_for_identity(architecture: &str) -> Option<TargetArch> {
+    match architecture {
+        // PE (always PE32+ x86-64 in this crate).
+        "x86_64" => Some(TargetArch::X86_64),
+
+        // Mach-O canonical strings.
+        "macho64-x86-64" => Some(TargetArch::X86_64),
+        "macho32-x86" => Some(TargetArch::X86),
+        "macho64-arm64" => Some(TargetArch::Aarch64),
+        "macho32-arm" => Some(TargetArch::Arm),
+        "macho32-ppc" => Some(TargetArch::PowerPc32),
+        "macho64-ppc64" => Some(TargetArch::PowerPc64),
+
+        // ELF canonical strings. x86-64 and aarch64 carry no endianness suffix;
+        // every other ELF architecture is emitted with a `-le`/`-be` suffix.
+        "elf64-x86-64" => Some(TargetArch::X86_64),
+        "elf32-x86-le" | "elf32-x86-be" => Some(TargetArch::X86),
+        "elf64-aarch64" => Some(TargetArch::Aarch64),
+        "elf32-arm-le" | "elf32-arm-be" => Some(TargetArch::Arm),
+        "elf32-em-mips-le" | "elf32-em-mips-be" => Some(TargetArch::Mips32),
+        "elf64-em-mips-le" | "elf64-em-mips-be" => Some(TargetArch::Mips64),
+        "elf32-riscv-le" | "elf32-riscv-be" => Some(TargetArch::Riscv32),
+        "elf64-riscv-le" | "elf64-riscv-be" => Some(TargetArch::Riscv64),
+        "elf32-ppc-le" | "elf32-ppc-be" => Some(TargetArch::PowerPc32),
+        "elf64-ppc64-le" | "elf64-ppc64-be" => Some(TargetArch::PowerPc64),
+
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identity_strings_map_to_expected_architectures() {
+        assert_eq!(target_arch_for_identity("x86_64"), Some(TargetArch::X86_64));
+        assert_eq!(
+            target_arch_for_identity("elf64-x86-64"),
+            Some(TargetArch::X86_64)
+        );
+        assert_eq!(
+            target_arch_for_identity("elf64-aarch64"),
+            Some(TargetArch::Aarch64)
+        );
+        assert_eq!(
+            target_arch_for_identity("elf32-arm-le"),
+            Some(TargetArch::Arm)
+        );
+        assert_eq!(
+            target_arch_for_identity("elf32-em-mips-le"),
+            Some(TargetArch::Mips32)
+        );
+        assert_eq!(
+            target_arch_for_identity("elf64-em-mips-be"),
+            Some(TargetArch::Mips64)
+        );
+        assert_eq!(
+            target_arch_for_identity("elf32-riscv-le"),
+            Some(TargetArch::Riscv32)
+        );
+        assert_eq!(
+            target_arch_for_identity("elf64-riscv-le"),
+            Some(TargetArch::Riscv64)
+        );
+        assert_eq!(
+            target_arch_for_identity("elf32-ppc-le"),
+            Some(TargetArch::PowerPc32)
+        );
+        assert_eq!(
+            target_arch_for_identity("elf64-ppc64-be"),
+            Some(TargetArch::PowerPc64)
+        );
+        assert_eq!(
+            target_arch_for_identity("macho64-arm64"),
+            Some(TargetArch::Aarch64)
+        );
+        assert_eq!(
+            target_arch_for_identity("macho64-x86-64"),
+            Some(TargetArch::X86_64)
+        );
+        assert_eq!(
+            target_arch_for_identity("macho32-arm"),
+            Some(TargetArch::Arm)
+        );
+        assert_eq!(
+            target_arch_for_identity("macho64-ppc64"),
+            Some(TargetArch::PowerPc64)
+        );
+    }
+
+    #[test]
+    fn unknown_identity_strings_are_none() {
+        assert_eq!(target_arch_for_identity(""), None);
+        assert_eq!(target_arch_for_identity("elf64-em-0x00f3-le"), None);
+        assert_eq!(target_arch_for_identity("macho64-cputype-4660"), None);
+        assert_eq!(target_arch_for_identity("sparc"), None);
+    }
+
+    #[test]
+    fn x86_decoders_are_always_available() {
+        assert_eq!(
+            decoder_for(TargetArch::X86_64)
+                .expect("x86-64 decoder")
+                .arch(),
+            TargetArch::X86_64
+        );
+        assert_eq!(
+            decoder_for(TargetArch::X86).expect("x86 decoder").arch(),
+            TargetArch::X86
+        );
+    }
+
+    #[cfg(not(feature = "capstone"))]
+    #[test]
+    fn non_x86_requires_the_capstone_feature() {
+        for arch in [
+            TargetArch::Aarch64,
+            TargetArch::Arm,
+            TargetArch::ArmThumb,
+            TargetArch::Mips32,
+            TargetArch::Mips64,
+            TargetArch::Riscv32,
+            TargetArch::Riscv64,
+            TargetArch::PowerPc32,
+            TargetArch::PowerPc64,
+        ] {
+            assert!(matches!(
+                decoder_for(arch),
+                Err(UnsupportedArchError::FeatureRequired { .. })
+            ));
+        }
+    }
+}

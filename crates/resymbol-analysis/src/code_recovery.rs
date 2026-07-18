@@ -9,6 +9,7 @@ use crate::{
     AnalysisError, MsvcRttiVftable, PeAnalysis, PeControlFlowTarget, PeDataReference,
     PeDelayImportLibrary, PeDirectCall, PeExport, PeGuardCfFunction, PeImportLibrary, PeSection,
     PeThunk, PeTlsCallback, RuntimeFunction,
+    arch::{FlowKind, TargetArch, iced_direct_target, iced_flow_kind},
     pe::{RvaMap, section_for_rva},
 };
 
@@ -247,6 +248,26 @@ enum TraversalAction {
 }
 
 fn traversal_action(instruction: &Instruction) -> TraversalAction {
+    // Direct branch targets are sourced from the architecture-neutral flow
+    // classification and direct-target resolution so this generalizes to other
+    // decoders. For x86-64 every unconditional near branch is `JMP` and every
+    // conditional near branch is a recognized conditional mnemonic, so these two
+    // shortcuts are exactly equivalent to the mnemonic-based classification
+    // below; the remaining (terminal/continue/indirect/far) decisions stay
+    // x86-specific and are handled by `traversal_action_x86`.
+    match (iced_flow_kind(instruction), iced_direct_target(instruction)) {
+        (FlowKind::UnconditionalBranch, Some(target)) => {
+            return TraversalAction::UnconditionalBranch { target };
+        }
+        (FlowKind::ConditionalBranch, Some(target)) => {
+            return TraversalAction::ConditionalBranch { target };
+        }
+        _ => {}
+    }
+    traversal_action_x86(instruction)
+}
+
+fn traversal_action_x86(instruction: &Instruction) -> TraversalAction {
     let mnemonic = instruction.mnemonic();
     let is_near_branch = matches!(
         instruction.op0_kind(),
@@ -350,6 +371,7 @@ struct RelationshipRetention {
 
 #[allow(clippy::too_many_arguments)]
 fn scan_runtime_function(
+    arch: TargetArch,
     begin_rva: u32,
     end_rva: u32,
     bytes: &[u8],
@@ -452,14 +474,22 @@ fn scan_runtime_function(
                 break;
             }
 
-            let reference = decode_data_reference(
-                begin_rva,
-                instruction_rva,
-                instruction_size_u8,
-                &instruction,
-                raw_instruction,
-                context,
-            );
+            // RIP-relative data-reference recovery is x86-specific. It is gated
+            // on the decoder architecture so that non-x86 backends (which lack
+            // the RIP-relative addressing this inspects) simply yield no data
+            // references rather than misinterpreting their operands.
+            let reference = (arch == TargetArch::X86_64)
+                .then(|| {
+                    decode_data_reference(
+                        begin_rva,
+                        instruction_rva,
+                        instruction_size_u8,
+                        &instruction,
+                        raw_instruction,
+                        context,
+                    )
+                })
+                .flatten();
 
             // Calls and data references share this decode pass, but their
             // retention caps are independent except that a resolved pointer
@@ -529,6 +559,12 @@ fn scan_runtime_function(
 }
 
 pub(crate) fn recover_code(input: CodeRecoveryInput<'_, '_>) -> CodeRecovery {
+    // PE images ingested by this crate are PE32+ x86-64, which selects the
+    // always-available `iced-x86` backend (`decoder_for(TargetArch::X86_64)`).
+    // The architecture is threaded through so the x86-specific recovery passes
+    // (RIP-relative data references) are explicitly gated and other backends can
+    // be wired in later without changing the generic control-flow traversal.
+    let arch = TargetArch::X86_64;
     let import_iat_rvas = import_iat_rvas(input.imports, input.delay_imports);
     let runtime_targets = RuntimeTargetPolicy::new(
         input.runtime_functions,
@@ -584,6 +620,7 @@ pub(crate) fn recover_code(input: CodeRecoveryInput<'_, '_>) -> CodeRecovery {
             continue;
         };
         match scan_runtime_function(
+            arch,
             begin_rva,
             end_rva,
             bytes,

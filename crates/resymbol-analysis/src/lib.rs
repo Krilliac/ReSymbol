@@ -4,6 +4,7 @@
 //! binaries, and each container parser uses checked arithmetic and explicit
 //! collection limits throughout.
 
+mod arch;
 mod code_recovery;
 mod elf;
 mod error;
@@ -16,6 +17,10 @@ mod session;
 mod string_recovery;
 mod types;
 
+pub use arch::{
+    DecodeOutcome, DecodedInstruction, FlowKind, InstructionDecoder, TargetArch,
+    UnsupportedArchError, decoder_for, target_arch_for_identity,
+};
 pub use elf::{ElfMachine, analyze_elf};
 pub use error::AnalysisError;
 pub use instruction::{
@@ -25,7 +30,7 @@ pub use linear_disassembly::{
     LinearDisassemblyError, LinearDisassemblyLimits, LinearDisassemblyPreview,
     LinearDisassemblyStopReason, LinearFlowControlCategory, LinearInstructionRow,
     LinearTruncationBoundary, MAX_LINEAR_DISASSEMBLY_BYTES, MAX_LINEAR_DISASSEMBLY_INSTRUCTIONS,
-    disassemble_x64_linear,
+    disassemble_linear, disassemble_x64_linear,
 };
 pub use macho::{MachOKind, analyze_macho, detect_macho};
 pub use pe::{
