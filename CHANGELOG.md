@@ -8,6 +8,13 @@ prereleases; breaking changes remain explicit.
 
 ### Added
 
+- Added a reusable capacity-one `SessionService` foundation for moving future live debugger
+  ownership onto a named child thread. A `Send` factory constructs the potentially non-`Send`
+  driver on that thread, accepted requests receive monotonic correlation IDs, polling never blocks
+  the client, and busy, disconnected, or exhausted submissions return their unconsumed payload.
+  Explicit shutdown joins the owner and returns typed cleanup evidence; `Drop` only signals and
+  detaches, so it cannot falsely claim cleanup completed. This is an ownership primitive, not a
+  Workbench connection or additional live-provider authority.
 - Added a no-write static patch validation preview to the Workbench. The bounded application-service
   worker rebuilds the exact canonical edit plan, applies it only to the retained verified source
   bytes in memory, and reports the exact source/output identities, deterministic output SHA-256,

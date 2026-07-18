@@ -31,11 +31,16 @@ use resymbol_debugger::{MAX_MEMORY_WRITE_BYTES, ValidatedLiveMemoryWrite};
 #[cfg(windows)]
 mod windows;
 
+mod session_service;
 mod session_worker;
 
 #[cfg(windows)]
 pub use windows::WindowsSessionWorker;
 
+pub use session_service::{
+    SessionService, SessionServiceDriver, SessionServiceRequestId, SessionServiceResponse,
+    SessionServiceSubmitError,
+};
 pub use session_worker::{
     DebugAttachReceipt, SessionWorkerCleanupReceipt, SessionWorkerError, SessionWorkerHealth,
     SessionWorkerMemoryReadReceipt, SessionWorkerMemoryWriteNoEffectReceipt,

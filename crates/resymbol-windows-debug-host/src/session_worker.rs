@@ -92,7 +92,7 @@ impl SessionWorkerMemoryWriteReceipt {
         &self.state
     }
 
-    #[must_use]
+    #[must_use = "the returned tuple carries the one-use live-patch history proof"]
     pub fn into_parts(
         self,
     ) -> (
@@ -125,7 +125,7 @@ impl SessionWorkerMemoryWriteNoEffectReceipt {
         &self.state
     }
 
-    #[must_use]
+    #[must_use = "the returned tuple carries the one-use live-patch history proof"]
     pub fn into_parts(
         self,
     ) -> (
