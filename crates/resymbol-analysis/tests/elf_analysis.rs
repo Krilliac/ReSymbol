@@ -134,7 +134,7 @@ fn elf32_mips_container_intake_is_sparse_and_claim_free() {
         .expect("container-only session is valid");
     let package = ResymPackage::from_bound_payload("0.1.0-test", session)
         .expect("ELF session binds to a package");
-    assert_eq!(CURRENT_SCHEMA_VERSION, 14);
+    assert_eq!(CURRENT_SCHEMA_VERSION, 15);
     let first = to_vec(&package).expect("package serializes");
     let second = to_vec(&package).expect("package serializes deterministically");
     assert_eq!(first, second);
@@ -164,25 +164,32 @@ fn sparse_mapping_does_not_materialize_large_virtual_gaps() {
 
 #[test]
 fn elf_identity_and_load_invariants_are_rejected_explicitly() {
-    let mut wrong_class = synthetic_elf32_mips();
-    wrong_class[4] = 2;
+    let mut invalid_class = synthetic_elf32_mips();
+    invalid_class[4] = 3;
     assert!(matches!(
-        analyze_bytes(&wrong_class),
-        Err(AnalysisError::UnsupportedElfClass { class: 2, .. })
+        analyze_bytes(&invalid_class),
+        Err(AnalysisError::UnsupportedElfClass { class: 3 })
     ));
 
-    let mut wrong_endian = synthetic_elf32_mips();
-    wrong_endian[5] = 2;
+    let mut invalid_endian = synthetic_elf32_mips();
+    invalid_endian[5] = 3;
     assert!(matches!(
-        analyze_bytes(&wrong_endian),
-        Err(AnalysisError::UnsupportedElfDataEncoding { data: 2, .. })
+        analyze_bytes(&invalid_endian),
+        Err(AnalysisError::UnsupportedElfDataEncoding { data: 3 })
     ));
 
-    let mut wrong_machine = synthetic_elf32_mips();
-    put_u16(&mut wrong_machine, 18, 62);
+    // Machine 3 (EM_386) is now accepted; the container is machine-independent.
+    let mut other_machine = synthetic_elf32_mips();
+    put_u16(&mut other_machine, 18, 3);
+    let analysis = analyze_bytes(&other_machine).expect("other machines are accepted");
+    assert_eq!(analysis.identity().architecture, "elf32-x86-le");
+
+    // ET_REL (1) is still rejected.
+    let mut relocatable = synthetic_elf32_mips();
+    put_u16(&mut relocatable, 16, 1);
     assert!(matches!(
-        analyze_bytes(&wrong_machine),
-        Err(AnalysisError::UnsupportedElfMachine { machine: 62, .. })
+        analyze_bytes(&relocatable),
+        Err(AnalysisError::UnsupportedElfType { elf_type: 1 })
     ));
 
     let mut oversized_file_span = synthetic_elf32_mips();

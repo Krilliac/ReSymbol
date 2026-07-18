@@ -885,8 +885,8 @@ fn validate_elf_subject_mapping(
         .checked_add(size)
         .ok_or(SessionValidationError::ElfSubjectOutsideLoadSegment { index })?;
     let segment = analysis.load_segments.iter().find(|segment| {
-        let segment_start = u64::from(segment.virtual_address) - analysis.identity.image_base;
-        let segment_end = segment_start + u64::from(segment.memory_size);
+        let segment_start = segment.virtual_address - analysis.identity.image_base;
+        let segment_end = segment_start + segment.memory_size;
         rva >= segment_start && end <= segment_end
     });
     let Some(segment) = segment else {

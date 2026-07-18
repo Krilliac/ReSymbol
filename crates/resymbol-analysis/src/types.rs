@@ -47,28 +47,48 @@ impl BinaryAnalysis {
     }
 }
 
-/// Deterministic, container-only analysis of an ELF32 little-endian `EM_MIPS` image.
+/// ELF file class read from `e_ident[EI_CLASS]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ElfClass {
+    Elf32,
+    Elf64,
+}
+
+/// ELF byte order read from `e_ident[EI_DATA]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ElfEndian {
+    Little,
+    Big,
+}
+
+/// Deterministic, container-only analysis of a bounded ELF image.
 ///
-/// This model deliberately makes no instruction-set or ABI claim beyond the exact
-/// ELF container fields. In particular, `EM_MIPS` does not imply that a generic
-/// MIPS32 decoder is correct for a PlayStation 2 Emotion Engine executable.
+/// Both ELF32 and ELF64, either byte order, and any `e_machine` value are
+/// accepted; container parsing is machine-independent. This model deliberately
+/// makes no instruction-set or ABI claim beyond the exact ELF container fields.
+/// In particular, `EM_MIPS` does not imply that a generic MIPS32 decoder is
+/// correct for a PlayStation 2 Emotion Engine executable.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "UncheckedElfAnalysis")]
 pub struct ElfAnalysis {
     pub identity: BinaryIdentity,
+    pub class: ElfClass,
+    pub endian: ElfEndian,
     pub os_abi: u8,
     pub abi_version: u8,
     pub elf_type: u16,
     pub machine: u16,
     pub elf_version: u32,
-    pub entry_va: u32,
-    pub entry_rva: u32,
+    pub entry_va: u64,
+    pub entry_rva: u64,
     pub flags: u32,
     pub header_size: u16,
-    pub program_header_offset: u32,
+    pub program_header_offset: u64,
     pub program_header_entry_size: u16,
     pub program_headers: Vec<ElfProgramHeader>,
-    pub section_header_offset: u32,
+    pub section_header_offset: u64,
     pub section_header_entry_size: u16,
     pub section_name_table_index: u16,
     pub section_headers: Vec<ElfSectionHeader>,
@@ -76,19 +96,25 @@ pub struct ElfAnalysis {
     pub load_segments: Vec<ElfLoadSegment>,
     /// Half-open RVA extent from the lowest mapped VA to the highest mapped end.
     pub image_size: u64,
-    /// Container intake contributes the exact binary identity and no symbol claims.
+    /// Bounded symbols recovered from `SHT_SYMTAB`/`SHT_DYNSYM` tables.
+    #[serde(default)]
+    pub symbols: Vec<ElfSymbol>,
+    /// Whether the symbol scan hit its fixed retention cap before finishing.
+    #[serde(default)]
+    pub symbol_scan_truncated: bool,
+    /// Exact binary identity plus deterministic function/global name claims.
     pub symbol_graph: SymbolGraph,
 }
 
 impl ElfAnalysis {
-    /// Validate cross-field invariants and the deterministic empty base graph.
+    /// Validate cross-field invariants and the deterministic base graph.
     pub fn validate(&self) -> Result<(), crate::AnalysisError> {
         crate::elf::validate_elf_analysis(self)
     }
 
-    /// Rebuild the base graph from exact container identity only.
+    /// Rebuild the base graph deterministically from stored container fields.
     pub fn rebuild_symbol_graph(&self) -> Result<SymbolGraph, crate::AnalysisError> {
-        crate::elf::build_symbol_graph(&self.identity)
+        crate::elf::build_symbol_graph(&self.identity, &self.symbols, &self.load_segments)
     }
 }
 
@@ -96,24 +122,30 @@ impl ElfAnalysis {
 #[serde(deny_unknown_fields)]
 struct UncheckedElfAnalysis {
     identity: BinaryIdentity,
+    class: ElfClass,
+    endian: ElfEndian,
     os_abi: u8,
     abi_version: u8,
     elf_type: u16,
     machine: u16,
     elf_version: u32,
-    entry_va: u32,
-    entry_rva: u32,
+    entry_va: u64,
+    entry_rva: u64,
     flags: u32,
     header_size: u16,
-    program_header_offset: u32,
+    program_header_offset: u64,
     program_header_entry_size: u16,
     program_headers: Vec<ElfProgramHeader>,
-    section_header_offset: u32,
+    section_header_offset: u64,
     section_header_entry_size: u16,
     section_name_table_index: u16,
     section_headers: Vec<ElfSectionHeader>,
     load_segments: Vec<ElfLoadSegment>,
     image_size: u64,
+    #[serde(default)]
+    symbols: Vec<ElfSymbol>,
+    #[serde(default)]
+    symbol_scan_truncated: bool,
     symbol_graph: SymbolGraph,
 }
 
@@ -123,6 +155,8 @@ impl TryFrom<UncheckedElfAnalysis> for ElfAnalysis {
     fn try_from(value: UncheckedElfAnalysis) -> Result<Self, Self::Error> {
         let analysis = Self {
             identity: value.identity,
+            class: value.class,
+            endian: value.endian,
             os_abi: value.os_abi,
             abi_version: value.abi_version,
             elf_type: value.elf_type,
@@ -141,6 +175,8 @@ impl TryFrom<UncheckedElfAnalysis> for ElfAnalysis {
             section_headers: value.section_headers,
             load_segments: value.load_segments,
             image_size: value.image_size,
+            symbols: value.symbols,
+            symbol_scan_truncated: value.symbol_scan_truncated,
             symbol_graph: value.symbol_graph,
         };
         analysis.validate()?;
@@ -148,22 +184,22 @@ impl TryFrom<UncheckedElfAnalysis> for ElfAnalysis {
     }
 }
 
-/// One exact 32-byte ELF32 program-header record.
+/// One exact ELF program-header record, widened to hold ELF64 fields.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ElfProgramHeader {
     pub table_index: u16,
     pub segment_type: u32,
-    pub file_offset: u32,
-    pub virtual_address: u32,
-    pub physical_address: u32,
-    pub file_size: u32,
-    pub memory_size: u32,
+    pub file_offset: u64,
+    pub virtual_address: u64,
+    pub physical_address: u64,
+    pub file_size: u64,
+    pub memory_size: u64,
     pub flags: u32,
     pub alignment: u32,
 }
 
-/// One exact 40-byte ELF32 section-header record.
+/// One exact ELF section-header record, widened to hold ELF64 fields.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ElfSectionHeader {
@@ -171,13 +207,13 @@ pub struct ElfSectionHeader {
     pub name_offset: u32,
     pub section_type: u32,
     pub flags: u32,
-    pub virtual_address: u32,
-    pub file_offset: u32,
-    pub size: u32,
+    pub virtual_address: u64,
+    pub file_offset: u64,
+    pub size: u64,
     pub link: u32,
     pub info: u32,
-    pub address_alignment: u32,
-    pub entry_size: u32,
+    pub address_alignment: u64,
+    pub entry_size: u64,
 }
 
 /// One non-empty sparse `PT_LOAD` mapping, sorted by virtual address.
@@ -185,12 +221,27 @@ pub struct ElfSectionHeader {
 #[serde(deny_unknown_fields)]
 pub struct ElfLoadSegment {
     pub program_header_index: u16,
-    pub file_offset: u32,
-    pub file_size: u32,
-    pub virtual_address: u32,
-    pub memory_size: u32,
+    pub file_offset: u64,
+    pub file_size: u64,
+    pub virtual_address: u64,
+    pub memory_size: u64,
     pub flags: u32,
     pub alignment: u32,
+}
+
+/// One bounded symbol recovered from an ELF `SHT_SYMTAB`/`SHT_DYNSYM` table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ElfSymbol {
+    /// Zero-based position within its source symbol table.
+    pub table_index: u32,
+    /// Non-empty name resolved from the linked string table.
+    pub name: String,
+    pub value: u64,
+    pub size: u64,
+    pub info: u8,
+    pub other: u8,
+    pub section_index: u16,
 }
 
 impl ElfLoadSegment {

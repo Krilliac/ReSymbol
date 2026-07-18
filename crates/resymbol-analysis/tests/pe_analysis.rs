@@ -7871,7 +7871,7 @@ fn recognizes_elf_magic_but_still_rejects_unknown_formats_without_guessing() {
     assert!(matches!(
         analyze_bytes(b"\x7fELFtest"),
         Err(AnalysisError::Truncated {
-            context: "ELF32 header",
+            context: "ELF identity",
             ..
         })
     ));

@@ -15,7 +15,7 @@ mod session;
 mod string_recovery;
 mod types;
 
-pub use elf::analyze_elf;
+pub use elf::{ElfMachine, analyze_elf};
 pub use error::AnalysisError;
 pub use instruction::{
     ExactX64InstructionError, MAX_X64_INSTRUCTION_BYTES, validate_exact_x64_instruction,
@@ -32,20 +32,23 @@ pub use pe::{
 };
 pub use session::{AnalysisSession, PluginRunRecord, PluginRunStatus, SessionValidationError};
 pub use types::{
-    BinaryAnalysis, CoffHeader, DataDirectory, ElfAnalysis, ElfLoadSegment, ElfProgramHeader,
-    ElfSectionHeader, ImportTarget, MsvcRttiBaseClass, MsvcRttiVftable, PeAnalysis,
-    PeControlFlowTarget, PeDataDirectories, PeDataReference, PeDelayImportLibrary, PeDirectCall,
-    PeExport, PeExportName, PeGuardAddressTakenIatEntry, PeGuardCfFunction,
-    PeGuardEhContinuationTarget, PeGuardLongJumpTarget, PeImport, PeImportLibrary,
-    PeLoadConfigGuardMemcpyAnchor, PeLoadConfigSecurityAnchors, PeLoadConfigXfgAnchors,
-    PeRecoveredString, PeSection, PeStringEncoding, PeThunk, PeTlsCallback, RuntimeFunction,
+    BinaryAnalysis, CoffHeader, DataDirectory, ElfAnalysis, ElfClass, ElfEndian, ElfLoadSegment,
+    ElfProgramHeader, ElfSectionHeader, ElfSymbol, ImportTarget, MsvcRttiBaseClass,
+    MsvcRttiVftable, PeAnalysis, PeControlFlowTarget, PeDataDirectories, PeDataReference,
+    PeDelayImportLibrary, PeDirectCall, PeExport, PeExportName, PeGuardAddressTakenIatEntry,
+    PeGuardCfFunction, PeGuardEhContinuationTarget, PeGuardLongJumpTarget, PeImport,
+    PeImportLibrary, PeLoadConfigGuardMemcpyAnchor, PeLoadConfigSecurityAnchors,
+    PeLoadConfigXfgAnchors, PeRecoveredString, PeSection, PeStringEncoding, PeThunk, PeTlsCallback,
+    RuntimeFunction,
 };
 
 /// Detect and analyze a supported binary container.
 ///
-/// PE32+ x86-64 images and bounded container-only ELF32 little-endian
-/// `EM_MIPS` images are accepted. Unsupported formats are reported explicitly
-/// rather than guessed from a filename.
+/// PE32+ x86-64 images and bounded ELF containers are accepted. ELF ingestion
+/// covers ELF32 and ELF64, either byte order, and any `e_machine` value;
+/// container parsing is machine-independent and records only bounded metadata,
+/// sparse `PT_LOAD` mappings, and symbol-table name claims. Unsupported formats
+/// are reported explicitly rather than guessed from a filename.
 pub fn analyze_bytes(bytes: &[u8]) -> Result<BinaryAnalysis, AnalysisError> {
     if bytes.starts_with(b"MZ") {
         return analyze_pe(bytes).map(BinaryAnalysis::Pe);
