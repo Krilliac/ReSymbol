@@ -90,7 +90,7 @@ enum Command {
     Patch(PatchArgs),
     /// Inspect and manage discovered plugins.
     Plugin(PluginArgs),
-    /// Launch or attach to a process and serve it over the GDB Remote Serial Protocol (Linux).
+    /// Serve a live process (Linux) or an ELF core dump over the GDB Remote Serial Protocol.
     Gdbserver(GdbserverArgs),
 }
 
@@ -250,7 +250,11 @@ const DEFAULT_GDBSERVER_TCP_ADDR: &str = "127.0.0.1:1234";
 #[derive(Debug, Args)]
 struct GdbserverArgs {
     /// Program to launch under the ptrace host (mutually exclusive with `--attach`).
-    #[arg(value_name = "PROGRAM", conflicts_with = "attach")]
+    #[arg(
+        value_name = "PROGRAM",
+        conflicts_with = "attach",
+        conflicts_with = "core"
+    )]
     program: Option<String>,
 
     /// Arguments passed to the launched program (everything after PROGRAM).
@@ -258,8 +262,12 @@ struct GdbserverArgs {
     program_args: Vec<String>,
 
     /// Attach to an already-running process by PID instead of launching one.
-    #[arg(long, value_name = "PID")]
+    #[arg(long, value_name = "PID", conflicts_with = "core")]
     attach: Option<i32>,
+
+    /// Serve a read-only, post-mortem view of an ELF core dump (all platforms).
+    #[arg(long, value_name = "FILE")]
+    core: Option<String>,
 
     /// Serve over TCP at this address (e.g. 127.0.0.1:1234).
     #[arg(long, value_name = "ADDR", conflicts_with = "serial")]
@@ -333,11 +341,95 @@ fn resolve_gdbserver_transport(args: &GdbserverArgs) -> Result<GdbserverTranspor
     }
 }
 
-#[cfg(target_os = "linux")]
+/// Serve `remote` over the resolved [`GdbserverTransport`].
+///
+/// Platform-independent for TCP; the serial branch is Unix-only (delegated to
+/// [`serve_serial`]).
+fn serve_target_over_transport<R>(remote: &mut R, transport: GdbserverTransport) -> Result<()>
+where
+    R: resymbol_gdb_remote::RemoteTarget,
+{
+    use resymbol_gdb_remote::{GdbStubServer, TcpServerListener};
+
+    match transport {
+        GdbserverTransport::Tcp(addr) => {
+            let listener = TcpServerListener::bind(&addr)
+                .with_context(|| format!("cannot bind TCP listener on {addr}"))?;
+            let bound = listener
+                .local_addr()
+                .with_context(|| format!("cannot query local address for {addr}"))?;
+            eprintln!("listening on {bound}; connect with: gdb -ex 'target remote {bound}'");
+            let connection = listener
+                .accept()
+                .with_context(|| format!("cannot accept a connection on {bound}"))?;
+            GdbStubServer::new(connection)
+                .serve(remote)
+                .context("gdb remote session failed")?;
+        }
+        GdbserverTransport::Serial { device, baud } => {
+            serve_serial(remote, &device, baud)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn serve_serial<R>(remote: &mut R, device: &str, baud: u32) -> Result<()>
+where
+    R: resymbol_gdb_remote::RemoteTarget,
+{
+    use resymbol_gdb_remote::{GdbStubServer, SerialTransport};
+
+    let connection = SerialTransport::open(device, baud)
+        .with_context(|| format!("cannot open serial device {device} at {baud} baud"))?;
+    eprintln!(
+        "serving on {device} at {baud} baud; connect with: \
+         gdb -ex 'set serial baud {baud}' -ex 'target remote {device}'"
+    );
+    GdbStubServer::new(connection)
+        .serve(remote)
+        .context("gdb remote session failed")?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn serve_serial<R>(_remote: &mut R, _device: &str, _baud: u32) -> Result<()>
+where
+    R: resymbol_gdb_remote::RemoteTarget,
+{
+    bail!("the serial transport is only supported on Unix; use --tcp instead")
+}
+
+/// Serve a read-only, post-mortem view of an ELF core dump. Platform-independent
+/// (pure parsing plus the shared transport path); no ptrace is involved.
+fn serve_core_dump(args: &GdbserverArgs, core_path: &str) -> Result<()> {
+    use resymbol_gdb_remote::{CoreDump, CoreDumpTarget};
+
+    let transport = resolve_gdbserver_transport(args)?;
+    let bytes =
+        fs::read(core_path).with_context(|| format!("cannot read core dump `{core_path}`"))?;
+    let core =
+        CoreDump::parse(&bytes).with_context(|| format!("cannot parse core dump `{core_path}`"))?;
+    eprintln!(
+        "serving read-only core dump `{core_path}` ({} PT_LOAD regions, stop signal {})",
+        core.regions().len(),
+        core.signal()
+    );
+    let mut remote = CoreDumpTarget::new(core);
+    serve_target_over_transport(&mut remote, transport)
+}
+
 fn gdbserver(args: GdbserverArgs) -> Result<()> {
-    use resymbol_gdb_remote::{
-        GdbStubServer, PtraceRemoteTarget, SerialTransport, TcpServerListener,
-    };
+    // The core-dump path is pure parsing and works on every platform.
+    if let Some(core_path) = args.core.clone() {
+        return serve_core_dump(&args, &core_path);
+    }
+    gdbserver_live(args)
+}
+
+#[cfg(target_os = "linux")]
+fn gdbserver_live(args: GdbserverArgs) -> Result<()> {
+    use resymbol_gdb_remote::PtraceRemoteTarget;
     use resymbol_linux_debug_host::{LaunchSpec, attach, launch};
 
     let target = resolve_gdbserver_target(&args)?;
@@ -360,45 +452,19 @@ fn gdbserver(args: GdbserverArgs) -> Result<()> {
     };
 
     let mut remote = PtraceRemoteTarget::new(session);
-
-    match transport {
-        GdbserverTransport::Tcp(addr) => {
-            let listener = TcpServerListener::bind(&addr)
-                .with_context(|| format!("cannot bind TCP listener on {addr}"))?;
-            let bound = listener
-                .local_addr()
-                .with_context(|| format!("cannot query local address for {addr}"))?;
-            eprintln!("listening on {bound}; connect with: gdb -ex 'target remote {bound}'");
-            let connection = listener
-                .accept()
-                .with_context(|| format!("cannot accept a connection on {bound}"))?;
-            GdbStubServer::new(connection)
-                .serve(&mut remote)
-                .context("gdb remote session failed")?;
-        }
-        GdbserverTransport::Serial { device, baud } => {
-            let connection = SerialTransport::open(&device, baud)
-                .with_context(|| format!("cannot open serial device {device} at {baud} baud"))?;
-            eprintln!(
-                "serving on {device} at {baud} baud; connect with: \
-                 gdb -ex 'set serial baud {baud}' -ex 'target remote {device}'"
-            );
-            GdbStubServer::new(connection)
-                .serve(&mut remote)
-                .context("gdb remote session failed")?;
-        }
-    }
-
-    Ok(())
+    serve_target_over_transport(&mut remote, transport)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn gdbserver(args: GdbserverArgs) -> Result<()> {
+fn gdbserver_live(args: GdbserverArgs) -> Result<()> {
     // Validate the argument shape so misuse is still reported off Linux, then
-    // report that live serving is unsupported here.
+    // report that live launch/attach is unsupported here. Core dumps
+    // (`--core`) are handled before this on every platform.
     let _ = resolve_gdbserver_target(&args)?;
     let _ = resolve_gdbserver_transport(&args)?;
-    bail!("`resymbol gdbserver` is only supported on Linux")
+    bail!(
+        "live `resymbol gdbserver` launch/attach is only supported on Linux; use --core <FILE> to serve a core dump"
+    )
 }
 
 fn main() -> Result<()> {
@@ -4664,6 +4730,59 @@ entrypoint = "Plugin.dll"
             resolve_gdbserver_transport(&args).expect("transport resolves"),
             GdbserverTransport::Tcp(addr) if addr == DEFAULT_GDBSERVER_TCP_ADDR
         ));
+    }
+
+    #[test]
+    fn command_line_accepts_gdbserver_core_over_tcp() {
+        let cli = Cli::try_parse_from([
+            "resymbol",
+            "gdbserver",
+            "--core",
+            "/tmp/x.core",
+            "--tcp",
+            "127.0.0.1:1234",
+        ])
+        .expect("gdbserver core arguments parse");
+        let Command::Gdbserver(args) = cli.command else {
+            panic!("gdbserver command expected");
+        };
+        assert_eq!(args.core.as_deref(), Some("/tmp/x.core"));
+        assert_eq!(args.program, None);
+        assert_eq!(args.attach, None);
+        assert_eq!(args.tcp.as_deref(), Some("127.0.0.1:1234"));
+        // A core is served over the resolved transport like any other target.
+        assert!(matches!(
+            resolve_gdbserver_transport(&args).expect("transport resolves"),
+            GdbserverTransport::Tcp(addr) if addr == "127.0.0.1:1234"
+        ));
+    }
+
+    #[test]
+    fn gdbserver_core_conflicts_with_a_program() {
+        // clap's `conflicts_with` rejects supplying both a core and a program.
+        let error = Cli::try_parse_from([
+            "resymbol",
+            "gdbserver",
+            "--core",
+            "/tmp/x.core",
+            "/bin/true",
+        ])
+        .expect_err("core and a positional program are mutually exclusive");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn gdbserver_core_conflicts_with_attach() {
+        let error = Cli::try_parse_from([
+            "resymbol",
+            "gdbserver",
+            "--core",
+            "/tmp/x.core",
+            "--attach",
+            "1",
+        ])
+        .expect_err("core and --attach are mutually exclusive");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]

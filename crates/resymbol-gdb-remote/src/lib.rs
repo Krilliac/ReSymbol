@@ -24,6 +24,7 @@
 //! server and client loops, and the ptrace adapter — is entirely safe.
 
 pub mod client;
+pub mod core_dump;
 pub mod protocol;
 pub mod server;
 pub mod target;
@@ -36,6 +37,7 @@ pub mod serial;
 pub mod ptrace_target;
 
 pub use client::GdbRemoteClient;
+pub use core_dump::{CoreClass, CoreDump, CoreDumpError, CoreDumpTarget, CoreEndian, CoreRegion};
 pub use protocol::{PacketEvent, PacketReader, encode_packet};
 pub use server::{GdbStubServer, serve_one};
 pub use target::{
