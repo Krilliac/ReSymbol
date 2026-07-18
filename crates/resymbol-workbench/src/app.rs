@@ -65,7 +65,8 @@ use crate::{
         OfflineImageReadOutcome, OfflineImageReadSpan, OperationGate, OperationId,
         OperationSequence, PatchSetOutcome, PublicationDestination, PublicationGate,
         PublicationKind, ReviewSaveOutcome, ServiceWorker, StaticPatchPreviewBinding,
-        StaticPatchPreviewOutcome, WorkerCommand, WorkerEvent, WorkerExportKind,
+        StaticPatchPreviewOutcome, StaticPatchPublicationConfirmation, WorkerCommand, WorkerEvent,
+        WorkerExportKind,
     },
 };
 
@@ -81,6 +82,10 @@ const FUNCTION_KEYBOARD_PAGE_ROWS: usize = 10;
 const SCREENSHOT_CANONICAL_JCC_RVA: u64 = 0x0000_116E;
 #[cfg(any(test, feature = "screenshot"))]
 const SCREENSHOT_CANONICAL_JCC_READ_BYTES: u32 = 32;
+#[cfg(feature = "screenshot")]
+const SCREENSHOT_STATIC_PATCH_RVA: u64 = 0x0000_1184;
+#[cfg(feature = "screenshot")]
+const SCREENSHOT_STATIC_PATCH_BYTES: [u8; 5] = [0xe9, 0x03, 0x00, 0x00, 0x00];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BinaryPickerPurpose {
@@ -164,6 +169,7 @@ enum ScreenshotScenario {
     Disassembly,
     DisassemblyActions,
     ExactByteEditor,
+    StaticPatchConfirmation,
     BinarySwitchConfirmation,
     DebuggerSandbox,
     DebuggerReadinessResult,
@@ -183,6 +189,7 @@ impl ScreenshotScenario {
             "disassembly" => Some(Self::Disassembly),
             "disassembly-actions" => Some(Self::DisassemblyActions),
             "exact-byte-editor" => Some(Self::ExactByteEditor),
+            "static-patch-confirmation" => Some(Self::StaticPatchConfirmation),
             "binary-switch-confirmation" => Some(Self::BinarySwitchConfirmation),
             "debugger-sandbox" | "readiness" => Some(Self::DebuggerSandbox),
             "debugger-readiness-result" => Some(Self::DebuggerReadinessResult),
@@ -202,6 +209,7 @@ impl ScreenshotScenario {
             Self::Disassembly => "disassembly",
             Self::DisassemblyActions => "disassembly-actions",
             Self::ExactByteEditor => "exact-byte-editor",
+            Self::StaticPatchConfirmation => "static-patch-confirmation",
             Self::BinarySwitchConfirmation => "binary-switch-confirmation",
             Self::DebuggerSandbox => "debugger-sandbox",
             Self::DebuggerReadinessResult => "debugger-readiness-result",
@@ -218,6 +226,10 @@ impl ScreenshotScenario {
 
     const fn needs_readiness_result(self) -> bool {
         matches!(self, Self::DebuggerSandbox | Self::DebuggerReadinessResult)
+    }
+
+    const fn needs_static_patch_preview(self) -> bool {
+        matches!(self, Self::StaticPatchConfirmation)
     }
 }
 
@@ -430,6 +442,12 @@ enum StaticExactByteDialogAction {
     Cancel,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StaticPatchPublicationDialogAction {
+    Publish,
+    Cancel,
+}
+
 impl ActivityLevel {
     const fn label(self) -> &'static str {
         match self {
@@ -619,6 +637,11 @@ enum OfflineReadDisplay<'a> {
     Unavailable { code: &'static str, detail: &'a str },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingStaticPatchPublication {
+    confirmation: StaticPatchPublicationConfirmation,
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum OfflineByteView {
     #[default]
@@ -697,6 +720,7 @@ pub struct WorkbenchApp {
         StaticPatchPreviewBinding,
         Result<StaticPatchPreviewOutcome, String>,
     )>,
+    pending_static_patch_publication: Option<PendingStaticPatchPublication>,
     patch_set_result: Option<Result<String, String>>,
 }
 
@@ -827,6 +851,7 @@ impl WorkbenchApp {
             static_exact_byte_edit_error: None,
             static_patch_result: None,
             static_patch_preview_result: None,
+            pending_static_patch_publication: None,
             patch_set_result: None,
         };
         app.log(
@@ -877,9 +902,9 @@ impl WorkbenchApp {
             app.analysis_path = Some(path.clone());
             app.stage = WorkflowStage::Review;
             app.main_tab = match scenario {
-                ScreenshotScenario::Overview | ScreenshotScenario::BinarySwitchConfirmation => {
-                    MainTab::Overview
-                }
+                ScreenshotScenario::Overview
+                | ScreenshotScenario::StaticPatchConfirmation
+                | ScreenshotScenario::BinarySwitchConfirmation => MainTab::Overview,
                 ScreenshotScenario::Functions | ScreenshotScenario::FunctionsFocused => {
                     MainTab::Functions
                 }
@@ -934,6 +959,19 @@ impl WorkbenchApp {
             if scenario.needs_readiness_result() {
                 app.queue_sandbox_readiness_probe()
                     .unwrap_or_else(|error| panic!("cannot queue readiness capture: {error}"));
+            }
+            if scenario.needs_static_patch_preview() {
+                app.pending_static_patch_drafts
+                    .queue_nop(
+                        SCREENSHOT_STATIC_PATCH_RVA,
+                        &SCREENSHOT_STATIC_PATCH_BYTES,
+                        "Disable internal jump thunk",
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("cannot queue screenshot static patch draft: {error}")
+                    });
+                app.queue_static_patch_preview()
+                    .unwrap_or_else(|error| panic!("cannot queue patch preview capture: {error}"));
             }
             if scenario == ScreenshotScenario::BinarySwitchConfirmation {
                 app.prepare_screenshot_binary_switch_confirmation();
@@ -1047,6 +1085,8 @@ impl WorkbenchApp {
         let scenario_work_is_pending = self.screenshot_scenario.is_some_and(|scenario| {
             (scenario.needs_readiness_result() && self.readiness_operation.is_pending())
                 || (scenario.needs_offline_read() && self.offline_read.is_pending())
+                || (scenario.needs_static_patch_preview()
+                    && self.static_patch_preview_operation.is_pending())
         });
         if scenario_work_is_pending {
             self.screenshot_frame_count = 0;
@@ -1135,6 +1175,141 @@ impl WorkbenchApp {
             dialog = dialog.set_file_name("project.review.json");
         }
         dialog.save_file()
+    }
+
+    fn show_static_patch_publication_confirmation(&mut self, context: &egui::Context) {
+        if self
+            .publication_operation
+            .is_kind(PublicationKind::StaticPatch)
+        {
+            return;
+        }
+        let Some(pending) = self.pending_static_patch_publication.clone() else {
+            return;
+        };
+        match self.current_static_patch_publication_confirmation(
+            pending.confirmation.destination().clone(),
+        ) {
+            Ok(current) if current == pending.confirmation => {}
+            Ok(_) | Err(_) => {
+                self.pending_static_patch_publication = None;
+                let error =
+                    "Static patch confirmation expired because the project, drafts, or preview changed; validate again"
+                        .to_owned();
+                self.static_patch_result = Some(Err(error.clone()));
+                self.log(ActivityLevel::Warning, error);
+                return;
+            }
+        }
+
+        let colors = self.preferences.theme.semantic_colors();
+        let confirmation = &pending.confirmation;
+        let destination_display =
+            self.static_patch_publication_destination_display(confirmation.destination());
+        let response = egui::Modal::new(egui::Id::new("static_patch_publication_confirmation"))
+            .show(context, |ui| {
+                ui.set_min_width(520.0);
+                ui.heading("Create the previewed patched binary?");
+                ui.label(
+                    "This confirmation is bound to the exact source, draft plan, output hash, warnings, and canonical destination shown below.",
+                );
+                ui.add_space(6.0);
+                ui.label(RichText::new("Create-new destination").strong());
+                ui.label(
+                    RichText::new(destination_display)
+                        .monospace()
+                        .small()
+                        .color(colors.exact_extracted),
+                );
+                ui.colored_label(
+                    colors.warning_conflict,
+                    "No existing file, link, directory, source binary, or alternate data stream will be replaced.",
+                );
+                ui.separator();
+                ui.small(format!(
+                    "Source SHA-256: {}",
+                    confirmation.preview().source_identity().id.as_str()
+                ));
+                ui.small(format!(
+                    "Canonical request/plan SHA-256: {}",
+                    confirmation.preview().request_fingerprint().as_str()
+                ));
+                ui.small(format!(
+                    "Expected output SHA-256: {}",
+                    confirmation.expected_output().id.as_str()
+                ));
+                ui.small(format!(
+                    "{} exact edit(s), {} changed byte(s)",
+                    confirmation.preview().requests().len(),
+                    confirmation.preview().changed_bytes()
+                ));
+                for warning in confirmation.warnings() {
+                    ui.colored_label(
+                        colors.warning_conflict,
+                        format!("[CONFIRMED WARNING] {warning}"),
+                    );
+                }
+                ui.small(
+                    "Immediately before staging, the worker re-reads the source from disk, reapplies the exact plan, and requires the regenerated identity and warnings to match this preview.",
+                );
+                ui.separator();
+                let mut action = None;
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(
+                            !self.publication_operation.is_pending()
+                                && !self.worker_disconnected,
+                            egui::Button::new("Create New Patched Binary"),
+                        )
+                        .clicked()
+                    {
+                        action = Some(StaticPatchPublicationDialogAction::Publish);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        action = Some(StaticPatchPublicationDialogAction::Cancel);
+                    }
+                });
+                action
+            });
+        let should_cancel = response.should_close();
+        let action = response
+            .inner
+            .or_else(|| should_cancel.then_some(StaticPatchPublicationDialogAction::Cancel));
+        match action {
+            Some(StaticPatchPublicationDialogAction::Publish) => {
+                if let Err(error) = self.queue_static_patch_publication() {
+                    self.static_patch_result = Some(Err(error.clone()));
+                    self.log(
+                        ActivityLevel::Error,
+                        format!("Static patch publication failed: {error}"),
+                    );
+                }
+            }
+            Some(StaticPatchPublicationDialogAction::Cancel) => {
+                self.pending_static_patch_publication = None;
+                self.log(
+                    ActivityLevel::Info,
+                    "Cancelled static patch publication; drafts and preview remain unchanged",
+                );
+            }
+            None => {}
+        }
+    }
+
+    fn static_patch_publication_destination_display(
+        &self,
+        destination: &PublicationDestination,
+    ) -> String {
+        #[cfg(feature = "screenshot")]
+        if self.screenshot_scenario == Some(ScreenshotScenario::StaticPatchConfirmation) {
+            let file_name = destination
+                .canonical_path()
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("screenshot publication destination has a Unicode filename");
+            return format!("<canonical-fixture-directory>/{file_name}");
+        }
+        destination.canonical_path().display().to_string()
     }
 
     fn show_close_confirmation(&mut self, context: &egui::Context) {
@@ -2550,8 +2725,12 @@ impl WorkbenchApp {
                 } => {
                     self.finish_static_patch_preview(operation, binding, result);
                 }
-                WorkerEvent::StaticPatchPublished { operation, result } => {
-                    self.finish_static_patch_publication(operation, result);
+                WorkerEvent::StaticPatchPublished {
+                    operation,
+                    confirmation,
+                    result,
+                } => {
+                    self.finish_static_patch_publication(operation, confirmation, result);
                 }
                 WorkerEvent::StaticPatchSetSaved { operation, result } => {
                     self.finish_static_patch_set_save(operation, result);
@@ -2636,6 +2815,7 @@ impl WorkbenchApp {
     fn finish_static_patch_publication(
         &mut self,
         operation: OperationId,
+        confirmation: StaticPatchPublicationConfirmation,
         result: Result<PublishedStaticPatch, String>,
     ) {
         if !self
@@ -2651,14 +2831,39 @@ impl WorkbenchApp {
             );
             return;
         }
+        let Some(pending) = self.pending_static_patch_publication.take() else {
+            let error =
+                "Static patch publication returned without matching pending confirmation evidence"
+                    .to_owned();
+            self.static_patch_result = Some(Err(error.clone()));
+            self.console_reply(false, &error);
+            self.log(ActivityLevel::Error, error);
+            return;
+        };
+        let current_confirmation = self.current_static_patch_publication_confirmation(
+            pending.confirmation.destination().clone(),
+        );
+        let envelope_matches = pending.confirmation == confirmation
+            && current_confirmation.as_ref().ok() == Some(&confirmation);
+        if !envelope_matches {
+            let error =
+                "Static patch publication response did not match the exact confirmed project, drafts, preview, or canonical destination"
+                    .to_owned();
+            self.static_patch_result = Some(Err(error.clone()));
+            self.console_reply(false, &error);
+            self.log(ActivityLevel::Error, error);
+            return;
+        }
         match result {
             Ok(outcome) => {
-                let matches_current = self.project.as_ref().is_some_and(|project| {
-                    project.session().base_analysis().identity() == outcome.source_identity()
-                });
-                if !matches_current {
-                    let error = "Static patch receipt did not match the current project identity"
-                        .to_owned();
+                let receipt_matches = outcome.path() == confirmation.canonical_path()
+                    && outcome.source_identity() == confirmation.preview().source_identity()
+                    && outcome.output_identity() == confirmation.expected_output()
+                    && outcome.warnings() == confirmation.warnings().as_slice();
+                if !receipt_matches {
+                    let error =
+                        "Static patch receipt did not match the confirmed path, source, output identity, or warnings"
+                            .to_owned();
                     self.static_patch_result = Some(Err(error.clone()));
                     self.console_reply(false, &error);
                     self.log(ActivityLevel::Error, error);
@@ -2675,6 +2880,7 @@ impl WorkbenchApp {
                 self.pending_static_patch_drafts.clear();
                 self.static_exact_byte_edit = None;
                 self.static_exact_byte_edit_error = None;
+                self.static_patch_preview_result = None;
                 self.static_patch_result = Some(Ok(outcome));
                 self.patch_set_result = None;
                 self.console_reply(true, &message);
@@ -2785,6 +2991,8 @@ impl WorkbenchApp {
                 self.static_exact_byte_edit = None;
                 self.static_exact_byte_edit_error = None;
                 self.static_patch_result = None;
+                self.static_patch_preview_result = None;
+                self.pending_static_patch_publication = None;
                 self.patch_set_result = Some(Ok(message.clone()));
                 self.console_reply(true, &message);
                 self.log(ActivityLevel::Success, message);
@@ -2857,6 +3065,7 @@ impl WorkbenchApp {
         if static_patch_preview_was_pending {
             self.static_patch_preview_result = None;
         }
+        self.pending_static_patch_publication = None;
         self.log(ActivityLevel::Error, error);
     }
 
@@ -2997,6 +3206,7 @@ impl WorkbenchApp {
         self.publication_operation.invalidate();
         self.patch_set_load_operation.invalidate();
         self.static_patch_preview_operation.invalidate();
+        self.pending_static_patch_publication = None;
         self.review_operation.invalidate();
         self.readiness_operation.invalidate();
         self.offline_read.clear();
@@ -3015,6 +3225,7 @@ impl WorkbenchApp {
             self.disassembly_row_focus_target = None;
             self.static_patch_result = None;
             self.static_patch_preview_result = None;
+            self.pending_static_patch_publication = None;
             self.patch_set_result = None;
         }
         self.analysis_path = Some(project.identity.active_binary_path().to_path_buf());
@@ -6063,6 +6274,32 @@ impl WorkbenchApp {
 
     #[cfg(feature = "screenshot")]
     fn show_screenshot_scenario_overlay(&mut self, context: &egui::Context) {
+        if self.screenshot_scenario == Some(ScreenshotScenario::StaticPatchConfirmation) {
+            assert!(
+                !self.publication_operation.is_pending() && self.static_patch_result.is_none(),
+                "static-patch-confirmation capture must not begin or report publication"
+            );
+            if self.static_patch_preview_operation.is_pending() {
+                return;
+            }
+            if self.pending_static_patch_publication.is_none() {
+                let output = default_static_patch_path(
+                    self.project
+                        .as_ref()
+                        .expect("static patch confirmation capture has a project"),
+                )
+                .expect("screenshot fixture has a patched-binary destination");
+                assert!(
+                    !output.exists(),
+                    "static patch confirmation capture destination must remain create-new"
+                );
+                self.prepare_static_patch_publication_confirmation(output)
+                    .unwrap_or_else(|error| {
+                        panic!("cannot prepare static patch confirmation capture: {error}")
+                    });
+            }
+            return;
+        }
         if self.screenshot_scenario == Some(ScreenshotScenario::DebuggerReadinessResult) {
             self.show_screenshot_readiness_result_overlay(context);
             return;
@@ -6791,6 +7028,7 @@ impl WorkbenchApp {
             return Err(error);
         }
         self.static_patch_preview_result = None;
+        self.pending_static_patch_publication = None;
         let message = format!(
             "Queued in-memory validation for {edit_count} static edit(s) changing {changed_bytes} byte(s); no file will be written"
         );
@@ -6916,21 +7154,39 @@ impl WorkbenchApp {
         Ok(message)
     }
 
-    fn queue_static_patch_publication(&mut self, path: PathBuf) -> Result<String, String> {
-        if path.file_name().is_none() {
-            return Err("choose a destination that names a new patched binary".to_owned());
+    fn current_static_patch_publication_confirmation(
+        &self,
+        destination: PublicationDestination,
+    ) -> Result<StaticPatchPublicationConfirmation, String> {
+        let current_binding = self.build_static_patch_preview_binding()?;
+        let (preview_binding, result) =
+            self.static_patch_preview_result.as_ref().ok_or_else(|| {
+                "validate the exact current drafts in memory before publishing".to_owned()
+            })?;
+        if preview_binding != &current_binding {
+            return Err(
+                "the static patch preview is stale; validate the current drafts again".to_owned(),
+            );
         }
+        let outcome = result.as_ref().map_err(|error| {
+            format!("the current static patch preview did not validate successfully: {error}")
+        })?;
+        StaticPatchPublicationConfirmation::new(
+            preview_binding.clone(),
+            outcome.clone(),
+            destination,
+        )
+    }
+
+    fn prepare_static_patch_publication_confirmation(
+        &mut self,
+        path: PathBuf,
+    ) -> Result<String, String> {
         if self.static_patch_preview_operation.is_pending() {
             return Err(
                 "wait for the current no-write static patch preview before publishing a patch"
                     .to_owned(),
             );
-        }
-        if path.exists() {
-            return Err(format!(
-                "choose a new path; existing patched destination {} will not be replaced",
-                path.display()
-            ));
         }
         if self.worker_disconnected {
             return Err("the application-service worker is unavailable".to_owned());
@@ -6944,41 +7200,95 @@ impl WorkbenchApp {
         if self.patch_set_load_operation.is_pending() {
             return Err("wait for the current patch-set load before publishing a patch".to_owned());
         }
-        let requests = self.build_static_patch_requests()?;
-        let (project, project_name, source_path) = {
-            let project = self
-                .project
-                .as_ref()
-                .ok_or_else(|| "open a project before publishing a static patch".to_owned())?;
-            let source_path = project.snapshot.verified_source_path().ok_or_else(|| {
-                "the exact source binary must be verified before publishing a static patch"
-                    .to_owned()
-            })?;
-            (
-                Arc::clone(&project.snapshot),
-                project.identity.display_name.clone(),
-                source_path.to_path_buf(),
-            )
-        };
-        if path == source_path {
+        if self.publication_operation.is_pending() {
             return Err(
-                "the patched destination must differ from the verified source path".to_owned(),
+                "wait for the current file publication before publishing a patch".to_owned(),
             );
         }
         let destination =
             PublicationDestination::resolve(&path).map_err(|error| error.to_string())?;
-        let edit_count = requests.len();
+        let confirmation = self.current_static_patch_publication_confirmation(destination)?;
+        let message = format!(
+            "Ready to confirm {} exact static edit(s) for create-new publication to {}",
+            confirmation.preview().requests().len(),
+            confirmation.canonical_path().display()
+        );
+        self.pending_static_patch_publication =
+            Some(PendingStaticPatchPublication { confirmation });
+        self.static_patch_result = None;
+        Ok(message)
+    }
+
+    fn queue_static_patch_publication(&mut self) -> Result<String, String> {
+        if self.static_patch_preview_operation.is_pending() {
+            return Err(
+                "wait for the current no-write static patch preview before publishing a patch"
+                    .to_owned(),
+            );
+        }
+        if self.worker_disconnected {
+            return Err("the application-service worker is unavailable".to_owned());
+        }
+        if self.project_operation.is_pending() {
+            return Err(
+                "wait for the current project or source operation before publishing a patch"
+                    .to_owned(),
+            );
+        }
+        if self.patch_set_load_operation.is_pending() {
+            return Err("wait for the current patch-set load before publishing a patch".to_owned());
+        }
+        if self.publication_operation.is_pending() {
+            return Err(
+                "wait for the current file publication before publishing a patch".to_owned(),
+            );
+        }
+        let pending = self
+            .pending_static_patch_publication
+            .clone()
+            .ok_or_else(|| "confirm the exact static patch preview before publishing".to_owned())?;
+        let current_confirmation = self.current_static_patch_publication_confirmation(
+            pending.confirmation.destination().clone(),
+        )?;
+        if current_confirmation != pending.confirmation {
+            self.pending_static_patch_publication = None;
+            return Err(
+                "the project, drafts, or preview changed before confirmation; validate again"
+                    .to_owned(),
+            );
+        }
+        let (project, project_name) = {
+            let project = self
+                .project
+                .as_ref()
+                .ok_or_else(|| "open a project before publishing a static patch".to_owned())?;
+            if !project.snapshot.has_verified_source() {
+                return Err(
+                    "the exact source binary must be verified before publishing a static patch"
+                        .to_owned(),
+                );
+            }
+            (
+                Arc::clone(&project.snapshot),
+                project.identity.display_name.clone(),
+            )
+        };
+        let edit_count = pending.confirmation.preview().requests().len();
+        let path = pending.confirmation.canonical_path().to_path_buf();
         let operation = self.operation_sequence.issue();
         self.publication_operation
-            .begin(operation, PublicationKind::StaticPatch, destination)
+            .begin(
+                operation,
+                PublicationKind::StaticPatch,
+                pending.confirmation.destination().clone(),
+            )
             .map_err(|error| error.to_string())?;
         let submit = self
             .service_worker
             .submit(WorkerCommand::PublishStaticPatch {
                 operation,
                 project,
-                requests,
-                path: path.clone(),
+                confirmation: pending.confirmation,
             });
         if let Err(error) = submit {
             let finished = self
@@ -7037,6 +7347,11 @@ impl WorkbenchApp {
             .static_patch_preview_result
             .as_ref()
             .is_some_and(|(binding, _)| Some(binding) == current_preview_binding.as_ref());
+        let preview_ready_for_publication = preview_result_is_current
+            && self
+                .static_patch_preview_result
+                .as_ref()
+                .is_some_and(|(_, result)| result.is_ok());
         egui::Frame::new()
             .fill(colors.raised)
             .stroke(egui::Stroke::new(1.0, colors.border))
@@ -7251,7 +7566,8 @@ impl WorkbenchApp {
                     && !self.worker_disconnected
                     && !self.project_operation.is_pending()
                     && exact_source_ready
-                    && !self.pending_static_patch_drafts.drafts().is_empty();
+                    && !self.pending_static_patch_drafts.drafts().is_empty()
+                    && preview_ready_for_publication;
                 let publish_label = if static_publication_pending {
                     "Publishing patched binary..."
                 } else if static_patch_preview_pending {
@@ -7267,6 +7583,8 @@ impl WorkbenchApp {
                     .add_enabled(can_publish, egui::Button::new(publish_label))
                     .on_disabled_hover_text(if publication_pending {
                         "A worker-owned create-new file publication is already running."
+                    } else if !preview_ready_for_publication {
+                        "Validate the exact current drafts successfully before publication."
                     } else if !exact_source_ready {
                         "Verify the exact source binary before publishing static edits."
                     } else if self.pending_static_patch_drafts.drafts().is_empty() {
@@ -7344,11 +7662,13 @@ impl WorkbenchApp {
             });
         if let Some(rva) = remove_rva {
             let _ = self.pending_static_patch_drafts.remove(rva);
+            self.pending_static_patch_publication = None;
             self.static_patch_result = None;
             self.patch_set_result = None;
         }
         if clear_all {
             self.pending_static_patch_drafts.clear();
+            self.pending_static_patch_publication = None;
             self.static_exact_byte_edit = None;
             self.static_exact_byte_edit_error = None;
             self.static_patch_result = None;
@@ -7389,12 +7709,15 @@ impl WorkbenchApp {
         }
         if publish_requested {
             if let Some(path) = self.choose_static_patch_destination() {
-                if let Err(error) = self.queue_static_patch_publication(path) {
-                    self.static_patch_result = Some(Err(error.clone()));
-                    self.log(
-                        ActivityLevel::Error,
-                        format!("Static patch publication failed: {error}"),
-                    );
+                match self.prepare_static_patch_publication_confirmation(path) {
+                    Ok(message) => self.log(ActivityLevel::Info, message),
+                    Err(error) => {
+                        self.static_patch_result = Some(Err(error.clone()));
+                        self.log(
+                            ActivityLevel::Error,
+                            format!("Static patch publication failed: {error}"),
+                        );
+                    }
                 }
             }
         }
@@ -8378,6 +8701,7 @@ impl eframe::App for WorkbenchApp {
         #[cfg(feature = "screenshot")]
         self.show_screenshot_scenario_overlay(context);
         self.show_static_exact_byte_editor(context);
+        self.show_static_patch_publication_confirmation(context);
         self.show_binary_switch_confirmation(context);
         self.show_close_confirmation(context);
 
@@ -9873,6 +10197,8 @@ mod tests {
     }
 
     fn publish_test_patch(project: &LoadedProject, output: &Path) -> PublishedStaticPatch {
+        let destination =
+            PublicationDestination::resolve(output).expect("canonical test publication path");
         let request = StaticPatchEditRequest::nop_instruction(
             THUNK_RVA,
             THUNK_BYTES,
@@ -9883,7 +10209,7 @@ mod tests {
         let plan = StaticPatchPlan::new(analysis.identity(), analysis, vec![request])
             .expect("valid fixture patch plan");
         AppServices::default()
-            .publish_static_patch_new(&project.snapshot, &plan, output)
+            .publish_static_patch_new(&project.snapshot, &plan, destination.canonical_path())
             .expect("publish fixture patch")
     }
 
@@ -9915,6 +10241,34 @@ mod tests {
             [image.warnings()[0], image.warnings()[1]],
             binding.request_fingerprint().clone(),
         )
+    }
+
+    fn prepare_test_static_publication(
+        app: &mut WorkbenchApp,
+        project: LoadedProject,
+        label: &str,
+        output: &Path,
+    ) -> PendingStaticPatchPublication {
+        let request = StaticPatchEditRequest::nop_instruction(THUNK_RVA, THUNK_BYTES, label)
+            .expect("valid preview request");
+        let binding = StaticPatchPreviewBinding::new(
+            project.session().base_analysis().identity().clone(),
+            vec![request],
+        )
+        .expect("preview binding");
+        let outcome = preview_outcome(&project, &binding);
+        app.finish_project_open(Ok(project));
+        app.pending_static_patch_drafts
+            .queue_nop(THUNK_RVA.into(), &THUNK_BYTES, label)
+            .expect("queue preview-bound draft");
+        let preview_operation = app.operation_sequence.issue();
+        app.static_patch_preview_operation.begin(preview_operation);
+        app.finish_static_patch_preview(preview_operation, binding, Ok(outcome));
+        app.prepare_static_patch_publication_confirmation(output.to_path_buf())
+            .expect("prepare exact publication confirmation");
+        app.pending_static_patch_publication
+            .clone()
+            .expect("pending static publication")
     }
 
     fn test_app() -> (egui::Context, WorkbenchApp) {
@@ -9967,18 +10321,19 @@ mod tests {
             ScreenshotScenario::Disassembly,
             ScreenshotScenario::DisassemblyActions,
             ScreenshotScenario::ExactByteEditor,
+            ScreenshotScenario::StaticPatchConfirmation,
             ScreenshotScenario::BinarySwitchConfirmation,
             ScreenshotScenario::DebuggerSandbox,
             ScreenshotScenario::DebuggerReadinessResult,
             ScreenshotScenario::Exports,
         ];
-        assert_eq!(scenarios.len(), 13);
+        assert_eq!(scenarios.len(), 14);
         assert_eq!(
             scenarios
                 .iter()
                 .filter(|scenario| **scenario != ScreenshotScenario::FunctionsFocused)
                 .count(),
-            12,
+            13,
             "the standard contract excludes only the focused minimum-viewport scenario"
         );
         for scenario in scenarios {
@@ -9987,6 +10342,7 @@ mod tests {
         assert!(ScreenshotScenario::parse("unknown-scenario").is_none());
         assert!(ScreenshotScenario::DisassemblyActions.needs_offline_read());
         assert!(ScreenshotScenario::ExactByteEditor.needs_offline_read());
+        assert!(ScreenshotScenario::StaticPatchConfirmation.needs_static_patch_preview());
         assert!(ScreenshotScenario::DebuggerReadinessResult.needs_readiness_result());
         assert!(!ScreenshotScenario::OpenEmpty.needs_offline_read());
     }
@@ -10996,20 +11352,22 @@ mod tests {
     #[test]
     fn stale_static_publication_result_cannot_clear_the_current_reservation_or_drafts() {
         let (_context, mut app) = test_app();
-        app.pending_static_patch_drafts
-            .queue_nop(THUNK_RVA.into(), &THUNK_BYTES, "current draft")
-            .expect("queue current draft");
+        let (_source, project) = loaded_project_with_bytes(SYMBOLIZED_FIXTURE);
         let directory = tempfile::tempdir().expect("temporary publication directory");
-        let destination =
-            PublicationDestination::resolve(&directory.path().join("current-patch.exe"))
-                .expect("canonical destination");
+        let output = directory.path().join("current-patch.exe");
+        let pending = prepare_test_static_publication(&mut app, project, "current draft", &output);
+        let destination = pending.confirmation.destination().clone();
         let stale = app.operation_sequence.issue();
         let current = app.operation_sequence.issue();
         app.publication_operation
             .begin(current, PublicationKind::StaticPatch, destination)
             .expect("reserve current publication");
 
-        app.finish_static_patch_publication(stale, Err("stale result".to_owned()));
+        app.finish_static_patch_publication(
+            stale,
+            pending.confirmation,
+            Err("stale result".to_owned()),
+        );
 
         assert!(app.publication_operation.is_pending());
         assert!(
@@ -11201,8 +11559,6 @@ mod tests {
         let load_path = directory
             .path()
             .join(format!("load{STATIC_PATCH_SET_SUFFIX}"));
-        let publication_path = directory.path().join("patched.exe");
-
         let save_error = app
             .queue_static_patch_set_save(save_path)
             .expect_err("preview must block patch-set save");
@@ -11210,7 +11566,7 @@ mod tests {
             .queue_static_patch_set_load(load_path)
             .expect_err("preview must block patch-set load");
         let publication_error = app
-            .queue_static_patch_publication(publication_path)
+            .queue_static_patch_publication()
             .expect_err("preview must block patched-binary publication");
 
         assert!(save_error.contains("no-write static patch preview"));
@@ -11219,6 +11575,28 @@ mod tests {
         assert!(app.static_patch_preview_operation.is_pending());
         assert!(!app.publication_operation.is_pending());
         assert!(!app.patch_set_load_operation.is_pending());
+        assert_eq!(app.pending_static_patch_drafts.drafts().len(), 1);
+    }
+
+    #[test]
+    fn publication_confirmation_requires_a_successful_current_preview() {
+        let (_context, mut app) = test_app();
+        let (_source, project) = loaded_project_with_bytes(SYMBOLIZED_FIXTURE);
+        app.finish_project_open(Ok(project));
+        app.pending_static_patch_drafts
+            .queue_nop(THUNK_RVA.into(), &THUNK_BYTES, "unpreviewed draft")
+            .expect("queue unpreviewed draft");
+        let directory = tempfile::tempdir().expect("temporary publication directory");
+        let output = directory.path().join("must-preview.exe");
+
+        let error = app
+            .prepare_static_patch_publication_confirmation(output.clone())
+            .expect_err("unpreviewed drafts must not create confirmation authority");
+
+        assert!(error.contains("validate the exact current drafts"));
+        assert!(app.pending_static_patch_publication.is_none());
+        assert!(!app.publication_operation.is_pending());
+        assert!(!output.exists());
         assert_eq!(app.pending_static_patch_drafts.drafts().len(), 1);
     }
 
@@ -11284,30 +11662,81 @@ mod tests {
     fn wrong_source_static_receipt_fails_closed_and_preserves_drafts() {
         let (_context, mut app) = test_app();
         let (active_source, active_project) = loaded_project_with_source();
-        app.analysis_path = Some(active_source.path().to_path_buf());
-        app.finish_project_open(Ok(active_project));
-        app.pending_static_patch_drafts
-            .queue_nop(THUNK_RVA.into(), &THUNK_BYTES, "retained draft")
-            .expect("queue retained draft");
-
         let (_other_source, other_project) = loaded_project_with_bytes(SYMBOLIZED_FIXTURE);
         let directory = tempfile::tempdir().expect("temporary publication directory");
         let output = directory.path().join("other-source-patch.exe");
-        let destination = PublicationDestination::resolve(&output).expect("canonical destination");
+        let receipt = publish_test_patch(&other_project, &output);
+        app.analysis_path = Some(active_source.path().to_path_buf());
+        let pending =
+            prepare_test_static_publication(&mut app, active_project, "retained draft", &output);
+        let destination = pending.confirmation.destination().clone();
         let operation = app.operation_sequence.issue();
         app.publication_operation
             .begin(operation, PublicationKind::StaticPatch, destination)
             .expect("reserve static publication");
-        let receipt = publish_test_patch(&other_project, &output);
 
-        app.finish_static_patch_publication(operation, Ok(receipt));
+        app.finish_static_patch_publication(operation, pending.confirmation, Ok(receipt));
 
         assert!(!app.publication_operation.is_pending());
         assert_eq!(app.pending_static_patch_drafts.drafts().len(), 1);
         assert!(matches!(
             app.static_patch_result.as_ref(),
-            Some(Err(error)) if error.contains("did not match the current project identity")
+            Some(Err(error)) if error.contains("did not match the confirmed path")
         ));
+    }
+
+    #[test]
+    fn substituted_static_confirmation_destination_fails_closed_without_filesystem_effects() {
+        let (_context, mut app) = test_app();
+        let (_source, project) = loaded_project_with_bytes(SYMBOLIZED_FIXTURE);
+        let directory = tempfile::tempdir().expect("temporary publication directory");
+        let confirmed_output = directory.path().join("confirmed-patch.exe");
+        let substituted_output = directory.path().join("substituted-patch.exe");
+        let pending = prepare_test_static_publication(
+            &mut app,
+            project,
+            "destination-bound draft",
+            &confirmed_output,
+        );
+        let reserved_destination = pending.confirmation.destination().clone();
+        let substituted_destination = PublicationDestination::resolve(&substituted_output)
+            .expect("canonical substituted destination");
+        let substituted_confirmation = app
+            .current_static_patch_publication_confirmation(substituted_destination)
+            .expect("otherwise matching substituted confirmation");
+        assert_ne!(
+            pending.confirmation.canonical_path(),
+            substituted_confirmation.canonical_path()
+        );
+        let operation = app.operation_sequence.issue();
+        app.publication_operation
+            .begin(
+                operation,
+                PublicationKind::StaticPatch,
+                reserved_destination,
+            )
+            .expect("reserve confirmed publication");
+
+        app.finish_static_patch_publication(
+            operation,
+            substituted_confirmation,
+            Err("worker rejected substituted destination".to_owned()),
+        );
+
+        assert!(!app.publication_operation.is_pending());
+        assert_eq!(app.pending_static_patch_drafts.drafts().len(), 1);
+        assert!(matches!(
+            app.static_patch_result.as_ref(),
+            Some(Err(error)) if error.contains("did not match the exact confirmed project")
+        ));
+        assert!(!confirmed_output.exists());
+        assert!(!substituted_output.exists());
+        assert_eq!(
+            std::fs::read_dir(directory.path())
+                .expect("read untouched destination directory")
+                .count(),
+            0
+        );
     }
 
     #[test]
@@ -11318,21 +11747,51 @@ mod tests {
         let output = directory.path().join("matching-source-patch.exe");
         let receipt = publish_test_patch(&project, &output);
         app.analysis_path = Some(source.path().to_path_buf());
-        app.finish_project_open(Ok(project));
-        app.pending_static_patch_drafts
-            .queue_nop(THUNK_RVA.into(), &THUNK_BYTES, "published draft")
-            .expect("queue published draft");
-        let destination = PublicationDestination::resolve(&output).expect("canonical destination");
+        let pending =
+            prepare_test_static_publication(&mut app, project, "published draft", &output);
+        let destination = pending.confirmation.destination().clone();
         let operation = app.operation_sequence.issue();
         app.publication_operation
             .begin(operation, PublicationKind::StaticPatch, destination)
             .expect("reserve static publication");
 
-        app.finish_static_patch_publication(operation, Ok(receipt));
+        app.finish_static_patch_publication(operation, pending.confirmation, Ok(receipt));
 
         assert!(!app.publication_operation.is_pending());
-        assert!(app.pending_static_patch_drafts.drafts().is_empty());
+        assert!(
+            app.pending_static_patch_drafts.drafts().is_empty(),
+            "matching receipt should clear drafts: {:?}",
+            app.static_patch_result
+        );
         assert!(matches!(app.static_patch_result.as_ref(), Some(Ok(_))));
+    }
+
+    #[test]
+    fn changed_drafts_reject_matching_receipt_without_clearing_any_draft() {
+        let (_context, mut app) = test_app();
+        let (_source, project) = loaded_project_with_bytes(SYMBOLIZED_FIXTURE);
+        let directory = tempfile::tempdir().expect("temporary publication directory");
+        let output = directory.path().join("changed-drafts-patch.exe");
+        let receipt = publish_test_patch(&project, &output);
+        let pending =
+            prepare_test_static_publication(&mut app, project, "confirmed draft", &output);
+        let destination = pending.confirmation.destination().clone();
+        let operation = app.operation_sequence.issue();
+        app.publication_operation
+            .begin(operation, PublicationKind::StaticPatch, destination)
+            .expect("reserve static publication");
+        app.pending_static_patch_drafts
+            .queue_nop(0x1200, &[0xcc], "later draft")
+            .expect("queue later draft through direct test setup");
+
+        app.finish_static_patch_publication(operation, pending.confirmation, Ok(receipt));
+
+        assert!(!app.publication_operation.is_pending());
+        assert_eq!(app.pending_static_patch_drafts.drafts().len(), 2);
+        assert!(matches!(
+            app.static_patch_result.as_ref(),
+            Some(Err(error)) if error.contains("did not match the exact confirmed project")
+        ));
     }
 
     #[test]

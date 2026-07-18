@@ -552,7 +552,11 @@ The instruction action menu maintains three separate authority domains:
    differ. Its worker command accepts no destination path; stale operation, project, or draft
    bindings, unchanged-output receipts, and plausible same-shape alternate results are rejected
    before they can update the UI. Patched-binary publication and patch-set save/load are unavailable
-   while the preview is pending.
+   while the preview is pending. Publication additionally requires explicit confirmation of that
+   exact preview and canonical create-new destination. The worker receives the sealed binding,
+   rebuilds its plan, re-reads the source path, and stages nothing unless the fresh output identity
+   and warnings equal the preview; existing entries/links, Windows path aliases, drift, and
+   uncorrelated receipts preserve every draft.
 3. Live actions are typed and visible but remain disabled until a real authenticated provider
    supplies a complete capability report, a current authenticated stop token, and the exact address
    bindings required by the action. A step route derives its only trusted thread identity from the

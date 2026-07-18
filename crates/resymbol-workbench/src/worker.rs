@@ -157,7 +157,6 @@ impl PublicationDestination {
         })
     }
 
-    #[cfg(test)]
     #[must_use]
     pub fn canonical_path(&self) -> &Path {
         &self.canonical_path
@@ -450,6 +449,94 @@ impl StaticPatchPreviewOutcome {
     #[must_use]
     pub const fn plan_fingerprint(&self) -> &BinaryId {
         &self.plan_fingerprint
+    }
+}
+
+/// Exact, sealed preview evidence required for one create-new publication.
+///
+/// Fields are private so UI code cannot assemble publication authority from raw
+/// edits. Construction succeeds only when the worker-produced preview is bound
+/// to the exact source, canonical requests, output identity, and warnings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaticPatchPublicationConfirmation {
+    preview: StaticPatchPreviewBinding,
+    expected_output: BinaryIdentity,
+    warnings: [StaticPatchWarning; 2],
+    destination: PublicationDestination,
+}
+
+impl StaticPatchPublicationConfirmation {
+    pub fn new(
+        preview: StaticPatchPreviewBinding,
+        outcome: StaticPatchPreviewOutcome,
+        destination: PublicationDestination,
+    ) -> Result<Self, String> {
+        if outcome.source_identity() != preview.source_identity() {
+            return Err(
+                "static patch preview source identity does not match its binding".to_owned(),
+            );
+        }
+        if outcome.edit_count() != preview.requests().len() {
+            return Err("static patch preview edit count does not match its binding".to_owned());
+        }
+        if outcome.changed_bytes() != preview.changed_bytes() {
+            return Err(
+                "static patch preview changed-byte count does not match its binding".to_owned(),
+            );
+        }
+        if outcome.plan_fingerprint() != preview.request_fingerprint() {
+            return Err(
+                "static patch preview plan fingerprint does not match its binding".to_owned(),
+            );
+        }
+        outcome
+            .output_identity()
+            .validate()
+            .map_err(|error| format!("invalid static patch preview output identity: {error}"))?;
+        let source = preview.source_identity();
+        let output = outcome.output_identity();
+        if output.size != source.size
+            || output.format != source.format
+            || output.architecture != source.architecture
+            || output.image_base != source.image_base
+            || output.id == source.id
+        {
+            return Err(
+                "static patch preview output metadata is not a changed image of its source"
+                    .to_owned(),
+            );
+        }
+        Ok(Self {
+            preview,
+            expected_output: outcome.output_identity,
+            warnings: outcome.warnings,
+            destination,
+        })
+    }
+
+    #[must_use]
+    pub const fn preview(&self) -> &StaticPatchPreviewBinding {
+        &self.preview
+    }
+
+    #[must_use]
+    pub const fn expected_output(&self) -> &BinaryIdentity {
+        &self.expected_output
+    }
+
+    #[must_use]
+    pub const fn warnings(&self) -> &[StaticPatchWarning; 2] {
+        &self.warnings
+    }
+
+    #[must_use]
+    pub const fn destination(&self) -> &PublicationDestination {
+        &self.destination
+    }
+
+    #[must_use]
+    pub fn canonical_path(&self) -> &Path {
+        self.destination.canonical_path()
     }
 }
 
@@ -953,8 +1040,7 @@ pub enum WorkerCommand {
     PublishStaticPatch {
         operation: OperationId,
         project: Arc<ProjectSnapshot>,
-        requests: Vec<StaticPatchEditRequest>,
-        path: PathBuf,
+        confirmation: StaticPatchPublicationConfirmation,
     },
     /// Validate and create-new save a portable static patch set.
     SaveStaticPatchSet {
@@ -1017,6 +1103,7 @@ pub enum WorkerEvent {
     },
     StaticPatchPublished {
         operation: OperationId,
+        confirmation: StaticPatchPublicationConfirmation,
         result: Result<PublishedStaticPatch, String>,
     },
     StaticPatchSetSaved {
@@ -1195,21 +1282,14 @@ fn process_command(services: &AppServices, command: WorkerCommand) -> Option<Wor
         WorkerCommand::PublishStaticPatch {
             operation,
             project,
-            requests,
-            path,
+            confirmation,
         } => {
-            let result = StaticPatchPlan::new(
-                project.session().base_analysis().identity(),
-                project.session().base_analysis(),
-                requests,
-            )
-            .map_err(|error| error.to_string())
-            .and_then(|plan| {
-                services
-                    .publish_static_patch_new(&project, &plan, &path)
-                    .map_err(|error| error.to_string())
-            });
-            WorkerEvent::StaticPatchPublished { operation, result }
+            let result = publish_confirmed_static_patch(services, &project, &confirmation);
+            WorkerEvent::StaticPatchPublished {
+                operation,
+                confirmation,
+                result,
+            }
         }
         WorkerCommand::SaveStaticPatchSet {
             operation,
@@ -1266,6 +1346,50 @@ fn preview_static_patch(
         warnings: [image.warnings()[0], image.warnings()[1]],
         plan_fingerprint,
     })
+}
+
+fn publish_confirmed_static_patch(
+    services: &AppServices,
+    project: &ProjectSnapshot,
+    confirmation: &StaticPatchPublicationConfirmation,
+) -> Result<PublishedStaticPatch, String> {
+    let binding = confirmation.preview();
+    let analysis = project.session().base_analysis();
+    if analysis.identity() != binding.source_identity() {
+        return Err(
+            "static patch publication binding does not match the worker project".to_owned(),
+        );
+    }
+    let plan = StaticPatchPlan::new(
+        binding.source_identity(),
+        analysis,
+        binding.requests().to_vec(),
+    )
+    .map_err(|error| error.to_string())?;
+    let fingerprint = fingerprint_static_patch_plan(&plan)?;
+    if &fingerprint != binding.request_fingerprint() {
+        return Err(
+            "resolved static patch plan does not match the confirmed preview fingerprint"
+                .to_owned(),
+        );
+    }
+    let receipt = services
+        .publish_static_patch_new_confirmed(
+            project,
+            &plan,
+            confirmation.expected_output(),
+            confirmation.warnings(),
+            confirmation.canonical_path(),
+        )
+        .map_err(|error| error.to_string())?;
+    if receipt.path() != confirmation.canonical_path()
+        || receipt.source_identity() != binding.source_identity()
+        || receipt.output_identity() != confirmation.expected_output()
+        || receipt.warnings() != confirmation.warnings().as_slice()
+    {
+        return Err("static patch publication receipt does not match its confirmation".to_owned());
+    }
+    Ok(receipt)
 }
 
 fn process_sandbox_provider_probe<B>(
@@ -1611,6 +1735,23 @@ mod tests {
             .analyze_binary(source.path())
             .expect("analyze worker fixture");
         (source, snapshot)
+    }
+
+    fn static_patch_confirmation(
+        services: &AppServices,
+        project: &ProjectSnapshot,
+        request: StaticPatchEditRequest,
+        destination: PublicationDestination,
+    ) -> StaticPatchPublicationConfirmation {
+        let binding = StaticPatchPreviewBinding::new(
+            project.session().base_analysis().identity().clone(),
+            vec![request],
+        )
+        .expect("bounded preview binding");
+        let outcome =
+            preview_static_patch(services, project, &binding).expect("valid patch preview");
+        StaticPatchPublicationConfirmation::new(binding, outcome, destination)
+            .expect("preview-bound publication confirmation")
     }
 
     #[test]
@@ -2031,10 +2172,14 @@ entrypoint = "plugin.wasm"
     }
 
     #[test]
-    fn worker_owns_checked_create_new_static_patch_publication() {
+    fn worker_derives_checked_create_new_destination_only_from_confirmation() {
         let (source, project) = project_snapshot_with_bytes(SYMBOLIZED_FIXTURE);
         let directory = tempdir().expect("temporary patch directory");
-        let path = directory.path().join("patched.exe");
+        let alias_path = directory.path().join(".").join("patched.exe");
+        let destination = PublicationDestination::resolve(&alias_path)
+            .expect("canonical publication destination");
+        let path = destination.canonical_path().to_path_buf();
+        let substituted_path = directory.path().join("substituted.exe");
         let request = || {
             StaticPatchEditRequest::nop_instruction(
                 THUNK_RVA,
@@ -2045,23 +2190,29 @@ entrypoint = "plugin.wasm"
         };
         let mut sequence = OperationSequence::default();
         let first = sequence.issue();
+        let services = AppServices::default();
+        let confirmation = static_patch_confirmation(&services, &project, request(), destination);
+        assert_eq!(confirmation.canonical_path(), path);
+        assert_ne!(confirmation.canonical_path(), substituted_path);
 
         let event = process_command(
-            &AppServices::default(),
+            &services,
             WorkerCommand::PublishStaticPatch {
                 operation: first,
                 project: Arc::clone(&project),
-                requests: vec![request()],
-                path: path.clone(),
+                confirmation: confirmation.clone(),
             },
         )
         .expect("static patch event");
         match event {
             WorkerEvent::StaticPatchPublished {
                 operation,
+                confirmation: actual_confirmation,
                 result: Ok(outcome),
             } => {
                 assert_eq!(operation, first);
+                assert_eq!(actual_confirmation, confirmation);
+                assert_eq!(actual_confirmation.canonical_path(), path);
                 assert_eq!(outcome.path(), path);
                 assert_eq!(
                     outcome.source_identity(),
@@ -2072,6 +2223,7 @@ entrypoint = "plugin.wasm"
             }
             _ => panic!("unexpected worker event"),
         }
+        assert!(!substituted_path.exists());
         let patched = fs::read(&path).expect("read patched output");
         assert_eq!(
             &patched[THUNK_FILE_OFFSET..THUNK_FILE_OFFSET + THUNK_BYTES.len()],
@@ -2084,12 +2236,11 @@ entrypoint = "plugin.wasm"
 
         let second = sequence.issue();
         let event = process_command(
-            &AppServices::default(),
+            &services,
             WorkerCommand::PublishStaticPatch {
                 operation: second,
                 project,
-                requests: vec![request()],
-                path,
+                confirmation,
             },
         )
         .expect("second static patch event");
@@ -2098,8 +2249,82 @@ entrypoint = "plugin.wasm"
             WorkerEvent::StaticPatchPublished {
                 operation,
                 result: Err(_),
+                ..
             } if operation == second
         ));
+    }
+
+    #[test]
+    fn worker_rejects_confirmation_with_alternate_output_before_staging() {
+        let directory = tempdir().expect("temporary forged-confirmation directory");
+        let source_path = directory.path().join("source.exe");
+        let output_path = directory.path().join("patched.exe");
+        fs::write(&source_path, SYMBOLIZED_FIXTURE).expect("write source fixture");
+        let services = AppServices::default();
+        let project = services
+            .analyze_binary(&source_path)
+            .expect("analyze source fixture");
+        let request = StaticPatchEditRequest::nop_instruction(
+            THUNK_RVA,
+            THUNK_BYTES,
+            "Disable internal jump thunk",
+        )
+        .expect("valid request");
+        let binding = StaticPatchPreviewBinding::new(
+            project.session().base_analysis().identity().clone(),
+            vec![request],
+        )
+        .expect("preview binding");
+        let outcome =
+            preview_static_patch(&services, &project, &binding).expect("valid patch preview");
+        let forged_output = BinaryIdentity {
+            id: BinaryId::digest(b"not-the-previewed-patched-image"),
+            ..outcome.output_identity().clone()
+        };
+        let forged_outcome = StaticPatchPreviewOutcome::from_parts_for_test(
+            outcome.source_identity().clone(),
+            forged_output,
+            outcome.edit_count(),
+            outcome.changed_bytes(),
+            [outcome.warnings()[0], outcome.warnings()[1]],
+            outcome.plan_fingerprint().clone(),
+        );
+        let destination =
+            PublicationDestination::resolve(&output_path).expect("canonical output destination");
+        let confirmation =
+            StaticPatchPublicationConfirmation::new(binding, forged_outcome, destination)
+                .expect("structurally correlated forged confirmation");
+
+        let event = process_command(
+            &services,
+            WorkerCommand::PublishStaticPatch {
+                operation: OperationSequence::default().issue(),
+                project,
+                confirmation,
+            },
+        )
+        .expect("publication event");
+
+        assert!(matches!(
+            event,
+            WorkerEvent::StaticPatchPublished {
+                result: Err(error),
+                ..
+            } if error.contains("does not match the confirmed preview")
+        ));
+        assert!(!output_path.exists());
+        let entries = fs::read_dir(directory.path())
+            .expect("read destination directory")
+            .map(|entry| entry.expect("directory entry").file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            entries,
+            vec![source_path.file_name().expect("source filename")]
+        );
+        assert_eq!(
+            fs::read(&source_path).expect("read unchanged source"),
+            SYMBOLIZED_FIXTURE
+        );
     }
 
     #[test]

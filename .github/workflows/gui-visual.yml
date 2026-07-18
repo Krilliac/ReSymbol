@@ -154,6 +154,7 @@ jobs:
             "disassembly",
             "disassembly-actions",
             "exact-byte-editor",
+            "static-patch-confirmation",
             "binary-switch-confirmation",
             "debugger-sandbox",
             "debugger-readiness-result",

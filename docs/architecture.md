@@ -778,6 +778,26 @@ Patched-binary publication and patch-set save/load are disabled and rejected whi
 pending, while local draft changes remain available and make the eventual result stale. Successful
 validation never clears the unpublished draft queue.
 
+Publication is authorized only by a sealed confirmation constructed from that exact successful
+preview. After destination selection, the Workbench shows a second explicit confirmation containing
+the source, request/plan, and output SHA-256 values, edit and changed-byte counts, both integrity
+warnings, and the canonical create-new path. Confirmation is rederived from current state before
+submission; the worker accepts no replacement raw request list, rebuilds and fingerprints the plan,
+then calls the confirmed application-service boundary. That boundary canonicalizes the parent and
+leaf, rejects every existing directory entry (including dangling symbolic links and hardlinks) plus
+Windows device names, alternate data streams, reserved characters, and trailing-dot/space aliases,
+and keeps `persist_noclobber` as the final race-safe authority. It re-reads and hashes the verified
+source path immediately before applying the immutable plan and creates no staging file unless the
+fresh output identity and warnings exactly match the preview. The result event echoes that
+destination-bound confirmation; only a receipt matching that envelope, the current draft binding,
+source, output, warnings, and path can clear those drafts. Rejection, disconnect, drift, or an
+uncorrelated receipt preserves them. The CLI's existing direct create-new publication path remains
+available and unchanged; this stricter contract is the Workbench publication boundary.
+This local-desktop boundary revalidates the sealed canonical path immediately before source recheck
+and staging. It does not claim to close a malicious ancestor replacement after that final recheck;
+eliminating that remaining Windows race requires future handle-relative publication rooted in an
+already-open destination-directory handle.
+
 The companion console is an opt-in process rather than a second state owner. The GUI spawns the
 packaged console helper only after the user enables it and uses private redirected standard-I/O
 pipes for bounded command and activity transport. The helper owns the visible terminal while typed
