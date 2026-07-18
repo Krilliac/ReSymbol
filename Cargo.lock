@@ -3049,6 +3049,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "resymbol-linux-debug-host"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "libc",
+ "resymbol-debugger",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "resymbol-native-host"
 version = "0.1.0-alpha.1"
 dependencies = [
