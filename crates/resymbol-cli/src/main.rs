@@ -24,7 +24,7 @@ use resymbol_core::{
     },
 };
 use resymbol_export::{
-    ExportLossReport, ExportProjection, ExportTarget, MAX_MAP_MODULE_NAME_BYTES,
+    ExportLossReport, ExportProjection, ExportTarget, MAX_MAP_MODULE_NAME_BYTES, render_dwarf,
     render_ghidra_java, render_ida_python, render_map, render_markdown, render_pdb,
     validate_ghidra_java_class_name,
 };
@@ -183,6 +183,8 @@ enum ExportFormat {
     IdaPython,
     #[value(name = "ghidra-java")]
     GhidraJava,
+    #[value(name = "dwarf")]
+    Dwarf,
 }
 
 impl ExportFormat {
@@ -194,6 +196,7 @@ impl ExportFormat {
             Self::Pdb => "exact-RSDS public-symbol PDB",
             Self::IdaPython => "IDA Python",
             Self::GhidraJava => "Ghidra Java",
+            Self::Dwarf => "DWARF ELF debug companion",
         }
     }
 
@@ -205,6 +208,7 @@ impl ExportFormat {
             Self::Pdb => ExportTarget::Pdb,
             Self::IdaPython => ExportTarget::IdaPython,
             Self::GhidraJava => ExportTarget::GhidraJava,
+            Self::Dwarf => ExportTarget::Dwarf,
         }
     }
 }
@@ -1720,6 +1724,9 @@ fn export(args: ExportArgs) -> Result<()> {
                 .context("cannot render Ghidra Java import script")?
                 .into_bytes()
         }
+        ExportFormat::Dwarf => render_dwarf(&projection)
+            .context("cannot render DWARF ELF debug companion")?
+            .into_bytes(),
     };
     if !dry_run {
         write_export_new(&output, &rendered)?;
@@ -1844,6 +1851,9 @@ fn export(args: ExportArgs) -> Result<()> {
         ExportFormat::IdaPython | ExportFormat::GhidraJava => println!(
             "identity gate: importer verifies the loaded program SHA-256 before any mutation"
         ),
+        ExportFormat::Dwarf => println!(
+            "identity notice: the DWARF companion addresses the image at its preferred base but carries no binary hash; load it only against the exact analyzed image"
+        ),
     }
 
     Ok(())
@@ -1869,6 +1879,7 @@ fn default_export_path(package: &Path, format: ExportFormat, binary_sha256: &str
         ExportFormat::Map => package.with_extension("map"),
         ExportFormat::Pdb => package.with_extension("pdb"),
         ExportFormat::IdaPython => package.with_extension("ida.py"),
+        ExportFormat::Dwarf => package.with_extension("debug"),
         ExportFormat::GhidraJava => {
             let prefix = binary_sha256
                 .get(..12)
