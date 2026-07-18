@@ -150,6 +150,18 @@ pub fn serve_one<T: Transport, R: RemoteTarget>(target: &mut R, transport: T) ->
 }
 
 /// Format a stop reply as its RSP wire form (`Sxx`, `Wxx`, or `Xxx`).
+/// Build a stop reply, tagging it with the stopping thread when the target
+/// knows it. A signal stop with a known thread uses the `T AA thread:tid;`
+/// form GDB expects for thread-aware stops; exit/terminate stay `W`/`X`.
+fn stop_reply_for<R: RemoteTarget + ?Sized>(reply: StopReply, target: &mut R) -> Vec<u8> {
+    if let StopReply::Signal(signal) = reply {
+        if let Some(thread) = target.stopped_thread() {
+            return format!("T{signal:02x}thread:{thread:x};").into_bytes();
+        }
+    }
+    stop_reply_packet(reply)
+}
+
 fn stop_reply_packet(reply: StopReply) -> Vec<u8> {
     match reply {
         StopReply::Signal(signal) => format!("S{signal:02x}").into_bytes(),
@@ -175,7 +187,7 @@ fn dispatch<R: RemoteTarget + ?Sized>(payload: &[u8], target: &mut R) -> Disposi
         return Disposition::Reply(empty_reply());
     };
     match first {
-        b'?' => Disposition::Reply(stop_reply_packet(target.stop_reason())),
+        b'?' => Disposition::Reply(stop_reply_for(target.stop_reason(), target)),
         b'g' => match target.read_registers() {
             Ok(bytes) => Disposition::Reply(hex_encode(&bytes)),
             Err(_) => Disposition::Reply(error_reply()),
@@ -190,17 +202,18 @@ fn dispatch<R: RemoteTarget + ?Sized>(payload: &[u8], target: &mut R) -> Disposi
         b'm' => Disposition::Reply(handle_read_memory(rest, target)),
         b'M' => Disposition::Reply(handle_write_memory(rest, target)),
         b'c' => Disposition::Reply(match target.cont() {
-            Ok(reply) => stop_reply_packet(reply),
+            Ok(reply) => stop_reply_for(reply, target),
             Err(_) => error_reply(),
         }),
         b's' => Disposition::Reply(match target.step() {
-            Ok(reply) => stop_reply_packet(reply),
+            Ok(reply) => stop_reply_for(reply, target),
             Err(_) => error_reply(),
         }),
         b'Z' => Disposition::Reply(handle_breakpoint(rest, target, true)),
         b'z' => Disposition::Reply(handle_breakpoint(rest, target, false)),
-        b'q' => Disposition::Reply(handle_query(rest)),
-        b'H' => Disposition::Reply(b"OK".to_vec()),
+        b'q' => Disposition::Reply(handle_query(rest, target)),
+        b'H' => Disposition::Reply(handle_set_thread(rest, target)),
+        b'T' => Disposition::Reply(handle_is_thread_alive(rest, target)),
         b'v' => Disposition::Reply(handle_v_packet(rest, target)),
         b'D' => Disposition::Detach(b"OK".to_vec()),
         b'k' => Disposition::Kill,
@@ -306,35 +319,116 @@ fn handle_breakpoint<R: RemoteTarget + ?Sized>(rest: &[u8], target: &mut R, set:
     }
 }
 
-/// Handle the `q...` query packets used during connection setup.
-fn handle_query(rest: &[u8]) -> Vec<u8> {
+/// Handle the `q...` query packets used during connection setup, including the
+/// thread-enumeration queries.
+fn handle_query<R: RemoteTarget + ?Sized>(rest: &[u8], target: &mut R) -> Vec<u8> {
     if rest.starts_with(b"Supported") {
-        return format!("PacketSize={ADVERTISED_PACKET_SIZE:x};swbreak+").into_bytes();
+        return format!("PacketSize={ADVERTISED_PACKET_SIZE:x};swbreak+;hwbreak+").into_bytes();
     }
     if rest == b"Attached" || rest.starts_with(b"Attached") {
         return b"1".to_vec();
     }
     if rest == b"C" {
-        return b"QC01".to_vec();
+        // Current thread id.
+        return match target.current_thread() {
+            Ok(tid) => format!("QC{tid:x}").into_bytes(),
+            Err(_) => b"QC01".to_vec(),
+        };
+    }
+    if rest == b"fThreadInfo" {
+        // First batch: the whole (bounded) thread list in one `m...` reply.
+        return match target.thread_ids() {
+            Ok(ids) if !ids.is_empty() => {
+                let mut out = vec![b'm'];
+                for (index, id) in ids.iter().enumerate() {
+                    if index != 0 {
+                        out.push(b',');
+                    }
+                    out.extend_from_slice(format!("{id:x}").as_bytes());
+                }
+                out
+            }
+            _ => b"l".to_vec(),
+        };
+    }
+    if rest == b"sThreadInfo" {
+        // Subsequent batch: end of list (the whole list fit in the first batch).
+        return b"l".to_vec();
     }
     empty_reply()
 }
 
+/// Handle `Hg<tid>` / `Hc<tid>`: select the current thread for subsequent
+/// register/memory (`g`) or step/continue (`c`) operations. A tid of `0` or the
+/// all-threads sentinel `-1` leaves the selection unchanged.
+fn handle_set_thread<R: RemoteTarget + ?Sized>(rest: &[u8], target: &mut R) -> Vec<u8> {
+    // rest is "<op><thread-id>", e.g. "g1a" or "c-1".
+    let Some((_op, id_bytes)) = rest.split_first() else {
+        return b"OK".to_vec();
+    };
+    match parse_thread_id(id_bytes) {
+        // "any"/"all" or the leader: leave the current selection unchanged.
+        None | Some(0) => b"OK".to_vec(),
+        Some(tid) => match target.set_current_thread(tid) {
+            Ok(()) => b"OK".to_vec(),
+            Err(_) => error_reply(),
+        },
+    }
+}
+
+/// Handle `T<tid>` (is-thread-alive): `OK` if the thread is listed, else `E01`.
+fn handle_is_thread_alive<R: RemoteTarget + ?Sized>(rest: &[u8], target: &mut R) -> Vec<u8> {
+    let Some(tid) = parse_thread_id(rest) else {
+        return error_reply();
+    };
+    match target.thread_ids() {
+        Ok(ids) if ids.contains(&tid) => b"OK".to_vec(),
+        _ => b"E01".to_vec(),
+    }
+}
+
+/// Parse a GDB thread-id field: a hex id, or `-1` (all threads) / `0` (any)
+/// which map to `None` (no specific thread). A leading `p<pid>.` multiprocess
+/// prefix is tolerated by taking the portion after the last `.`.
+fn parse_thread_id(bytes: &[u8]) -> Option<u64> {
+    let tail = match bytes.iter().rposition(|&b| b == b'.') {
+        Some(dot) => &bytes[dot + 1..],
+        None => bytes,
+    };
+    let tail = tail.strip_prefix(b"p").unwrap_or(tail);
+    if tail == b"-1" {
+        return None;
+    }
+    parse_hex_u64(tail)
+}
+
 /// Handle `v...` packets: `vCont?` advertises continue/step support and
-/// `vCont;c`/`vCont;s` execute them.
+/// `vCont;c`/`vCont;s` execute them. A per-action `:tid` suffix selects the
+/// thread before a step (all-stop: `c` resumes every thread).
 fn handle_v_packet<R: RemoteTarget + ?Sized>(rest: &[u8], target: &mut R) -> Vec<u8> {
     if rest == b"Cont?" {
-        return b"vCont;c;s".to_vec();
+        return b"vCont;c;s;t".to_vec();
     }
     if let Some(actions) = rest.strip_prefix(b"Cont;") {
-        // Use the first action letter (e.g. "c" or "s", possibly with a thread).
-        return match actions.first() {
+        // Take the first action (e.g. "c", "s", or "s:1a"); honor a :tid suffix.
+        let first_action = actions.split(|&b| b == b';').next().unwrap_or(actions);
+        let (letter, thread) = match first_action.iter().position(|&b| b == b':') {
+            Some(colon) => (
+                first_action.first().copied(),
+                parse_thread_id(&first_action[colon + 1..]),
+            ),
+            None => (first_action.first().copied(), None),
+        };
+        if let Some(tid) = thread {
+            let _ = target.set_current_thread(tid);
+        }
+        return match letter {
             Some(b'c') | Some(b'C') => match target.cont() {
-                Ok(reply) => stop_reply_packet(reply),
+                Ok(reply) => stop_reply_for(reply, target),
                 Err(_) => error_reply(),
             },
             Some(b's') | Some(b'S') => match target.step() {
-                Ok(reply) => stop_reply_packet(reply),
+                Ok(reply) => stop_reply_for(reply, target),
                 Err(_) => error_reply(),
             },
             _ => empty_reply(),

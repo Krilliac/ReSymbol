@@ -22,6 +22,13 @@ const GDB_SIGTRAP: u8 = 5;
 pub struct PtraceRemoteTarget {
     session: LinuxDebugSession<PtraceBackend>,
     last_stop: StopReply,
+    /// The thread GDB has selected via `Hg`/`Hc`; `None` means the leader.
+    ///
+    /// Thread enumeration and selection are honored so GDB's `info threads`
+    /// lists every thread, but register and memory access are currently scoped
+    /// to the primary (leader) thread's stopped state — full per-thread
+    /// register/execution control is future work.
+    selected_thread: Option<u64>,
 }
 
 impl PtraceRemoteTarget {
@@ -31,7 +38,13 @@ impl PtraceRemoteTarget {
         Self {
             session,
             last_stop: StopReply::Signal(GDB_SIGTRAP),
+            selected_thread: None,
         }
+    }
+
+    /// The thread-group leader id (the target pid) as a GDB thread id.
+    fn leader_tid(&self) -> u64 {
+        u64::try_from(self.session.pid()).unwrap_or(1)
     }
 
     /// Borrow the underlying session (e.g. to detach or kill it).
@@ -129,6 +142,51 @@ impl RemoteTarget for PtraceRemoteTarget {
     fn stop_reason(&mut self) -> StopReply {
         self.last_stop
     }
+
+    fn thread_ids(&mut self) -> Result<Vec<u64>, TargetError> {
+        Ok(read_thread_ids(self.session.pid(), self.leader_tid()))
+    }
+
+    fn current_thread(&mut self) -> Result<u64, TargetError> {
+        Ok(self.selected_thread.unwrap_or_else(|| self.leader_tid()))
+    }
+
+    fn set_current_thread(&mut self, id: u64) -> Result<(), TargetError> {
+        self.selected_thread = Some(id);
+        Ok(())
+    }
+
+    fn stopped_thread(&mut self) -> Option<u64> {
+        // All-stop model: stops are reported against the leader thread.
+        Some(self.leader_tid())
+    }
+}
+
+/// Enumerate the live thread ids of `pid` from `/proc/<pid>/task`. Falls back to
+/// just the `leader` id if the directory cannot be read (e.g. the process has a
+/// single thread or `/proc` is unavailable). The list is sorted and bounded.
+fn read_thread_ids(pid: i32, leader: u64) -> Vec<u64> {
+    /// A defensive ceiling on the number of threads reported to a client.
+    const MAX_THREADS: usize = 4096;
+    let mut ids = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/task")) {
+        for entry in entries.flatten() {
+            if let Ok(name) = entry.file_name().into_string() {
+                if let Ok(tid) = name.parse::<u64>() {
+                    ids.push(tid);
+                }
+            }
+            if ids.len() >= MAX_THREADS {
+                break;
+            }
+        }
+    }
+    if ids.is_empty() {
+        ids.push(leader);
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    ids
 }
 
 /// Map an RSP [`WatchKind`] onto a host [`HardwareKind`]. x86-64 debug registers

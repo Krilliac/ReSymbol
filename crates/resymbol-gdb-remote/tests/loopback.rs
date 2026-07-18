@@ -212,6 +212,92 @@ fn server_dispatches_hardware_breakpoint_packets() {
     );
 }
 
+/// A target reporting two threads, with a mutable current-thread selection, so
+/// the thread packets (`qfThreadInfo`, `qC`, `Hg`, `T`, thread-tagged stops)
+/// can be exercised through the real server dispatch.
+struct ThreadedTarget {
+    threads: Vec<u64>,
+    current: u64,
+}
+
+impl RemoteTarget for ThreadedTarget {
+    fn read_registers(&mut self) -> Result<Vec<u8>, TargetError> {
+        Ok(Amd64CoreRegisters::default().to_gpacket())
+    }
+    fn write_registers(&mut self, _raw: &[u8]) -> Result<(), TargetError> {
+        Ok(())
+    }
+    fn read_memory(&mut self, _addr: u64, len: usize) -> Result<Vec<u8>, TargetError> {
+        Ok(vec![0u8; len])
+    }
+    fn write_memory(&mut self, _addr: u64, _data: &[u8]) -> Result<(), TargetError> {
+        Ok(())
+    }
+    fn cont(&mut self) -> Result<StopReply, TargetError> {
+        Ok(StopReply::Signal(5))
+    }
+    fn step(&mut self) -> Result<StopReply, TargetError> {
+        Ok(StopReply::Signal(5))
+    }
+    fn set_sw_breakpoint(&mut self, _addr: u64) -> Result<(), TargetError> {
+        Ok(())
+    }
+    fn remove_sw_breakpoint(&mut self, _addr: u64) -> Result<(), TargetError> {
+        Ok(())
+    }
+    fn stop_reason(&mut self) -> StopReply {
+        StopReply::Signal(5)
+    }
+    fn thread_ids(&mut self) -> Result<Vec<u64>, TargetError> {
+        Ok(self.threads.clone())
+    }
+    fn current_thread(&mut self) -> Result<u64, TargetError> {
+        Ok(self.current)
+    }
+    fn set_current_thread(&mut self, id: u64) -> Result<(), TargetError> {
+        self.current = id;
+        Ok(())
+    }
+    fn stopped_thread(&mut self) -> Option<u64> {
+        Some(self.threads[0])
+    }
+}
+
+#[test]
+fn server_dispatches_thread_packets() {
+    let (server_transport, client_transport) = memory_pair();
+
+    let server = std::thread::spawn(move || {
+        let mut target = ThreadedTarget {
+            threads: vec![1, 7],
+            current: 1,
+        };
+        let mut server = GdbStubServer::new(server_transport);
+        server.serve(&mut target).expect("server loop");
+    });
+
+    let mut client = GdbRemoteClient::new(client_transport);
+
+    // Thread list: first batch carries both ids, second batch ends the list.
+    assert_eq!(client.transact(b"qfThreadInfo").unwrap(), b"m1,7");
+    assert_eq!(client.transact(b"qsThreadInfo").unwrap(), b"l");
+    // Current thread.
+    assert_eq!(client.transact(b"qC").unwrap(), b"QC1");
+    // Select thread 7 for continue/step; qC then reflects it.
+    assert_eq!(client.transact(b"Hc7").unwrap(), b"OK");
+    assert_eq!(client.transact(b"qC").unwrap(), b"QC7");
+    // is-thread-alive: known -> OK, unknown -> E01.
+    assert_eq!(client.transact(b"T7").unwrap(), b"OK");
+    assert_eq!(client.transact(b"T9").unwrap(), b"E01");
+    // The stop reply is tagged with the stopping thread.
+    assert_eq!(client.transact(b"?").unwrap(), b"T05thread:1;");
+    // vCont advertises the thread action.
+    assert_eq!(client.transact(b"vCont?").unwrap(), b"vCont;c;s;t");
+
+    client.send_packet(b"k").expect("kill");
+    server.join().expect("server thread");
+}
+
 #[test]
 fn client_drives_server_over_in_memory_transport() {
     let (server_transport, client_transport) = memory_pair();

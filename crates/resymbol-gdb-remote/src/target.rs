@@ -187,6 +187,49 @@ pub trait RemoteTarget {
 
     /// The most recent stop reason, without resuming the target.
     fn stop_reason(&mut self) -> StopReply;
+
+    /// The list of thread ids (GDB LWP ids) currently in the target.
+    ///
+    /// Defaults to a single thread with id `1`, which is correct for
+    /// single-threaded targets and read-only snapshots. Multi-threaded live
+    /// backends override this to enumerate every thread so GDB's `info threads`
+    /// lists them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TargetError`] if the thread list cannot be determined.
+    fn thread_ids(&mut self) -> Result<Vec<u64>, TargetError> {
+        Ok(vec![1])
+    }
+
+    /// The currently selected thread id (the subject of register, memory, and
+    /// step operations). Defaults to `1`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TargetError`] if the current thread cannot be determined.
+    fn current_thread(&mut self) -> Result<u64, TargetError> {
+        Ok(1)
+    }
+
+    /// Select the current thread. The default accepts any id as a no-op; live
+    /// backends override this to switch the subject thread. Ids `0` and the
+    /// all-threads sentinel are treated as "leave unchanged".
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TargetError`] if `id` is not a known thread.
+    fn set_current_thread(&mut self, id: u64) -> Result<(), TargetError> {
+        let _ = id;
+        Ok(())
+    }
+
+    /// The id of the thread that produced the most recent stop, if the backend
+    /// tracks it. `None` means "unknown"; the server then omits the `thread:`
+    /// field from the stop reply. Defaults to `None`.
+    fn stopped_thread(&mut self) -> Option<u64> {
+        None
+    }
 }
 
 /// The total size of an amd64 `g`-packet: 17 eight-byte registers plus seven
