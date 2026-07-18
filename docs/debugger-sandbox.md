@@ -110,6 +110,8 @@ view, target, provider stop, address, exact bytes, and committed reducer state. 
 checkpoints remain private. Success commits only after exact provider correlation. Safe rejection can
 restore the old logical stop only while the provider still proves the exact retained stopped state;
 contradictory or unsafe outcomes commit `Failed` and freeze or poison the worker before cleanup.
+Committed and proved no-effect writes carry distinct move-only local receipts for
+`LivePatchHistory`; contradictory or unsafe outcomes carry none.
 Reducer state, worker health, and provider state are separate axes. `Closed` health proves complete
 provider/core cleanup but retains the last reducer snapshot; it does not synthesize a controller
 `SessionState::Closed` or close receipt. Incomplete cleanup is retryable while the provider remains
@@ -570,13 +572,19 @@ pending compare-before-write operation, and separates reservation from a single-
 transition. A reservation may be cancelled only before dispatch begins; a dispatched operation must
 resolve exact evidence or freeze on an unknown transport outcome. It commits only the exact
 `MemoryWritten`, refreshed `Stopped`, and successful command-result receipt already validated by
-`DebugHostClient`. Its undo is strict LIFO and uses the fresh current stop token; it expects the
+`DebugHostClient`, or the move-only local receipt minted after exact `WindowsSessionWorker`
+correlation. Its undo is strict LIFO and uses the fresh current stop token; it expects the
 prior replacement and restores the prior original bytes. Safe rejection leaves the stack intact.
 Unknown transport outcome, indeterminate recovery, binding or session drift after dispatch, or
 malformed evidence freezes the stack for inspection instead of offering another mutation. Capacity
 is reserved before dispatch (256 entries and 1 MiB of retained before/after bytes), with neither
 eviction nor redo. This history is not connected to the Workbench and grants no attach, stop, write,
 cleanup, or sandbox authority.
+The planned threaded application service owns both `WindowsSessionWorker` and this history, so
+local proofs never reach UI or plugin code. Binding a receipt to one particular
+`LivePatchHistory` allocation is a non-goal for this slice; exact dispatched reservation and
+context checks remain authoritative. Reducer resolution is a trusted host-local orchestration
+precondition, not hostile-crate attestation that OS dispatch occurred.
 
 `CommandReceipt` construction is crate-sealed, so downstream UI/controller code can inspect or
 consume host-client receipts but cannot manufacture the evidence used by this reducer.

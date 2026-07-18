@@ -101,8 +101,9 @@ pub use sandbox::{
     VmIsolationIdentity, Win32kProfile,
 };
 pub use session_machine::{
-    MAX_REGISTERED_AUTHORIZATION_LEASES, RemoteCommandCheckpoint, SessionMachine,
-    SessionMachineError, ValidatedLiveMemoryWrite,
+    LocalLiveMemoryWriteReceiptIdentity, MAX_REGISTERED_AUTHORIZATION_LEASES,
+    RemoteCommandCheckpoint, SessionMachine, SessionMachineError, ValidatedLiveMemoryWrite,
+    ValidatedLocalLivePatchReceipt,
 };
 pub use software_breakpoint::{
     INT3_OPCODE, MAX_SOFTWARE_BREAKPOINTS, SoftwareBreakpointAcknowledgement,

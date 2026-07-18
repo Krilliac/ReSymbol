@@ -31,7 +31,7 @@ use crate::{
     DebugFileToken, DebugHostError, DebugHostMemoryWriteError, DebugHostMemoryWriteReceipt,
     DebugHostWorker, DebugHostWorkerState, PendingStopEvidence, SessionWorkerCleanupReceipt,
     SessionWorkerError, SessionWorkerHealth, SessionWorkerMemoryReadReceipt,
-    SessionWorkerMemoryWriteReceipt, phase_one_capability_report,
+    SessionWorkerMemoryWriteOutcome, phase_one_capability_report,
     session_worker::SessionWorkerCore,
 };
 
@@ -254,7 +254,7 @@ impl WindowsSessionWorker {
     pub fn write_memory(
         &mut self,
         envelope: CommandEnvelope,
-    ) -> Result<SessionWorkerMemoryWriteReceipt, SessionWorkerError> {
+    ) -> Result<SessionWorkerMemoryWriteOutcome, SessionWorkerError> {
         self.inner.write_memory(envelope)
     }
 

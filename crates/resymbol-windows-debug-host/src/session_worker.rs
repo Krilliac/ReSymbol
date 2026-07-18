@@ -7,6 +7,7 @@ use std::fmt;
 
 use resymbol_debugger::{
     CommandId, LiveTargetBinding, MemoryAddress, ReadViewToken, SessionMachineError, SessionState,
+    ValidatedLocalLivePatchReceipt,
 };
 use thiserror::Error;
 
@@ -72,12 +73,13 @@ impl DebugAttachReceipt {
     }
 }
 
-/// Provider mutation evidence paired with the committed reducer state.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Provider mutation evidence paired with reducer and history proof.
+#[derive(Debug)]
 #[must_use = "a successful memory-write receipt must be published"]
 pub struct SessionWorkerMemoryWriteReceipt {
     provider: DebugHostMemoryWriteReceipt,
     state: SessionState,
+    history_receipt: ValidatedLocalLivePatchReceipt,
 }
 
 impl SessionWorkerMemoryWriteReceipt {
@@ -89,6 +91,58 @@ impl SessionWorkerMemoryWriteReceipt {
     pub const fn state(&self) -> &SessionState {
         &self.state
     }
+
+    #[must_use]
+    pub fn into_parts(
+        self,
+    ) -> (
+        DebugHostMemoryWriteReceipt,
+        SessionState,
+        ValidatedLocalLivePatchReceipt,
+    ) {
+        (self.provider, self.state, self.history_receipt)
+    }
+}
+
+/// Proved no-effect provider rejection paired with restored reducer state and
+/// the one-use history proof that clears the dispatched reservation.
+#[derive(Debug)]
+#[must_use = "a safe memory-write rejection must resolve live-patch history"]
+pub struct SessionWorkerMemoryWriteNoEffectReceipt {
+    error: DebugHostMemoryWriteError,
+    state: SessionState,
+    history_receipt: ValidatedLocalLivePatchReceipt,
+}
+
+impl SessionWorkerMemoryWriteNoEffectReceipt {
+    #[must_use]
+    pub const fn error(&self) -> &DebugHostMemoryWriteError {
+        &self.error
+    }
+
+    #[must_use]
+    pub const fn state(&self) -> &SessionState {
+        &self.state
+    }
+
+    #[must_use]
+    pub fn into_parts(
+        self,
+    ) -> (
+        DebugHostMemoryWriteError,
+        SessionState,
+        ValidatedLocalLivePatchReceipt,
+    ) {
+        (self.error, self.state, self.history_receipt)
+    }
+}
+
+/// Safe reducer/provider resolution of one local live-memory write.
+#[derive(Debug)]
+#[must_use = "memory-write outcomes carry one-use live-patch history evidence"]
+pub enum SessionWorkerMemoryWriteOutcome {
+    Committed(SessionWorkerMemoryWriteReceipt),
+    RejectedNoEffect(SessionWorkerMemoryWriteNoEffectReceipt),
 }
 
 /// Exact stopped-memory read evidence paired with committed reducer state.
@@ -211,7 +265,7 @@ pub enum SessionWorkerError {
 #[cfg(any(windows, test))]
 use resymbol_debugger::{
     AttachMode, AttachScope, CommandEnvelope, DebugCommand, DebugTargetRequest, HostRiskLease,
-    RemoteCommandCheckpoint, SessionMachine, StopReason,
+    LocalLiveMemoryWriteReceiptIdentity, RemoteCommandCheckpoint, SessionMachine, StopReason,
 };
 
 #[cfg(any(windows, test))]
@@ -225,6 +279,7 @@ use super::AttachedPhase;
 struct PendingTransaction {
     command_id: CommandId,
     checkpoint: RemoteCommandCheckpoint,
+    local_write_receipt_identity: Option<LocalLiveMemoryWriteReceiptIdentity>,
 }
 
 /// Single-owner reducer/provider core used by the concrete session worker.
@@ -333,6 +388,7 @@ impl<B: DebugBackend> SessionWorkerCore<B> {
         self.pending_transaction = Some(PendingTransaction {
             command_id,
             checkpoint,
+            local_write_receipt_identity: None,
         });
 
         let pending_stop = match self.provider.attach_after_authorization(&binding, limits) {
@@ -437,6 +493,7 @@ impl<B: DebugBackend> SessionWorkerCore<B> {
         self.pending_transaction = Some(PendingTransaction {
             command_id,
             checkpoint,
+            local_write_receipt_identity: None,
         });
 
         let result = self.provider.read_stopped_main_image(address, expected_len);
@@ -492,7 +549,7 @@ impl<B: DebugBackend> SessionWorkerCore<B> {
     pub(crate) fn write_memory(
         &mut self,
         envelope: CommandEnvelope,
-    ) -> Result<SessionWorkerMemoryWriteReceipt, SessionWorkerError> {
+    ) -> Result<SessionWorkerMemoryWriteOutcome, SessionWorkerError> {
         self.ensure_can_begin()?;
         let binding = self
             .binding
@@ -503,7 +560,7 @@ impl<B: DebugBackend> SessionWorkerCore<B> {
             .clone()
             .ok_or(SessionWorkerError::NotDebugAttached)?;
         let command_id = envelope.command_id;
-        let (checkpoint, ticket) = self
+        let (checkpoint, ticket, receipt_identity) = self
             .machine
             .begin_live_memory_write(envelope, binding.clone())?;
         let ticket_stop = ticket.stop();
@@ -513,6 +570,7 @@ impl<B: DebugBackend> SessionWorkerCore<B> {
         self.pending_transaction = Some(PendingTransaction {
             command_id,
             checkpoint,
+            local_write_receipt_identity: Some(receipt_identity),
         });
 
         let result = {
@@ -552,11 +610,16 @@ impl<B: DebugBackend> SessionWorkerCore<B> {
                         detail: "memory-write success did not match worker-owned transaction",
                     });
                 }
-                self.commit_pending("committing the memory-write checkpoint")?;
-                Ok(SessionWorkerMemoryWriteReceipt {
-                    provider,
-                    state: self.machine.state().clone(),
-                })
+                let history_receipt = self.resolve_pending_live_write_success(
+                    "committing the correlated local memory write",
+                )?;
+                Ok(SessionWorkerMemoryWriteOutcome::Committed(
+                    SessionWorkerMemoryWriteReceipt {
+                        provider,
+                        state: self.machine.state().clone(),
+                        history_receipt,
+                    },
+                ))
             }
             Err(error) if error.permits_effect_free_checkpoint_rejection() => {
                 let provider_retains_exact_stop = self.provider.state()
@@ -564,7 +627,6 @@ impl<B: DebugBackend> SessionWorkerCore<B> {
                     && self.provider.binding() == Some(&binding)
                     && self.provider.pending_stop() == Some(&pending_stop);
                 if provider_retains_exact_stop {
-                    self.reject_pending("rejecting the effect-free memory-write checkpoint")?;
                     if matches!(
                         &error,
                         DebugHostMemoryWriteError::NotStopped
@@ -572,15 +634,29 @@ impl<B: DebugBackend> SessionWorkerCore<B> {
                             | DebugHostMemoryWriteError::CheckpointMismatch
                             | DebugHostMemoryWriteError::TargetBindingMismatch
                     ) {
+                        self.reject_pending(
+                            "rejecting a contradictory but effect-free memory-write checkpoint",
+                        )?;
                         self.health = SessionWorkerHealth::Poisoned;
+                        return Err(SessionWorkerError::MemoryWrite(error));
                     }
+                    let history_receipt = self.resolve_pending_live_write_no_effect(
+                        "resolving the proved no-effect local memory write",
+                    )?;
+                    Ok(SessionWorkerMemoryWriteOutcome::RejectedNoEffect(
+                        SessionWorkerMemoryWriteNoEffectReceipt {
+                            error,
+                            state: self.machine.state().clone(),
+                            history_receipt,
+                        },
+                    ))
                 } else {
                     self.fail_and_commit_pending(
                         SessionWorkerHealth::Poisoned,
                         "effect-free write rejection contradicted retained provider state",
                     )?;
+                    Err(SessionWorkerError::MemoryWrite(error))
                 }
-                Err(SessionWorkerError::MemoryWrite(error))
             }
             Err(error) => {
                 let health = if self.provider.state() == DebugHostWorkerState::CleanupRequired
@@ -666,6 +742,44 @@ impl<B: DebugBackend> SessionWorkerCore<B> {
         self.machine
             .reject_remote_command(transaction.checkpoint, transaction.command_id)
             .map(|_| ())
+            .map_err(|source| {
+                self.health = SessionWorkerHealth::Poisoned;
+                SessionWorkerError::Resolution { operation, source }
+            })
+    }
+
+    fn resolve_pending_live_write_success(
+        &mut self,
+        operation: &'static str,
+    ) -> Result<ValidatedLocalLivePatchReceipt, SessionWorkerError> {
+        let transaction = self.take_pending()?;
+        let Some(receipt_identity) = transaction.local_write_receipt_identity else {
+            self.health = SessionWorkerHealth::Poisoned;
+            return Err(SessionWorkerError::ContradictoryEvidence {
+                detail: "the local memory-write receipt identity disappeared before commit",
+            });
+        };
+        self.machine
+            .resolve_live_memory_write_success(transaction.checkpoint, receipt_identity)
+            .map_err(|source| {
+                self.health = SessionWorkerHealth::Poisoned;
+                SessionWorkerError::Resolution { operation, source }
+            })
+    }
+
+    fn resolve_pending_live_write_no_effect(
+        &mut self,
+        operation: &'static str,
+    ) -> Result<ValidatedLocalLivePatchReceipt, SessionWorkerError> {
+        let transaction = self.take_pending()?;
+        let Some(receipt_identity) = transaction.local_write_receipt_identity else {
+            self.health = SessionWorkerHealth::Poisoned;
+            return Err(SessionWorkerError::ContradictoryEvidence {
+                detail: "the local memory-write receipt identity disappeared before rejection",
+            });
+        };
+        self.machine
+            .resolve_live_memory_write_no_effect(transaction.checkpoint, receipt_identity)
             .map_err(|source| {
                 self.health = SessionWorkerHealth::Poisoned;
                 SessionWorkerError::Resolution { operation, source }

@@ -3,16 +3,22 @@
 //! This module is a pure controller-side reducer. It neither authorizes nor
 //! performs a process-memory operation. Callers must dispatch the returned
 //! [`DebugCommand`] through an authenticated host and resolve the pending
-//! operation only with that host client's already-validated [`CommandReceipt`].
+//! operation only with that host client's already-validated [`CommandReceipt`]
+//! or a move-only [`ValidatedLocalLivePatchReceipt`] minted by the local reducer.
+//! The local resolution methods are trusted host-orchestration APIs whose caller
+//! must first perform exact session-worker correlation; they are not
+//! hostile-crate attestation that OS dispatch occurred.
 //! A reservation must be explicitly marked for dispatch before its command is
 //! exposed; it may be cancelled only while dispatch is proven not to have begun.
 
 use thiserror::Error;
 
+use crate::session_machine::ValidatedLocalLivePatchResolution;
 use crate::{
     CommandId, CommandOutcome, CommandReceipt, DebugCommand, DebugEvent, LiveTargetBinding,
     LiveTargetBindingError, MAX_MEMORY_WRITE_BYTES, MEMORY_WRITE_FAILURE_REJECTION_CODE,
     MemoryAddress, MemoryWriteFailure, SessionId, SessionState, StateToken, StopToken,
+    ValidatedLocalLivePatchReceipt,
 };
 
 /// Maximum number of committed forward writes retained for strict-LIFO undo.
@@ -639,6 +645,96 @@ impl LivePatchHistory {
         }
     }
 
+    /// Resolves a dispatched operation from one move-only local reducer proof.
+    ///
+    /// The proof is already bound to one reducer allocation and one exact local
+    /// write, but this history still checks its immutable session/target,
+    /// dispatched reservation, command ordering, stop, address, and byte images
+    /// before changing the undo stack.
+    pub fn resolve_local_receipt(
+        &mut self,
+        receipt: ValidatedLocalLivePatchReceipt,
+    ) -> Result<LivePatchResolution, LivePatchHistoryError> {
+        if self.freeze_evidence.is_some() {
+            return Err(LivePatchHistoryError::InspectionOnly);
+        }
+        let command_id = receipt.command_id();
+        if self.pending.is_none() {
+            return match self.last_receipt_command_id {
+                Some(last) if command_id == last => {
+                    Err(LivePatchHistoryError::DuplicateReceipt { command_id })
+                }
+                Some(last) if command_id < last => Err(LivePatchHistoryError::OutOfOrderReceipt {
+                    last,
+                    received: command_id,
+                }),
+                _ => Err(LivePatchHistoryError::NoPendingOperation),
+            };
+        }
+        if self.pending.as_ref().expect("pending checked above").phase
+            != LivePatchOperationPhase::Dispatched
+        {
+            return Err(LivePatchHistoryError::OperationNotDispatched);
+        }
+        if receipt.stop().state.session_id != self.session_id {
+            return Ok(self.freeze(
+                Some(command_id),
+                LivePatchFreezeCause::ReceiptMismatch(LivePatchReceiptMismatch::SessionDrift),
+            ));
+        }
+        if receipt.binding() != &self.binding {
+            return Ok(self.freeze(
+                Some(command_id),
+                LivePatchFreezeCause::ReceiptMismatch(LivePatchReceiptMismatch::TargetDrift),
+            ));
+        }
+        if let Some(previous) = self.last_receipt_command_id {
+            if command_id <= previous {
+                return Ok(self.freeze(
+                    Some(command_id),
+                    LivePatchFreezeCause::ReceiptMismatch(
+                        LivePatchReceiptMismatch::NonMonotonicCommandId {
+                            previous,
+                            actual: command_id,
+                        },
+                    ),
+                ));
+            }
+        }
+
+        let pending = self.pending.as_ref().expect("pending checked above");
+        if pending.stop != receipt.stop()
+            || pending.address != receipt.address()
+            || pending.expected.as_slice() != receipt.expected()
+            || pending.replacement.as_slice() != receipt.replacement()
+        {
+            return Ok(self.freeze(
+                Some(command_id),
+                LivePatchFreezeCause::ReceiptMismatch(
+                    LivePatchReceiptMismatch::WriteEvidenceMismatch,
+                ),
+            ));
+        }
+
+        match receipt.resolution() {
+            ValidatedLocalLivePatchResolution::Committed { resulting_stop } => {
+                if !Self::is_exact_successor_stop(pending.stop, resulting_stop) {
+                    return Ok(self.freeze(
+                        Some(command_id),
+                        LivePatchFreezeCause::ReceiptMismatch(
+                            LivePatchReceiptMismatch::StateEvidenceMismatch,
+                        ),
+                    ));
+                }
+                self.commit_success(command_id, resulting_stop)
+            }
+            ValidatedLocalLivePatchResolution::RejectedNoEffect => {
+                self.clear_safe_rejection(command_id);
+                Ok(LivePatchResolution::RejectedNoEffect)
+            }
+        }
+    }
+
     /// Freezes a dispatched pending operation whose transport outcome is not
     /// backed by an exact [`CommandReceipt`].
     pub fn mark_transport_outcome_unknown(
@@ -722,6 +818,12 @@ impl LivePatchHistory {
             });
         }
         Ok(())
+    }
+
+    fn is_exact_successor_stop(prior: StopToken, resulting: StopToken) -> bool {
+        resulting.state.session_id == prior.state.session_id
+            && prior.state.generation.get().checked_add(1) == Some(resulting.state.generation.get())
+            && prior.stop_id.get().checked_add(1) == Some(resulting.stop_id.get())
     }
 
     fn validate_image_span(
@@ -952,9 +1054,10 @@ impl<'a> ReceiptScan<'a> {
 mod tests {
     use super::*;
     use crate::{
-        EventEnvelope, EventSequence, MemoryWriteRecovery, MemoryWriteStage, ProcessId,
-        ProcessIdentity, ProcessStartKey, ProtocolVersion, StateGeneration, StopId, StopReason,
-        ThreadId,
+        AttachMode, AttachScope, AttachTarget, CommandEnvelope, DebugTargetRequest, EventEnvelope,
+        EventSequence, HelperBuildId, HostRiskLeaseIssuer, HostRiskOperation, MemoryWriteRecovery,
+        MemoryWriteStage, ProcessId, ProcessIdentity, ProcessStartKey, ProtocolVersion,
+        ProvisioningEpoch, SessionMachine, StateGeneration, StopId, StopReason, ThreadId,
     };
     use resymbol_core::BinaryId;
 
@@ -975,6 +1078,62 @@ mod tests {
             0x20_0000,
         )
         .expect("binding")
+    }
+
+    fn local_write_machine(binding: &LiveTargetBinding) -> (SessionMachine, StopToken) {
+        let provisioning_epoch =
+            ProvisioningEpoch::new("a".repeat(64)).expect("provisioning epoch");
+        let helper_build = HelperBuildId::new("local-live-patch-history").expect("helper build");
+        let mut issuer = HostRiskLeaseIssuer::new().expect("host-risk issuer");
+        let (lease, _verifier) = issuer
+            .issue(
+                session_id(),
+                provisioning_epoch.clone(),
+                HostRiskOperation::Attach {
+                    process: binding.process().clone(),
+                    mode: AttachMode::Debug,
+                },
+            )
+            .expect("issue exact host-risk lease");
+        let risk_lease = lease.id().clone();
+        let mut machine = SessionMachine::new(session_id(), provisioning_epoch, helper_build);
+        machine
+            .register_host_risk_lease(lease)
+            .expect("register exact host-risk lease");
+        let initial = machine.state().state_token();
+        machine
+            .accept_command(&CommandEnvelope {
+                version: ProtocolVersion::current(),
+                command_id: CommandId::new(1).expect("open command id"),
+                session_id: Some(session_id()),
+                expected_state: Some(initial),
+                command: DebugCommand::Open(DebugTargetRequest::Attach(AttachTarget {
+                    scope: AttachScope::Host {
+                        process: binding.process().clone(),
+                        risk_lease,
+                    },
+                    mode: AttachMode::Debug,
+                })),
+            })
+            .expect("accept exact debug attach");
+        machine
+            .mark_stopped(StopReason::Initial, ThreadId::new(11).expect("thread id"))
+            .expect("attach reaches stopped state");
+        let SessionState::Stopped { token, .. } = machine.state() else {
+            panic!("local write machine is stopped");
+        };
+        let stop = *token;
+        (machine, stop)
+    }
+
+    fn local_write_envelope(stop: StopToken, command: DebugCommand) -> CommandEnvelope {
+        CommandEnvelope {
+            version: ProtocolVersion::current(),
+            command_id: CommandId::new(2).expect("write command id"),
+            session_id: Some(session_id()),
+            expected_state: Some(stop.state),
+            command,
+        }
     }
 
     fn stop(generation: u64, stop_id: u64) -> StopToken {
@@ -1151,6 +1310,125 @@ mod tests {
         assert_eq!(history.entries(), &[entry]);
         assert_eq!(history.stored_bytes(), 4);
         assert!(history.pending().is_none());
+    }
+
+    #[test]
+    fn exact_local_success_receipt_resolves_history_once() {
+        let binding = binding(100);
+        let (mut machine, stop) = local_write_machine(&binding);
+        let mut history = LivePatchHistory::new(session_id(), binding.clone());
+        begin(&mut history, &binding, stop);
+        let command = dispatch(&mut history);
+        let (checkpoint, _ticket, receipt_identity) = machine
+            .begin_live_memory_write(local_write_envelope(stop, command), binding.clone())
+            .expect("local reducer accepts exact dispatched write");
+        let receipt = machine
+            .resolve_live_memory_write_success(checkpoint, receipt_identity)
+            .expect("fully correlated local success mints history proof");
+
+        let resolution = history
+            .resolve_local_receipt(receipt)
+            .expect("exact local proof resolves history");
+
+        let LivePatchResolution::ForwardCommitted(entry) = resolution else {
+            panic!("local success did not commit forward history")
+        };
+        assert_eq!(entry.command_id(), CommandId::new(2).expect("command id"));
+        assert_eq!(entry.applied_stop(), stop);
+        assert_eq!(entry.resulting_stop(), successor_stop(stop));
+        assert_eq!(history.entries(), &[entry]);
+        assert!(history.pending().is_none());
+        assert!(!history.is_inspection_only());
+    }
+
+    #[test]
+    fn distinct_local_allocation_cannot_replay_resolved_history() {
+        let binding = binding(100);
+        let (mut first_machine, stop) = local_write_machine(&binding);
+        let mut history = LivePatchHistory::new(session_id(), binding.clone());
+        begin(&mut history, &binding, stop);
+        let command = dispatch(&mut history);
+        let (first_checkpoint, _first_ticket, first_identity) = first_machine
+            .begin_live_memory_write(local_write_envelope(stop, command.clone()), binding.clone())
+            .expect("first local reducer accepts write");
+        let first_receipt = first_machine
+            .resolve_live_memory_write_success(first_checkpoint, first_identity)
+            .expect("first local success resolves");
+        history
+            .resolve_local_receipt(first_receipt)
+            .expect("first local receipt resolves history");
+
+        let (mut second_machine, second_stop) = local_write_machine(&binding);
+        let (second_checkpoint, _second_ticket, second_identity) = second_machine
+            .begin_live_memory_write(local_write_envelope(second_stop, command), binding.clone())
+            .expect("distinct reducer accepts identical metadata");
+        let second_receipt = second_machine
+            .resolve_live_memory_write_success(second_checkpoint, second_identity)
+            .expect("distinct reducer mints its own proof");
+
+        assert!(matches!(
+            history.resolve_local_receipt(second_receipt),
+            Err(LivePatchHistoryError::DuplicateReceipt { command_id })
+                if command_id == CommandId::new(2).expect("command id")
+        ));
+        assert_eq!(history.entries().len(), 1);
+        assert!(!history.is_inspection_only());
+    }
+
+    #[test]
+    fn local_no_effect_receipt_preserves_history_and_allows_retry_cancel() {
+        let binding = binding(100);
+        let (mut machine, stop) = local_write_machine(&binding);
+        let mut history = LivePatchHistory::new(session_id(), binding.clone());
+        begin(&mut history, &binding, stop);
+        let command = dispatch(&mut history);
+        let (checkpoint, _ticket, receipt_identity) = machine
+            .begin_live_memory_write(local_write_envelope(stop, command), binding.clone())
+            .expect("local reducer accepts exact dispatched write");
+        let receipt = machine
+            .resolve_live_memory_write_no_effect(checkpoint, receipt_identity)
+            .expect("proved no-effect restores the exact old stop");
+
+        assert_eq!(
+            history.resolve_local_receipt(receipt),
+            Ok(LivePatchResolution::RejectedNoEffect)
+        );
+        assert!(history.entries().is_empty());
+        assert_eq!(history.stored_bytes(), 0);
+        assert!(history.pending().is_none());
+        assert!(!history.is_inspection_only());
+        begin(&mut history, &binding, stop);
+        assert_eq!(history.cancel_before_dispatch(), Ok(()));
+    }
+
+    #[test]
+    fn unsafe_local_outcome_freezes_only_after_explicit_unknown_mark() {
+        let binding = binding(100);
+        let (mut machine, stop) = local_write_machine(&binding);
+        let mut history = LivePatchHistory::new(session_id(), binding.clone());
+        begin(&mut history, &binding, stop);
+        let command = dispatch(&mut history);
+        let (checkpoint, ticket, receipt_identity) = machine
+            .begin_live_memory_write(local_write_envelope(stop, command), binding)
+            .expect("local reducer accepts exact dispatched write");
+        machine
+            .commit_remote_command(checkpoint, ticket.command_id())
+            .expect("unsafe path resolves reducer without minting local proof");
+        drop(receipt_identity);
+
+        assert!(history.pending().is_some());
+        assert!(!history.is_inspection_only());
+        assert_eq!(
+            history.mark_transport_outcome_unknown(),
+            Ok(LivePatchResolution::Frozen)
+        );
+        assert!(history.is_inspection_only());
+        assert!(matches!(
+            history
+                .freeze_evidence()
+                .map(LivePatchFreezeEvidence::cause),
+            Some(LivePatchFreezeCause::TransportOutcomeUnknown)
+        ));
     }
 
     #[test]

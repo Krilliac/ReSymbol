@@ -623,9 +623,11 @@ the process freshness key, so a replacement process with the same binary hash is
 target. It reserves entry and aggregate before/after-byte capacity before yielding a forward
 operation. A reservation exposes its exact `WriteMemory` command only through a single-use
 reserved-to-dispatched transition. It may be cancelled only before that transition; afterward it
-must resolve an exact receipt or freeze as transport-unknown. Only the public host client's exact
-`MemoryWritten`, refreshed `Stopped`, and
-successful command-result receipt pushes that write or pops the strict-LIFO undo stack; each entry
+must resolve an exact receipt or freeze as transport-unknown. The public host client's exact
+`MemoryWritten`, refreshed `Stopped`, and successful command-result receipt remains supported.
+The same reducer also consumes a move-only local receipt minted only after the session worker
+correlates the provider result with its private per-write allocation. Either validated path pushes
+that write or pops the strict-LIFO undo stack; each entry
 retains both its source and resulting stop. Undo constructs a new compare-before-write command from
 the current stop, with the prior replacement as `expected` and prior original bytes as `replacement`.
 Safe no-effect or fully restored rejection clears only the pending operation. Indeterminate recovery,
@@ -634,6 +636,10 @@ inspection while retaining bounded pending evidence. The fixed bounds are 256 co
 1 MiB across retained before/after bytes, with no eviction and no redo. This reducer performs no I/O,
 does not issue authority, and is not a substitute for the authenticated worker that must dispatch its
 commands.
+The planned threaded application service owns both `WindowsSessionWorker` and
+`LivePatchHistory`; local proofs remain inside that service and never cross into UI or plugin code.
+They deliberately do not bind a particular history allocation in this slice: the existing exact
+reservation/dispatched/session/binding/write-context checks remain the history boundary.
 
 `CommandReceipt` construction is sealed inside `resymbol-debugger`; downstream callers receive
 read-only accessors or consume a receipt into its parts, but cannot construct purportedly validated
@@ -688,7 +694,9 @@ consumes the exact move-only host-risk lease, retains the binding and OS stop, a
 checkpoint and one-use write ticket private. It accepts only stopped read and write command
 envelopes. A read validates the complete image span before opening its checkpoint and returns a
 must-use receipt that binds the command, read view, target, provider stop, address, exact bytes, and
-committed reducer state. Read and write success are committed only after full
+committed reducer state. A write returns either committed provider evidence plus a move-only local
+history receipt, or proved no-effect evidence plus the corresponding one-use history receipt. Read
+and write success are committed only after full
 command/stop/binding/address/result correlation. Safe rejection may restore the old stop only while
 the provider still proves the exact retained stopped state; unsafe or contradictory evidence commits
 a terminal reducer failure and freezes or poisons the worker until cleanup. Provider state, reducer

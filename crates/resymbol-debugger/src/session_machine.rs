@@ -80,6 +80,16 @@ pub(crate) enum UnsolicitedObservationError {
 #[derive(Debug, PartialEq, Eq)]
 struct ReducerInstanceBinding;
 
+#[derive(Debug)]
+struct LocalLiveMemoryWriteAllocation {
+    command_id: CommandId,
+    stop: StopToken,
+    binding: LiveTargetBinding,
+    address: MemoryAddress,
+    expected: Vec<u8>,
+    replacement: Vec<u8>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExecutionGate {
     NotApplicable,
@@ -143,6 +153,7 @@ enum ExecutionGate {
 #[must_use = "remote command tickets must be committed or rejected"]
 pub struct RemoteCommandCheckpoint {
     reducer_instance: Arc<ReducerInstanceBinding>,
+    local_live_memory_write: Option<Arc<LocalLiveMemoryWriteAllocation>>,
     command_id: CommandId,
     state: SessionState,
     target: Option<DebugTargetRequest>,
@@ -158,8 +169,8 @@ pub struct RemoteCommandCheckpoint {
 /// This ticket is deliberately neither cloneable nor serializable. It is not a
 /// wire credential and has no public constructor. A host-local `SessionWorker`
 /// obtains it only from [`SessionMachine::begin_live_memory_write`] and moves it
-/// directly into the selected provider while retaining the separate
-/// [`RemoteCommandCheckpoint`] for commit or rejection.
+/// directly into the selected provider while retaining the separately bound
+/// [`RemoteCommandCheckpoint`] and [`LocalLiveMemoryWriteReceiptIdentity`].
 ///
 /// ```compile_fail
 /// use resymbol_debugger::ValidatedLiveMemoryWrite;
@@ -178,51 +189,148 @@ pub struct RemoteCommandCheckpoint {
 #[must_use = "validated live-memory writes must be dispatched or explicitly abandoned with their checkpoint"]
 pub struct ValidatedLiveMemoryWrite {
     reducer_instance: Arc<ReducerInstanceBinding>,
-    command_id: CommandId,
-    stop: StopToken,
-    binding: LiveTargetBinding,
-    address: MemoryAddress,
-    expected: Vec<u8>,
-    replacement: Vec<u8>,
+    write: Arc<LocalLiveMemoryWriteAllocation>,
 }
 
 impl ValidatedLiveMemoryWrite {
     #[must_use]
-    pub const fn command_id(&self) -> CommandId {
-        self.command_id
+    pub fn command_id(&self) -> CommandId {
+        self.write.command_id
     }
 
     #[must_use]
-    pub const fn stop(&self) -> StopToken {
-        self.stop
+    pub fn stop(&self) -> StopToken {
+        self.write.stop
     }
 
     #[must_use]
-    pub const fn binding(&self) -> &LiveTargetBinding {
-        &self.binding
+    pub fn binding(&self) -> &LiveTargetBinding {
+        &self.write.binding
     }
 
     #[must_use]
-    pub const fn address(&self) -> MemoryAddress {
-        self.address
+    pub fn address(&self) -> MemoryAddress {
+        self.write.address
     }
 
     #[must_use]
     pub fn expected(&self) -> &[u8] {
-        &self.expected
+        &self.write.expected
     }
 
     #[must_use]
     pub fn replacement(&self) -> &[u8] {
-        &self.replacement
+        &self.write.replacement
     }
 
     /// Confirms that this ticket and checkpoint came from the same reducer
     /// acceptance. This is correlation evidence, not a second authority.
     #[must_use]
     pub fn matches_checkpoint(&self, checkpoint: &RemoteCommandCheckpoint) -> bool {
-        self.command_id == checkpoint.command_id
+        self.write.command_id == checkpoint.command_id
             && Arc::ptr_eq(&self.reducer_instance, &checkpoint.reducer_instance)
+            && checkpoint
+                .local_live_memory_write
+                .as_ref()
+                .is_some_and(|write| Arc::ptr_eq(write, &self.write))
+    }
+}
+
+/// Move-only identity retained while one local live-memory write is dispatched.
+///
+/// This value has no public constructor or inspectable fields. It is neither
+/// cloneable nor serializable and is useful only when consumed with the exact
+/// checkpoint by a local write-resolution method on the reducer that minted it.
+///
+/// ~~~compile_fail
+/// use resymbol_debugger::LocalLiveMemoryWriteReceiptIdentity;
+///
+/// fn require_clone<T: Clone>() {}
+/// require_clone::<LocalLiveMemoryWriteReceiptIdentity>();
+/// ~~~
+///
+/// ~~~compile_fail
+/// use resymbol_debugger::LocalLiveMemoryWriteReceiptIdentity;
+///
+/// fn require_serde<T: serde::Serialize + serde::de::DeserializeOwned>() {}
+/// require_serde::<LocalLiveMemoryWriteReceiptIdentity>();
+/// ~~~
+#[derive(Debug)]
+#[must_use = "local live-memory write identities must resolve their exact checkpoint"]
+pub struct LocalLiveMemoryWriteReceiptIdentity {
+    write: Arc<LocalLiveMemoryWriteAllocation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ValidatedLocalLivePatchResolution {
+    Committed { resulting_stop: StopToken },
+    RejectedNoEffect,
+}
+
+/// Move-only reducer proof for one fully resolved local live-memory write.
+///
+/// Only SessionMachine::resolve_live_memory_write_success and
+/// SessionMachine::resolve_live_memory_write_no_effect can mint this value.
+/// Its fields are opaque, it is not serializable, and
+/// LivePatchHistory::resolve_local_receipt consumes it by value.
+///
+/// ~~~compile_fail
+/// use resymbol_debugger::ValidatedLocalLivePatchReceipt;
+///
+/// fn require_clone<T: Clone>() {}
+/// require_clone::<ValidatedLocalLivePatchReceipt>();
+/// ~~~
+///
+/// ~~~compile_fail
+/// use resymbol_debugger::ValidatedLocalLivePatchReceipt;
+///
+/// fn require_serde<T: serde::Serialize + serde::de::DeserializeOwned>() {}
+/// require_serde::<ValidatedLocalLivePatchReceipt>();
+/// ~~~
+///
+/// ~~~compile_fail
+/// use resymbol_debugger::{LivePatchHistory, ValidatedLocalLivePatchReceipt};
+///
+/// fn replay(history: &mut LivePatchHistory, receipt: ValidatedLocalLivePatchReceipt) {
+///     let _ = history.resolve_local_receipt(receipt);
+///     let _ = history.resolve_local_receipt(receipt);
+/// }
+/// ~~~
+#[derive(Debug)]
+#[must_use = "validated local patch receipts must resolve one live-patch history operation"]
+pub struct ValidatedLocalLivePatchReceipt {
+    write: Arc<LocalLiveMemoryWriteAllocation>,
+    resolution: ValidatedLocalLivePatchResolution,
+}
+
+impl ValidatedLocalLivePatchReceipt {
+    #[must_use]
+    pub fn command_id(&self) -> CommandId {
+        self.write.command_id
+    }
+
+    pub(crate) fn stop(&self) -> StopToken {
+        self.write.stop
+    }
+
+    pub(crate) fn binding(&self) -> &LiveTargetBinding {
+        &self.write.binding
+    }
+
+    pub(crate) fn address(&self) -> MemoryAddress {
+        self.write.address
+    }
+
+    pub(crate) fn expected(&self) -> &[u8] {
+        &self.write.expected
+    }
+
+    pub(crate) fn replacement(&self) -> &[u8] {
+        &self.write.replacement
+    }
+
+    pub(crate) fn resolution(&self) -> ValidatedLocalLivePatchResolution {
+        self.resolution
     }
 }
 
@@ -494,6 +602,7 @@ impl SessionMachine {
         self.pending_remote_command = Some(envelope.command_id);
         Ok(RemoteCommandCheckpoint {
             reducer_instance: Arc::clone(&self.reducer_instance),
+            local_live_memory_write: None,
             command_id: envelope.command_id,
             state,
             target,
@@ -505,7 +614,8 @@ impl SessionMachine {
     }
 
     /// Accepts one exact debug-attach memory-write command and returns its
-    /// reducer checkpoint plus a separate provider-consumable ticket.
+    /// reducer checkpoint, provider-consumable ticket, and separately retained
+    /// local receipt identity. All three share one private per-write allocation.
     ///
     /// The command variant, accepted attach mode, and exact attached process
     /// binding are checked before reducer state or command-ID watermarks can
@@ -517,7 +627,14 @@ impl SessionMachine {
         &mut self,
         envelope: CommandEnvelope,
         binding: LiveTargetBinding,
-    ) -> Result<(RemoteCommandCheckpoint, ValidatedLiveMemoryWrite), SessionMachineError> {
+    ) -> Result<
+        (
+            RemoteCommandCheckpoint,
+            ValidatedLiveMemoryWrite,
+            LocalLiveMemoryWriteReceiptIdentity,
+        ),
+        SessionMachineError,
+    > {
         let (address, expected_len) = match &envelope.command {
             DebugCommand::WriteMemory {
                 address, expected, ..
@@ -546,7 +663,7 @@ impl SessionMachine {
             .rva_for_address_span(address, expected_len as u64)
             .map_err(SessionMachineError::LiveMemoryWriteImageSpan)?;
 
-        let checkpoint = self.begin_remote_command(&envelope)?;
+        let mut checkpoint = self.begin_remote_command(&envelope)?;
         let CommandEnvelope {
             command_id,
             command,
@@ -561,17 +678,80 @@ impl SessionMachine {
         else {
             unreachable!("memory-write variant checked before reducer acceptance")
         };
-        let ticket = ValidatedLiveMemoryWrite {
-            reducer_instance: Arc::clone(&checkpoint.reducer_instance),
+        let write = Arc::new(LocalLiveMemoryWriteAllocation {
             command_id,
             stop,
             binding,
             address,
             expected,
             replacement,
+        });
+        checkpoint.local_live_memory_write = Some(Arc::clone(&write));
+        let ticket = ValidatedLiveMemoryWrite {
+            reducer_instance: Arc::clone(&checkpoint.reducer_instance),
+            write: Arc::clone(&write),
         };
+        let receipt_identity = LocalLiveMemoryWriteReceiptIdentity { write };
         debug_assert!(ticket.matches_checkpoint(&checkpoint));
-        Ok((checkpoint, ticket))
+        Ok((checkpoint, ticket, receipt_identity))
+    }
+
+    /// Commits one fully correlated local provider write and mints the sole
+    /// history-consumable proof of that target-side effect.
+    ///
+    /// The caller must invoke this only after correlating the provider command,
+    /// target binding, operating-system stop, protocol stop, address, and exact
+    /// before/after bytes. This is a trusted host-local orchestration
+    /// precondition, not attestation against a hostile crate that directly owns
+    /// a SessionMachine.
+    pub fn resolve_live_memory_write_success(
+        &mut self,
+        checkpoint: RemoteCommandCheckpoint,
+        receipt_identity: LocalLiveMemoryWriteReceiptIdentity,
+    ) -> Result<ValidatedLocalLivePatchReceipt, SessionMachineError> {
+        let resulting_stop =
+            self.validate_local_live_memory_write_resolution(&checkpoint, &receipt_identity)?;
+        self.pending_remote_command = None;
+        Ok(ValidatedLocalLivePatchReceipt {
+            write: receipt_identity.write,
+            resolution: ValidatedLocalLivePatchResolution::Committed { resulting_stop },
+        })
+    }
+
+    /// Restores the exact pre-command stopped view after proved no-effect and
+    /// mints the sole history-consumable proof of that safe rejection.
+    ///
+    /// As with successful resolution, the trusted host-local owner must first
+    /// correlate the provider result. This API does not attest OS dispatch
+    /// against a hostile crate that directly owns the reducer.
+    pub fn resolve_live_memory_write_no_effect(
+        &mut self,
+        checkpoint: RemoteCommandCheckpoint,
+        receipt_identity: LocalLiveMemoryWriteReceiptIdentity,
+    ) -> Result<ValidatedLocalLivePatchReceipt, SessionMachineError> {
+        self.validate_local_live_memory_write_resolution(&checkpoint, &receipt_identity)?;
+        let expected_stop = receipt_identity.write.stop;
+        let RemoteCommandCheckpoint {
+            state,
+            target,
+            execution_gate,
+            sandbox,
+            inherited_sandbox,
+            ..
+        } = checkpoint;
+        if !matches!(&state, SessionState::Stopped { token, .. } if *token == expected_stop) {
+            return Err(SessionMachineError::LocalLiveMemoryWriteReceiptMismatch);
+        }
+        self.pending_remote_command = None;
+        self.state = state;
+        self.target = target;
+        self.execution_gate = execution_gate;
+        self.sandbox = sandbox;
+        self.inherited_sandbox = inherited_sandbox;
+        Ok(ValidatedLocalLivePatchReceipt {
+            write: receipt_identity.write,
+            resolution: ValidatedLocalLivePatchResolution::RejectedNoEffect,
+        })
     }
 
     /// Resolves a remote command whose response has been fully validated and
@@ -634,6 +814,40 @@ impl SessionMachine {
             });
         }
         Ok(())
+    }
+
+    fn validate_local_live_memory_write_resolution(
+        &self,
+        checkpoint: &RemoteCommandCheckpoint,
+        receipt_identity: &LocalLiveMemoryWriteReceiptIdentity,
+    ) -> Result<StopToken, SessionMachineError> {
+        self.validate_remote_checkpoint(checkpoint, receipt_identity.write.command_id)?;
+        if self.remote_command_post_accept_state() != checkpoint.post_accept {
+            return Err(SessionMachineError::RemoteCommandStateChanged);
+        }
+        let Some(checkpoint_write) = checkpoint.local_live_memory_write.as_ref() else {
+            return Err(SessionMachineError::LocalLiveMemoryWriteReceiptMismatch);
+        };
+        if !Arc::ptr_eq(checkpoint_write, &receipt_identity.write) {
+            return Err(SessionMachineError::LocalLiveMemoryWriteReceiptMismatch);
+        }
+        let SessionState::Stopped {
+            token: prior_stop, ..
+        } = &checkpoint.state
+        else {
+            return Err(SessionMachineError::LocalLiveMemoryWriteReceiptMismatch);
+        };
+        if *prior_stop != receipt_identity.write.stop {
+            return Err(SessionMachineError::LocalLiveMemoryWriteReceiptMismatch);
+        }
+        let SessionState::Stopped {
+            token: resulting_stop,
+            ..
+        } = &self.state
+        else {
+            return Err(SessionMachineError::LocalLiveMemoryWriteReceiptMismatch);
+        };
+        Ok(*resulting_stop)
     }
 
     fn remote_command_post_accept_state(&self) -> RemoteCommandPostAcceptState {
@@ -1367,6 +1581,8 @@ pub enum SessionMachineError {
     },
     #[error("remote command state changed after acceptance and cannot be rolled back")]
     RemoteCommandStateChanged,
+    #[error("local live-memory write identity does not match the exact pending allocation")]
+    LocalLiveMemoryWriteReceiptMismatch,
     #[error("cannot {action} from session state {from:?}")]
     InvalidTransition {
         from: SessionStateKind,
@@ -1620,6 +1836,7 @@ mod tests {
     ) -> RemoteCommandCheckpoint {
         RemoteCommandCheckpoint {
             reducer_instance: Arc::clone(&checkpoint.reducer_instance),
+            local_live_memory_write: checkpoint.local_live_memory_write.as_ref().map(Arc::clone),
             command_id: checkpoint.command_id,
             state: checkpoint.state.clone(),
             target: checkpoint.target.clone(),
@@ -1916,7 +2133,7 @@ mod tests {
             },
         );
 
-        let (checkpoint, ticket) = machine
+        let (checkpoint, ticket, receipt_identity) = machine
             .begin_live_memory_write(envelope, binding.clone())
             .expect("exact stopped debug-attach write is accepted");
 
@@ -1934,9 +2151,56 @@ mod tests {
             panic!("write acceptance retains stopped state")
         };
         assert_ne!(*refreshed, stop);
-        machine
-            .commit_remote_command(checkpoint, ticket.command_id())
-            .expect("exact checkpoint commits");
+        let receipt = machine
+            .resolve_live_memory_write_success(checkpoint, receipt_identity)
+            .expect("exact checkpoint and receipt identity commit");
+        assert_eq!(receipt.command_id(), ticket.command_id());
+    }
+
+    #[test]
+    fn local_live_memory_write_resolution_rejects_distinct_allocation_identity() {
+        let process = process_identity(44, 55, b"validated local receipt target");
+        let binding = live_binding(process.clone(), 0x1_4000_0000);
+        let mut machine = machine();
+        let stop = open_debug_attach_and_stop(&mut machine, process);
+        let address = binding
+            .address_for_rva_span(0x40, 4)
+            .expect("write span is in the main image");
+        let (checkpoint, _ticket, receipt_identity) = machine
+            .begin_live_memory_write(
+                command(
+                    2,
+                    stop.state,
+                    DebugCommand::WriteMemory {
+                        stop,
+                        address,
+                        expected: b"old!".to_vec(),
+                        replacement: b"new!".to_vec(),
+                    },
+                ),
+                binding,
+            )
+            .expect("exact write is accepted");
+        let mismatched_identity = LocalLiveMemoryWriteReceiptIdentity {
+            write: Arc::new(LocalLiveMemoryWriteAllocation {
+                command_id: receipt_identity.write.command_id,
+                stop: receipt_identity.write.stop,
+                binding: receipt_identity.write.binding.clone(),
+                address: receipt_identity.write.address,
+                expected: receipt_identity.write.expected.clone(),
+                replacement: receipt_identity.write.replacement.clone(),
+            }),
+        };
+        let duplicate = duplicate_remote_checkpoint(&checkpoint);
+
+        assert!(matches!(
+            machine.resolve_live_memory_write_success(duplicate, mismatched_identity),
+            Err(SessionMachineError::LocalLiveMemoryWriteReceiptMismatch)
+        ));
+        let receipt = machine
+            .resolve_live_memory_write_success(checkpoint, receipt_identity)
+            .expect("failed mismatch check does not consume the real allocation");
+        assert_eq!(receipt.command_id(), CommandId::new(2).expect("command id"));
     }
 
     #[test]
@@ -1974,12 +2238,13 @@ mod tests {
             Some(CommandId::new(1).expect("open command id"))
         );
 
-        let (checkpoint, ticket) = machine
+        let (checkpoint, ticket, receipt_identity) = machine
             .begin_live_memory_write(write(), binding)
             .expect("same command id remains available after pre-accept rejection");
-        machine
-            .reject_remote_command(checkpoint, ticket.command_id())
-            .expect("undispatched ticket may restore visible state");
+        let receipt = machine
+            .resolve_live_memory_write_no_effect(checkpoint, receipt_identity)
+            .expect("proved no-effect restores the visible stopped state");
+        assert_eq!(receipt.command_id(), ticket.command_id());
     }
 
     #[test]
@@ -2046,10 +2311,10 @@ mod tests {
             )
         };
 
-        let (first_checkpoint, first_ticket) = first
+        let (first_checkpoint, first_ticket, _first_receipt_identity) = first
             .begin_live_memory_write(write(first_stop), binding.clone())
             .expect("first reducer accepts write");
-        let (second_checkpoint, second_ticket) = second
+        let (second_checkpoint, second_ticket, _second_receipt_identity) = second
             .begin_live_memory_write(write(second_stop), binding)
             .expect("second reducer accepts identical write metadata");
 

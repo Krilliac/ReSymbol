@@ -38,7 +38,8 @@ pub use windows::WindowsSessionWorker;
 
 pub use session_worker::{
     DebugAttachReceipt, SessionWorkerCleanupReceipt, SessionWorkerError, SessionWorkerHealth,
-    SessionWorkerMemoryReadReceipt, SessionWorkerMemoryWriteReceipt,
+    SessionWorkerMemoryReadReceipt, SessionWorkerMemoryWriteNoEffectReceipt,
+    SessionWorkerMemoryWriteOutcome, SessionWorkerMemoryWriteReceipt,
 };
 
 /// Hard ceiling on the finite current-state event drain before attach fails
@@ -1234,7 +1235,8 @@ mod tests {
     use resymbol_debugger::{
         AttachMode, AttachScope, AttachTarget, CapabilityAvailability, CommandEnvelope, CommandId,
         DebugCapability, DebugCommand, DebugTargetRequest, HelperBuildId, HostRiskLeaseIssuer,
-        HostRiskOperation, LiveTargetBinding, MemoryAddress, MemoryWriteFailure,
+        HostRiskOperation, LivePatchHistory, LivePatchResolution, LiveTargetBinding,
+        LocalLiveMemoryWriteReceiptIdentity, MemoryAddress, MemoryWriteFailure,
         MemoryWriteRecovery, MemoryWriteStage, ProcessId, ProcessIdentity, ProcessStartKey,
         ProtocolVersion, ProvisioningEpoch, RemoteCommandCheckpoint, SessionId, SessionMachine,
         SessionState, StopId, StopReason, StopToken, ThreadId, ValidatedLiveMemoryWrite,
@@ -1247,7 +1249,8 @@ mod tests {
         DebugHostMemoryWriteError, DebugHostMemoryWriteReceipt, DebugHostWorker,
         DebugHostWorkerState, EXCEPTION_BREAKPOINT_CODE, MAX_INITIAL_DRAIN_TIMEOUT,
         PendingStopEvidence, SessionWorkerError, SessionWorkerHealth,
-        phase_one_capability_report_for_platform, session_worker::SessionWorkerCore,
+        SessionWorkerMemoryWriteOutcome, phase_one_capability_report_for_platform,
+        session_worker::SessionWorkerCore,
     };
 
     const PID: u32 = 41;
@@ -1473,6 +1476,7 @@ mod tests {
         machine: SessionMachine,
         checkpoint: Option<RemoteCommandCheckpoint>,
         ticket: Option<ValidatedLiveMemoryWrite>,
+        receipt_identity: Option<LocalLiveMemoryWriteReceiptIdentity>,
     }
 
     impl ValidatedWriteTransaction {
@@ -1507,10 +1511,16 @@ mod tests {
 
         fn reject(&mut self, command_id: CommandId) -> SessionState {
             let checkpoint = self.checkpoint.take().expect("checkpoint is resolved once");
-            self.machine
-                .reject_remote_command(checkpoint, command_id)
-                .expect("effect-free error rejects exact checkpoint")
-                .clone()
+            let receipt_identity = self
+                .receipt_identity
+                .take()
+                .expect("receipt identity is resolved once");
+            let receipt = self
+                .machine
+                .resolve_live_memory_write_no_effect(checkpoint, receipt_identity)
+                .expect("effect-free error resolves the exact local write");
+            assert_eq!(receipt.command_id(), command_id);
+            self.machine.state().clone()
         }
 
         fn state(&self) -> &SessionState {
@@ -1583,13 +1593,14 @@ mod tests {
                 replacement: replacement.to_vec(),
             },
         };
-        let (checkpoint, ticket) = machine
+        let (checkpoint, ticket, receipt_identity) = machine
             .begin_live_memory_write(envelope, binding.clone())
             .expect("mint exact validated write ticket");
         ValidatedWriteTransaction {
             machine,
             checkpoint: Some(checkpoint),
             ticket: Some(ticket),
+            receipt_identity: Some(receipt_identity),
         }
     }
 
@@ -1926,21 +1937,48 @@ mod tests {
     fn session_worker_commits_fully_correlated_memory_write() {
         let (mut worker, open, binding, session_id) = session_worker_fixture();
         let attach_receipt = worker
-            .open_debug_attach(open, binding, DebugAttachLimits::default())
+            .open_debug_attach(open, binding.clone(), DebugAttachLimits::default())
             .expect("authenticated attach succeeds");
         assert_eq!(attach_receipt.state(), worker.state());
         let address = MemoryAddress::new(IMAGE_BASE + 0x40);
+        let SessionState::Stopped { token: stop, .. } = worker.state() else {
+            panic!("attach reaches stopped state")
+        };
+        let stop = *stop;
+        let mut history = LivePatchHistory::new(session_id, binding.clone());
+        history
+            .begin_forward_write(
+                session_id,
+                &binding,
+                stop,
+                address,
+                b"phas".to_vec(),
+                b"PHAS".to_vec(),
+            )
+            .expect("reserve exact local write");
+        let dispatched = history.mark_for_dispatch().expect("mark exact dispatch");
         let envelope = session_write_envelope(&worker, session_id, address, b"phas", b"PHAS");
+        assert_eq!(envelope.command, dispatched);
 
-        let receipt = worker
+        let outcome = worker
             .write_memory(envelope)
             .expect("exact stopped write succeeds");
+        let SessionWorkerMemoryWriteOutcome::Committed(receipt) = outcome else {
+            panic!("exact stopped write must return committed evidence")
+        };
 
+        let (provider, state, history_receipt) = receipt.into_parts();
         assert_eq!(worker.health(), SessionWorkerHealth::Ready);
-        assert_eq!(receipt.provider().address(), address);
-        assert_eq!(receipt.provider().before(), b"phas");
-        assert_eq!(receipt.provider().after(), b"PHAS");
-        assert_eq!(worker.state(), receipt.state());
+        assert_eq!(provider.address(), address);
+        assert_eq!(provider.before(), b"phas");
+        assert_eq!(provider.after(), b"PHAS");
+        assert_eq!(worker.state(), &state);
+        assert!(matches!(
+            history
+                .resolve_local_receipt(history_receipt)
+                .expect("worker success proof resolves exact history"),
+            LivePatchResolution::ForwardCommitted(_)
+        ));
     }
 
     #[test]
@@ -1952,22 +1990,47 @@ mod tests {
         assert_eq!(attach_receipt.binding(), &binding);
         let stopped_before = worker.state().clone();
         let pending_before = worker.pending_stop().expect("retained OS stop").clone();
-        let envelope = session_write_envelope(
-            &worker,
-            session_id,
-            MemoryAddress::new(IMAGE_BASE + 0x40),
-            b"nope",
-            b"NOPE",
-        );
+        let SessionState::Stopped { token: stop, .. } = worker.state() else {
+            panic!("attach reaches stopped state")
+        };
+        let stop = *stop;
+        let address = MemoryAddress::new(IMAGE_BASE + 0x40);
+        let mut history = LivePatchHistory::new(session_id, binding.clone());
+        history
+            .begin_forward_write(
+                session_id,
+                &binding,
+                stop,
+                address,
+                b"nope".to_vec(),
+                b"NOPE".to_vec(),
+            )
+            .expect("reserve exact local write");
+        let dispatched = history.mark_for_dispatch().expect("mark exact dispatch");
+        let envelope = session_write_envelope(&worker, session_id, address, b"nope", b"NOPE");
+        assert_eq!(envelope.command, dispatched);
 
-        let error = worker
+        let outcome = worker
             .write_memory(envelope)
-            .expect_err("compare mismatch rejects without effect");
+            .expect("compare mismatch is a proved no-effect resolution");
+        let SessionWorkerMemoryWriteOutcome::RejectedNoEffect(receipt) = outcome else {
+            panic!("compare mismatch must return no-effect evidence")
+        };
 
+        let (error, state, history_receipt) = receipt.into_parts();
         assert!(matches!(
             error,
-            SessionWorkerError::MemoryWrite(DebugHostMemoryWriteError::SafeNoEffectRejected { .. })
+            DebugHostMemoryWriteError::SafeNoEffectRejected { .. }
         ));
+        assert_eq!(state, stopped_before);
+        assert_eq!(
+            history
+                .resolve_local_receipt(history_receipt)
+                .expect("worker no-effect proof clears exact dispatch"),
+            LivePatchResolution::RejectedNoEffect
+        );
+        assert!(history.entries().is_empty());
+        assert!(history.pending().is_none());
         assert_eq!(worker.state(), &stopped_before);
         assert_eq!(worker.health(), SessionWorkerHealth::Ready);
         assert_eq!(worker.provider_state(), DebugHostWorkerState::Stopped);
@@ -1999,14 +2062,18 @@ mod tests {
             }));
         let envelope = session_write_envelope(&worker, session_id, address, b"phas", b"PHAS");
 
-        let error = worker
+        let outcome = worker
             .write_memory(envelope)
-            .expect_err("rollback-safe provider failure remains a rejection");
+            .expect("rollback-safe provider failure is a proved no-effect resolution");
+        let SessionWorkerMemoryWriteOutcome::RejectedNoEffect(receipt) = outcome else {
+            panic!("rollback-safe provider failure must return no-effect evidence")
+        };
 
         assert!(matches!(
-            error,
-            SessionWorkerError::MemoryWrite(DebugHostMemoryWriteError::MemoryWriteFailed { .. })
+            receipt.error(),
+            DebugHostMemoryWriteError::MemoryWriteFailed { .. }
         ));
+        assert_eq!(receipt.state(), &state_before);
         assert_eq!(worker.state(), &state_before);
         assert_eq!(worker.health(), SessionWorkerHealth::Ready);
         assert_eq!(worker.provider_state(), DebugHostWorkerState::Stopped);
@@ -2080,7 +2147,7 @@ mod tests {
     fn session_worker_unsafe_write_commits_failure_and_freezes() {
         let (mut worker, open, binding, session_id) = session_worker_fixture();
         let attach_receipt = worker
-            .open_debug_attach(open, binding, DebugAttachLimits::default())
+            .open_debug_attach(open, binding.clone(), DebugAttachLimits::default())
             .expect("authenticated attach succeeds");
         assert_eq!(attach_receipt.state(), worker.state());
         let address = MemoryAddress::new(IMAGE_BASE + 0x40);
@@ -2088,6 +2155,18 @@ mod tests {
             panic!("attach reaches stopped state");
         };
         let stop = *stop;
+        let mut history = LivePatchHistory::new(session_id, binding.clone());
+        history
+            .begin_forward_write(
+                session_id,
+                &binding,
+                stop,
+                address,
+                b"phas".to_vec(),
+                b"PHAS".to_vec(),
+            )
+            .expect("reserve exact local write");
+        let dispatched = history.mark_for_dispatch().expect("mark exact dispatch");
         worker.backend_for_test_mut().write_failure =
             Some(BackendWriteFailure::MemoryWriteFailed(MemoryWriteFailure {
                 stop,
@@ -2102,6 +2181,7 @@ mod tests {
                 detail: "injected indeterminate mutation".to_owned(),
             }));
         let envelope = session_write_envelope(&worker, session_id, address, b"phas", b"PHAS");
+        assert_eq!(envelope.command, dispatched);
 
         let error = worker
             .write_memory(envelope)
@@ -2117,6 +2197,13 @@ mod tests {
             DebugHostWorkerState::CleanupRequired
         );
         assert!(matches!(worker.state(), SessionState::Failed { .. }));
+        assert!(history.pending().is_some());
+        assert!(!history.is_inspection_only());
+        assert_eq!(
+            history.mark_transport_outcome_unknown(),
+            Ok(LivePatchResolution::Frozen)
+        );
+        assert!(history.is_inspection_only());
     }
 
     #[test]

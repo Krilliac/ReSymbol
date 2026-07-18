@@ -12,12 +12,13 @@ use std::{
 use resymbol_core::BinaryId;
 use resymbol_debugger::{
     AttachMode, AttachScope, AttachTarget, CommandEnvelope, CommandId, DebugCommand,
-    DebugTargetRequest, HelperBuildId, HostRiskLeaseIssuer, HostRiskOperation, MemoryAddress,
-    ProcessId, ProcessStartKey, ProtocolVersion, ProvisioningEpoch, ReadViewToken, SessionId,
-    SessionState,
+    DebugTargetRequest, HelperBuildId, HostRiskLeaseIssuer, HostRiskOperation, LivePatchHistory,
+    LivePatchResolution, MemoryAddress, ProcessId, ProcessStartKey, ProtocolVersion,
+    ProvisioningEpoch, ReadViewToken, SessionId, SessionState,
 };
 use resymbol_windows_debug_host::{
-    DebugAttachLimits, DebugHostWorkerState, SessionWorkerHealth, WindowsSessionWorker,
+    DebugAttachLimits, DebugHostWorkerState, SessionWorkerHealth, SessionWorkerMemoryWriteOutcome,
+    WindowsSessionWorker,
 };
 use resymbol_windows_live_access::{OpenLiveProcessRequest, ReadOnlyLiveProcessAccess};
 
@@ -187,6 +188,27 @@ fn owned_child_attach_stopped_read_continue_and_detach() {
         .read_memory(initial_read_command)
         .expect("read exact bytes under retained attach stop");
     assert_eq!(initial_read.bytes(), EXPECTED_BYTES);
+    let SessionState::Stopped {
+        token: initial_stop,
+        ..
+    } = worker.state()
+    else {
+        panic!("owned-child worker remains stopped after read")
+    };
+    let mut history = LivePatchHistory::new(session_id, binding.clone());
+    history
+        .begin_forward_write(
+            session_id,
+            &binding,
+            *initial_stop,
+            write_address,
+            EXPECTED_BYTES.to_vec(),
+            PATCHED_BYTES.to_vec(),
+        )
+        .expect("reserve exact owned-child write");
+    let dispatched_write = history
+        .mark_for_dispatch()
+        .expect("mark owned-child write dispatched");
     let write_command = stopped_write_command(
         &worker,
         session_id,
@@ -195,20 +217,44 @@ fn owned_child_attach_stopped_read_continue_and_detach() {
         EXPECTED_BYTES,
         PATCHED_BYTES,
     );
-    let receipt = worker
+    assert_eq!(write_command.command, dispatched_write);
+    let write_outcome = worker
         .write_memory(write_command)
         .expect("write exact bytes under retained attach stop");
-    assert_eq!(receipt.provider().pending_stop(), attach.pending_stop());
-    assert_eq!(receipt.provider().binding(), &binding);
-    assert_eq!(receipt.provider().address(), write_address);
-    assert_eq!(receipt.provider().before(), EXPECTED_BYTES);
-    assert_eq!(receipt.provider().after(), PATCHED_BYTES);
+    let SessionWorkerMemoryWriteOutcome::Committed(receipt) = write_outcome else {
+        panic!("owned-child write must commit")
+    };
+    let (provider, _state, history_receipt) = receipt.into_parts();
+    assert_eq!(provider.pending_stop(), attach.pending_stop());
+    assert_eq!(provider.binding(), &binding);
+    assert_eq!(provider.address(), write_address);
+    assert_eq!(provider.before(), EXPECTED_BYTES);
+    assert_eq!(provider.after(), PATCHED_BYTES);
+    assert!(matches!(
+        history
+            .resolve_local_receipt(history_receipt)
+            .expect("real local write proof resolves exact history"),
+        LivePatchResolution::ForwardCommitted(_)
+    ));
     let patched_read_command =
         stopped_read_command(&worker, session_id, 4, write_address, PATCHED_BYTES.len());
     let patched_read = worker
         .read_memory(patched_read_command)
         .expect("read patched bytes under retained attach stop");
     assert_eq!(patched_read.bytes(), PATCHED_BYTES);
+    let SessionState::Stopped {
+        token: restore_stop,
+        ..
+    } = worker.state()
+    else {
+        panic!("owned-child worker remains stopped before restore")
+    };
+    history
+        .begin_undo(session_id, &binding, *restore_stop)
+        .expect("reserve exact owned-child undo");
+    let dispatched_restore = history
+        .mark_for_dispatch()
+        .expect("mark owned-child undo dispatched");
     let restore_command = stopped_write_command(
         &worker,
         session_id,
@@ -217,13 +263,25 @@ fn owned_child_attach_stopped_read_continue_and_detach() {
         PATCHED_BYTES,
         EXPECTED_BYTES,
     );
-    let restore_receipt = worker
+    assert_eq!(restore_command.command, dispatched_restore);
+    let restore_outcome = worker
         .write_memory(restore_command)
         .expect("restore exact fixture bytes under retained attach stop");
-    assert_eq!(restore_receipt.provider().binding(), &binding);
-    assert_eq!(restore_receipt.provider().address(), write_address);
-    assert_eq!(restore_receipt.provider().before(), PATCHED_BYTES);
-    assert_eq!(restore_receipt.provider().after(), EXPECTED_BYTES);
+    let SessionWorkerMemoryWriteOutcome::Committed(restore_receipt) = restore_outcome else {
+        panic!("owned-child restore must commit")
+    };
+    let (restore_provider, _state, restore_history_receipt) = restore_receipt.into_parts();
+    assert_eq!(restore_provider.binding(), &binding);
+    assert_eq!(restore_provider.address(), write_address);
+    assert_eq!(restore_provider.before(), PATCHED_BYTES);
+    assert_eq!(restore_provider.after(), EXPECTED_BYTES);
+    assert!(matches!(
+        history
+            .resolve_local_receipt(restore_history_receipt)
+            .expect("real local restore proof resolves exact undo"),
+        LivePatchResolution::UndoCommitted(_)
+    ));
+    assert!(history.entries().is_empty());
     let restored_read_command =
         stopped_read_command(&worker, session_id, 6, write_address, EXPECTED_BYTES.len());
     let restored_read = worker

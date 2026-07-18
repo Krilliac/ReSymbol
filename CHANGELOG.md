@@ -34,6 +34,11 @@ prereleases; breaking changes remain explicit.
 - Sealed `CommandReceipt` construction inside `resymbol-debugger` while retaining read-only
   accessors and a consuming parts API, so downstream controller code cannot fabricate host-validated
   evidence.
+- Added move-only, non-serialized local live-write identities and patch receipts. One private
+  per-write allocation now binds the reducer checkpoint, provider ticket, and retained identity;
+  only exact committed success or proved no-effect resolution mints a receipt that
+  `LivePatchHistory` consumes once. The Windows session worker exposes those two safe outcomes
+  distinctly, while contradictory or unsafe outcomes mint no history evidence.
 - Added a static-only exact-byte editor to every bounded x64 disassembly row. **Edit Exact Bytes...**
   queues the existing same-size `ReplaceBytes` request, while **Edit Queued Patch...** transactionally
   replaces the draft bound to that exact RVA and immutable source instruction. The modal accepts only
