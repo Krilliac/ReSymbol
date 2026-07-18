@@ -90,6 +90,8 @@ enum Command {
     Patch(PatchArgs),
     /// Inspect and manage discovered plugins.
     Plugin(PluginArgs),
+    /// Launch or attach to a process and serve it over the GDB Remote Serial Protocol (Linux).
+    Gdbserver(GdbserverArgs),
 }
 
 #[derive(Debug, Args)]
@@ -242,6 +244,163 @@ enum PluginCommand {
     Reset { id: String },
 }
 
+/// Default TCP address served when neither `--tcp` nor `--serial` is given.
+const DEFAULT_GDBSERVER_TCP_ADDR: &str = "127.0.0.1:1234";
+
+#[derive(Debug, Args)]
+struct GdbserverArgs {
+    /// Program to launch under the ptrace host (mutually exclusive with `--attach`).
+    #[arg(value_name = "PROGRAM", conflicts_with = "attach")]
+    program: Option<String>,
+
+    /// Arguments passed to the launched program (everything after PROGRAM).
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    program_args: Vec<String>,
+
+    /// Attach to an already-running process by PID instead of launching one.
+    #[arg(long, value_name = "PID")]
+    attach: Option<i32>,
+
+    /// Serve over TCP at this address (e.g. 127.0.0.1:1234).
+    #[arg(long, value_name = "ADDR", conflicts_with = "serial")]
+    tcp: Option<String>,
+
+    /// Serve over this serial device (e.g. /dev/ttyS0).
+    #[arg(long, value_name = "DEVICE")]
+    serial: Option<String>,
+
+    /// Baud rate for `--serial`.
+    #[arg(long, value_name = "BAUD", default_value_t = 115_200)]
+    baud: u32,
+
+    /// Keep address-space layout randomization enabled (disabled by default for stable RVAs).
+    #[arg(long)]
+    aslr: bool,
+}
+
+/// What the `gdbserver` command should attach the RSP server to.
+enum GdbserverTarget {
+    /// Launch `program` with `arguments` (already including `argv[0]`).
+    Launch {
+        program: String,
+        arguments: Vec<String>,
+        disable_aslr: bool,
+    },
+    /// Attach to an already-running process by PID.
+    Attach(i32),
+}
+
+/// The link the `gdbserver` command should serve the RSP over.
+enum GdbserverTransport {
+    Tcp(String),
+    Serial { device: String, baud: u32 },
+}
+
+/// Resolve the mutually-exclusive target selector from the parsed arguments.
+fn resolve_gdbserver_target(args: &GdbserverArgs) -> Result<GdbserverTarget> {
+    match (&args.program, args.attach) {
+        (Some(program), None) => {
+            let mut arguments = Vec::with_capacity(args.program_args.len() + 1);
+            arguments.push(program.clone());
+            arguments.extend(args.program_args.iter().cloned());
+            Ok(GdbserverTarget::Launch {
+                program: program.clone(),
+                arguments,
+                disable_aslr: !args.aslr,
+            })
+        }
+        (None, Some(pid)) => Ok(GdbserverTarget::Attach(pid)),
+        (Some(_), Some(_)) => {
+            bail!("provide either a PROGRAM to launch or --attach <PID>, not both")
+        }
+        (None, None) => bail!("provide a PROGRAM to launch or --attach <PID>"),
+    }
+}
+
+/// Resolve the transport, defaulting to TCP on [`DEFAULT_GDBSERVER_TCP_ADDR`].
+fn resolve_gdbserver_transport(args: &GdbserverArgs) -> Result<GdbserverTransport> {
+    match (&args.tcp, &args.serial) {
+        (Some(_), Some(_)) => bail!("provide either --tcp or --serial, not both"),
+        (Some(addr), None) => Ok(GdbserverTransport::Tcp(addr.clone())),
+        (None, Some(device)) => Ok(GdbserverTransport::Serial {
+            device: device.clone(),
+            baud: args.baud,
+        }),
+        // Neither given: default to a local TCP endpoint.
+        (None, None) => Ok(GdbserverTransport::Tcp(
+            DEFAULT_GDBSERVER_TCP_ADDR.to_owned(),
+        )),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn gdbserver(args: GdbserverArgs) -> Result<()> {
+    use resymbol_gdb_remote::{
+        GdbStubServer, PtraceRemoteTarget, SerialTransport, TcpServerListener,
+    };
+    use resymbol_linux_debug_host::{LaunchSpec, attach, launch};
+
+    let target = resolve_gdbserver_target(&args)?;
+    let transport = resolve_gdbserver_transport(&args)?;
+
+    let session = match target {
+        GdbserverTarget::Launch {
+            program,
+            arguments,
+            disable_aslr,
+        } => {
+            let mut spec = LaunchSpec::new(program.clone());
+            spec.arguments = arguments;
+            spec.disable_aslr = disable_aslr;
+            launch(&spec).with_context(|| format!("cannot launch program `{program}`"))?
+        }
+        GdbserverTarget::Attach(pid) => {
+            attach(pid).with_context(|| format!("cannot attach to process {pid}"))?
+        }
+    };
+
+    let mut remote = PtraceRemoteTarget::new(session);
+
+    match transport {
+        GdbserverTransport::Tcp(addr) => {
+            let listener = TcpServerListener::bind(&addr)
+                .with_context(|| format!("cannot bind TCP listener on {addr}"))?;
+            let bound = listener
+                .local_addr()
+                .with_context(|| format!("cannot query local address for {addr}"))?;
+            eprintln!("listening on {bound}; connect with: gdb -ex 'target remote {bound}'");
+            let connection = listener
+                .accept()
+                .with_context(|| format!("cannot accept a connection on {bound}"))?;
+            GdbStubServer::new(connection)
+                .serve(&mut remote)
+                .context("gdb remote session failed")?;
+        }
+        GdbserverTransport::Serial { device, baud } => {
+            let connection = SerialTransport::open(&device, baud)
+                .with_context(|| format!("cannot open serial device {device} at {baud} baud"))?;
+            eprintln!(
+                "serving on {device} at {baud} baud; connect with: \
+                 gdb -ex 'set serial baud {baud}' -ex 'target remote {device}'"
+            );
+            GdbStubServer::new(connection)
+                .serve(&mut remote)
+                .context("gdb remote session failed")?;
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn gdbserver(args: GdbserverArgs) -> Result<()> {
+    // Validate the argument shape so misuse is still reported off Linux, then
+    // report that live serving is unsupported here.
+    let _ = resolve_gdbserver_target(&args)?;
+    let _ = resolve_gdbserver_transport(&args)?;
+    bail!("`resymbol gdbserver` is only supported on Linux")
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -251,6 +410,7 @@ fn main() -> Result<()> {
         Command::Export(args) => export(args),
         Command::Patch(args) => patch_binary(args),
         Command::Plugin(args) => plugins(args, cli.safe_mode, cli.plugin_dir),
+        Command::Gdbserver(args) => gdbserver(args),
     }
 }
 
@@ -4406,6 +4566,104 @@ entrypoint = "Plugin.dll"
         };
         assert_eq!(args.binary, None);
         assert!(!args.json);
+    }
+
+    #[test]
+    fn command_line_accepts_gdbserver_launch_over_tcp() {
+        let cli = Cli::try_parse_from([
+            "resymbol",
+            "gdbserver",
+            "--tcp",
+            "127.0.0.1:1234",
+            "/bin/true",
+        ])
+        .expect("gdbserver launch arguments parse");
+        let Command::Gdbserver(args) = cli.command else {
+            panic!("gdbserver command expected");
+        };
+        assert_eq!(args.program.as_deref(), Some("/bin/true"));
+        assert_eq!(args.attach, None);
+        assert_eq!(args.tcp.as_deref(), Some("127.0.0.1:1234"));
+        assert_eq!(args.serial, None);
+        assert_eq!(args.baud, 115_200);
+        // ASLR stays disabled by default (the flag keeps it on).
+        assert!(!args.aslr);
+
+        let GdbserverTarget::Launch {
+            program,
+            arguments,
+            disable_aslr,
+        } = resolve_gdbserver_target(&args).expect("target resolves")
+        else {
+            panic!("launch target expected");
+        };
+        assert_eq!(program, "/bin/true");
+        assert_eq!(arguments, ["/bin/true".to_owned()]);
+        assert!(disable_aslr);
+        assert!(matches!(
+            resolve_gdbserver_transport(&args).expect("transport resolves"),
+            GdbserverTransport::Tcp(addr) if addr == "127.0.0.1:1234"
+        ));
+    }
+
+    #[test]
+    fn command_line_accepts_gdbserver_attach_over_serial() {
+        let cli = Cli::try_parse_from([
+            "resymbol",
+            "gdbserver",
+            "--attach",
+            "123",
+            "--serial",
+            "/dev/ttyS0",
+        ])
+        .expect("gdbserver attach arguments parse");
+        let Command::Gdbserver(args) = cli.command else {
+            panic!("gdbserver command expected");
+        };
+        assert_eq!(args.program, None);
+        assert_eq!(args.attach, Some(123));
+        assert_eq!(args.tcp, None);
+        assert_eq!(args.serial.as_deref(), Some("/dev/ttyS0"));
+
+        assert!(matches!(
+            resolve_gdbserver_target(&args).expect("target resolves"),
+            GdbserverTarget::Attach(123)
+        ));
+        assert!(matches!(
+            resolve_gdbserver_transport(&args).expect("transport resolves"),
+            GdbserverTransport::Serial { device, baud } if device == "/dev/ttyS0" && baud == 115_200
+        ));
+    }
+
+    #[test]
+    fn gdbserver_rejects_both_program_and_attach() {
+        // clap's `conflicts_with` rejects supplying both selectors at parse time.
+        let error = Cli::try_parse_from(["resymbol", "gdbserver", "--attach", "1", "/bin/true"])
+            .expect_err("program and --attach are mutually exclusive");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn gdbserver_requires_a_target() {
+        let cli = Cli::try_parse_from(["resymbol", "gdbserver", "--tcp", "127.0.0.1:1234"])
+            .expect("arguments parse without a target selector");
+        let Command::Gdbserver(args) = cli.command else {
+            panic!("gdbserver command expected");
+        };
+        assert!(resolve_gdbserver_target(&args).is_err());
+    }
+
+    #[test]
+    fn gdbserver_defaults_to_local_tcp() {
+        let cli = Cli::try_parse_from(["resymbol", "gdbserver", "/bin/true"])
+            .expect("arguments parse without a transport selector");
+        let Command::Gdbserver(args) = cli.command else {
+            panic!("gdbserver command expected");
+        };
+        assert!(matches!(
+            resolve_gdbserver_transport(&args).expect("transport resolves"),
+            GdbserverTransport::Tcp(addr) if addr == DEFAULT_GDBSERVER_TCP_ADDR
+        ));
     }
 
     #[test]

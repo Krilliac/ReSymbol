@@ -2999,6 +2999,8 @@ dependencies = [
  "resymbol-app",
  "resymbol-core",
  "resymbol-export",
+ "resymbol-gdb-remote",
+ "resymbol-linux-debug-host",
  "resymbol-package",
  "resymbol-plugin-runtime",
  "resymbol-plugin-state",
