@@ -34,7 +34,7 @@ fn launch_step_read_and_run_to_exit() {
         match session.single_step().expect("single-step") {
             WaitOutcome::Stopped(_) => {}
             WaitOutcome::Finished(_) => return,
-            WaitOutcome::BreakpointHit { .. } => {}
+            WaitOutcome::BreakpointHit { .. } | WaitOutcome::WatchpointHit { .. } => {}
         }
     }
 

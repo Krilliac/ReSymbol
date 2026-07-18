@@ -17,6 +17,50 @@ pub const MAX_MEMORY_TRANSFER_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum concurrently armed software breakpoints in one session.
 pub const MAX_SOFTWARE_BREAKPOINTS: usize = 4096;
 
+/// Number of x86-64 hardware debug-register slots (`DR0`-`DR3`).
+pub const HARDWARE_SLOTS: usize = 4;
+
+/// USER-area byte offset of `offsetof(struct user, u_debugreg)` on x86-64.
+///
+/// The debug registers live in the ptrace USER area (accessed via
+/// `PTRACE_PEEKUSER`/`PTRACE_POKEUSER`), not in general-purpose register space.
+/// `u_debugreg[n]` sits at [`USER_DEBUGREG_OFFSET`]` + n * 8`. These offsets are
+/// shared by the safe worker (which decides *which* register to touch) and the
+/// real backend (which performs the FFI), so they live in this backend-neutral
+/// module.
+pub const USER_DEBUGREG_OFFSET: usize = 848;
+
+/// USER-area byte offsets of `DR0`..=`DR3` (the four breakpoint address slots).
+pub const DR_ADDRESS_OFFSETS: [usize; HARDWARE_SLOTS] = [
+    USER_DEBUGREG_OFFSET,      // DR0 = 848
+    USER_DEBUGREG_OFFSET + 8,  // DR1 = 856
+    USER_DEBUGREG_OFFSET + 16, // DR2 = 864
+    USER_DEBUGREG_OFFSET + 24, // DR3 = 872
+];
+
+/// USER-area byte offset of `DR6`, the debug *status* register.
+pub const DR6_OFFSET: usize = USER_DEBUGREG_OFFSET + 48; // 896
+
+/// USER-area byte offset of `DR7`, the debug *control* register.
+pub const DR7_OFFSET: usize = USER_DEBUGREG_OFFSET + 56; // 904
+
+/// The kind of a hardware breakpoint or watchpoint condition.
+///
+/// These map onto the two-bit `R/W` field of a `DR7` slot. x86-64 has no
+/// pure *read-only* watchpoint: the hardware offers execute, write-only, and
+/// read/write (data access) conditions. A GDB "read watchpoint" (`Z3`) is
+/// therefore mapped to [`HardwareKind::ReadWrite`] by callers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HardwareKind {
+    /// Break when the instruction at the address is about to execute
+    /// (`R/W = 00`, length must be 1).
+    Execute,
+    /// Break when the data at the address is written (`R/W = 01`).
+    Write,
+    /// Break when the data at the address is read or written (`R/W = 11`).
+    ReadWrite,
+}
+
 /// A complete x86-64 general-purpose and control register snapshot.
 ///
 /// Field order and naming mirror `user_regs_struct` on Linux/x86-64 so the
@@ -108,8 +152,14 @@ pub enum WaitOutcome {
     /// The target terminated; the session is finished.
     Finished(StopEvent),
     /// The target hit an armed software breakpoint; `RIP` has been rewound to
-    /// the breakpoint address, which is reported here.
+    /// the breakpoint address, which is reported here. Also reported for a
+    /// hardware *execute* breakpoint, whose trap fires before the instruction
+    /// runs (so `RIP` already sits at `address` and no rewind is needed).
     BreakpointHit { address: u64 },
+    /// The target hit an armed hardware data watchpoint; the watched address is
+    /// reported here. Unlike an execute stop, `RIP` points past the
+    /// instruction that performed the access.
+    WatchpointHit { address: u64 },
 }
 
 /// A specification for launching a new traced child.
@@ -188,6 +238,31 @@ pub enum HostError {
         /// The enforced ceiling.
         limit: usize,
     },
+    /// All four hardware debug-register slots (`DR0`-`DR3`) are in use.
+    #[error("no free hardware debug-register slot (all {limit} are in use)")]
+    NoHardwareSlot {
+        /// The number of hardware slots.
+        limit: usize,
+    },
+    /// A hardware breakpoint/watchpoint was already armed at this address.
+    #[error("a hardware breakpoint or watchpoint is already armed at {address:#x}")]
+    HardwareBreakpointExists {
+        /// The duplicate address.
+        address: u64,
+    },
+    /// No hardware breakpoint/watchpoint was armed at this address.
+    #[error("no hardware breakpoint or watchpoint is armed at {address:#x}")]
+    HardwareBreakpointMissing {
+        /// The missing address.
+        address: u64,
+    },
+    /// A watchpoint length was not one of the hardware-supported `{1, 2, 4, 8}`
+    /// (or an execute breakpoint requested a length other than 1).
+    #[error("invalid hardware watchpoint length {length}; must be 1, 2, 4, or 8")]
+    InvalidWatchpointLength {
+        /// The rejected length.
+        length: u64,
+    },
     /// An operation required a live, stopped target but the target had exited.
     #[error("the target is no longer alive")]
     TargetNotAlive,
@@ -225,6 +300,15 @@ pub trait PtraceOps {
     /// Write `bytes` starting at `address` into the target, bypassing page
     /// protections (so executable text can be patched for breakpoints).
     fn write_memory(&mut self, address: u64, bytes: &[u8]) -> Result<(), HostError>;
+
+    /// Read one word from the ptrace USER area at byte `offset` (the real
+    /// backend uses `PTRACE_PEEKUSER`). Used for the debug registers
+    /// (`DR0`-`DR7`); see [`DR_ADDRESS_OFFSETS`], [`DR6_OFFSET`], [`DR7_OFFSET`].
+    fn peek_user(&mut self, offset: usize) -> Result<u64, HostError>;
+
+    /// Write one word into the ptrace USER area at byte `offset` (the real
+    /// backend uses `PTRACE_POKEUSER`). Used for the debug registers.
+    fn poke_user(&mut self, offset: usize, value: u64) -> Result<(), HostError>;
 
     /// Detach, leaving the target running.
     fn detach(&mut self) -> Result<(), HostError>;

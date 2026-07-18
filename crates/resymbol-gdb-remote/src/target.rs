@@ -23,6 +23,19 @@ pub enum StopReply {
     Terminated(u8),
 }
 
+/// The access condition of a hardware watchpoint, as distinguished by the RSP
+/// `Z2`/`Z3`/`Z4` packet types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchKind {
+    /// A write watchpoint (`Z2`).
+    Write,
+    /// A read watchpoint (`Z3`). x86-64 has no read-only debug condition, so an
+    /// adapter maps this to a read/write condition.
+    Read,
+    /// An access (read or write) watchpoint (`Z4`).
+    Access,
+}
+
 /// A fault raised while driving a [`RemoteTarget`].
 #[derive(Debug, Error)]
 pub enum TargetError {
@@ -44,6 +57,17 @@ pub enum TargetError {
     /// The target is gone and can no longer be driven.
     #[error("the target is no longer available")]
     Unavailable,
+    /// The target does not support the requested operation.
+    #[error("operation not supported by this target: {0}")]
+    Unsupported(String),
+}
+
+impl TargetError {
+    /// Build an [`TargetError::Unsupported`] describing an unsupported `what`.
+    #[must_use]
+    pub fn unsupported(what: &str) -> Self {
+        Self::Unsupported(format!("{what} is not supported by this target"))
+    }
 }
 
 /// The backend the RSP server serves.
@@ -107,6 +131,59 @@ pub trait RemoteTarget {
     ///
     /// Returns [`TargetError::Breakpoint`] if the breakpoint cannot be removed.
     fn remove_sw_breakpoint(&mut self, addr: u64) -> Result<(), TargetError>;
+
+    /// Arm a hardware execute breakpoint at `addr` (RSP `Z1`).
+    ///
+    /// The default implementation reports the operation as unsupported, so a
+    /// read-only or mock target need not override it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TargetError::Unsupported`] by default, or
+    /// [`TargetError::Breakpoint`] from an implementor.
+    fn set_hw_breakpoint(&mut self, addr: u64) -> Result<(), TargetError> {
+        let _ = addr;
+        Err(TargetError::unsupported("hardware breakpoints"))
+    }
+
+    /// Remove the hardware execute breakpoint at `addr` (RSP `z1`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TargetError::Unsupported`] by default, or
+    /// [`TargetError::Breakpoint`] from an implementor.
+    fn remove_hw_breakpoint(&mut self, addr: u64) -> Result<(), TargetError> {
+        let _ = addr;
+        Err(TargetError::unsupported("hardware breakpoints"))
+    }
+
+    /// Arm a hardware watchpoint of `len` bytes at `addr` (RSP `Z2`/`Z3`/`Z4`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TargetError::Unsupported`] by default, or
+    /// [`TargetError::Breakpoint`] from an implementor.
+    fn set_watchpoint(&mut self, addr: u64, len: u64, kind: WatchKind) -> Result<(), TargetError> {
+        let _ = (addr, len, kind);
+        Err(TargetError::unsupported("hardware watchpoints"))
+    }
+
+    /// Remove the hardware watchpoint of `len` bytes at `addr` (RSP
+    /// `z2`/`z3`/`z4`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TargetError::Unsupported`] by default, or
+    /// [`TargetError::Breakpoint`] from an implementor.
+    fn remove_watchpoint(
+        &mut self,
+        addr: u64,
+        len: u64,
+        kind: WatchKind,
+    ) -> Result<(), TargetError> {
+        let _ = (addr, len, kind);
+        Err(TargetError::unsupported("hardware watchpoints"))
+    }
 
     /// The most recent stop reason, without resuming the target.
     fn stop_reason(&mut self) -> StopReply;

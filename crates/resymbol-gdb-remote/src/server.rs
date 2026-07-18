@@ -11,7 +11,7 @@
 use crate::protocol::{
     PacketEvent, PacketReader, encode_packet, hex_decode, hex_encode, parse_hex_u64,
 };
-use crate::target::{RemoteTarget, StopReply};
+use crate::target::{RemoteTarget, StopReply, WatchKind};
 use crate::transport::Transport;
 use std::io;
 
@@ -241,30 +241,64 @@ fn handle_write_memory<R: RemoteTarget + ?Sized>(rest: &[u8], target: &mut R) ->
     }
 }
 
-/// Handle `Z0,addr,kind` / `z0,addr,kind`. Only software breakpoints (type `0`)
-/// are supported; other types yield the empty reply.
+/// Handle `Ztype,addr,kind[;...]` / `ztype,addr,kind[;...]`. Supports software
+/// breakpoints (`0`), hardware execute breakpoints (`1`), and write/read/access
+/// watchpoints (`2`/`3`/`4`). Any other type yields the empty reply, as the
+/// protocol requires for an unknown packet. For watchpoints the third field is
+/// the byte length; for `Z0`/`Z1` it is the (ignored) instruction kind. The
+/// optional `;cond`/`;cmd` list after the third field is ignored.
 fn handle_breakpoint<R: RemoteTarget + ?Sized>(rest: &[u8], target: &mut R, set: bool) -> Vec<u8> {
-    let Some((&kind, after_kind)) = rest.split_first() else {
+    let Some((&bptype, after_type)) = rest.split_first() else {
         return error_reply();
     };
-    if kind != b'0' {
-        // Hardware breakpoints/watchpoints are not implemented.
-        return empty_reply();
-    }
-    // after_kind is ",addr,kind"; strip the leading comma, then take up to the
-    // next comma as the address.
-    let fields = after_kind.strip_prefix(b",").unwrap_or(after_kind);
-    let addr_bytes = match fields.iter().position(|&b| b == b',') {
-        Some(comma) => &fields[..comma],
+    // `after_type` is ",addr,kind[;...]"; drop the leading comma, then drop any
+    // trailing ";cond/command" list before parsing the two numeric fields.
+    let fields = after_type.strip_prefix(b",").unwrap_or(after_type);
+    let fields = match fields.iter().position(|&b| b == b';') {
+        Some(semi) => &fields[..semi],
         None => fields,
+    };
+    let (addr_bytes, third_bytes) = match fields.iter().position(|&b| b == b',') {
+        Some(comma) => (&fields[..comma], Some(&fields[comma + 1..])),
+        None => (fields, None),
     };
     let Some(addr) = parse_hex_u64(addr_bytes) else {
         return error_reply();
     };
-    let result = if set {
-        target.set_sw_breakpoint(addr)
-    } else {
-        target.remove_sw_breakpoint(addr)
+    // The third field is the length (watchpoints) or kind (breakpoints).
+    let third = third_bytes.and_then(parse_hex_u64);
+
+    let result = match bptype {
+        b'0' => {
+            if set {
+                target.set_sw_breakpoint(addr)
+            } else {
+                target.remove_sw_breakpoint(addr)
+            }
+        }
+        b'1' => {
+            if set {
+                target.set_hw_breakpoint(addr)
+            } else {
+                target.remove_hw_breakpoint(addr)
+            }
+        }
+        b'2' | b'3' | b'4' => {
+            let watch = match bptype {
+                b'2' => WatchKind::Write,
+                b'3' => WatchKind::Read,
+                _ => WatchKind::Access,
+            };
+            let len = third.unwrap_or(1);
+            if set {
+                target.set_watchpoint(addr, len, watch)
+            } else {
+                target.remove_watchpoint(addr, len, watch)
+            }
+        }
+        // A genuinely unknown breakpoint type: the empty reply signals "not
+        // supported" per the protocol.
+        _ => return empty_reply(),
     };
     match result {
         Ok(()) => b"OK".to_vec(),

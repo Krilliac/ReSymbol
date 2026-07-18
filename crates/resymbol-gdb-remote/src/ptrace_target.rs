@@ -8,9 +8,10 @@
 //! its own; all `unsafe` remains in the ptrace host and this crate's serial
 //! module.
 
-use crate::target::{Amd64CoreRegisters, RemoteTarget, StopReply, TargetError};
+use crate::target::{Amd64CoreRegisters, RemoteTarget, StopReply, TargetError, WatchKind};
 use resymbol_linux_debug_host::{
-    HostError, LinuxDebugSession, PtraceBackend, SIGTRAP, StopEvent, WaitOutcome, X64Registers,
+    HardwareKind, HostError, LinuxDebugSession, PtraceBackend, SIGTRAP, StopEvent, WaitOutcome,
+    X64Registers,
 };
 
 /// GDB's `SIGTRAP` value, reported for breakpoint and single-step stops.
@@ -98,15 +99,54 @@ impl RemoteTarget for PtraceRemoteTarget {
             .map_err(breakpoint_error)
     }
 
+    fn set_hw_breakpoint(&mut self, addr: u64) -> Result<(), TargetError> {
+        self.session
+            .set_hw_breakpoint(addr)
+            .map_err(breakpoint_error)
+    }
+
+    fn remove_hw_breakpoint(&mut self, addr: u64) -> Result<(), TargetError> {
+        self.session.clear_hw(addr).map_err(breakpoint_error)
+    }
+
+    fn set_watchpoint(&mut self, addr: u64, len: u64, kind: WatchKind) -> Result<(), TargetError> {
+        self.session
+            .set_watchpoint(addr, len, watch_to_hardware(kind))
+            .map_err(breakpoint_error)
+    }
+
+    fn remove_watchpoint(
+        &mut self,
+        addr: u64,
+        _len: u64,
+        _kind: WatchKind,
+    ) -> Result<(), TargetError> {
+        // A slot is keyed by address; the length/kind are not needed to release
+        // it (they must match what was armed).
+        self.session.clear_hw(addr).map_err(breakpoint_error)
+    }
+
     fn stop_reason(&mut self) -> StopReply {
         self.last_stop
+    }
+}
+
+/// Map an RSP [`WatchKind`] onto a host [`HardwareKind`]. x86-64 debug registers
+/// have no read-only condition, so a GDB read watchpoint (`Z3`) and an access
+/// watchpoint (`Z4`) both become a read/write condition.
+fn watch_to_hardware(kind: WatchKind) -> HardwareKind {
+    match kind {
+        WatchKind::Write => HardwareKind::Write,
+        WatchKind::Read | WatchKind::Access => HardwareKind::ReadWrite,
     }
 }
 
 /// Translate a ptrace [`WaitOutcome`] to an RSP [`StopReply`].
 fn outcome_to_reply(outcome: WaitOutcome) -> StopReply {
     match outcome {
-        WaitOutcome::BreakpointHit { .. } => StopReply::Signal(GDB_SIGTRAP),
+        WaitOutcome::BreakpointHit { .. } | WaitOutcome::WatchpointHit { .. } => {
+            StopReply::Signal(GDB_SIGTRAP)
+        }
         WaitOutcome::Stopped(event) | WaitOutcome::Finished(event) => event_to_reply(event),
     }
 }

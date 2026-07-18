@@ -41,7 +41,7 @@ pub use core_dump::{CoreClass, CoreDump, CoreDumpError, CoreDumpTarget, CoreEndi
 pub use protocol::{PacketEvent, PacketReader, encode_packet};
 pub use server::{GdbStubServer, serve_one};
 pub use target::{
-    AMD64_GPACKET_BYTES, Amd64CoreRegisters, RemoteTarget, StopReply, TargetError,
+    AMD64_GPACKET_BYTES, Amd64CoreRegisters, RemoteTarget, StopReply, TargetError, WatchKind,
     amd64_gpacket_to_registers, amd64_registers_to_gpacket,
 };
 pub use transport::{

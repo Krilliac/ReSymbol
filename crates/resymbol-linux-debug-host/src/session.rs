@@ -12,8 +12,9 @@
 use std::collections::BTreeMap;
 
 use crate::types::{
-    BREAKPOINT_BYTE, HostError, MAX_MEMORY_TRANSFER_BYTES, MAX_SOFTWARE_BREAKPOINTS, PtraceOps,
-    StopEvent, WaitOutcome, X64Registers,
+    BREAKPOINT_BYTE, DR_ADDRESS_OFFSETS, DR6_OFFSET, DR7_OFFSET, HARDWARE_SLOTS, HardwareKind,
+    HostError, MAX_MEMORY_TRANSFER_BYTES, MAX_SOFTWARE_BREAKPOINTS, PtraceOps, StopEvent,
+    WaitOutcome, X64Registers,
 };
 
 /// One armed software breakpoint: its address and the original byte it hides.
@@ -22,11 +23,22 @@ struct ArmedBreakpoint {
     original_byte: u8,
 }
 
+/// One occupied hardware debug-register slot (`DR0`-`DR3`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HardwareSlot {
+    /// The watched / breakpoint address programmed into `DRn`.
+    address: u64,
+    /// The condition (execute / write / read-write) encoded in `DR7`.
+    kind: HardwareKind,
+}
+
 /// A live debug session over a stopped, ptrace-controlled target.
 #[derive(Debug)]
 pub struct LinuxDebugSession<O: PtraceOps> {
     ops: O,
     breakpoints: BTreeMap<u64, ArmedBreakpoint>,
+    /// The four hardware slots, indexed by `DRn`; `None` means free.
+    hardware: [Option<HardwareSlot>; HARDWARE_SLOTS],
     alive: bool,
 }
 
@@ -37,6 +49,7 @@ impl<O: PtraceOps> LinuxDebugSession<O> {
         Self {
             ops,
             breakpoints: BTreeMap::new(),
+            hardware: [None; HARDWARE_SLOTS],
             alive: true,
         }
     }
@@ -57,6 +70,92 @@ impl<O: PtraceOps> LinuxDebugSession<O> {
     #[must_use]
     pub fn armed_breakpoints(&self) -> Vec<u64> {
         self.breakpoints.keys().copied().collect()
+    }
+
+    /// The `(address, kind)` of every occupied hardware slot, in slot order.
+    #[must_use]
+    pub fn hardware_slots(&self) -> Vec<(u64, HardwareKind)> {
+        self.hardware
+            .iter()
+            .flatten()
+            .map(|slot| (slot.address, slot.kind))
+            .collect()
+    }
+
+    /// Arm a hardware *execute* breakpoint at `address` (`DR7` condition `00`,
+    /// length 1). Fails with [`HostError::NoHardwareSlot`] when all four slots
+    /// are occupied.
+    pub fn set_hw_breakpoint(&mut self, address: u64) -> Result<(), HostError> {
+        self.arm_hardware(address, 1, HardwareKind::Execute)
+    }
+
+    /// Arm a hardware data watchpoint of `len` bytes (one of `{1, 2, 4, 8}`) at
+    /// `address` with the given [`HardwareKind`] (`Write` or `ReadWrite`).
+    pub fn set_watchpoint(
+        &mut self,
+        address: u64,
+        len: u64,
+        kind: HardwareKind,
+    ) -> Result<(), HostError> {
+        self.arm_hardware(address, len, kind)
+    }
+
+    /// Release the hardware slot armed at `address` (breakpoint or watchpoint):
+    /// clear its `DR7` enable/condition/length bits and zero its `DRn`.
+    pub fn clear_hw(&mut self, address: u64) -> Result<(), HostError> {
+        self.require_alive()?;
+        let slot = self
+            .hardware
+            .iter()
+            .position(|slot| slot.is_some_and(|slot| slot.address == address))
+            .ok_or(HostError::HardwareBreakpointMissing { address })?;
+
+        let mut dr7 = self.ops.peek_user(DR7_OFFSET)?;
+        dr7 = clear_dr7_slot(dr7, slot);
+        self.ops.poke_user(DR7_OFFSET, dr7)?;
+        self.ops.poke_user(DR_ADDRESS_OFFSETS[slot], 0)?;
+        self.hardware[slot] = None;
+        Ok(())
+    }
+
+    /// Allocate a free `DRn` slot, program the address, and set the slot's
+    /// enable, condition, and length bits in `DR7`.
+    fn arm_hardware(
+        &mut self,
+        address: u64,
+        len: u64,
+        kind: HardwareKind,
+    ) -> Result<(), HostError> {
+        self.require_alive()?;
+        if self
+            .hardware
+            .iter()
+            .any(|slot| slot.is_some_and(|slot| slot.address == address))
+        {
+            return Err(HostError::HardwareBreakpointExists { address });
+        }
+        let length_bits = encode_length(kind, len)?;
+        let condition_bits = encode_condition(kind);
+        let slot =
+            self.hardware
+                .iter()
+                .position(Option::is_none)
+                .ok_or(HostError::NoHardwareSlot {
+                    limit: HARDWARE_SLOTS,
+                })?;
+
+        self.ops.poke_user(DR_ADDRESS_OFFSETS[slot], address)?;
+        let mut dr7 = self.ops.peek_user(DR7_OFFSET)?;
+        dr7 = clear_dr7_slot(dr7, slot);
+        // Local-enable bit for this slot: bit 2*n.
+        dr7 |= 1u64 << (2 * slot);
+        // Condition (bits 16+4n..) and length (bits 18+4n..) nibble.
+        let nibble = u64::from(condition_bits) | (u64::from(length_bits) << 2);
+        dr7 |= nibble << (16 + 4 * slot);
+        self.ops.poke_user(DR7_OFFSET, dr7)?;
+
+        self.hardware[slot] = Some(HardwareSlot { address, kind });
+        Ok(())
     }
 
     /// Read the full register file.
@@ -212,6 +311,15 @@ impl<O: PtraceOps> LinuxDebugSession<O> {
             for address in addresses {
                 let _ = self.clear_breakpoint(address);
             }
+            let hardware: Vec<u64> = self
+                .hardware
+                .iter()
+                .flatten()
+                .map(|slot| slot.address)
+                .collect();
+            for address in hardware {
+                let _ = self.clear_hw(address);
+            }
             self.ops.detach()?;
         }
         Ok(())
@@ -226,6 +334,38 @@ impl<O: PtraceOps> LinuxDebugSession<O> {
         Ok(())
     }
 
+    /// If any hardware slot fired, read `DR6`, map the lowest set status bit to
+    /// its slot's address/kind, clear `DR6`, and return the outcome. Returns
+    /// `Ok(None)` when no slots are armed or none fired.
+    fn check_hardware_hit(&mut self) -> Result<Option<WaitOutcome>, HostError> {
+        if self.hardware.iter().all(Option::is_none) {
+            return Ok(None);
+        }
+        let status = self.ops.peek_user(DR6_OFFSET)?;
+        let mut outcome = None;
+        for (slot, armed) in self.hardware.iter().enumerate() {
+            if status & (1u64 << slot) == 0 {
+                continue;
+            }
+            if let Some(armed) = armed {
+                outcome = Some(match armed.kind {
+                    HardwareKind::Execute => WaitOutcome::BreakpointHit {
+                        address: armed.address,
+                    },
+                    HardwareKind::Write | HardwareKind::ReadWrite => WaitOutcome::WatchpointHit {
+                        address: armed.address,
+                    },
+                });
+                break;
+            }
+        }
+        if outcome.is_some() {
+            // Acknowledge the stop by clearing the DR6 status bits.
+            self.ops.poke_user(DR6_OFFSET, 0)?;
+        }
+        Ok(outcome)
+    }
+
     fn wait_and_classify(&mut self) -> Result<WaitOutcome, HostError> {
         let event = self.ops.wait()?;
         match event {
@@ -234,6 +374,12 @@ impl<O: PtraceOps> LinuxDebugSession<O> {
                 Ok(WaitOutcome::Finished(event))
             }
             StopEvent::Stopped { signal } if signal == crate::types::SIGTRAP => {
+                // A hardware stop is signalled by DR6; check it before the
+                // software-breakpoint RIP heuristic, since a hardware execute
+                // trap fires with RIP already at the breakpoint (no rewind).
+                if let Some(outcome) = self.check_hardware_hit()? {
+                    return Ok(outcome);
+                }
                 let mut registers = self.ops.read_registers()?;
                 let candidate = registers.instruction_pointer().wrapping_sub(1);
                 if self.breakpoints.contains_key(&candidate) {
@@ -286,6 +432,45 @@ impl<O: PtraceOps> LinuxDebugSession<O> {
     }
 }
 
+/// Clear a slot's enable bit (`2*n`) and its four-bit condition/length nibble
+/// (`16+4*n`), leaving the other slots' `DR7` bits untouched.
+fn clear_dr7_slot(dr7: u64, slot: usize) -> u64 {
+    let mut cleared = dr7;
+    // Local-enable bit for this slot.
+    cleared &= !(1u64 << (2 * slot));
+    // Condition (2 bits) + length (2 bits) nibble for this slot.
+    cleared &= !(0b1111u64 << (16 + 4 * slot));
+    cleared
+}
+
+/// The two-bit `DR7` `R/W` condition encoding for a [`HardwareKind`].
+fn encode_condition(kind: HardwareKind) -> u8 {
+    match kind {
+        HardwareKind::Execute => 0b00,
+        HardwareKind::Write => 0b01,
+        HardwareKind::ReadWrite => 0b11,
+    }
+}
+
+/// The two-bit `DR7` `LEN` encoding for a `(kind, len)` pair. Execute
+/// breakpoints must use length 1; watchpoints accept `{1, 2, 4, 8}`.
+fn encode_length(kind: HardwareKind, len: u64) -> Result<u8, HostError> {
+    if matches!(kind, HardwareKind::Execute) {
+        return if len == 1 {
+            Ok(0b00)
+        } else {
+            Err(HostError::InvalidWatchpointLength { length: len })
+        };
+    }
+    match len {
+        1 => Ok(0b00),
+        2 => Ok(0b01),
+        4 => Ok(0b11),
+        8 => Ok(0b10),
+        _ => Err(HostError::InvalidWatchpointLength { length: len }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,6 +483,8 @@ mod tests {
         alive: bool,
         /// Queue of stop events the next `wait` calls will return.
         pending: Vec<StopEvent>,
+        /// The ptrace USER area, keyed by byte offset (the debug registers).
+        user: BTreeMap<usize, u64>,
     }
 
     impl MockTarget {
@@ -314,11 +501,16 @@ mod tests {
                 registers,
                 alive: true,
                 pending: Vec::new(),
+                user: BTreeMap::new(),
             }
         }
 
         fn byte(&self, address: u64) -> u8 {
             self.memory.get(&address).copied().unwrap_or(0)
+        }
+
+        fn user(&self, offset: usize) -> u64 {
+            self.user.get(&offset).copied().unwrap_or(0)
         }
     }
 
@@ -382,6 +574,15 @@ mod tests {
             for (i, byte) in bytes.iter().enumerate() {
                 self.memory.insert(address + i as u64, *byte);
             }
+            Ok(())
+        }
+
+        fn peek_user(&mut self, offset: usize) -> Result<u64, HostError> {
+            Ok(self.user(offset))
+        }
+
+        fn poke_user(&mut self, offset: usize, value: u64) -> Result<(), HostError> {
+            self.user.insert(offset, value);
             Ok(())
         }
 
@@ -496,5 +697,157 @@ mod tests {
         }
         assert!(!session.is_alive());
         assert_eq!(session.read_registers(), Err(HostError::TargetNotAlive));
+    }
+
+    #[test]
+    fn hw_execute_breakpoint_programs_dr0_and_dr7() {
+        use crate::types::{DR_ADDRESS_OFFSETS, DR7_OFFSET};
+        let base = 0x40_0000;
+        let mut session = LinuxDebugSession::new(MockTarget::new(base, &[0x90, 0xC3]));
+        session.set_hw_breakpoint(base).unwrap();
+
+        // DR0 holds the address; slot 0's local-enable bit (bit 0) is set.
+        assert_eq!(session.ops.user(DR_ADDRESS_OFFSETS[0]), base);
+        let dr7 = session.ops.user(DR7_OFFSET);
+        assert_eq!(dr7 & 0b1, 0b1, "L0 enable bit set");
+        // Execute condition (00) + length 1 (00) => nibble at bit 16 is 0.
+        assert_eq!((dr7 >> 16) & 0b1111, 0b0000);
+        assert_eq!(
+            session.hardware_slots(),
+            vec![(base, HardwareKind::Execute)]
+        );
+    }
+
+    #[test]
+    fn write_watchpoint_programs_condition_and_length() {
+        use crate::types::DR7_OFFSET;
+        let base = 0x50_0000;
+        let mut session = LinuxDebugSession::new(MockTarget::new(base, &[0xC3]));
+        session
+            .set_watchpoint(base + 0x100, 4, HardwareKind::Write)
+            .unwrap();
+
+        let dr7 = session.ops.user(DR7_OFFSET);
+        assert_eq!(dr7 & 0b1, 0b1, "L0 enable bit set");
+        // Write condition (01) + length 4 (11) => nibble 0b1101 at bit 16.
+        assert_eq!((dr7 >> 16) & 0b1111, 0b1101);
+    }
+
+    #[test]
+    fn read_write_watchpoint_encodes_len_eight() {
+        use crate::types::DR7_OFFSET;
+        let base = 0x51_0000;
+        let mut session = LinuxDebugSession::new(MockTarget::new(base, &[0xC3]));
+        session
+            .set_watchpoint(base, 8, HardwareKind::ReadWrite)
+            .unwrap();
+        let dr7 = session.ops.user(DR7_OFFSET);
+        // ReadWrite condition (11) + length 8 (10) => nibble 0b1011.
+        assert_eq!((dr7 >> 16) & 0b1111, 0b1011);
+    }
+
+    #[test]
+    fn invalid_watchpoint_length_is_rejected() {
+        let base = 0x52_0000;
+        let mut session = LinuxDebugSession::new(MockTarget::new(base, &[0xC3]));
+        assert_eq!(
+            session.set_watchpoint(base, 3, HardwareKind::Write),
+            Err(HostError::InvalidWatchpointLength { length: 3 })
+        );
+        // An execute breakpoint may only cover one byte.
+        assert_eq!(
+            session.set_watchpoint(base, 2, HardwareKind::Execute),
+            Err(HostError::InvalidWatchpointLength { length: 2 })
+        );
+    }
+
+    #[test]
+    fn clear_hw_frees_slot_and_dr7_bits() {
+        use crate::types::{DR_ADDRESS_OFFSETS, DR7_OFFSET};
+        let base = 0x60_0000;
+        let mut session = LinuxDebugSession::new(MockTarget::new(base, &[0xC3]));
+        session.set_hw_breakpoint(base).unwrap();
+        session.clear_hw(base).unwrap();
+
+        assert!(session.hardware_slots().is_empty());
+        assert_eq!(session.ops.user(DR_ADDRESS_OFFSETS[0]), 0);
+        // Every enable/condition/length bit for slot 0 is cleared.
+        let dr7 = session.ops.user(DR7_OFFSET);
+        assert_eq!(dr7 & 0b1, 0);
+        assert_eq!((dr7 >> 16) & 0b1111, 0);
+        // Clearing an unarmed address reports the missing error.
+        assert_eq!(
+            session.clear_hw(base),
+            Err(HostError::HardwareBreakpointMissing { address: base })
+        );
+    }
+
+    #[test]
+    fn duplicate_hw_breakpoint_is_rejected() {
+        let base = 0x61_0000;
+        let mut session = LinuxDebugSession::new(MockTarget::new(base, &[0xC3]));
+        session.set_hw_breakpoint(base).unwrap();
+        assert_eq!(
+            session.set_hw_breakpoint(base),
+            Err(HostError::HardwareBreakpointExists { address: base })
+        );
+    }
+
+    #[test]
+    fn fifth_hardware_allocation_is_rejected() {
+        let base = 0x70_0000;
+        let mut session = LinuxDebugSession::new(MockTarget::new(base, &[0xC3]));
+        for index in 0..4u64 {
+            session.set_hw_breakpoint(base + index * 8).unwrap();
+        }
+        assert_eq!(session.hardware_slots().len(), 4);
+        assert_eq!(
+            session.set_hw_breakpoint(base + 0x1000),
+            Err(HostError::NoHardwareSlot { limit: 4 })
+        );
+    }
+
+    #[test]
+    fn dr6_status_maps_execute_hit_to_breakpoint_outcome() {
+        use crate::types::{DR6_OFFSET, SIGTRAP};
+        let base = 0x80_0000;
+        let mut session = LinuxDebugSession::new(MockTarget::new(base, &[0x90, 0xC3]));
+        session.set_hw_breakpoint(base).unwrap();
+        // Simulate the kernel: slot 0 fired (DR6 bit 0) and a SIGTRAP is pending.
+        // RIP already sits at the breakpoint for a hardware execute trap.
+        session.ops.user.insert(DR6_OFFSET, 0b0001);
+        session
+            .ops
+            .pending
+            .push(StopEvent::Stopped { signal: SIGTRAP });
+        match session.wait_and_classify().unwrap() {
+            WaitOutcome::BreakpointHit { address } => assert_eq!(address, base),
+            other => panic!("expected hardware breakpoint hit, got {other:?}"),
+        }
+        // DR6 status bits were acknowledged (cleared).
+        assert_eq!(session.ops.user(DR6_OFFSET), 0);
+    }
+
+    #[test]
+    fn dr6_status_maps_watchpoint_hit_to_watchpoint_outcome() {
+        use crate::types::{DR6_OFFSET, SIGTRAP};
+        let base = 0x90_0000;
+        let watched = base + 0x200;
+        let mut session = LinuxDebugSession::new(MockTarget::new(base, &[0x90, 0xC3]));
+        // Occupy slot 0 with an execute breakpoint, slot 1 with the watchpoint.
+        session.set_hw_breakpoint(base).unwrap();
+        session
+            .set_watchpoint(watched, 4, HardwareKind::Write)
+            .unwrap();
+        // Slot 1 (DR6 bit 1) fired.
+        session.ops.user.insert(DR6_OFFSET, 0b0010);
+        session
+            .ops
+            .pending
+            .push(StopEvent::Stopped { signal: SIGTRAP });
+        match session.wait_and_classify().unwrap() {
+            WaitOutcome::WatchpointHit { address } => assert_eq!(address, watched),
+            other => panic!("expected watchpoint hit, got {other:?}"),
+        }
     }
 }

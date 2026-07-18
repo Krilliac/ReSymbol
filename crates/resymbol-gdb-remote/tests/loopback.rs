@@ -3,9 +3,12 @@
 //! background thread. No sockets, no ptrace — this runs in the normal test
 //! gate.
 
-use resymbol_gdb_remote::target::{Amd64CoreRegisters, RemoteTarget, StopReply, TargetError};
+use resymbol_gdb_remote::target::{
+    Amd64CoreRegisters, RemoteTarget, StopReply, TargetError, WatchKind,
+};
 use resymbol_gdb_remote::{GdbRemoteClient, GdbStubServer, memory_pair};
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 /// A deterministic in-memory target: fixed registers, a sparse memory map, a
 /// breakpoint set, and a scripted stop reply.
@@ -86,6 +89,127 @@ impl RemoteTarget for MockTarget {
     fn stop_reason(&mut self) -> StopReply {
         self.stop
     }
+}
+
+/// One recorded hardware breakpoint/watchpoint request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HwCall {
+    SetHwBreak(u64),
+    RemoveHwBreak(u64),
+    SetWatch(u64, u64, WatchKind),
+    RemoveWatch(u64, u64, WatchKind),
+}
+
+/// A target that records the hardware-related [`RemoteTarget`] calls the server
+/// dispatches to it, so a test can assert the `Z1`/`Z2`/`Z3`/`Z4` (and `z*`)
+/// packets were parsed correctly.
+struct RecordingTarget {
+    calls: Arc<Mutex<Vec<HwCall>>>,
+}
+
+impl RemoteTarget for RecordingTarget {
+    fn read_registers(&mut self) -> Result<Vec<u8>, TargetError> {
+        Ok(Amd64CoreRegisters::default().to_gpacket())
+    }
+    fn write_registers(&mut self, _raw: &[u8]) -> Result<(), TargetError> {
+        Ok(())
+    }
+    fn read_memory(&mut self, _addr: u64, len: usize) -> Result<Vec<u8>, TargetError> {
+        Ok(vec![0u8; len])
+    }
+    fn write_memory(&mut self, _addr: u64, _data: &[u8]) -> Result<(), TargetError> {
+        Ok(())
+    }
+    fn cont(&mut self) -> Result<StopReply, TargetError> {
+        Ok(StopReply::Signal(5))
+    }
+    fn step(&mut self) -> Result<StopReply, TargetError> {
+        Ok(StopReply::Signal(5))
+    }
+    fn set_sw_breakpoint(&mut self, _addr: u64) -> Result<(), TargetError> {
+        Ok(())
+    }
+    fn remove_sw_breakpoint(&mut self, _addr: u64) -> Result<(), TargetError> {
+        Ok(())
+    }
+    fn set_hw_breakpoint(&mut self, addr: u64) -> Result<(), TargetError> {
+        self.calls.lock().unwrap().push(HwCall::SetHwBreak(addr));
+        Ok(())
+    }
+    fn remove_hw_breakpoint(&mut self, addr: u64) -> Result<(), TargetError> {
+        self.calls.lock().unwrap().push(HwCall::RemoveHwBreak(addr));
+        Ok(())
+    }
+    fn set_watchpoint(&mut self, addr: u64, len: u64, kind: WatchKind) -> Result<(), TargetError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(HwCall::SetWatch(addr, len, kind));
+        Ok(())
+    }
+    fn remove_watchpoint(
+        &mut self,
+        addr: u64,
+        len: u64,
+        kind: WatchKind,
+    ) -> Result<(), TargetError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(HwCall::RemoveWatch(addr, len, kind));
+        Ok(())
+    }
+    fn stop_reason(&mut self) -> StopReply {
+        StopReply::Signal(5)
+    }
+}
+
+#[test]
+fn server_dispatches_hardware_breakpoint_packets() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let target_calls = Arc::clone(&calls);
+    let (server_transport, client_transport) = memory_pair();
+
+    let server = std::thread::spawn(move || {
+        let mut target = RecordingTarget {
+            calls: target_calls,
+        };
+        let mut server = GdbStubServer::new(server_transport);
+        server.serve(&mut target).expect("server loop");
+    });
+
+    let mut client = GdbRemoteClient::new(client_transport);
+
+    // Z1: hardware execute breakpoint. Third field is an ignored kind byte.
+    assert_eq!(client.transact(b"Z1,401000,1").unwrap(), b"OK");
+    // Z2/Z3/Z4: watchpoints, third field is the byte length.
+    assert_eq!(client.transact(b"Z2,401010,4").unwrap(), b"OK");
+    assert_eq!(client.transact(b"Z3,401020,2").unwrap(), b"OK");
+    assert_eq!(client.transact(b"Z4,401030,8").unwrap(), b"OK");
+    // A trailing ";cond" list must be ignored.
+    assert_eq!(client.transact(b"Z1,401040,1;X1,0").unwrap(), b"OK");
+    // Removals.
+    assert_eq!(client.transact(b"z1,401000,1").unwrap(), b"OK");
+    assert_eq!(client.transact(b"z2,401010,4").unwrap(), b"OK");
+    // An unknown breakpoint type gets the empty reply.
+    assert_eq!(client.transact(b"Z9,401000,1").unwrap(), b"");
+
+    client.send_packet(b"k").expect("kill");
+    server.join().expect("server thread");
+
+    let recorded = calls.lock().unwrap().clone();
+    assert_eq!(
+        recorded,
+        vec![
+            HwCall::SetHwBreak(0x40_1000),
+            HwCall::SetWatch(0x40_1010, 4, WatchKind::Write),
+            HwCall::SetWatch(0x40_1020, 2, WatchKind::Read),
+            HwCall::SetWatch(0x40_1030, 8, WatchKind::Access),
+            HwCall::SetHwBreak(0x40_1040),
+            HwCall::RemoveHwBreak(0x40_1000),
+            HwCall::RemoveWatch(0x40_1010, 4, WatchKind::Write),
+        ]
+    );
 }
 
 #[test]

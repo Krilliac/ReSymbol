@@ -258,6 +258,52 @@ impl PtraceOps for PtraceBackend {
         Ok(())
     }
 
+    fn peek_user(&mut self, offset: usize) -> Result<u64, HostError> {
+        // Clear errno: PEEKUSER returns the word as the return value, so -1 is
+        // ambiguous and must be disambiguated via errno.
+        // SAFETY: writing errno is always sound; libc exposes it via a helper.
+        unsafe { *libc::__errno_location() = 0 };
+        // SAFETY: PTRACE_PEEKUSER reads one word from the traced target's USER
+        // area at byte `offset`; the offset is passed as the address argument
+        // and consumed only by the kernel, never dereferenced by us.
+        let value = unsafe {
+            libc::ptrace(
+                libc::PTRACE_PEEKUSER,
+                self.pid,
+                offset as *mut c_void,
+                ptr::null_mut::<c_void>(),
+            )
+        };
+        if value == -1 {
+            let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if errno != 0 {
+                return Err(HostError::Syscall {
+                    operation: "PTRACE_PEEKUSER",
+                    errno,
+                });
+            }
+        }
+        Ok(value as u64)
+    }
+
+    fn poke_user(&mut self, offset: usize, value: u64) -> Result<(), HostError> {
+        // SAFETY: PTRACE_POKEUSER writes one word into the traced target's USER
+        // area at byte `offset`; both the offset and the value are passed by
+        // value and consumed only by the kernel, never dereferenced by us.
+        let rc = unsafe {
+            libc::ptrace(
+                libc::PTRACE_POKEUSER,
+                self.pid,
+                offset as *mut c_void,
+                value as *mut c_void,
+            )
+        };
+        if rc < 0 {
+            return Err(last_errno("PTRACE_POKEUSER"));
+        }
+        Ok(())
+    }
+
     fn detach(&mut self) -> Result<(), HostError> {
         // SAFETY: PTRACE_DETACH releases the target, leaving it running.
         let rc = unsafe {

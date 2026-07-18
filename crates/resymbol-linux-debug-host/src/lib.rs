@@ -15,10 +15,13 @@
 //! and on a hit the original byte is restored, `RIP` is rewound, the target is
 //! single-stepped, and the breakpoint is re-armed.
 //!
+//! Hardware breakpoints and watchpoints are supported via the x86-64 debug
+//! registers (`DR0`-`DR7`), accessed through `PTRACE_PEEKUSER`/`PTRACE_POKEUSER`
+//! in [`linux`]; all `DR7` bit-twiddling lives in the safe worker.
+//!
 //! This host performs live control, not offline image analysis or OS-level
 //! sandboxing; a launched or attached target runs with the caller's ambient
-//! authority. Hardware breakpoints and sandbox provisioning are not yet
-//! implemented.
+//! authority. Sandbox provisioning is not implemented.
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -27,8 +30,9 @@ mod types;
 
 pub use session::LinuxDebugSession;
 pub use types::{
-    BREAKPOINT_BYTE, HostError, LaunchSpec, MAX_MEMORY_TRANSFER_BYTES, MAX_SOFTWARE_BREAKPOINTS,
-    PtraceOps, SIGTRAP, StopEvent, WaitOutcome, X64Registers,
+    BREAKPOINT_BYTE, HARDWARE_SLOTS, HardwareKind, HostError, LaunchSpec,
+    MAX_MEMORY_TRANSFER_BYTES, MAX_SOFTWARE_BREAKPOINTS, PtraceOps, SIGTRAP, StopEvent,
+    WaitOutcome, X64Registers,
 };
 
 #[cfg(target_os = "linux")]
@@ -86,15 +90,12 @@ fn availability_for(capability: DebugCapability) -> CapabilityAvailability {
         | C::RegisterRead
         | C::RegisterWrite
         | C::SoftwareBreakpoints
+        | C::HardwareBreakpoints
         | C::HostLaunch
         | C::HostAttach => CapabilityAvailability::Available,
         C::StepOver | C::StepOut => unavailable(
             CapabilityUnavailableCode::ProviderUnavailable,
             "step-over and step-out are not yet implemented; use single-step",
-        ),
-        C::HardwareBreakpoints => unavailable(
-            CapabilityUnavailableCode::ProviderUnavailable,
-            "hardware breakpoints and debug registers are not yet implemented",
         ),
         C::SandboxedLaunch => unavailable(
             CapabilityUnavailableCode::BackendUnavailable,
