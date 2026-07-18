@@ -9,6 +9,7 @@ mod elf;
 mod error;
 mod instruction;
 mod linear_disassembly;
+mod macho;
 mod msvc_rtti;
 mod pe;
 mod session;
@@ -26,6 +27,7 @@ pub use linear_disassembly::{
     LinearTruncationBoundary, MAX_LINEAR_DISASSEMBLY_BYTES, MAX_LINEAR_DISASSEMBLY_INSTRUCTIONS,
     disassemble_x64_linear,
 };
+pub use macho::{MachOKind, analyze_macho, detect_macho};
 pub use pe::{
     PeCodeViewInspection, PeCodeViewRsds, PeLayoutInspection, analyze_pe, inspect_pe_codeview,
     inspect_pe_layout,
@@ -33,28 +35,35 @@ pub use pe::{
 pub use session::{AnalysisSession, PluginRunRecord, PluginRunStatus, SessionValidationError};
 pub use types::{
     BinaryAnalysis, CoffHeader, DataDirectory, ElfAnalysis, ElfClass, ElfEndian, ElfLoadSegment,
-    ElfProgramHeader, ElfSectionHeader, ElfSymbol, ImportTarget, MsvcRttiBaseClass,
-    MsvcRttiVftable, PeAnalysis, PeControlFlowTarget, PeDataDirectories, PeDataReference,
-    PeDelayImportLibrary, PeDirectCall, PeExport, PeExportName, PeGuardAddressTakenIatEntry,
-    PeGuardCfFunction, PeGuardEhContinuationTarget, PeGuardLongJumpTarget, PeImport,
-    PeImportLibrary, PeLoadConfigGuardMemcpyAnchor, PeLoadConfigSecurityAnchors,
-    PeLoadConfigXfgAnchors, PeRecoveredString, PeSection, PeStringEncoding, PeThunk, PeTlsCallback,
-    RuntimeFunction,
+    ElfProgramHeader, ElfSectionHeader, ElfSymbol, ImportTarget, MachOAnalysis, MachOArchSlice,
+    MachOContainer, MachOEndian, MachOFat, MachOImage, MachOSection, MachOSegment, MachOSymbol,
+    MsvcRttiBaseClass, MsvcRttiVftable, PeAnalysis, PeControlFlowTarget, PeDataDirectories,
+    PeDataReference, PeDelayImportLibrary, PeDirectCall, PeExport, PeExportName,
+    PeGuardAddressTakenIatEntry, PeGuardCfFunction, PeGuardEhContinuationTarget,
+    PeGuardLongJumpTarget, PeImport, PeImportLibrary, PeLoadConfigGuardMemcpyAnchor,
+    PeLoadConfigSecurityAnchors, PeLoadConfigXfgAnchors, PeRecoveredString, PeSection,
+    PeStringEncoding, PeThunk, PeTlsCallback, RuntimeFunction,
 };
 
 /// Detect and analyze a supported binary container.
 ///
-/// PE32+ x86-64 images and bounded ELF containers are accepted. ELF ingestion
-/// covers ELF32 and ELF64, either byte order, and any `e_machine` value;
-/// container parsing is machine-independent and records only bounded metadata,
-/// sparse `PT_LOAD` mappings, and symbol-table name claims. Unsupported formats
-/// are reported explicitly rather than guessed from a filename.
+/// PE32+ x86-64 images, bounded ELF containers, and bounded Mach-O containers
+/// are accepted. ELF ingestion covers ELF32 and ELF64, either byte order, and
+/// any `e_machine` value. Mach-O ingestion covers thin 32/64-bit images in
+/// either byte order and fat/universal containers, dispatched only after PE and
+/// ELF so the `0xCAFEBABE` fat magic cannot shadow those formats. Container
+/// parsing is machine-independent and records only bounded metadata and
+/// symbol-table name claims. Unsupported formats are reported explicitly rather
+/// than guessed from a filename.
 pub fn analyze_bytes(bytes: &[u8]) -> Result<BinaryAnalysis, AnalysisError> {
     if bytes.starts_with(b"MZ") {
         return analyze_pe(bytes).map(BinaryAnalysis::Pe);
     }
     if bytes.starts_with(b"\x7fELF") {
         return analyze_elf(bytes).map(BinaryAnalysis::Elf);
+    }
+    if detect_macho(bytes).is_some() {
+        return analyze_macho(bytes).map(BinaryAnalysis::MachO);
     }
 
     let magic = bytes

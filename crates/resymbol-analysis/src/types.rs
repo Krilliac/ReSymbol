@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 pub enum BinaryAnalysis {
     Pe(PeAnalysis),
     Elf(ElfAnalysis),
+    MachO(MachOAnalysis),
 }
 
 impl BinaryAnalysis {
@@ -17,6 +18,7 @@ impl BinaryAnalysis {
         match self {
             Self::Pe(analysis) => &analysis.identity,
             Self::Elf(analysis) => &analysis.identity,
+            Self::MachO(analysis) => &analysis.identity,
         }
     }
 
@@ -26,6 +28,7 @@ impl BinaryAnalysis {
         match self {
             Self::Pe(analysis) => &analysis.symbol_graph,
             Self::Elf(analysis) => &analysis.symbol_graph,
+            Self::MachO(analysis) => &analysis.symbol_graph,
         }
     }
 
@@ -34,6 +37,7 @@ impl BinaryAnalysis {
         match self {
             Self::Pe(analysis) => analysis.validate(),
             Self::Elf(analysis) => analysis.validate(),
+            Self::MachO(analysis) => analysis.validate(),
         }
     }
 
@@ -43,6 +47,7 @@ impl BinaryAnalysis {
         match self {
             Self::Pe(analysis) => analysis.size_of_image as u64,
             Self::Elf(analysis) => analysis.image_size,
+            Self::MachO(analysis) => analysis.image_size,
         }
     }
 }
@@ -259,6 +264,213 @@ impl ElfLoadSegment {
     pub const fn executable(&self) -> bool {
         self.flags & 1 != 0
     }
+}
+
+/// Mach-O byte order carried by a thin image's magic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MachOEndian {
+    Little,
+    Big,
+}
+
+/// Deterministic, container-only analysis of a bounded Mach-O image.
+///
+/// Thin images (32- or 64-bit, either byte order, any `cputype`) contribute
+/// exact segment, section, and symbol metadata plus deterministic
+/// function/global name claims. Fat/universal images retain every architecture
+/// slice's container metadata but deliberately keep an identity-only symbol
+/// graph: a single whole-file binary id cannot host per-architecture RVA claims
+/// without collisions across slices, so no per-symbol claim is emitted.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "UncheckedMachOAnalysis")]
+pub struct MachOAnalysis {
+    pub identity: BinaryIdentity,
+    /// Half-open virtual image extent. For a fat container this is the maximum
+    /// slice image size, since one identity must expose a single `image_size`.
+    pub image_size: u64,
+    pub container: MachOContainer,
+    /// Exact identity plus deterministic name claims (thin) or identity-only (fat).
+    pub symbol_graph: SymbolGraph,
+}
+
+impl MachOAnalysis {
+    /// Validate cross-field invariants and the deterministic base graph.
+    pub fn validate(&self) -> Result<(), crate::AnalysisError> {
+        crate::macho::validate_macho_analysis(self)
+    }
+
+    /// Rebuild the base graph deterministically from stored container fields.
+    pub fn rebuild_symbol_graph(&self) -> Result<SymbolGraph, crate::AnalysisError> {
+        crate::macho::build_symbol_graph(&self.identity, &self.container)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UncheckedMachOAnalysis {
+    identity: BinaryIdentity,
+    image_size: u64,
+    container: MachOContainer,
+    symbol_graph: SymbolGraph,
+}
+
+impl TryFrom<UncheckedMachOAnalysis> for MachOAnalysis {
+    type Error = crate::AnalysisError;
+
+    fn try_from(value: UncheckedMachOAnalysis) -> Result<Self, Self::Error> {
+        let analysis = Self {
+            identity: value.identity,
+            image_size: value.image_size,
+            container: value.container,
+            symbol_graph: value.symbol_graph,
+        };
+        analysis.validate()?;
+        Ok(analysis)
+    }
+}
+
+/// A thin single-architecture image or a fat/universal container of slices.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "body", rename_all = "kebab-case")]
+pub enum MachOContainer {
+    Thin(MachOImage),
+    Fat(MachOFat),
+}
+
+/// One parsed thin Mach-O image: header facts plus bounded container tables.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MachOImage {
+    pub endian: MachOEndian,
+    /// Whether the container magic selected the 64-bit header and record widths.
+    pub is_64: bool,
+    pub cputype: i32,
+    pub cpusubtype: i32,
+    pub filetype: u32,
+    pub ncmds: u32,
+    pub flags: u32,
+    /// Lowest non-`__PAGEZERO` segment virtual address.
+    pub image_base: u64,
+    /// Half-open virtual extent from `image_base` to the highest mapped end.
+    pub image_size: u64,
+    /// `LC_MAIN` entry file offset, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_offset: Option<u64>,
+    /// Whether an `LC_UNIXTHREAD` entry-state command was present.
+    #[serde(default)]
+    pub has_unixthread: bool,
+    pub segments: Vec<MachOSegment>,
+    /// Sections flattened in load order; a symbol's `n_sect` is a 1-based index.
+    pub sections: Vec<MachOSection>,
+    #[serde(default)]
+    pub symbols: Vec<MachOSymbol>,
+    /// Whether the symbol scan hit its fixed retention cap before finishing.
+    #[serde(default)]
+    pub symbol_scan_truncated: bool,
+}
+
+/// A fat/universal container's architecture slices.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MachOFat {
+    /// Whether the fat header used the 64-bit (`FAT_MAGIC_64`) arch records.
+    pub is_64: bool,
+    pub slices: Vec<MachOArchSlice>,
+}
+
+/// One architecture slice of a fat/universal container.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MachOArchSlice {
+    /// Zero-based position in the fat architecture table.
+    pub index: u32,
+    pub cputype: i32,
+    pub cpusubtype: i32,
+    /// Byte offset of this slice within the whole fat file.
+    pub offset: u64,
+    /// Byte length of this slice within the whole fat file.
+    pub size: u64,
+    /// Power-of-two alignment exponent declared by the fat record.
+    pub align: u32,
+    /// Canonical architecture string for this slice's image.
+    pub architecture: String,
+    /// The thin image parsed from this slice's sub-range.
+    pub image: MachOImage,
+}
+
+/// One Mach-O segment load command, widened to hold 64-bit fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MachOSegment {
+    /// Zero-based position among the image's segment load commands.
+    pub index: u32,
+    /// Printable, escaped representation of the fixed-width segment name.
+    pub name: String,
+    /// The exact sixteen bytes of the segment name field.
+    pub raw_name: [u8; 16],
+    pub vmaddr: u64,
+    pub vmsize: u64,
+    pub fileoff: u64,
+    pub filesize: u64,
+    pub maxprot: i32,
+    pub initprot: i32,
+    pub nsects: u32,
+    pub flags: u32,
+    /// Index of this segment's first section in the flat `sections` list.
+    pub first_section: u32,
+}
+
+impl MachOSegment {
+    #[must_use]
+    pub const fn readable(&self) -> bool {
+        self.initprot & 0x1 != 0
+    }
+
+    #[must_use]
+    pub const fn writable(&self) -> bool {
+        self.initprot & 0x2 != 0
+    }
+
+    #[must_use]
+    pub const fn executable(&self) -> bool {
+        self.initprot & 0x4 != 0
+    }
+}
+
+/// One Mach-O section record, widened to hold 64-bit fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MachOSection {
+    /// Zero-based position in the flat, load-ordered section list.
+    pub index: u32,
+    /// Index of the owning segment in the image's `segments` list.
+    pub segment_index: u32,
+    pub name: String,
+    pub raw_name: [u8; 16],
+    pub segment_name: String,
+    pub raw_segment_name: [u8; 16],
+    pub addr: u64,
+    pub size: u64,
+    pub offset: u32,
+    pub align: u32,
+    pub reloff: u32,
+    pub nreloc: u32,
+    pub flags: u32,
+}
+
+/// One bounded symbol recovered from a Mach-O `LC_SYMTAB` string/nlist table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MachOSymbol {
+    /// Zero-based position within the symbol table.
+    pub table_index: u32,
+    /// Non-empty name resolved from the linked string table.
+    pub name: String,
+    pub n_type: u8,
+    pub n_sect: u8,
+    pub n_desc: u16,
+    pub n_value: u64,
 }
 
 /// Deterministic analysis of one PE32+ x86-64 image.

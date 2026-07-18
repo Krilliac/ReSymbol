@@ -76,6 +76,10 @@ pub enum AnalysisError {
         second: usize,
         space: &'static str,
     },
+    #[error("invalid Mach-O magic (first bytes: {magic})")]
+    InvalidMachOMagic { magic: String },
+    #[error("Mach-O fat slice {index} is not a supported thin Mach-O image")]
+    InvalidMachOSlice { index: u32 },
     #[error("failed to construct a validated symbol claim: {0}")]
     Claim(#[from] ClaimValidationError),
     #[error("failed to construct the symbol graph: {0}")]
