@@ -8,6 +8,18 @@ prereleases; breaking changes remain explicit.
 
 ### Added
 
+- Made the Workbench's no-write static preview mandatory authority for patched-binary publication.
+  File selection now opens an explicit confirmation modal bound to the exact source identity,
+  canonical request/plan fingerprint, deterministic output identity, warnings, edit counts, and
+  canonical create-new destination. The worker receives that sealed confirmation instead of raw
+  UI drafts, rebuilds and fingerprints the plan again, re-reads the source path immediately before
+  staging, and requires the regenerated output identity and warnings to equal the preview.
+  Publication rejects existing filesystem entries including dangling links and hardlinks, unsafe
+  Windows device/alternate-stream/trailing-dot-or-space aliases, stale source contents, substituted
+  evidence, and mismatched receipts without clearing drafts or leaving staging residue. Successful
+  draft clearing requires an exact echoed confirmation, destination, source, output, and warning
+  receipt. A deterministic `static-patch-confirmation` visual scenario opens the real modal after a
+  worker-owned no-write preview without invoking a native picker or creating a binary.
 - Added a no-write static patch validation preview to the Workbench. The bounded application-service
   worker rebuilds the exact canonical edit plan, applies it only to the retained verified source
   bytes in memory, and reports the exact source/output identities, deterministic output SHA-256,

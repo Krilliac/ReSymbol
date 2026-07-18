@@ -18,7 +18,7 @@ use resymbol_analysis::{
 use resymbol_core::{BinaryFormat, BinaryId, BinaryIdentity, ClaimValidationError};
 use thiserror::Error;
 
-use crate::{AppServices, ProjectSnapshot};
+use crate::{AppError, AppServices, ProjectSnapshot};
 
 const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 const X86_NOP: u8 = 0x90;
@@ -612,6 +612,205 @@ impl AppServices {
         let image = self.apply_static_patch(project, plan)?;
         publish_image_new(&image, output)
     }
+
+    /// Publish only the exact image and warnings accepted by a prior preview.
+    ///
+    /// This is the GUI-safe publication boundary. The create-new destination
+    /// supplied by the caller must already be canonical and sealed; this method
+    /// re-resolves it only to reject a changed binding. It then re-reads the
+    /// verified source from disk and independently reapplies the plan. No staging
+    /// file is created unless the destination and fresh image still match the
+    /// preview evidence supplied by the caller.
+    pub fn publish_static_patch_new_confirmed(
+        &self,
+        project: &ProjectSnapshot,
+        plan: &StaticPatchPlan,
+        expected_output: &BinaryIdentity,
+        expected_warnings: &[StaticPatchWarning; 2],
+        output: impl AsRef<Path>,
+    ) -> Result<PublishedStaticPatch, StaticPatchError> {
+        expected_output
+            .validate()
+            .map_err(StaticPatchError::InvalidExpectedOutputIdentity)?;
+
+        let output = output.as_ref();
+        let revalidated_output = canonical_new_output_path(output)?;
+        if revalidated_output != output {
+            return Err(StaticPatchError::DestinationBindingChanged {
+                sealed: output.to_path_buf(),
+                resolved: revalidated_output,
+            });
+        }
+        let source_path = project
+            .verified_source_path()
+            .ok_or(StaticPatchError::ExactSourceRequired)?;
+        if paths_refer_to_same_location(source_path, output) {
+            return Err(StaticPatchError::OutputMatchesSource {
+                path: output.to_path_buf(),
+            });
+        }
+
+        // The retained project bytes are immutable, but publication must also
+        // prove that the source path still names the exact reviewed binary.
+        verify_current_source_identity(source_path, plan.source_identity()).map_err(|source| {
+            StaticPatchError::CurrentSourceRevalidation {
+                path: source_path.to_path_buf(),
+                source: Box::new(source),
+            }
+        })?;
+
+        let image = self.apply_static_patch(project, plan)?;
+        if image.output_identity() != expected_output {
+            return Err(StaticPatchError::PreviewOutputMismatch {
+                expected: Box::new(expected_output.clone()),
+                actual: Box::new(image.output_identity().clone()),
+            });
+        }
+        if image.warnings() != expected_warnings.as_slice() {
+            return Err(StaticPatchError::PreviewWarningsMismatch);
+        }
+        publish_image_new(&image, output)
+    }
+}
+
+fn canonical_new_output_path(output: &Path) -> Result<PathBuf, StaticPatchError> {
+    validate_new_output_path(output)?;
+    let file_name = output
+        .file_name()
+        .ok_or_else(|| StaticPatchError::InvalidOutputPath {
+            path: output.to_path_buf(),
+        })?;
+    let parent = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let canonical_parent = fs::canonicalize(parent)
+        .map_err(|source| StaticPatchError::io("resolve output directory", parent, source))?;
+    let canonical = canonical_parent.join(file_name);
+    validate_new_output_path(&canonical)?;
+    Ok(canonical)
+}
+
+fn verify_current_source_identity(
+    source_path: &Path,
+    expected: &BinaryIdentity,
+) -> Result<(), AppError> {
+    let canonical = fs::canonicalize(source_path)
+        .map_err(|source| AppError::io("resolve current source path", source_path, source))?;
+    let file = fs::File::open(&canonical)
+        .map_err(|source| AppError::io("open current source", &canonical, source))?;
+    let metadata = file
+        .metadata()
+        .map_err(|source| AppError::io("inspect current source", &canonical, source))?;
+    if !metadata.is_file() {
+        return Err(AppError::NotRegularFile { path: canonical });
+    }
+    let declared_size = metadata.len();
+    if declared_size != expected.size {
+        return Err(AppError::SourceSizeMismatch {
+            path: canonical,
+            expected: expected.size,
+            actual: declared_size,
+        });
+    }
+    let (actual_id, actual_size) = BinaryId::digest_reader(file)
+        .map_err(|source| AppError::io("hash current source", &canonical, source))?;
+    if actual_size != declared_size {
+        return Err(AppError::FileSizeChanged {
+            path: canonical,
+            expected: declared_size,
+            actual: actual_size,
+        });
+    }
+    if actual_id != expected.id {
+        return Err(AppError::SourceIdentityMismatch {
+            path: canonical,
+            expected: expected.id.to_string(),
+            actual: actual_id.to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_new_output_path(output: &Path) -> Result<(), StaticPatchError> {
+    #[cfg(not(windows))]
+    if output.file_name().is_none() {
+        return Err(StaticPatchError::InvalidOutputPath {
+            path: output.to_path_buf(),
+        });
+    }
+    #[cfg(windows)]
+    {
+        let file_name = output
+            .file_name()
+            .ok_or_else(|| StaticPatchError::InvalidOutputPath {
+                path: output.to_path_buf(),
+            })?;
+        validate_windows_output_name(output, file_name)?;
+    }
+
+    match fs::symlink_metadata(output) {
+        Ok(_) => Err(StaticPatchError::TargetAlreadyExists {
+            path: output.to_path_buf(),
+        }),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(StaticPatchError::io(
+            "inspect patched binary destination",
+            output,
+            source,
+        )),
+    }
+}
+
+#[cfg(windows)]
+fn validate_windows_output_name(
+    output: &Path,
+    file_name: &std::ffi::OsStr,
+) -> Result<(), StaticPatchError> {
+    let Some(name) = file_name.to_str() else {
+        return Err(StaticPatchError::UnsafeWindowsOutputName {
+            path: output.to_path_buf(),
+            reason: "the final path component is not valid Unicode",
+        });
+    };
+    let unsafe_reason = if name.contains(':') {
+        Some("alternate data stream syntax is not permitted")
+    } else if name.ends_with('.') || name.ends_with(' ') {
+        Some("trailing dots or spaces are not permitted")
+    } else if name
+        .chars()
+        .any(|character| character.is_control() || r#"<>"|?*"#.contains(character))
+    {
+        Some("reserved Windows filename characters are not permitted")
+    } else {
+        let stem = name.split('.').next().unwrap_or_default();
+        let stem = stem.trim_end_matches(['.', ' ']).to_ascii_uppercase();
+        let numbered_device = stem
+            .strip_prefix("COM")
+            .or_else(|| stem.strip_prefix("LPT"))
+            .is_some_and(|number| {
+                matches!(
+                    number,
+                    "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                )
+            });
+        if matches!(
+            stem.as_str(),
+            "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$" | "CONIN$" | "CONOUT$"
+        ) || numbered_device
+        {
+            Some("reserved DOS device names are not permitted")
+        } else {
+            None
+        }
+    };
+    if let Some(reason) = unsafe_reason {
+        return Err(StaticPatchError::UnsafeWindowsOutputName {
+            path: output.to_path_buf(),
+            reason,
+        });
+    }
+    Ok(())
 }
 
 fn paths_refer_to_same_location(source: &Path, output: &Path) -> bool {
@@ -864,11 +1063,7 @@ fn publish_image_new_with_durability_probe(
     output: &Path,
     durability_probe: impl FnOnce(&Path, &Path) -> StaticPatchDurability,
 ) -> Result<PublishedStaticPatch, StaticPatchError> {
-    if output.file_name().is_none() {
-        return Err(StaticPatchError::InvalidOutputPath {
-            path: output.to_path_buf(),
-        });
-    }
+    validate_new_output_path(output)?;
     let parent = output
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -1048,6 +1243,8 @@ pub enum StaticPatchError {
     },
     #[error("the source binary identity is invalid: {0}")]
     InvalidSourceIdentity(ClaimValidationError),
+    #[error("the preview output identity is invalid: {0}")]
+    InvalidExpectedOutputIdentity(ClaimValidationError),
     #[error("the analysis model is invalid: {0}")]
     InvalidAnalysis(AnalysisError),
     #[error("static patching currently supports analyzed PE images only")]
@@ -1146,10 +1343,32 @@ pub enum StaticPatchError {
     },
     #[error("static patch publication requires the project's exact verified source binary")]
     ExactSourceRequired,
+    #[error("cannot revalidate exact source `{path}` immediately before publication: {source}")]
+    CurrentSourceRevalidation {
+        path: PathBuf,
+        #[source]
+        source: Box<AppError>,
+    },
+    #[error(
+        "freshly patched output identity does not match the confirmed preview: expected {expected:?}, found {actual:?}"
+    )]
+    PreviewOutputMismatch {
+        expected: Box<BinaryIdentity>,
+        actual: Box<BinaryIdentity>,
+    },
+    #[error("freshly generated patch warnings do not match the confirmed preview")]
+    PreviewWarningsMismatch,
     #[error("patched binary output path `{path}` does not name a file")]
     InvalidOutputPath { path: PathBuf },
+    #[error(
+        "sealed patched binary destination `{sealed}` now resolves to `{resolved}`; publication authority is no longer valid"
+    )]
+    DestinationBindingChanged { sealed: PathBuf, resolved: PathBuf },
     #[error("patched binary output path `{path}` is the verified source path")]
     OutputMatchesSource { path: PathBuf },
+    #[cfg(windows)]
+    #[error("unsafe Windows patched binary output path `{path}`: {reason}")]
+    UnsafeWindowsOutputName { path: PathBuf, reason: &'static str },
     #[error("refusing to overwrite existing patched binary `{path}`")]
     TargetAlreadyExists { path: PathBuf },
     #[error(

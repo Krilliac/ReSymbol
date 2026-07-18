@@ -185,10 +185,16 @@ are called out explicitly without pretending the arbitrary-byte escape hatch is 
 verified source buffer is never changed. All add/edit operations retain canonical RVA ordering and
 revalidate overlap, count, per-edit, and aggregate-byte limits before swapping draft state.
 
-**Create New Patched Binary** accepts the resulting drafts, then performs checked plan construction,
-source identity and byte revalidation, and create-new publication on the application-service worker.
-It writes only a new binary, never the open source or a process, and presents signature/checksum
-warnings. Static
+**Create New Patched Binary** is enabled only for a successful preview of the exact current drafts.
+After selecting a path, an explicit confirmation modal shows the exact source, canonical
+request/plan, and expected output SHA-256 values, edit and changed-byte counts, integrity warnings,
+and canonical create-new destination. Confirming sends sealed preview evidence rather than a fresh
+raw draft list. The worker independently rebuilds and fingerprints the plan, re-reads the exact
+source from disk immediately before staging, requires the fresh output and warnings to match the
+preview, and validates the echoed receipt before the bound drafts are cleared. Existing entries,
+links, Windows device or alternate-stream aliases, source drift, changed drafts, and substituted
+receipts fail closed without draft loss or staging residue. It writes only a new binary, never the
+open source or a process, and presents signature/checksum warnings. Static
 patches and ordinary exports share one canonical destination reservation, so their worker-owned
 publication lifecycles cannot overlap. A successful patch receipt requires the named destination to
 be reopened and match the expected exact size and SHA-256; post-publication directory-sync failure

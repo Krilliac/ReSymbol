@@ -1,6 +1,6 @@
 # Workbench visual captures
 
-ReSymbol's standard deterministic capture contract covers twelve scenarios for the checked-in
+ReSymbol's standard deterministic capture contract covers thirteen scenarios for the checked-in
 symbolized MSVC fixture:
 
 - `open-empty` shows the unmistakable **Open Binary** empty state without invoking a native dialog;
@@ -12,6 +12,10 @@ symbolized MSVC fixture:
 - `exact-byte-editor` opens the real static-only editor on that same canonical branch with a
   deterministic same-length condition inversion, preserving immutable original evidence while
   showing a complete replacement decode and an enabled queue action without queuing or publishing;
+- `static-patch-confirmation` queues one fixed exact NOP draft, waits for the real worker-owned
+  no-write preview, resolves a canonical create-new destination, and opens the explicit publication
+  modal with bound source/plan/output hashes and warnings without invoking a picker or writing a
+  patched binary;
 - `binary-switch-confirmation` binds a real unsaved review decision and shows the deterministic
   replacement confirmation with a synthetic, never-opened path;
 - `debugger-sandbox` shows the non-executing discovery surface, while
@@ -55,7 +59,7 @@ disposable output directory; they do not replace the default checked-in referenc
 
 The default output directory is `docs/images`. Use `-OutputDirectory <path>` for disposable review
 artifacts or `-SkipBuild` after explicitly building
-`resymbol-workbench --features screenshot --bin resymbol-workbench`. A default run writes the twelve
+`resymbol-workbench --features screenshot --bin resymbol-workbench`. A default run writes the thirteen
 standard PNGs and `capture-manifest.json`. Manifest schema 2 records the capture-set name, requested
 view names, exact expected artifact names, dimensions, byte sizes, and SHA-256 hashes for the input
 fixture and outputs. The script refuses to write a successful manifest when the captured artifact
@@ -71,12 +75,12 @@ has a bounded process timeout so a failed GUI startup cannot occupy a CI runner 
 Its `requested_views`, `expected_artifacts`, and `captures` entries must agree with every
 `workbench-*.png` actually present in that directory. These captures document accepted appearance
 and make visual changes reviewable in source control, but they are not automated pixel-equivalence
-thresholds. The current manifest identifies the eleven previously reviewed reference PNGs
-explicitly; the next intentional default refresh promotes the complete twelve-scenario standard set
-without pretending that the new editor pixels have already been reviewed.
+thresholds. The current manifest identifies the twelve previously reviewed reference PNGs
+explicitly; the next intentional default refresh promotes the complete thirteen-scenario standard
+set without pretending that the new confirmation pixels have already been reviewed.
 
 When intentionally updating the references, run the script with its default output directory,
-inspect all twelve full-size images for layout, clipping, stale or duplicate widget warnings,
+inspect all thirteen full-size images for layout, clipping, stale or duplicate widget warnings,
 incorrect state, and accidental hover styling, then review the manifest hashes and commit the
 manifest plus every PNG whose bytes changed. A manually replaced individual image or manifest-only
 edit is not a complete reference refresh; CI compares the reference manifest's declared view and
@@ -84,7 +88,7 @@ artifact names with the files on disk. Byte-identical regenerated images do not 
 objects.
 
 The Windows visual-review workflow runs for relevant crate, fixture, capture-tool, reference, and
-Rust dependency changes. It regenerates all twelve standard scenarios plus a separate focused
+Rust dependency changes. It regenerates all thirteen standard scenarios plus a separate focused
 Functions view at 1024x680. CI validates PNG format, each scenario's exact dimensions, schema-2
 manifest metadata, the complete stable view and artifact-name contract, and checked-in reference
 manifest/file agreement. It uploads the files for three days with PNG recompression disabled. CI

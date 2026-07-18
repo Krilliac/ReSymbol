@@ -10,6 +10,7 @@
                             "disassembly",
                             "disassembly-actions",
                             "exact-byte-editor",
+                            "static-patch-confirmation",
                             "binary-switch-confirmation",
                             "debugger-sandbox",
                             "debugger-readiness-result",
@@ -24,6 +25,7 @@
                                "workbench-disassembly.png",
                                "workbench-disassembly-actions.png",
                                "workbench-exact-byte-editor.png",
+                               "workbench-static-patch-confirmation.png",
                                "workbench-binary-switch-confirmation.png",
                                "workbench-debugger-sandbox.png",
                                "workbench-debugger-readiness-result.png",
@@ -106,6 +108,14 @@
                          "height":  900,
                          "bytes":  413875,
                          "sha256":  "d30ef12b5f3cbf937762f475b28ecd1b7696a568cfa3a6e199e637f052776855"
+                     },
+                     {
+                         "file":  "workbench-static-patch-confirmation.png",
+                         "view":  "static-patch-confirmation",
+                         "width":  1440,
+                         "height":  900,
+                         "bytes":  440201,
+                         "sha256":  "ae380135608377cd2020837875421b332b84b04e6af3f9a555d8d5fabf5eb35a"
                      },
                      {
                          "file":  "workbench-binary-switch-confirmation.png",

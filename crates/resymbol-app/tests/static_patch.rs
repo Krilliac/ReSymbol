@@ -27,6 +27,14 @@ fn write_source(temp: &TempDir) -> std::path::PathBuf {
     path
 }
 
+fn canonical_new_path(path: &std::path::Path) -> std::path::PathBuf {
+    let file_name = path.file_name().expect("new path has a file name");
+    let parent = path.parent().expect("new path has a parent");
+    fs::canonicalize(parent)
+        .expect("canonicalize new-path parent")
+        .join(file_name)
+}
+
 fn directory_entries(path: &std::path::Path) -> BTreeSet<std::ffi::OsString> {
     fs::read_dir(path)
         .expect("read test directory")
@@ -391,6 +399,270 @@ fn publication_is_create_new_and_cleans_staging_on_failure() {
             [THUNK_FILE_OFFSET..THUNK_FILE_OFFSET + 5],
         &[0x90; 5]
     );
+    assert_eq!(fs::read(&source).expect("read unchanged source"), EXACT_PE);
+}
+
+#[test]
+fn confirmed_publication_requires_exact_preview_evidence_before_staging() {
+    let temp = TempDir::new().expect("create temp directory");
+    let source = write_source(&temp);
+    let services = AppServices::default();
+    let project = services.analyze_binary(&source).expect("analyze exact PE");
+    let request = StaticPatchEditRequest::nop_instruction(THUNK_RVA, THUNK_BYTES, "Disable jump")
+        .expect("valid NOP request");
+    let plan = StaticPatchPlan::new(
+        project.session().base_analysis().identity(),
+        project.session().base_analysis(),
+        vec![request],
+    )
+    .expect("valid patch plan");
+    let preview = services
+        .apply_static_patch(&project, &plan)
+        .expect("apply preview image");
+    let warnings = [preview.warnings()[0], preview.warnings()[1]];
+    let output = canonical_new_path(&temp.path().join("confirmed.exe"));
+
+    let receipt = services
+        .publish_static_patch_new_confirmed(
+            &project,
+            &plan,
+            preview.output_identity(),
+            &warnings,
+            &output,
+        )
+        .expect("publish exact preview");
+    assert_eq!(receipt.path(), output);
+    assert_eq!(receipt.output_identity(), preview.output_identity());
+    assert_eq!(receipt.warnings(), warnings);
+
+    let mismatched_output = canonical_new_path(&temp.path().join("mismatched.exe"));
+    let mismatched_identity = resymbol_core::BinaryIdentity {
+        id: resymbol_core::BinaryId::digest(b"not-the-previewed-image"),
+        ..preview.output_identity().clone()
+    };
+    let before_identity_rejection = directory_entries(temp.path());
+    assert!(matches!(
+        services.publish_static_patch_new_confirmed(
+            &project,
+            &plan,
+            &mismatched_identity,
+            &warnings,
+            &mismatched_output,
+        ),
+        Err(StaticPatchError::PreviewOutputMismatch { .. })
+    ));
+    assert_eq!(
+        directory_entries(temp.path()),
+        before_identity_rejection,
+        "identity mismatch must not create a destination or staging residue"
+    );
+
+    let mismatched_warnings_output = canonical_new_path(&temp.path().join("warning-mismatch.exe"));
+    let reversed_warnings = [warnings[1], warnings[0]];
+    let before_warning_rejection = directory_entries(temp.path());
+    assert!(matches!(
+        services.publish_static_patch_new_confirmed(
+            &project,
+            &plan,
+            preview.output_identity(),
+            &reversed_warnings,
+            &mismatched_warnings_output,
+        ),
+        Err(StaticPatchError::PreviewWarningsMismatch)
+    ));
+    assert_eq!(
+        directory_entries(temp.path()),
+        before_warning_rejection,
+        "warning mismatch must not create a destination or staging residue"
+    );
+
+    let alias_parent = temp.path().join("alias-parent");
+    fs::create_dir(&alias_parent).expect("create lexical alias parent");
+    let alias_output = alias_parent.join("..").join("alias-destination.exe");
+    let resolved_output = canonical_new_path(&alias_output);
+    assert_ne!(alias_output, resolved_output);
+    let before_binding_rejection = directory_entries(temp.path());
+    assert!(matches!(
+        services.publish_static_patch_new_confirmed(
+            &project,
+            &plan,
+            preview.output_identity(),
+            &warnings,
+            &alias_output,
+        ),
+        Err(StaticPatchError::DestinationBindingChanged {
+            sealed,
+            resolved,
+        }) if sealed == alias_output && resolved == resolved_output
+    ));
+    assert_eq!(
+        directory_entries(temp.path()),
+        before_binding_rejection,
+        "destination-binding rejection must not create output or staging residue"
+    );
+    assert!(!resolved_output.exists());
+    assert_eq!(fs::read(&source).expect("read unchanged source"), EXACT_PE);
+}
+
+#[test]
+fn confirmed_publication_rechecks_source_on_disk_before_staging() {
+    let temp = TempDir::new().expect("create temp directory");
+    let source = write_source(&temp);
+    let services = AppServices::default();
+    let project = services.analyze_binary(&source).expect("analyze exact PE");
+    let request = StaticPatchEditRequest::nop_instruction(THUNK_RVA, THUNK_BYTES, "Disable jump")
+        .expect("valid NOP request");
+    let plan = StaticPatchPlan::new(
+        project.session().base_analysis().identity(),
+        project.session().base_analysis(),
+        vec![request],
+    )
+    .expect("valid patch plan");
+    let preview = services
+        .apply_static_patch(&project, &plan)
+        .expect("apply preview image");
+    let warnings = [preview.warnings()[0], preview.warnings()[1]];
+    let output = canonical_new_path(&temp.path().join("stale-source.exe"));
+    let mut changed_source = EXACT_PE.to_vec();
+    changed_source[0x200] ^= 0x01;
+    fs::write(&source, &changed_source).expect("change source after preview");
+    let entries_before = directory_entries(temp.path());
+
+    assert!(matches!(
+        services.publish_static_patch_new_confirmed(
+            &project,
+            &plan,
+            preview.output_identity(),
+            &warnings,
+            &output,
+        ),
+        Err(StaticPatchError::CurrentSourceRevalidation { .. })
+    ));
+    assert_eq!(
+        directory_entries(temp.path()),
+        entries_before,
+        "stale source rejection must not create a destination or staging residue"
+    );
+    assert!(!output.exists());
+    assert_eq!(
+        fs::read(&source).expect("read changed source"),
+        changed_source
+    );
+}
+
+#[test]
+fn confirmed_publication_rejects_existing_link_entries_without_touching_source() {
+    let temp = TempDir::new().expect("create temp directory");
+    let source = write_source(&temp);
+    let services = AppServices::default();
+    let project = services.analyze_binary(&source).expect("analyze exact PE");
+    let request = StaticPatchEditRequest::nop_instruction(THUNK_RVA, THUNK_BYTES, "Disable jump")
+        .expect("valid NOP request");
+    let plan = StaticPatchPlan::new(
+        project.session().base_analysis().identity(),
+        project.session().base_analysis(),
+        vec![request],
+    )
+    .expect("valid patch plan");
+    let preview = services
+        .apply_static_patch(&project, &plan)
+        .expect("apply preview image");
+    let warnings = [preview.warnings()[0], preview.warnings()[1]];
+
+    let hardlink = canonical_new_path(&temp.path().join("source-hardlink.exe"));
+    fs::hard_link(&source, &hardlink).expect("create source hardlink");
+    let before_hardlink_rejection = directory_entries(temp.path());
+    assert!(matches!(
+        services.publish_static_patch_new_confirmed(
+            &project,
+            &plan,
+            preview.output_identity(),
+            &warnings,
+            &hardlink,
+        ),
+        Err(StaticPatchError::TargetAlreadyExists { .. })
+    ));
+    assert_eq!(directory_entries(temp.path()), before_hardlink_rejection);
+    assert_eq!(fs::read(&source).expect("read source"), EXACT_PE);
+    assert_eq!(fs::read(&hardlink).expect("read source hardlink"), EXACT_PE);
+
+    let dangling = canonical_new_path(&temp.path().join("dangling-output.exe"));
+    let missing_target = temp.path().join("missing-target.exe");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&missing_target, &dangling).expect("create dangling symlink");
+    #[cfg(windows)]
+    if std::os::windows::fs::symlink_file(&missing_target, &dangling).is_err() {
+        return;
+    }
+    let before_dangling_rejection = directory_entries(temp.path());
+    assert!(matches!(
+        services.publish_static_patch_new_confirmed(
+            &project,
+            &plan,
+            preview.output_identity(),
+            &warnings,
+            &dangling,
+        ),
+        Err(StaticPatchError::TargetAlreadyExists { .. })
+    ));
+    assert_eq!(
+        directory_entries(temp.path()),
+        before_dangling_rejection,
+        "dangling link rejection must not leave staging residue"
+    );
+    assert_eq!(fs::read(&source).expect("read unchanged source"), EXACT_PE);
+}
+
+#[cfg(windows)]
+#[test]
+fn confirmed_publication_rejects_windows_alias_names_before_staging() {
+    let temp = TempDir::new().expect("create temp directory");
+    let source = write_source(&temp);
+    let services = AppServices::default();
+    let project = services.analyze_binary(&source).expect("analyze exact PE");
+    let request = StaticPatchEditRequest::nop_instruction(THUNK_RVA, THUNK_BYTES, "Disable jump")
+        .expect("valid NOP request");
+    let plan = StaticPatchPlan::new(
+        project.session().base_analysis().identity(),
+        project.session().base_analysis(),
+        vec![request],
+    )
+    .expect("valid patch plan");
+    let preview = services
+        .apply_static_patch(&project, &plan)
+        .expect("apply preview image");
+    let warnings = [preview.warnings()[0], preview.warnings()[1]];
+    let entries_before = directory_entries(temp.path());
+
+    for name in [
+        "NUL.exe",
+        "COM1.bin",
+        "COM¹.bin",
+        "COM².bin",
+        "COM³.bin",
+        "LPT¹.bin",
+        "LPT².bin",
+        "LPT³.bin",
+        "patched.exe:stream",
+        "trailing-dot.",
+    ] {
+        let output = canonical_new_path(&temp.path().join(name));
+        assert!(matches!(
+            services.publish_static_patch_new_confirmed(
+                &project,
+                &plan,
+                preview.output_identity(),
+                &warnings,
+                &output,
+            ),
+            Err(StaticPatchError::UnsafeWindowsOutputName { .. })
+        ));
+        assert_eq!(
+            directory_entries(temp.path()),
+            entries_before,
+            "unsafe Windows path `{name}` left a filesystem effect"
+        );
+    }
     assert_eq!(fs::read(&source).expect("read unchanged source"), EXACT_PE);
 }
 
