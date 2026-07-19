@@ -1,4 +1,4 @@
-//! Minimal, fail-closed PlayStation 2 Emotion Engine/R5900 core decoder.
+//! Minimal, fail-closed PlayStation 2 Emotion Engine/R5900 core decoders.
 //!
 //! This decoder intentionally covers only the frozen scalar core-v1 whitelist.
 //! It never delegates unknown words to a generic MIPS backend, and it reports
@@ -41,6 +41,60 @@ impl InstructionDecoder for Ps2EeR5900LeCoreV1Decoder {
 
         let word = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         decode_word(word, address as u32)
+    }
+}
+
+/// Always-available pure-Rust decoder for the little-endian EE/R5900 core-v1
+/// profile plus the frozen MMI word-immediate-shift-v1 extension.
+#[derive(Debug, Default)]
+pub(crate) struct Ps2EeR5900LeCoreV1MmiWordShiftV1Decoder;
+
+impl Ps2EeR5900LeCoreV1MmiWordShiftV1Decoder {
+    pub(crate) const fn new() -> Self {
+        Self
+    }
+}
+
+impl InstructionDecoder for Ps2EeR5900LeCoreV1MmiWordShiftV1Decoder {
+    fn arch(&self) -> TargetArch {
+        TargetArch::Mips64
+    }
+
+    fn profile(&self) -> DecoderProfile {
+        DecoderProfile::Ps2EeR5900LeCoreV1MmiWordShiftV1
+    }
+
+    fn decode_one(&mut self, bytes: &[u8], address: u64) -> DecodeOutcome {
+        if bytes.len() < 4 {
+            return DecodeOutcome::Truncated {
+                available: bytes.len(),
+            };
+        }
+        if address > u64::from(u32::MAX) || address % 4 != 0 {
+            return DecodeOutcome::Invalid;
+        }
+
+        let word = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        if field(word, 26, 0x3f) == 0x1c {
+            decode_mmi_word_shift(word, address as u32)
+        } else {
+            decode_word(word, address as u32)
+        }
+    }
+}
+
+fn decode_mmi_word_shift(word: u32, address: u32) -> DecodeOutcome {
+    const MASK: u32 = 0xffe0_003f;
+    const PSLLW: u32 = 0x7000_003c;
+    const PSRLW: u32 = 0x7000_003e;
+    const PSRAW: u32 = 0x7000_003f;
+
+    match word & MASK {
+        PSLLW => shift_immediate("psllw", word, address),
+        PSRLW => shift_immediate("psrlw", word, address),
+        PSRAW => shift_immediate("psraw", word, address),
+        _ if matches!(field(word, 0, 0x3f), 0x3c | 0x3e | 0x3f) => DecodeOutcome::Invalid,
+        _ => unsupported(UnsupportedInstructionClass::Ps2EeMmiEncoding),
     }
 }
 

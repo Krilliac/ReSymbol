@@ -33,7 +33,10 @@ does not itself authorize instruction-decoding or control-flow claims.
 Callers may explicitly select the exact in-memory decoder profile
 `ps2-ee-r5900-le-core-v1`. It returns an always-available pure-Rust decoder for
 a frozen, fail-closed scalar R5900 core whitelist and never consults generic
-MIPS or Capstone. Recognized-but-unmodeled MMI, coprocessor, VU macro, and
+MIPS or Capstone. The separate immutable profile
+`ps2-ee-r5900-le-core-v1-mmi-word-shift-v1` preserves that entire contract and
+adds only canonical `PSLLW`, `PSRLW`, and `PSRAW` encodings with `rs = 0`.
+Recognized-but-unmodeled residual MMI, coprocessor, VU macro, and
 conditional-trap spaces return typed unsupported outcomes; reserved and unknown
 words remain invalid. This opt-in API does not identify an input automatically,
 model delay slots, create graph evidence, or change a package, projection,

@@ -4,8 +4,8 @@
 //! disassembly passes (linear preview, control-flow block sweep) can be driven
 //! by more than one instruction decoder. Always-available pure-Rust backends
 //! cover x86/x86-64 through `iced-x86` and the frozen PlayStation 2
-//! EE/R5900 core-v1 profile. When the optional `capstone` feature is enabled, a
-//! Capstone-based backend covers a broad set of other architectures.
+//! EE/R5900 core-v1 profiles. When the optional `capstone` feature is enabled,
+//! a Capstone-based backend covers a broad set of other architectures.
 //!
 //! The abstraction is deliberately minimal and total: every decode attempt maps
 //! to exactly one [`DecodeOutcome`], and no method reads files, maps images, or
@@ -19,7 +19,7 @@ pub(crate) use iced_x86::{
 };
 
 mod ps2_ee_r5900;
-use ps2_ee_r5900::Ps2EeR5900LeCoreV1Decoder;
+use ps2_ee_r5900::{Ps2EeR5900LeCoreV1Decoder, Ps2EeR5900LeCoreV1MmiWordShiftV1Decoder};
 
 #[cfg(feature = "capstone")]
 mod capstone;
@@ -70,6 +70,7 @@ impl TargetArch {
 pub enum DecoderProfile {
     Generic(TargetArch),
     Ps2EeR5900LeCoreV1,
+    Ps2EeR5900LeCoreV1MmiWordShiftV1,
 }
 
 impl DecoderProfile {
@@ -79,6 +80,7 @@ impl DecoderProfile {
         match self {
             Self::Generic(arch) => arch.name(),
             Self::Ps2EeR5900LeCoreV1 => "ps2-ee-r5900-le-core-v1",
+            Self::Ps2EeR5900LeCoreV1MmiWordShiftV1 => "ps2-ee-r5900-le-core-v1-mmi-word-shift-v1",
         }
     }
 }
@@ -220,7 +222,7 @@ pub fn decoder_for(arch: TargetArch) -> Result<Box<dyn InstructionDecoder>, Unsu
 /// Construct a boxed decoder for an explicit selection profile.
 ///
 /// Generic profiles delegate to [`decoder_for`]. The PlayStation 2 Emotion
-/// Engine/R5900 profile returns its dedicated pure-Rust core-v1 decoder without
+/// Engine/R5900 profiles return their dedicated pure-Rust decoders without
 /// consulting Capstone or any generic MIPS backend.
 pub fn decoder_for_profile(
     profile: DecoderProfile,
@@ -228,6 +230,9 @@ pub fn decoder_for_profile(
     match profile {
         DecoderProfile::Generic(arch) => decoder_for(arch).map_err(Into::into),
         DecoderProfile::Ps2EeR5900LeCoreV1 => Ok(Box::new(Ps2EeR5900LeCoreV1Decoder::new())),
+        DecoderProfile::Ps2EeR5900LeCoreV1MmiWordShiftV1 => {
+            Ok(Box::new(Ps2EeR5900LeCoreV1MmiWordShiftV1Decoder::new()))
+        }
     }
 }
 
@@ -381,15 +386,27 @@ mod tests {
             DecoderProfile::Ps2EeR5900LeCoreV1.to_string(),
             "ps2-ee-r5900-le-core-v1"
         );
+        assert_eq!(
+            DecoderProfile::Ps2EeR5900LeCoreV1MmiWordShiftV1.name(),
+            "ps2-ee-r5900-le-core-v1-mmi-word-shift-v1"
+        );
+        assert_eq!(
+            DecoderProfile::Ps2EeR5900LeCoreV1MmiWordShiftV1.to_string(),
+            "ps2-ee-r5900-le-core-v1-mmi-word-shift-v1"
+        );
     }
 
     #[test]
     fn specialized_r5900_profile_uses_the_exact_decoder() {
-        let profile = DecoderProfile::Ps2EeR5900LeCoreV1;
-        let decoder = decoder_for_profile(profile).expect("always-available R5900 decoder");
+        for profile in [
+            DecoderProfile::Ps2EeR5900LeCoreV1,
+            DecoderProfile::Ps2EeR5900LeCoreV1MmiWordShiftV1,
+        ] {
+            let decoder = decoder_for_profile(profile).expect("always-available R5900 decoder");
 
-        assert_eq!(decoder.arch(), TargetArch::Mips64);
-        assert_eq!(decoder.profile(), profile);
+            assert_eq!(decoder.arch(), TargetArch::Mips64);
+            assert_eq!(decoder.profile(), profile);
+        }
     }
 
     #[cfg(not(feature = "capstone"))]
