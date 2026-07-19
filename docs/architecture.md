@@ -221,6 +221,23 @@ ELF identity, and none is serialized into packages, projections, plugins, the CL
 format. Callers own the copyable profile choice and unique boxed decoder; no registry, global state,
 filesystem access, or additional thread-safety contract is introduced.
 
+`DecoderProfile::PS2_EE_R5900_LATEST` is a moving source-level convenience constant that currently
+resolves to the exact packed-compare-gt-v1 enum variant. Any retained selection stores that resolved
+variant, never the alias name. The Workbench is the first UI consumer: it offers no automatic
+selection and enables the bridge only for structured `BinaryAnalysis::Elf` values that are ELF32,
+little-endian, `ET_EXEC`, and `ElfMachine::Mips`. The transient selection and preview bind the full
+`BinaryIdentity`, canonical verified source, exact RVA span, and resolved profile; none enters
+preferences, packages, projections, reviews, plugins, the CLI, or worker/debugger protocols.
+
+The unchanged offline worker still reads an RVA span without knowing a decoder profile. A pure UI
+planner then checks four-byte alignment, one of the exact 16/32/64/128/256-byte sizes, checked RVA
+and preferred-VA spans within the 32-bit ISA domain, and a 64-row ceiling. It constructs the decoder
+stack-locally and decodes at the preferred VA so R5900 J/JAL region bits are correct. Every row and
+address-bearing stop reason is mapped back to RVA for presentation; canonical instruction text keeps
+its preferred-VA operand. Direct targets are translated through the sparse address space, and Follow
+is exposed only when both region membership and exact file offset are proven. This remains a linear,
+read-only preview with no delay-slot, CFG, or function-boundary model.
+
 Core-v1 accepts only aligned, 32-bit-addressed, fixed four-byte little-endian EE words. It decodes a
 frozen scalar whitelist across `SPECIAL`, `REGIMM`, immediate, branch/jump, and scalar load/store
 forms, including EE `LQ`/`SQ`, SA-register moves, and the R5900 three-register `MULT`/`MULTU`
@@ -807,7 +824,8 @@ export crates. The workbench does not fork reconciliation or identity rules from
 The initial shell implements the approved four-region structure: persistent, resizable and
 collapsible project/plugin navigation, a virtualized sortable/filterable function table, a bounded
 Reconstruction Graph, a static Address Space/protection view with an at-most-256-byte worker-owned
-exact-RVA reader, a non-executing Debugger / Sandbox readiness view, an evidence inspector, and a
+exact-RVA reader with automatic PE/x64 and explicitly selected eligible ELF/R5900 linear previews,
+a non-executing Debugger / Sandbox readiness view, an evidence inspector, and a
 progress/warning/log area. The reader constructs one in-process offline client per request, then
 closes the session, releases it, and disconnects before returning a result. The shell accepts that
 result only when its operation, full identity, canonical verified source, span, and lifecycle receipt

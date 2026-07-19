@@ -76,6 +76,14 @@ pub struct LinearInstructionRow {
 }
 
 impl LinearInstructionRow {
+    /// Address in the caller-selected decode domain.
+    ///
+    /// [`Self::rva`] remains the compatibility accessor for existing callers.
+    #[must_use]
+    pub const fn address(&self) -> u64 {
+        self.rva
+    }
+
     #[must_use]
     pub const fn rva(&self) -> u64 {
         self.rva
@@ -100,6 +108,15 @@ impl LinearInstructionRow {
     /// instructions return `None`; this API never guesses a runtime target.
     #[must_use]
     pub const fn direct_target_rva(&self) -> Option<u64> {
+        self.direct_target_rva
+    }
+
+    /// Typed direct target in the caller-selected decode address domain.
+    ///
+    /// [`Self::direct_target_rva`] retains its existing behavior for callers
+    /// that decode in RVA space.
+    #[must_use]
+    pub const fn direct_target_address(&self) -> Option<u64> {
         self.direct_target_rva
     }
 
@@ -205,6 +222,13 @@ pub enum LinearDisassemblyStopReason {
 impl LinearDisassemblyStopReason {
     #[must_use]
     pub fn label(&self) -> String {
+        self.label_in_domain("RVA")
+    }
+
+    /// Render an address-bearing stop reason with an explicit caller-selected
+    /// address-domain label. Existing [`Self::label`] output remains unchanged.
+    #[must_use]
+    pub fn label_in_domain(&self, address_domain: &str) -> String {
         match self {
             Self::EmptyInput => "no verified bytes were supplied".to_owned(),
             Self::EndOfInput => "reached the end of the verified byte span".to_owned(),
@@ -217,10 +241,12 @@ impl LinearDisassemblyStopReason {
                 format!("reached the independent {decoded_instructions}-instruction preview limit")
             }
             Self::InvalidInstruction { rva, .. } => {
-                format!("the selected decoder rejected the encoding at RVA 0x{rva:016X}")
+                format!(
+                    "the selected decoder rejected the encoding at {address_domain} 0x{rva:016X}"
+                )
             }
             Self::UnsupportedInstruction { rva, class, .. } => format!(
-                "the selected decoder does not model {} at RVA 0x{rva:016X}",
+                "the selected decoder does not model {} at {address_domain} 0x{rva:016X}",
                 class.name()
             ),
             Self::TruncatedInstruction {
@@ -233,15 +259,58 @@ impl LinearDisassemblyStopReason {
                     LinearTruncationBoundary::ByteLimit => "the byte preview limit was reached",
                 };
                 format!(
-                    "instruction at RVA 0x{rva:016X} is truncated after {available_bytes} byte(s): {boundary}"
+                    "instruction at {address_domain} 0x{rva:016X} is truncated after {available_bytes} byte(s): {boundary}"
                 )
             }
             Self::AddressOverflow {
                 rva,
                 instruction_length,
             } => format!(
-                "instruction at RVA 0x{rva:016X} with length {instruction_length} overflows the RVA address space"
+                "instruction at {address_domain} 0x{rva:016X} with length {instruction_length} overflows the {address_domain} address space"
             ),
+        }
+    }
+
+    /// Return a copy with every embedded instruction address mapped into a new
+    /// domain. Non-address stop reasons are copied unchanged.
+    #[must_use]
+    pub fn map_address(&self, mut map: impl FnMut(u64) -> u64) -> Self {
+        match self {
+            Self::EmptyInput => Self::EmptyInput,
+            Self::EndOfInput => Self::EndOfInput,
+            Self::ByteLimitReached { decoded_bytes } => Self::ByteLimitReached {
+                decoded_bytes: *decoded_bytes,
+            },
+            Self::InstructionLimitReached {
+                decoded_instructions,
+            } => Self::InstructionLimitReached {
+                decoded_instructions: *decoded_instructions,
+            },
+            Self::InvalidInstruction { rva, offset } => Self::InvalidInstruction {
+                rva: map(*rva),
+                offset: *offset,
+            },
+            Self::UnsupportedInstruction { rva, offset, class } => Self::UnsupportedInstruction {
+                rva: map(*rva),
+                offset: *offset,
+                class: *class,
+            },
+            Self::TruncatedInstruction {
+                rva,
+                available_bytes,
+                boundary,
+            } => Self::TruncatedInstruction {
+                rva: map(*rva),
+                available_bytes: *available_bytes,
+                boundary: *boundary,
+            },
+            Self::AddressOverflow {
+                rva,
+                instruction_length,
+            } => Self::AddressOverflow {
+                rva: map(*rva),
+                instruction_length: *instruction_length,
+            },
         }
     }
 }
@@ -262,6 +331,15 @@ impl LinearDisassemblyPreview {
 
     #[must_use]
     pub const fn start_rva(&self) -> u64 {
+        self.start_rva
+    }
+
+    /// Start address in the caller-selected decode domain.
+    ///
+    /// [`Self::start_rva`] remains the compatibility accessor for existing
+    /// callers that decode in RVA space.
+    #[must_use]
+    pub const fn start_address(&self) -> u64 {
         self.start_rva
     }
 
@@ -431,6 +509,7 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(first.rows().len(), 4);
         assert_eq!(first.rows()[0].rva(), 0x1000);
+        assert_eq!(first.rows()[0].address(), first.rows()[0].rva());
         assert_eq!(first.rows()[0].bytes(), &[0x55]);
         assert_eq!(first.rows()[0].text(), "push rbp");
         assert_eq!(first.rows()[1].text(), "mov rbp,rsp");
@@ -440,6 +519,11 @@ mod tests {
         );
         assert_eq!(first.rows()[2].direct_target_rva(), Some(0x1008));
         assert_eq!(
+            first.rows()[2].direct_target_address(),
+            first.rows()[2].direct_target_rva()
+        );
+        assert_eq!(first.start_address(), first.start_rva());
+        assert_eq!(
             first.rows()[3].flow_control(),
             LinearFlowControlCategory::Return
         );
@@ -447,6 +531,54 @@ mod tests {
         assert_eq!(
             first.stop_reason(),
             &LinearDisassemblyStopReason::EndOfInput
+        );
+    }
+
+    #[test]
+    fn stop_reason_domain_labels_and_address_mapping_are_explicit() {
+        let stop = LinearDisassemblyStopReason::UnsupportedInstruction {
+            rva: 0x1200_0060,
+            offset: 4,
+            class: UnsupportedInstructionClass::Ps2EeCop2Encoding,
+        };
+        let mapped = stop.map_address(|address| address - 0x1200_0000);
+
+        assert_eq!(
+            stop.label_in_domain("Preferred VA"),
+            "the selected decoder does not model ps2-ee-cop2-encoding at Preferred VA 0x0000000012000060"
+        );
+        assert_eq!(
+            mapped.label(),
+            "the selected decoder does not model ps2-ee-cop2-encoding at RVA 0x0000000000000060"
+        );
+        assert_eq!(
+            LinearDisassemblyStopReason::EndOfInput.map_address(|_| unreachable!()),
+            LinearDisassemblyStopReason::EndOfInput
+        );
+        assert_eq!(
+            LinearDisassemblyStopReason::InvalidInstruction {
+                rva: 0x1234,
+                offset: 0,
+            }
+            .label(),
+            "the selected decoder rejected the encoding at RVA 0x0000000000001234"
+        );
+        assert_eq!(
+            LinearDisassemblyStopReason::TruncatedInstruction {
+                rva: 0x1234,
+                available_bytes: 2,
+                boundary: LinearTruncationBoundary::InputEnd,
+            }
+            .label(),
+            "instruction at RVA 0x0000000000001234 is truncated after 2 byte(s): verified input ended"
+        );
+        assert_eq!(
+            LinearDisassemblyStopReason::AddressOverflow {
+                rva: 0x1234,
+                instruction_length: 4,
+            }
+            .label(),
+            "instruction at RVA 0x0000000000001234 with length 4 overflows the RVA address space"
         );
     }
 

@@ -8,6 +8,17 @@ prereleases; breaking changes remain explicit.
 
 ### Added
 
+- Added an explicit, read-only ELF/R5900 Workbench linear preview without changing the existing
+  profile-agnostic offline worker. Only structured ELF32 little-endian `ET_EXEC`/`EM_MIPS` analyses
+  are eligible, no profile is selected automatically, and each transient selection/preview is bound
+  to the full binary identity, canonical source path, exact RVA span, and resolved decoder variant.
+  The planner decodes four-byte words at checked preferred VAs, projects every row and stop address
+  back to RVA, retains preferred-VA J/JAL text, and offers Follow only for targets proven file-backed.
+  R5900 rows expose exactly Copy RVA, Copy Preferred Address, Copy Bytes, Copy Instruction, and
+  Follow Direct Target; PE/x64 automatic preview and edit/live action behavior is unchanged. Added
+  `DecoderProfile::PS2_EE_R5900_LATEST`, currently resolving to the exact packed-compare-gt-v1
+  variant. No preference, package, projection, plugin, CLI, worker, debugger-host, or wire schema
+  changed.
 - Added the immutable, explicitly selected
   `ps2-ee-r5900-le-core-v1-mmi-word-shift-v1-packed-logical-v1-packed-add-v1-packed-sub-v1-packed-compare-gt-v1`
   decoder profile. It preserves all five earlier profiles and adds only `PCGTW`, `PCGTH`, and

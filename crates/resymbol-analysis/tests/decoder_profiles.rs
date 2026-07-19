@@ -83,6 +83,18 @@ fn public_r5900_profile_returns_the_exact_always_available_decoder() {
 }
 
 #[test]
+fn public_latest_r5900_alias_resolves_before_the_factory_is_used() {
+    let exact =
+        DecoderProfile::Ps2EeR5900LeCoreV1MmiWordShiftV1PackedLogicalV1PackedAddV1PackedSubV1PackedCompareGtV1;
+
+    assert_eq!(DecoderProfile::PS2_EE_R5900_LATEST, exact);
+    let decoder = decoder_for_profile(DecoderProfile::PS2_EE_R5900_LATEST)
+        .expect("latest bundled R5900 decoder");
+    assert_eq!(decoder.profile(), exact);
+    assert_eq!(decoder.profile().name(), exact.name());
+}
+
+#[test]
 fn public_generic_x86_profile_delegates_to_the_existing_factory() {
     let mut decoder = decoder_for_profile(DecoderProfile::Generic(TargetArch::X86_64))
         .expect("x86-64 decoder is always available");

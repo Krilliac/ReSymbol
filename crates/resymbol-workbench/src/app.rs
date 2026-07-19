@@ -49,6 +49,11 @@ use crate::{
         FunctionFilter, FunctionRow, FunctionSort, FunctionSortKey, FunctionStatus, LoadedProject,
         ProtectionAssessment, SortDirection,
     },
+    offline_disassembly::{
+        R5900_WARNING, R5900DecoderSelection, R5900InstructionAction, R5900InstructionRow,
+        R5900OfflinePreview, plan_r5900_preview, require_explicit_r5900_eligibility,
+        retain_current_r5900_selection,
+    },
     readiness::{
         DebuggerReadinessEvidence, DebuggerReadinessOutcome, ReadinessProtectionStatus,
         SandboxProviderChoice,
@@ -710,6 +715,7 @@ pub struct WorkbenchApp {
     offline_read_rva_input: String,
     offline_read_size: u32,
     offline_byte_view: OfflineByteView,
+    r5900_decoder_selection: Option<R5900DecoderSelection>,
     selected_disassembly_instruction: Option<usize>,
     disassembly_row_focus_target: Option<usize>,
     pending_static_patch_drafts: PendingStaticPatchDrafts,
@@ -844,6 +850,7 @@ impl WorkbenchApp {
             offline_read_rva_input: "0x00000000".to_owned(),
             offline_read_size: 64,
             offline_byte_view: OfflineByteView::default(),
+            r5900_decoder_selection: None,
             selected_disassembly_instruction: None,
             disassembly_row_focus_target: None,
             pending_static_patch_drafts: PendingStaticPatchDrafts::default(),
@@ -3030,6 +3037,7 @@ impl WorkbenchApp {
         self.plugin_operation.invalidate();
         self.readiness_operation.invalidate();
         self.offline_read.clear();
+        self.r5900_decoder_selection = None;
         if let Some(previous) = self.pending_review_rollback.take() {
             self.review = Some(previous);
         }
@@ -3210,6 +3218,7 @@ impl WorkbenchApp {
         self.review_operation.invalidate();
         self.readiness_operation.invalidate();
         self.offline_read.clear();
+        self.r5900_decoder_selection = None;
         self.pending_review_rollback = None;
         self.readiness_outcome = None;
         self.readiness_error = None;
@@ -3327,6 +3336,7 @@ impl WorkbenchApp {
         self.export_result = None;
         if offline_source_changed {
             self.offline_read.clear();
+            self.r5900_decoder_selection = None;
         }
         self.project = Some(project);
     }
@@ -5598,8 +5608,39 @@ impl WorkbenchApp {
             });
     }
 
+    fn current_r5900_source(&self) -> Option<OfflineSourceBinding> {
+        let project = self.project.as_ref()?;
+        require_explicit_r5900_eligibility(project.session().base_analysis()).ok()?;
+        OfflineSourceBinding::from_project(project)
+    }
+
+    fn reconcile_r5900_selection(&mut self) {
+        let current = self.current_r5900_source();
+        retain_current_r5900_selection(
+            &mut self.r5900_decoder_selection,
+            current
+                .as_ref()
+                .map(|source| (&source.identity, source.canonical_source_path.as_path())),
+        );
+    }
+
+    fn r5900_preview_selected(&self) -> bool {
+        self.r5900_decoder_selection.is_some() && self.current_r5900_source().is_some()
+    }
+
+    fn offline_disassembly_available(&self) -> bool {
+        self.x64_linear_preview_available() || self.r5900_preview_selected()
+    }
+
     fn show_offline_byte_reader(&mut self, ui: &mut egui::Ui, colors: SemanticColors) {
-        let disassembly_available = self.x64_linear_preview_available();
+        self.reconcile_r5900_selection();
+        let x64_disassembly = self.x64_linear_preview_available();
+        let r5900_source = self.current_r5900_source();
+        let r5900_eligible = self.project.as_ref().is_some_and(|project| {
+            require_explicit_r5900_eligibility(project.session().base_analysis()).is_ok()
+        });
+        let r5900_selected = self.r5900_preview_selected();
+        let disassembly_available = x64_disassembly || r5900_selected;
         if !disassembly_available {
             self.offline_byte_view = OfflineByteView::Hex;
             self.selected_disassembly_instruction = None;
@@ -5677,6 +5718,48 @@ impl WorkbenchApp {
                         ui.spinner();
                     }
                 });
+                if r5900_eligible {
+                    let mut select_r5900 = false;
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("Decoder profile").strong());
+                        if let Some(selection) = self.r5900_decoder_selection.as_ref() {
+                            ui.monospace(selection.exact_profile().name());
+                            if ui.button("Clear explicit profile").clicked() {
+                                self.r5900_decoder_selection = None;
+                                self.offline_byte_view = OfflineByteView::Hex;
+                                self.selected_disassembly_instruction = None;
+                                self.disassembly_row_focus_target = None;
+                            }
+                        } else {
+                            select_r5900 = ui
+                                .add_enabled(
+                                    r5900_source.is_some(),
+                                    egui::Button::new("Select exact bundled R5900 profile"),
+                                )
+                                .on_disabled_hover_text(
+                                    "Verify the exact source before selecting a decoder profile.",
+                                )
+                                .clicked();
+                            ui.label(
+                                RichText::new("No instruction decoder is selected automatically.")
+                                    .small()
+                                    .color(colors.secondary_text),
+                            );
+                        }
+                    });
+                    if select_r5900 {
+                        let selection = self.project.as_ref().zip(r5900_source.as_ref()).and_then(
+                            |(project, source)| {
+                                R5900DecoderSelection::explicit_latest(
+                                    project.session().base_analysis(),
+                                    &source.canonical_source_path,
+                                )
+                                .ok()
+                            },
+                        );
+                        self.r5900_decoder_selection = selection;
+                    }
+                }
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new("Preview").strong());
                     ui.selectable_value(&mut self.offline_byte_view, OfflineByteView::Hex, "Hex")
@@ -5687,11 +5770,17 @@ impl WorkbenchApp {
                             OfflineByteView::Disassembly,
                             "Disassembly",
                         )
-                        .on_hover_text("Show bounded x64 linear preview (keyboard: D)");
+                        .on_hover_text(if x64_disassembly {
+                            "Show bounded x64 linear preview (keyboard: D)"
+                        } else {
+                            "Show bounded explicit R5900 linear preview (keyboard: D)"
+                        });
                     });
                     ui.label(
                         RichText::new(if disassembly_available {
                             "H/D switch view; arrow keys select instructions"
+                        } else if r5900_eligible {
+                            "Hex is available; explicitly select the exact R5900 decoder to enable disassembly"
                         } else {
                             "Hex is available; x64 disassembly is PE-only"
                         })
@@ -5751,12 +5840,18 @@ impl WorkbenchApp {
                                             );
                                         }
                                         OfflineByteView::Disassembly => {
-                                            self.show_linear_disassembly_preview(
-                                                ui,
-                                                outcome.span().rva(),
-                                                bytes,
-                                                colors,
-                                            );
+                                            if x64_disassembly {
+                                                self.show_linear_disassembly_preview(
+                                                    ui,
+                                                    outcome.span().rva(),
+                                                    bytes,
+                                                    colors,
+                                                );
+                                            } else {
+                                                self.show_r5900_disassembly_preview(
+                                                    ui, &outcome, bytes, colors,
+                                                );
+                                            }
                                         }
                                     }
                                 }
@@ -5790,7 +5885,9 @@ impl WorkbenchApp {
                 }
             });
 
-        self.show_pending_static_patch_drafts(ui, colors);
+        if self.static_patch_draft_panel_available() {
+            self.show_pending_static_patch_drafts(ui, colors);
+        }
 
         if queue_requested {
             if let Err(error) = self.queue_offline_image_read() {
@@ -5820,7 +5917,7 @@ impl WorkbenchApp {
         });
         if show_hex {
             self.offline_byte_view = OfflineByteView::Hex;
-        } else if show_disassembly && self.x64_linear_preview_available() {
+        } else if show_disassembly && self.offline_disassembly_available() {
             self.offline_byte_view = OfflineByteView::Disassembly;
         }
     }
@@ -5829,6 +5926,12 @@ impl WorkbenchApp {
         self.project.as_ref().is_some_and(|project| {
             matches!(project.session().base_analysis(), BinaryAnalysis::Pe(_))
         })
+    }
+
+    fn static_patch_draft_panel_available(&self) -> bool {
+        self.project
+            .as_ref()
+            .is_some_and(LoadedProject::supports_static_patch_actions)
     }
 
     fn show_offline_hex_preview(&self, ui: &mut egui::Ui, start_rva: u64, bytes: &[u8]) {
@@ -6002,6 +6105,329 @@ impl WorkbenchApp {
                     .color(colors.secondary_text),
                 );
             });
+        }
+    }
+
+    fn show_r5900_disassembly_preview(
+        &mut self,
+        ui: &mut egui::Ui,
+        outcome: &OfflineImageReadOutcome,
+        bytes: &[u8],
+        colors: SemanticColors,
+    ) {
+        let preview = (|| {
+            let project = self.project.as_ref().ok_or_else(|| {
+                "the active project changed before the explicit preview was built".to_owned()
+            })?;
+            let selection = self.r5900_decoder_selection.as_ref().ok_or_else(|| {
+                "an explicit R5900 decoder profile has not been selected".to_owned()
+            })?;
+            let address_space = project
+                .static_address_space
+                .as_ref()
+                .ok_or_else(|| "the active ELF has no validated static address space".to_owned())?;
+            let binding = selection
+                .bind_span(
+                    outcome.binding().identity(),
+                    outcome.binding().source_path(),
+                    outcome.span().rva(),
+                    outcome.span().size(),
+                )
+                .map_err(|error| error.to_string())?;
+            plan_r5900_preview(
+                project.session().base_analysis(),
+                address_space,
+                binding,
+                bytes,
+            )
+            .map_err(|error| error.to_string())
+        })();
+        let preview = match preview {
+            Ok(preview) => preview,
+            Err(error) => {
+                ui.colored_label(
+                    colors.destructive_quarantined,
+                    format!("[FAILED CLOSED] Cannot construct explicit R5900 preview: {error}"),
+                );
+                return;
+            }
+        };
+
+        if self
+            .selected_disassembly_instruction
+            .is_some_and(|index| index >= preview.rows().len())
+        {
+            self.selected_disassembly_instruction = None;
+            self.disassembly_row_focus_target = None;
+        }
+        self.apply_r5900_keyboard_navigation(ui, &preview);
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new(R5900_WARNING)
+                    .strong()
+                    .color(colors.warning_conflict),
+            );
+            ui.label(
+                RichText::new(format!(
+                    "Profile: {}; start RVA 0x{:016X}; preferred VA 0x{:016X}; {}-byte binding; {} instruction(s), {} byte(s) considered; {}",
+                    preview.binding().exact_profile().name(),
+                    preview.binding().start_rva(),
+                    preview.start_preferred_address(),
+                    preview.binding().size(),
+                    preview.rows().len(),
+                    preview.considered_bytes(),
+                    preview.stop_reason().label()
+                ))
+                .small()
+                .color(colors.secondary_text),
+            )
+            .on_hover_text(format!(
+                "Identity: {} / {} bytes\nCanonical source: {}",
+                preview.binding().identity().id,
+                preview.binding().identity().size,
+                preview.binding().canonical_source_path().display()
+            ));
+        });
+
+        let selected_index = self
+            .selected_disassembly_instruction
+            .filter(|index| *index < preview.rows().len());
+        let focus_target = self.disassembly_row_focus_target;
+        ScrollArea::both()
+            .id_salt("offline_r5900_disassembly_scroll")
+            .auto_shrink([false, true])
+            .max_height(180.0)
+            .show(ui, |ui| {
+                ui.set_min_width(940.0);
+                egui::Grid::new("offline_r5900_disassembly_rows")
+                    .num_columns(6)
+                    .spacing([12.0, 3.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.strong("RVA");
+                        ui.strong("Preferred VA");
+                        ui.strong("Bytes");
+                        ui.strong("Instruction");
+                        ui.strong("Flow");
+                        ui.strong("Len");
+                        ui.end_row();
+                        for (index, row) in preview.rows().iter().enumerate() {
+                            let selected = selected_index == Some(index);
+                            let accessible = r5900_instruction_row_accessible_label(
+                                row,
+                                index,
+                                preview.rows().len(),
+                            );
+                            let rva_response = ui
+                                .add(
+                                    egui::Label::new(
+                                        RichText::new(format!("0x{:016X}", row.rva())).monospace(),
+                                    )
+                                    .sense(Sense::click()),
+                                )
+                                .on_hover_text(&accessible);
+                            self.bind_r5900_instruction_row_context(&rva_response, index, row);
+                            let preferred_response = ui
+                                .add(
+                                    egui::Label::new(
+                                        RichText::new(format!(
+                                            "0x{:016X}",
+                                            row.preferred_address()
+                                        ))
+                                        .monospace(),
+                                    )
+                                    .sense(Sense::click()),
+                                )
+                                .on_hover_text(&accessible);
+                            self.bind_r5900_instruction_row_context(
+                                &preferred_response,
+                                index,
+                                row,
+                            );
+                            let bytes_response = ui
+                                .add(
+                                    egui::Label::new(
+                                        RichText::new(format_instruction_bytes(row.bytes()))
+                                            .monospace(),
+                                    )
+                                    .sense(Sense::click()),
+                                )
+                                .on_hover_text(&accessible);
+                            self.bind_r5900_instruction_row_context(&bytes_response, index, row);
+                            let response = ui
+                                .selectable_label(selected, RichText::new(row.text()).monospace())
+                                .on_hover_text(&accessible);
+                            response.widget_info(|| {
+                                egui::WidgetInfo::selected(
+                                    egui::WidgetType::SelectableLabel,
+                                    true,
+                                    selected,
+                                    &accessible,
+                                )
+                            });
+                            if focus_target == Some(index) {
+                                response.request_focus();
+                                response.scroll_to_me(Some(Align::Center));
+                            }
+                            self.bind_r5900_instruction_row_context(&response, index, row);
+                            let flow_response = ui
+                                .add(
+                                    egui::Label::new(
+                                        RichText::new(row.flow_control().label()).monospace(),
+                                    )
+                                    .sense(Sense::click()),
+                                )
+                                .on_hover_text(&accessible);
+                            self.bind_r5900_instruction_row_context(&flow_response, index, row);
+                            let length_response = ui
+                                .add(
+                                    egui::Label::new(
+                                        RichText::new(row.length().to_string()).monospace(),
+                                    )
+                                    .sense(Sense::click()),
+                                )
+                                .on_hover_text(&accessible);
+                            self.bind_r5900_instruction_row_context(&length_response, index, row);
+                            ui.end_row();
+                        }
+                    });
+            });
+        if focus_target.is_some() {
+            self.disassembly_row_focus_target = None;
+        }
+
+        if let Some(index) = self
+            .selected_disassembly_instruction
+            .filter(|index| *index < preview.rows().len())
+        {
+            ui.horizontal_wrapped(|ui| {
+                ui.menu_button("Selected instruction actions...", |ui| {
+                    self.show_r5900_instruction_action_menu(ui, &preview.rows()[index]);
+                });
+                ui.label(
+                    RichText::new(
+                        "Read-only: arrows/Home/End select, Ctrl+C copies RVA, Ctrl+Shift+C copies bytes",
+                    )
+                    .small()
+                    .color(colors.secondary_text),
+                );
+            });
+        }
+    }
+
+    fn bind_r5900_instruction_row_context(
+        &mut self,
+        response: &egui::Response,
+        index: usize,
+        row: &R5900InstructionRow,
+    ) {
+        if response.clicked() || response.secondary_clicked() {
+            self.selected_disassembly_instruction = Some(index);
+        }
+        response.context_menu(|ui| {
+            self.show_r5900_instruction_action_menu(ui, row);
+        });
+    }
+
+    fn apply_r5900_keyboard_navigation(&mut self, ui: &egui::Ui, preview: &R5900OfflinePreview) {
+        if ui.ctx().wants_keyboard_input() {
+            return;
+        }
+        let (movement, copy_rva, copy_bytes) = ui.ctx().input(|input| {
+            let movement = if input.modifiers.command
+                || input.modifiers.ctrl
+                || input.modifiers.alt
+                || input.modifiers.shift
+            {
+                None
+            } else if input.key_pressed(Key::ArrowUp) {
+                Some(InstructionSelectionMove::Previous)
+            } else if input.key_pressed(Key::ArrowDown) {
+                Some(InstructionSelectionMove::Next)
+            } else if input.key_pressed(Key::Home) {
+                Some(InstructionSelectionMove::First)
+            } else if input.key_pressed(Key::End) {
+                Some(InstructionSelectionMove::Last)
+            } else {
+                None
+            };
+            let command = input.modifiers.command || input.modifiers.ctrl;
+            (
+                movement,
+                command && !input.modifiers.shift && input.key_pressed(Key::C),
+                command && input.modifiers.shift && input.key_pressed(Key::C),
+            )
+        });
+        if let Some(movement) = movement {
+            let selected = navigate_instruction_selection(
+                self.selected_disassembly_instruction,
+                preview.rows().len(),
+                movement,
+            );
+            self.selected_disassembly_instruction = selected;
+            self.disassembly_row_focus_target = selected;
+        }
+        let Some(row) = self
+            .selected_disassembly_instruction
+            .and_then(|index| preview.rows().get(index))
+        else {
+            return;
+        };
+        if copy_rva {
+            ui.ctx().copy_text(format!("0x{:016X}", row.rva()));
+        }
+        if copy_bytes {
+            ui.ctx().copy_text(format_instruction_bytes(row.bytes()));
+        }
+    }
+
+    fn show_r5900_instruction_action_menu(&mut self, ui: &mut egui::Ui, row: &R5900InstructionRow) {
+        debug_assert_eq!(R5900InstructionAction::ALL.len(), 5);
+        ui.label(RichText::new(row.text()).monospace().strong());
+        if ui.button(R5900InstructionAction::CopyRva.label()).clicked() {
+            ui.ctx().copy_text(format!("0x{:016X}", row.rva()));
+            ui.close();
+        }
+        if ui
+            .button(R5900InstructionAction::CopyPreferredAddress.label())
+            .clicked()
+        {
+            ui.ctx()
+                .copy_text(format!("0x{:016X}", row.preferred_address()));
+            ui.close();
+        }
+        if ui
+            .button(R5900InstructionAction::CopyBytes.label())
+            .clicked()
+        {
+            ui.ctx().copy_text(format_instruction_bytes(row.bytes()));
+            ui.close();
+        }
+        if ui
+            .button(R5900InstructionAction::CopyInstruction.label())
+            .clicked()
+        {
+            ui.ctx().copy_text(row.text().to_owned());
+            ui.close();
+        }
+        let follow_target = row.follow_direct_target_rva();
+        let follow = ui
+            .add_enabled(
+                follow_target.is_some(),
+                egui::Button::new(R5900InstructionAction::FollowDirectTarget.label()),
+            )
+            .on_disabled_hover_text(match row.direct_target_rva() {
+                None => {
+                    "No in-image typed direct branch/call target is present; indirect targets are never guessed."
+                }
+                Some(_) => {
+                    "The direct target is not backed by exact source bytes in the verified static image."
+                }
+        });
+        if follow.clicked() {
+            self.follow_r5900_static_target(follow_target.expect("enabled R5900 direct target"));
+            ui.close();
         }
     }
 
@@ -6606,6 +7032,17 @@ impl WorkbenchApp {
             })
     }
 
+    fn static_rva_has_file_backing(&self, rva: u64) -> bool {
+        let address = RelativeAddress::new(rva);
+        self.project
+            .as_ref()
+            .and_then(|project| project.static_address_space.as_ref())
+            .is_some_and(|address_space| {
+                address_space.region_at(address).is_some()
+                    && address_space.file_offset_at(address).is_some()
+            })
+    }
+
     fn static_instruction_patchability(
         &self,
         row: &LinearInstructionRow,
@@ -6686,6 +7123,27 @@ impl WorkbenchApp {
             self.log(
                 ActivityLevel::Error,
                 format!("Cannot follow direct target: {error}"),
+            );
+        }
+    }
+
+    fn follow_r5900_static_target(&mut self, target_rva: u64) {
+        if !self.static_rva_has_file_backing(target_rva) {
+            self.log(
+                ActivityLevel::Warning,
+                format!(
+                    "Cannot follow R5900 RVA 0x{target_rva:016X}: target is not in exact file backing"
+                ),
+            );
+            return;
+        }
+        self.offline_read_rva_input = format!("0x{target_rva:016X}");
+        self.selected_disassembly_instruction = None;
+        self.disassembly_row_focus_target = None;
+        if let Err(error) = self.queue_offline_image_read() {
+            self.log(
+                ActivityLevel::Error,
+                format!("Cannot follow R5900 direct target: {error}"),
             );
         }
     }
@@ -7109,6 +7567,11 @@ impl WorkbenchApp {
     }
 
     fn queue_static_patch_set_load(&mut self, path: PathBuf) -> Result<String, String> {
+        if !self.static_patch_draft_panel_available() {
+            return Err(
+                "static patch-set loading is available only for PE/x86-64 projects".to_owned(),
+            );
+        }
         if !is_static_patch_set_path(&path) {
             return Err(format!(
                 "patch-set input must end with {STATIC_PATCH_SET_SUFFIX}"
@@ -9286,6 +9749,37 @@ fn instruction_row_accessible_label(
     )
 }
 
+fn r5900_instruction_row_accessible_label(
+    row: &R5900InstructionRow,
+    index: usize,
+    row_count: usize,
+) -> String {
+    let direct_target = match (
+        row.direct_target_preferred_address(),
+        row.direct_target_rva(),
+    ) {
+        (Some(preferred), Some(rva)) => {
+            format!("direct target preferred VA 0x{preferred:016X}, RVA 0x{rva:016X}")
+        }
+        (Some(preferred), None) => {
+            format!("direct target preferred VA 0x{preferred:016X}, outside the static image")
+        }
+        (None, _) => "no direct target".to_owned(),
+    };
+    format!(
+        "Explicit R5900 linear instruction {} of {}: RVA 0x{:016X}; preferred VA 0x{:016X}; bytes {}; {}; flow {}; {}; length {}",
+        index + 1,
+        row_count,
+        row.rva(),
+        row.preferred_address(),
+        format_instruction_bytes(row.bytes()),
+        row.text(),
+        row.flow_control().label(),
+        direct_target,
+        row.length()
+    )
+}
+
 fn protocol_route_text(route: &LiveDebuggerProtocolRoute) -> String {
     match route {
         LiveDebuggerProtocolRoute::WriteMemoryCompareBeforeWrite {
@@ -10751,6 +11245,51 @@ mod tests {
     fn legacy_preferences_default_to_an_empty_recent_binary_list() {
         let preferences: Preferences = serde_json::from_str("{}").expect("legacy preferences");
         assert!(preferences.recent_binaries.is_empty());
+    }
+
+    #[test]
+    fn explicit_decoder_selection_does_not_change_the_preferences_json_schema() {
+        let serialized = serde_json::to_value(Preferences::default()).expect("preferences JSON");
+        let keys = serialized
+            .as_object()
+            .expect("preferences object")
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from([
+                "bottom_panel_open",
+                "left_panel_open",
+                "recent_binaries",
+                "right_panel_open",
+                "theme",
+            ])
+        );
+        assert!(serialized.get("decoder_profile").is_none());
+        assert!(serialized.get("r5900_decoder_selection").is_none());
+    }
+
+    #[test]
+    fn pe_x64_preview_remains_automatic_and_has_no_explicit_r5900_state() {
+        let (_source, project) = loaded_project_with_source();
+        let (_context, mut app) = test_app();
+        app.project = Some(project);
+
+        assert!(app.x64_linear_preview_available());
+        assert!(app.offline_disassembly_available());
+        assert!(app.static_patch_draft_panel_available());
+        assert!(app.r5900_decoder_selection.is_none());
+
+        let limits = LinearDisassemblyLimits::new(2, 2).expect("x64 limits");
+        let automatic = disassemble_x64_linear(&[0x90, 0xc3], 0x1000, limits);
+        assert_eq!(automatic.rows()[0].text(), "nop");
+        assert_eq!(automatic.rows()[1].text(), "ret");
+        assert!(matches!(
+            automatic.stop_reason(),
+            LinearDisassemblyStopReason::EndOfInput
+        ));
     }
 
     #[test]

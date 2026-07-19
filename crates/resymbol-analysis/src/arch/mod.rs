@@ -84,6 +84,12 @@ pub enum DecoderProfile {
 }
 
 impl DecoderProfile {
+    /// Moving convenience alias for the most complete bundled PlayStation 2
+    /// EE/R5900 decoder. Callers that retain or publish a selection must store
+    /// the resolved enum variant rather than the alias name.
+    pub const PS2_EE_R5900_LATEST: Self =
+        Self::Ps2EeR5900LeCoreV1MmiWordShiftV1PackedLogicalV1PackedAddV1PackedSubV1PackedCompareGtV1;
+
     /// Stable human-readable identifier used in diagnostics.
     #[must_use]
     pub const fn name(self) -> &'static str {
@@ -485,6 +491,18 @@ mod tests {
             assert_eq!(decoder.arch(), TargetArch::Mips64);
             assert_eq!(decoder.profile(), profile);
         }
+    }
+
+    #[test]
+    fn latest_r5900_alias_resolves_to_the_exact_current_profile_and_factory() {
+        let expected =
+            DecoderProfile::Ps2EeR5900LeCoreV1MmiWordShiftV1PackedLogicalV1PackedAddV1PackedSubV1PackedCompareGtV1;
+
+        assert_eq!(DecoderProfile::PS2_EE_R5900_LATEST, expected);
+        let decoder = decoder_for_profile(DecoderProfile::PS2_EE_R5900_LATEST)
+            .expect("latest bundled R5900 decoder");
+        assert_eq!(decoder.profile(), expected);
+        assert_eq!(decoder.arch(), TargetArch::Mips64);
     }
 
     #[cfg(not(feature = "capstone"))]

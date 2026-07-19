@@ -46,17 +46,28 @@ all four earlier profiles and adds only `PSUBW`, `PSUBH`, and `PSUBB`. The next 
 `ps2-ee-r5900-le-core-v1-mmi-word-shift-v1-packed-logical-v1-packed-add-v1-packed-sub-v1-packed-compare-gt-v1`
 preserves all five earlier profiles and adds only `PCGTW`, `PCGTH`, and `PCGTB`.
 Recognized-but-unmodeled residual MMI, coprocessor, VU macro, and conditional-trap spaces return
-typed unsupported outcomes; reserved and unknown words remain invalid. This opt-in API does not
-identify an input automatically, model delay slots, create graph evidence, or change a package,
-projection, plugin, CLI, Workbench, or wire schema.
+typed unsupported outcomes; reserved and unknown words remain invalid.
+`DecoderProfile::PS2_EE_R5900_LATEST` currently resolves to that exact packed-compare-gt-v1 variant;
+stored selections retain the resolved variant rather than the moving alias.
+
+The Workbench can use this opt-in decoder only for a structured ELF32, little-endian, `ET_EXEC`,
+`EM_MIPS` analysis with an exact verified source. It never infers R5900 from `EM_MIPS` or an
+architecture string. The user must explicitly select the exact bundled profile, and the transient
+binding includes full identity, canonical source path, requested RVA span, and resolved profile.
+The existing profile-agnostic offline worker still reads the bytes; a pure planner decodes at the
+checked preferred VA, then maps every row and stop address back to RVA. This preserves correct
+high-base J/JAL targets. Follow is available only for a translated target with exact file backing.
+No selection is serialized into preferences, packages, projections, plugins, reviews, the CLI, or
+wire protocols, and the preview does not model delay slots, CFG, or function boundaries.
 
 Debugger-neutral JSON and Markdown projection, IDAPython, and Ghidra Java can
 represent the empty validated graph. The format-neutral static address-space
 model and offline host retain exactly one region per non-empty `PT_LOAD`, so the
 workbench can show mapped permissions and exact file-backed bytes as hex while
 rejecting virtual gaps, zero-fill, cross-segment spans, and partial backing.
-PE/x86-64-only MAP, PDB, static patch, linear-disassembly, PE plugin-host, and
-protection-analysis actions remain explicitly unavailable.
+MAP, PDB, static patch, PE plugin-host, and protection-analysis actions remain PE/x86-64-only. The
+explicit R5900 preview exposes read-only copy and file-backed direct-target navigation actions only;
+all x64 editing, NOP/Jcc, live-debugger sections, and Alt+N are suppressed.
 
 The regression fixture is assembled from explicit, independently chosen
 synthetic fields in `resymbol-analysis/tests/elf_analysis.rs`. It contains no

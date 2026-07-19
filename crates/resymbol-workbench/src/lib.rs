@@ -6,6 +6,7 @@ mod console_host;
 mod graph;
 mod instruction_actions;
 mod model;
+mod offline_disassembly;
 mod readiness;
 mod review_state;
 mod theme;
