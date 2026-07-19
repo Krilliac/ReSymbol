@@ -151,10 +151,11 @@ control-flow graphing remains later work.
 ### Static address space and protection assessment
 
 The implemented **Address Space** tab is a non-executing preferred-image view for supported PE32+
-inputs. It validates `FileAlignment` and `SectionAlignment`, models loader-aligned headers and
-section extents, and distinguishes exact file-backed bytes, virtual zero-fill, mapped alignment
-padding, and explicit image gaps. The table shows preferred virtual addresses, exact file ranges,
-tail ownership, and declared read/write/execute attributes while staying bound to the same SHA-256
+and sparse ELF inputs. PE validates `FileAlignment` and `SectionAlignment` and models loader-aligned
+headers and section extents; ELF retains sorted `PT_LOAD` regions without materializing gaps. Both
+distinguish exact file-backed bytes, virtual zero-fill, mapped alignment padding, and explicit image
+gaps. The table shows preferred virtual addresses, exact file ranges, tail ownership, and declared
+read/write/execute attributes while staying bound to the same SHA-256
 identity as the analysis package. It is not a live process map and must not imply that ASLR, runtime
 allocations, loaded modules, guard pages, or changed page protections have been observed.
 
@@ -166,12 +167,16 @@ against the exact canonical `OfflineTarget` backed by the retained source snapsh
 accepts it only when the monotonic operation, full binary identity, canonical source path, requested
 span, and completed lifecycle still match the current project.
 File gaps, zero-fill, loader padding, raw tails, and crossing spans are shown as typed unavailability;
-package-only projects remain **SOURCE REQUIRED**. The exact result can be viewed as hex/ASCII or as
-a bounded x64 linear-disassembly preview with independent byte and instruction caps and an explicit
-stop reason. The preview is non-executing and visibly states that it is not CFG or function-boundary
-truth. It retains exact instruction bytes and offers a follow action only for decoder-proven direct
-branch/call targets that land in readable exact file backing in the static image; indirect control
-flow is unavailable rather than guessed.
+package-only projects remain **SOURCE REQUIRED**. The exact result can be viewed as hex/ASCII. PE
+x64 retains its automatic bounded linear preview and existing actions byte-for-byte. A structured
+ELF32 little-endian `ET_EXEC`/`EM_MIPS` source offers no decoder automatically; the user must select
+the exact bundled R5900 profile in transient state. Its planner decodes at checked preferred VAs and
+projects row and stop addresses back to RVA, while instruction text retains preferred-VA J/JAL
+operands. The visible warning says: **Explicit profile; ELF EM_MIPS does not identify R5900. Linear
+preview only; delay slots, CFG, and function boundaries are not modeled.** Its six columns are RVA,
+Preferred VA, Bytes, Instruction, Flow, and Len. Only Copy RVA, Copy Preferred Address, Copy Bytes,
+Copy Instruction, and file-backed Follow Direct Target are exposed; exact-byte editing, NOP/Jcc,
+live actions, and Alt+N are absent.
 
 Instruction actions keep static and live mutation separate. **Queue NOP for Patched Binary** records
 an exact-RVA, exact-source-byte draft. **Edit Exact Bytes...** exposes the existing same-length

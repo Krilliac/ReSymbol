@@ -44,8 +44,9 @@ The current alpha implements and tests an end-to-end, deliberately narrow analys
   canonical `PSLLW`/`PSRLW`/`PSRAW` shifts, then `PAND`/`POR`/`PXOR`/`PNOR`, then
   `PADDW`/`PADDH`/`PADDB`, then `PSUBW`/`PSUBH`/`PSUBB`, and finally
   `PCGTW`/`PCGTH`/`PCGTB` while retaining typed stops for residual MMI, coprocessor, VU macro, and
-  conditional-trap spaces, and none is wired into container analysis, packages, plugins, the CLI,
-  or the Workbench;
+  conditional-trap spaces. No profile is inferred by container analysis or stored in packages,
+  projections, plugins, the CLI, or a wire format; the Workbench can transiently use the complete
+  packed-compare-gt-v1 profile only after an explicit user selection for an eligible exact source;
 - bounded discovery of modern MSVC x64 Rev1 RTTI and vftables from file-backed compiler metadata,
   including both legacy 24-byte and `BCD_HASPCHD` 28-byte base-class descriptors, validated
   class/type names, and contiguous executable slot candidates;
@@ -82,8 +83,9 @@ The current alpha implements and tests an end-to-end, deliberately narrow analys
   ELF32 container, or current `.resym` package, runs core-only analysis in the background, and
   presents exact binary identity,
   durable provenance-first exact-claim review, a bounded Reconstruction Graph, a non-executing
-  static Address Space/protection view with a worker-owned exact-RVA byte reader and bounded x64
-  linear-disassembly preview for verified source snapshots, read-only debugger/sandbox provider
+  static Address Space/protection view with a worker-owned exact-RVA byte reader, automatic bounded
+  x64 preview for PE, and an explicitly selected bounded R5900 preview for eligible ELF sources,
+  read-only debugger/sandbox provider
   readiness, and read-only plugin health.
   The graph starts from the PE entry point or a clearly labeled deterministic lowest-RVA fallback,
   shares function selection with the table and inspector, and draws only retained direct-call,
@@ -96,9 +98,10 @@ The current alpha implements and tests an end-to-end, deliberately narrow analys
   is a non-mutating preflight only: it does not provision a sandbox, launch or attach to a target, or
   attest containment. The Address Space reader serves at most 256 bytes from the frozen exact source
   through the in-process offline host; its disassembly is a capped linear preview, not CFG or
-  function-boundary truth. Its row context menu can queue exact NOP, invert-condition, and
+  function-boundary truth. PE/x64 row context menus can queue exact NOP, invert-condition, and
   always-taken edits for canonical conditional branches; these remain unpublished drafts, and
-  neither view opens a process or claims a live mapping. See
+  explicit R5900 rows expose only copy and file-backed direct-target navigation. Neither view opens
+  a process or claims a live mapping. See
   [the debugger and sandbox architecture](docs/debugger-sandbox.md);
 - a UI-neutral, same-size static patch service for exact PE source snapshots. An immutable patch
   plan is bound to the complete source `BinaryIdentity`; each labeled NOP instruction must decode
@@ -402,8 +405,10 @@ resymbol analyze application.exe --plugin community.example-analyzer
 ```
 
 On Windows, open the same supported container in the desktop workbench. ELF projects expose their
-sparse `PT_LOAD` address map and exact file-backed offline bytes as hex; x64 disassembly, static
-patching, protection analysis, MAP, and PDB remain PE-only:
+sparse `PT_LOAD` address map and exact file-backed offline bytes as hex. Eligible ELF32
+little-endian `ET_EXEC`/`EM_MIPS` projects can also use the bounded R5900 linear preview after the
+user explicitly selects its exact bundled profile; static patching, protection analysis, MAP, and
+PDB remain PE-only:
 
 ```console
 .\resymbol-workbench.exe application.exe
@@ -422,9 +427,11 @@ function inspector, and shows only relationships retained by analysis. Large gra
 through an explicit bounded view rather than implying complete call-graph recovery. Address Space is
 a preferred-image model, not a live process map. When an exact source snapshot is present, its reader
 can return a 16, 32, 64, 128, or 256-byte file-backed RVA span through the in-process offline host.
-Both PE and ELF mappings support exact hex; PE/x64 bytes can additionally use the capped linear
-preview. The preview reports why it stopped, never claims CFG or function-boundary truth, and
-follows only decoder-proven direct branch/call targets.
+Both PE and ELF mappings support exact hex. PE/x64 bytes automatically use their existing capped
+linear preview. Eligible ELF bytes require an explicit transient selection of the exact bundled
+R5900 profile; decoding uses preferred VAs while every table and stop address is projected back to
+RVA. The preview reports why it stopped, never claims delay-slot, CFG, or function-boundary truth,
+and follows only decoder-proven direct branch/call targets with exact file backing.
 Gaps, zero-fill, padding, and crossing spans remain explicitly unavailable. Static NOP requests are
 exact-byte drafts; **Create New Patched Binary** validates them as complete instructions on the
 application-service worker, rechecks the exact source identity and bytes, then publishes a separate
@@ -572,7 +579,9 @@ GuardMemcpy function-pointer-slot RVA, and package schema 14 adds checked ELF32 
 `EM_MIPS` container metadata and sparse `PT_LOAD` mappings without automatic instruction decoding.
 The separately selectable R5900 core-v1, MMI-word-shift-v1, packed-logical-v1, packed-add-v1,
 packed-sub-v1, and packed-compare-gt-v1 decoder profiles remain in-memory analysis API state and
-create no package claim. The independently versioned neutral projection remains schema 6, and the
+create no package claim. `DecoderProfile::PS2_EE_R5900_LATEST` currently resolves to the exact
+packed-compare-gt-v1 variant; the Workbench stores that resolved value only in transient UI state.
+The independently versioned neutral projection remains schema 6, and the
 plugin API and external wire handshake remain unchanged. A plugin granted `symbols.read` can
 observe these additive result families in its base-analysis JSON; a plugin without that permission
 still receives no base analysis.

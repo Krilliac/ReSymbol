@@ -300,8 +300,9 @@ pub struct LoadedProject {
     pub snapshot: Arc<ProjectSnapshot>,
     pub identity: ProjectIdentity,
     pub projection: Arc<ExportProjection>,
-    /// PE-only preferred-image layout. Container-only formats remain openable
-    /// while byte-dependent and PE-layout views stay explicitly unavailable.
+    /// Validated preferred-image layout for PE and sparse ELF containers.
+    /// Other container formats remain openable while layout-dependent views
+    /// stay explicitly unavailable.
     pub static_address_space: Option<StaticAddressSpace>,
     pub protection_assessment: ProtectionAssessment,
     pub functions: Vec<FunctionRow>,
@@ -391,6 +392,12 @@ impl LoadedProject {
     #[must_use]
     pub fn session(&self) -> &AnalysisSession {
         self.snapshot.session()
+    }
+
+    /// Whether PE/x64 static patch drafts and patch-set controls may be exposed.
+    #[must_use]
+    pub fn supports_static_patch_actions(&self) -> bool {
+        matches!(self.session().base_analysis(), BinaryAnalysis::Pe(_))
     }
 
     /// Inspector details for a canonical row index.
@@ -915,6 +922,7 @@ mod tests {
     fn checked_in_fixture_builds_one_bound_shared_model() {
         let project = loaded_fixture(STRIPPED_FIXTURE);
 
+        assert!(project.supports_static_patch_actions());
         assert_eq!(project.identity.origin_path, project.snapshot.origin_path());
         assert_eq!(
             project.identity.verified_source_path.as_deref(),
@@ -988,6 +996,7 @@ mod tests {
             ProtectionAssessment::UnsupportedFormat
         ));
         assert!(project.functions.is_empty());
+        assert!(!project.supports_static_patch_actions());
     }
 
     #[test]
