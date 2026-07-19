@@ -207,7 +207,9 @@ Decoder selection has a separate, explicit in-memory profile boundary. A
 Engine/R5900 scalar core profile and
 `DecoderProfile::Ps2EeR5900LeCoreV1MmiWordShiftV1` names its immutable MMI word-immediate-shift
 extension. `DecoderProfile::Ps2EeR5900LeCoreV1MmiWordShiftV1PackedLogicalV1` names the next immutable
-packed-logical extension. All three specialized profiles return dedicated, always-available
+packed-logical extension, and
+`DecoderProfile::Ps2EeR5900LeCoreV1MmiWordShiftV1PackedLogicalV1PackedAddV1` names the following
+immutable packed-add extension. All four specialized profiles return dedicated, always-available
 pure-Rust decoders and never consult Capstone or a generic MIPS backend. Each decoder's `profile()`
 result is its authoritative exact identity; `arch()` reports `Mips64` only as a broad compatibility
 family. No parser infers any profile from an ELF identity, and none is serialized into packages,
@@ -238,6 +240,14 @@ operations; `rd`, `rs`, and `rt` are all unconstrained register operands and ren
 There are no reserved operand fields, so selector near-misses remain residual typed MMI unsupported
 rather than invalid. The two earlier profiles continue to classify all four forms as typed
 unsupported.
+
+The additive packed-add-v1 profile preserves every packed-logical-v1 disposition, then matches only
+`PADDW`, `PADDH`, and `PADDB` under mask `0xfc0007ff` with patterns `0x70000008`, `0x70000108`, and
+`0x70000208`. The fixed MMI0 function and secondary-selector fields choose the word, halfword, and
+byte lane widths; `rd`, `rs`, and `rt` are all unconstrained register operands and render in that
+order. There are no reserved operand fields, so selector, subtraction, comparison, saturating, and
+unsigned-add near-misses remain residual typed MMI unsupported rather than invalid. The three
+earlier profiles continue to classify all three forms as typed unsupported.
 
 `PSLLH`, `PSRLH`, and `PSRAH` remain deliberately excluded because their five-bit shift field leaves
 the halfword-width bit-4 alias semantics unresolved; both apparent base forms and bit-4 aliases stay

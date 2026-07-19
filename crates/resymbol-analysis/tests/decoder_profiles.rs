@@ -31,6 +31,14 @@ fn public_profile_names_are_exact_and_stable() {
         DecoderProfile::Ps2EeR5900LeCoreV1MmiWordShiftV1PackedLogicalV1.to_string(),
         "ps2-ee-r5900-le-core-v1-mmi-word-shift-v1-packed-logical-v1"
     );
+    assert_eq!(
+        DecoderProfile::Ps2EeR5900LeCoreV1MmiWordShiftV1PackedLogicalV1PackedAddV1.name(),
+        "ps2-ee-r5900-le-core-v1-mmi-word-shift-v1-packed-logical-v1-packed-add-v1"
+    );
+    assert_eq!(
+        DecoderProfile::Ps2EeR5900LeCoreV1MmiWordShiftV1PackedLogicalV1PackedAddV1.to_string(),
+        "ps2-ee-r5900-le-core-v1-mmi-word-shift-v1-packed-logical-v1-packed-add-v1"
+    );
 }
 
 #[test]
@@ -39,6 +47,7 @@ fn public_r5900_profile_returns_the_exact_always_available_decoder() {
         DecoderProfile::Ps2EeR5900LeCoreV1,
         DecoderProfile::Ps2EeR5900LeCoreV1MmiWordShiftV1,
         DecoderProfile::Ps2EeR5900LeCoreV1MmiWordShiftV1PackedLogicalV1,
+        DecoderProfile::Ps2EeR5900LeCoreV1MmiWordShiftV1PackedLogicalV1PackedAddV1,
     ] {
         let mut decoder = decoder_for_profile(profile).expect("pure-Rust R5900 decoder");
 

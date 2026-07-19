@@ -155,6 +155,7 @@ jobs:
           --test decoder_profiles --test ps2_ee_r5900_core_v1
           --test ps2_ee_r5900_core_v1_mmi_word_shift_v1
           --test ps2_ee_r5900_core_v1_mmi_word_shift_v1_packed_logical_v1
+          --test ps2_ee_r5900_core_v1_mmi_word_shift_v1_packed_logical_v1_packed_add_v1
           --no-default-features
 
       - name: Build CLI and disposable native host

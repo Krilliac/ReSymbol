@@ -35,10 +35,12 @@ The current alpha implements and tests an end-to-end, deliberately narrow analys
   headers, section records, and sparse non-empty `PT_LOAD` mappings with a deterministic claim-free
   base graph; container intake still does not infer or run any MIPS decoder;
 - explicit, in-memory, always-available pure-Rust `ps2-ee-r5900-le-core-v1`,
-  `ps2-ee-r5900-le-core-v1-mmi-word-shift-v1`, and
-  `ps2-ee-r5900-le-core-v1-mmi-word-shift-v1-packed-logical-v1` decoder profiles for a fail-closed
-  Emotion Engine/R5900 whitelist; the immutable extensions add canonical `PSLLW`/`PSRLW`/`PSRAW`
-  shifts and then `PAND`/`POR`/`PXOR`/`PNOR` while retaining typed stops for residual MMI,
+  `ps2-ee-r5900-le-core-v1-mmi-word-shift-v1`,
+  `ps2-ee-r5900-le-core-v1-mmi-word-shift-v1-packed-logical-v1`, and
+  `ps2-ee-r5900-le-core-v1-mmi-word-shift-v1-packed-logical-v1-packed-add-v1` decoder profiles for a
+  fail-closed Emotion Engine/R5900 whitelist; the immutable extensions add canonical
+  `PSLLW`/`PSRLW`/`PSRAW` shifts, then `PAND`/`POR`/`PXOR`/`PNOR`, and finally
+  `PADDW`/`PADDH`/`PADDB` while retaining typed stops for residual MMI,
   coprocessor, VU macro, and conditional-trap spaces, and none is wired into container analysis,
   packages, plugins, the CLI, or the Workbench;
 - bounded discovery of modern MSVC x64 Rev1 RTTI and vftables from file-backed compiler metadata,
@@ -565,11 +567,11 @@ package schema 11 adds checked security-cookie and GuardCF check/dispatch pointe
 package schema 12 adds checked XFG and CastGuard storage RVAs, package schema 13 adds the checked
 GuardMemcpy function-pointer-slot RVA, and package schema 14 adds checked ELF32 little-endian
 `EM_MIPS` container metadata and sparse `PT_LOAD` mappings without automatic instruction decoding.
-The separately selectable R5900 core-v1, MMI-word-shift-v1, and packed-logical-v1 decoder profiles
-remain in-memory analysis API state and create no package claim. The independently versioned neutral
-projection remains schema 6, and the plugin API and external wire handshake remain unchanged. A
-plugin granted `symbols.read` can observe these additive result families in its base-analysis JSON;
-a plugin without that permission still receives no base analysis.
+The separately selectable R5900 core-v1, MMI-word-shift-v1, packed-logical-v1, and packed-add-v1
+decoder profiles remain in-memory analysis API state and create no package claim. The independently
+versioned neutral projection remains schema 6, and the plugin API and external wire handshake remain
+unchanged. A plugin granted `symbols.read` can observe these additive result families in its
+base-analysis JSON; a plugin without that permission still receives no base analysis.
 
 The `analyze` and `inspect` summaries report recovered strings, data references, direct calls,
 thunks, security-cookie, GuardCF, XFG, CastGuard, and GuardMemcpy storage anchors, GuardCF
