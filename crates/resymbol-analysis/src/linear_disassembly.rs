@@ -1,4 +1,4 @@
-//! Bounded, deterministic x64 linear-disassembly previews.
+//! Bounded, deterministic linear-disassembly previews.
 //!
 //! This module is deliberately a pure value transformer. It does not discover
 //! control-flow graphs or function boundaries, read files, map images, or
@@ -7,7 +7,9 @@
 
 use thiserror::Error;
 
-use crate::arch::{DecodeOutcome, FlowKind, IcedX64Decoder, InstructionDecoder};
+use crate::arch::{
+    DecodeOutcome, FlowKind, IcedX64Decoder, InstructionDecoder, UnsupportedInstructionClass,
+};
 
 /// Hard ceiling for source bytes considered by one preview.
 pub const MAX_LINEAR_DISASSEMBLY_BYTES: usize = 64 * 1024;
@@ -169,6 +171,7 @@ pub enum LinearTruncationBoundary {
 }
 
 /// Exact, deterministic reason the linear sweep stopped.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LinearDisassemblyStopReason {
     EmptyInput,
@@ -182,6 +185,11 @@ pub enum LinearDisassemblyStopReason {
     InvalidInstruction {
         rva: u64,
         offset: usize,
+    },
+    UnsupportedInstruction {
+        rva: u64,
+        offset: usize,
+        class: UnsupportedInstructionClass,
     },
     TruncatedInstruction {
         rva: u64,
@@ -209,8 +217,12 @@ impl LinearDisassemblyStopReason {
                 format!("reached the independent {decoded_instructions}-instruction preview limit")
             }
             Self::InvalidInstruction { rva, .. } => {
-                format!("iced-x86 rejected the encoding at RVA 0x{rva:016X}")
+                format!("the selected decoder rejected the encoding at RVA 0x{rva:016X}")
             }
+            Self::UnsupportedInstruction { rva, class, .. } => format!(
+                "the selected decoder does not model {} at RVA 0x{rva:016X}",
+                class.name()
+            ),
             Self::TruncatedInstruction {
                 rva,
                 available_bytes,
@@ -355,6 +367,9 @@ pub fn disassemble_linear(
             }
             DecodeOutcome::Invalid => {
                 break LinearDisassemblyStopReason::InvalidInstruction { rva, offset };
+            }
+            DecodeOutcome::Unsupported { class } => {
+                break LinearDisassemblyStopReason::UnsupportedInstruction { rva, offset, class };
             }
         };
 

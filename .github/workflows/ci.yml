@@ -150,7 +150,10 @@ jobs:
 
       - name: Verify decoder profiles without optional backends
         if: runner.os == 'Linux'
-        run: cargo test --locked -p resymbol-analysis --test decoder_profiles --no-default-features
+        run: >-
+          cargo test --locked -p resymbol-analysis
+          --test decoder_profiles --test ps2_ee_r5900_core_v1
+          --no-default-features
 
       - name: Build CLI and disposable native host
         run: cargo build --locked --bin resymbol --bin resymbol-native-host

@@ -33,7 +33,11 @@ The current alpha implements and tests an end-to-end, deliberately narrow analys
   checked security-cookie, GuardCF, XFG, CastGuard, and GuardMemcpy storage anchors;
 - bounded container-only ingestion of ELF32 little-endian `EM_MIPS` executables, retaining checked
   headers, section records, and sparse non-empty `PT_LOAD` mappings with a deterministic claim-free
-  base graph; this slice does not classify or decode MIPS or Emotion Engine instructions;
+  base graph; container intake still does not infer or run any MIPS decoder;
+- an explicit, in-memory, always-available pure-Rust `ps2-ee-r5900-le-core-v1` decoder profile for a
+  fail-closed scalar Emotion Engine/R5900 whitelist, with typed stops for recognized MMI,
+  coprocessor, VU macro, and conditional-trap spaces; it is not wired into container analysis,
+  packages, plugins, the CLI, or the Workbench;
 - bounded discovery of modern MSVC x64 Rev1 RTTI and vftables from file-backed compiler metadata,
   including both legacy 24-byte and `BCD_HASPCHD` 28-byte base-class descriptors, validated
   class/type names, and contiguous executable slot candidates;
@@ -557,10 +561,12 @@ load-config and GuardCF state, package schema 10 adds the three modern Guard tar
 package schema 11 adds checked security-cookie and GuardCF check/dispatch pointer-slot storage RVAs,
 package schema 12 adds checked XFG and CastGuard storage RVAs, package schema 13 adds the checked
 GuardMemcpy function-pointer-slot RVA, and package schema 14 adds checked ELF32 little-endian
-`EM_MIPS` container metadata and sparse `PT_LOAD` mappings without instruction decoding. The
-independently versioned neutral projection remains schema 6, and the plugin API and external wire handshake
-remain unchanged. A plugin granted `symbols.read` can observe these additive result families in its
-base-analysis JSON; a plugin without that permission still receives no base analysis.
+`EM_MIPS` container metadata and sparse `PT_LOAD` mappings without automatic instruction decoding.
+The separately selectable R5900 core-v1 decoder remains in-memory analysis API state and creates no
+package claim. The independently versioned neutral projection remains schema 6, and the plugin API
+and external wire handshake remain unchanged. A plugin granted `symbols.read` can observe these
+additive result families in its base-analysis JSON; a plugin without that permission still receives
+no base analysis.
 
 The `analyze` and `inspect` summaries report recovered strings, data references, direct calls,
 thunks, security-cookie, GuardCF, XFG, CastGuard, and GuardMemcpy storage anchors, GuardCF

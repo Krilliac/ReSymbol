@@ -2,10 +2,10 @@
 //!
 //! This module introduces a thin decoder abstraction so the higher-level
 //! disassembly passes (linear preview, control-flow block sweep) can be driven
-//! by more than one instruction decoder. The always-available backend wraps the
-//! pure-Rust `iced-x86` decoder for x86/x86-64. When the optional `capstone`
-//! feature is enabled, a Capstone-based backend covers a broad set of other
-//! architectures.
+//! by more than one instruction decoder. Always-available pure-Rust backends
+//! cover x86/x86-64 through `iced-x86` and the frozen PlayStation 2
+//! EE/R5900 core-v1 profile. When the optional `capstone` feature is enabled, a
+//! Capstone-based backend covers a broad set of other architectures.
 //!
 //! The abstraction is deliberately minimal and total: every decode attempt maps
 //! to exactly one [`DecodeOutcome`], and no method reads files, maps images, or
@@ -17,6 +17,9 @@ mod iced_x86;
 pub(crate) use iced_x86::{
     IcedX64Decoder, direct_target as iced_direct_target, flow_kind as iced_flow_kind,
 };
+
+mod ps2_ee_r5900;
+use ps2_ee_r5900::Ps2EeR5900LeCoreV1Decoder;
 
 #[cfg(feature = "capstone")]
 mod capstone;
@@ -109,6 +112,35 @@ pub enum FlowKind {
     Invalid,
 }
 
+/// A recognized instruction class deliberately outside the selected decoder
+/// profile's supported semantic subset.
+///
+/// These classes identify an opcode space, not a claim that the word is a
+/// valid member of that instruction family.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnsupportedInstructionClass {
+    Ps2EeMmiEncoding,
+    Ps2EeCop0Encoding,
+    Ps2EeCop1Encoding,
+    Ps2EeCop2Encoding,
+    Ps2EeVuMacroEncoding,
+    Ps2EeConditionalTrapEncoding,
+}
+
+impl UnsupportedInstructionClass {
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Ps2EeMmiEncoding => "ps2-ee-mmi-encoding",
+            Self::Ps2EeCop0Encoding => "ps2-ee-cop0-encoding",
+            Self::Ps2EeCop1Encoding => "ps2-ee-cop1-encoding",
+            Self::Ps2EeCop2Encoding => "ps2-ee-cop2-encoding",
+            Self::Ps2EeVuMacroEncoding => "ps2-ee-vu-macro-encoding",
+            Self::Ps2EeConditionalTrapEncoding => "ps2-ee-conditional-trap-encoding",
+        }
+    }
+}
+
 /// One successfully decoded instruction, described architecture-neutrally.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodedInstruction {
@@ -120,11 +152,13 @@ pub struct DecodedInstruction {
 }
 
 /// Total result of a single-instruction decode attempt.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecodeOutcome {
     Decoded(DecodedInstruction),
     Invalid,
     Truncated { available: usize },
+    Unsupported { class: UnsupportedInstructionClass },
 }
 
 /// A stateless-per-call single-instruction decoder for one architecture.
@@ -132,11 +166,20 @@ pub trait InstructionDecoder {
     /// The architecture this decoder decodes.
     fn arch(&self) -> TargetArch;
 
+    /// The authoritative exact decoder identity.
+    ///
+    /// Existing generic decoders inherit their broad architecture identity;
+    /// specialized decoders override this method with their precise profile.
+    fn profile(&self) -> DecoderProfile {
+        DecoderProfile::Generic(self.arch())
+    }
+
     /// Decode exactly one instruction from the start of `bytes`, treating the
     /// first byte as located at `address`. Trailing bytes beyond the first
     /// instruction are ignored. Insufficient bytes yield
     /// [`DecodeOutcome::Truncated`]; an undecodable encoding yields
-    /// [`DecodeOutcome::Invalid`].
+    /// [`DecodeOutcome::Invalid`]. Recognized opcode spaces deliberately
+    /// outside the selected profile yield [`DecodeOutcome::Unsupported`].
     fn decode_one(&mut self, bytes: &[u8], address: u64) -> DecodeOutcome;
 }
 
@@ -177,14 +220,14 @@ pub fn decoder_for(arch: TargetArch) -> Result<Box<dyn InstructionDecoder>, Unsu
 /// Construct a boxed decoder for an explicit selection profile.
 ///
 /// Generic profiles delegate to [`decoder_for`]. The PlayStation 2 Emotion
-/// Engine/R5900 profile is declaration-only: it fails with a typed error before
+/// Engine/R5900 profile returns its dedicated pure-Rust core-v1 decoder without
 /// consulting Capstone or any generic MIPS backend.
 pub fn decoder_for_profile(
     profile: DecoderProfile,
 ) -> Result<Box<dyn InstructionDecoder>, DecoderProfileError> {
     match profile {
         DecoderProfile::Generic(arch) => decoder_for(arch).map_err(Into::into),
-        DecoderProfile::Ps2EeR5900LeCoreV1 => Err(DecoderProfileError::Unavailable { profile }),
+        DecoderProfile::Ps2EeR5900LeCoreV1 => Ok(Box::new(Ps2EeR5900LeCoreV1Decoder::new())),
     }
 }
 
@@ -341,16 +384,12 @@ mod tests {
     }
 
     #[test]
-    fn specialized_r5900_profile_is_declared_but_unavailable() {
+    fn specialized_r5900_profile_uses_the_exact_decoder() {
         let profile = DecoderProfile::Ps2EeR5900LeCoreV1;
-        let result = decoder_for_profile(profile);
+        let decoder = decoder_for_profile(profile).expect("always-available R5900 decoder");
 
-        assert!(matches!(
-            result,
-            Err(DecoderProfileError::Unavailable {
-                profile: DecoderProfile::Ps2EeR5900LeCoreV1
-            })
-        ));
+        assert_eq!(decoder.arch(), TargetArch::Mips64);
+        assert_eq!(decoder.profile(), profile);
     }
 
     #[cfg(not(feature = "capstone"))]
