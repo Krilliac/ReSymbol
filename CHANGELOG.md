@@ -522,6 +522,9 @@ prereleases; breaking changes remain explicit.
 
 ### Changed
 
+- Made ELF `EM_MIPS` architecture identities fail closed during automatic decoder selection.
+  The container field no longer infers generic MIPS32 or MIPS64 decoding; callers that intend
+  generic MIPS semantics must now request that target explicitly.
 - Made workbench visual evidence deterministic across machines and repeated captures. Offline
   lifecycle rows no longer render request-local session identifiers, while exact-source and export
   rows show compact artifact filenames instead of canonical capture-machine directories. Complete
