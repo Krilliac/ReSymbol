@@ -23,6 +23,7 @@ use ps2_ee_r5900::{
     Ps2EeR5900LeCoreV1Decoder, Ps2EeR5900LeCoreV1MmiWordShiftV1Decoder,
     Ps2EeR5900LeCoreV1MmiWordShiftV1PackedLogicalV1Decoder,
     Ps2EeR5900LeCoreV1MmiWordShiftV1PackedLogicalV1PackedAddV1Decoder,
+    Ps2EeR5900LeCoreV1MmiWordShiftV1PackedLogicalV1PackedAddV1PackedSubV1Decoder,
 };
 
 #[cfg(feature = "capstone")]
@@ -77,6 +78,7 @@ pub enum DecoderProfile {
     Ps2EeR5900LeCoreV1MmiWordShiftV1,
     Ps2EeR5900LeCoreV1MmiWordShiftV1PackedLogicalV1,
     Ps2EeR5900LeCoreV1MmiWordShiftV1PackedLogicalV1PackedAddV1,
+    Ps2EeR5900LeCoreV1MmiWordShiftV1PackedLogicalV1PackedAddV1PackedSubV1,
 }
 
 impl DecoderProfile {
@@ -92,6 +94,9 @@ impl DecoderProfile {
             }
             Self::Ps2EeR5900LeCoreV1MmiWordShiftV1PackedLogicalV1PackedAddV1 => {
                 "ps2-ee-r5900-le-core-v1-mmi-word-shift-v1-packed-logical-v1-packed-add-v1"
+            }
+            Self::Ps2EeR5900LeCoreV1MmiWordShiftV1PackedLogicalV1PackedAddV1PackedSubV1 => {
+                "ps2-ee-r5900-le-core-v1-mmi-word-shift-v1-packed-logical-v1-packed-add-v1-packed-sub-v1"
             }
         }
     }
@@ -251,6 +256,11 @@ pub fn decoder_for_profile(
         DecoderProfile::Ps2EeR5900LeCoreV1MmiWordShiftV1PackedLogicalV1PackedAddV1 => Ok(Box::new(
             Ps2EeR5900LeCoreV1MmiWordShiftV1PackedLogicalV1PackedAddV1Decoder::new(),
         )),
+        DecoderProfile::Ps2EeR5900LeCoreV1MmiWordShiftV1PackedLogicalV1PackedAddV1PackedSubV1 => {
+            Ok(Box::new(
+                Ps2EeR5900LeCoreV1MmiWordShiftV1PackedLogicalV1PackedAddV1PackedSubV1Decoder::new(),
+            ))
+        }
     }
 }
 
@@ -428,6 +438,16 @@ mod tests {
             DecoderProfile::Ps2EeR5900LeCoreV1MmiWordShiftV1PackedLogicalV1PackedAddV1.to_string(),
             "ps2-ee-r5900-le-core-v1-mmi-word-shift-v1-packed-logical-v1-packed-add-v1"
         );
+        assert_eq!(
+            DecoderProfile::Ps2EeR5900LeCoreV1MmiWordShiftV1PackedLogicalV1PackedAddV1PackedSubV1
+                .name(),
+            "ps2-ee-r5900-le-core-v1-mmi-word-shift-v1-packed-logical-v1-packed-add-v1-packed-sub-v1"
+        );
+        assert_eq!(
+            DecoderProfile::Ps2EeR5900LeCoreV1MmiWordShiftV1PackedLogicalV1PackedAddV1PackedSubV1
+                .to_string(),
+            "ps2-ee-r5900-le-core-v1-mmi-word-shift-v1-packed-logical-v1-packed-add-v1-packed-sub-v1"
+        );
     }
 
     #[test]
@@ -437,6 +457,7 @@ mod tests {
             DecoderProfile::Ps2EeR5900LeCoreV1MmiWordShiftV1,
             DecoderProfile::Ps2EeR5900LeCoreV1MmiWordShiftV1PackedLogicalV1,
             DecoderProfile::Ps2EeR5900LeCoreV1MmiWordShiftV1PackedLogicalV1PackedAddV1,
+            DecoderProfile::Ps2EeR5900LeCoreV1MmiWordShiftV1PackedLogicalV1PackedAddV1PackedSubV1,
         ] {
             let decoder = decoder_for_profile(profile).expect("always-available R5900 decoder");
 
