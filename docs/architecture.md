@@ -204,12 +204,29 @@ read-only function-pointer fallback. The inventory itself does not create a new 
 Decoder selection has a separate, explicit in-memory profile boundary. A
 `DecoderProfile::Generic(TargetArch)` request preserves the existing architecture factory, while
 `DecoderProfile::Ps2EeR5900LeCoreV1` names the exact little-endian PlayStation 2 Emotion
-Engine/R5900 core profile. That specialized profile is declaration-only and currently returns a
-typed `DecoderProfileError::Unavailable` before Capstone or a generic MIPS backend is consulted.
+Engine/R5900 core profile. That specialized profile now returns a dedicated, always-available
+pure-Rust decoder and never consults Capstone or a generic MIPS backend. Its `profile()` result is
+the authoritative exact identity; `arch()` reports `Mips64` only as a broad compatibility family.
 No parser infers it from an ELF identity, and it is not serialized into packages, projections,
-plugins, the CLI, or any wire format. Callers own the copyable profile choice and the unique boxed
-decoder returned for an available generic profile; no registry, global state, filesystem access,
-or additional thread-safety contract is introduced.
+plugins, the CLI, or any wire format. Callers own the copyable profile choice and unique boxed
+decoder; no registry, global state, filesystem access, or additional thread-safety contract is
+introduced.
+
+Core-v1 accepts only aligned, 32-bit-addressed, fixed four-byte little-endian EE words. It decodes a
+frozen scalar whitelist across `SPECIAL`, `REGIMM`, immediate, branch/jump, and scalar load/store
+forms, including EE `LQ`/`SQ`, SA-register moves, and the R5900 three-register `MULT`/`MULTU`
+syntax. Reserved fields are checked before a word is accepted. Direct branch and jump targets use
+wrapping 32-bit PC arithmetic; output retains ABI register names, exact lowercase text, length four,
+typed flow, and a direct target only where the encoding contains one. Delay slots and branch-likely
+annul behavior are deliberately not modeled.
+
+Recognized MMI, COP0, valid EE COP1, COP2, VU macro, and conditional-trap opcode spaces return a
+typed `DecodeOutcome::Unsupported` and stop a linear preview after preserving its accepted prefix.
+Other unknown or reserved encodings are invalid. Conditional traps remain outside core-v1 because
+the shared flow taxonomy cannot truthfully represent conditional exceptions. Standalone VU
+microprogram pairs are also outside this four-byte scalar profile and would require a separate
+eight-byte-pair profile. Neither successful decoding nor a typed stop creates CFG, package, or
+container claims.
 
 The x86-64 decoder is a pure-Rust, bounded control-flow-guided block sweep used only over complete
 file-backed executable exception ranges and the first instruction at deterministic thunk seeds.

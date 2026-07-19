@@ -1,8 +1,8 @@
-#[cfg(not(feature = "capstone"))]
-use resymbol_analysis::UnsupportedArchError;
 use resymbol_analysis::{
-    DecoderProfile, DecoderProfileError, TargetArch, decoder_for_profile, target_arch_for_identity,
+    DecodeOutcome, DecoderProfile, TargetArch, decoder_for_profile, target_arch_for_identity,
 };
+#[cfg(not(feature = "capstone"))]
+use resymbol_analysis::{DecoderProfileError, UnsupportedArchError};
 
 #[test]
 fn public_profile_names_are_exact_and_stable() {
@@ -18,15 +18,15 @@ fn public_profile_names_are_exact_and_stable() {
 }
 
 #[test]
-fn public_r5900_profile_fails_with_the_typed_unavailable_error() {
+fn public_r5900_profile_returns_the_exact_always_available_decoder() {
     let profile = DecoderProfile::Ps2EeR5900LeCoreV1;
-    let result = decoder_for_profile(profile);
+    let mut decoder = decoder_for_profile(profile).expect("pure-Rust R5900 decoder");
 
+    assert_eq!(decoder.arch(), TargetArch::Mips64);
+    assert_eq!(decoder.profile(), profile);
     assert!(matches!(
-        result,
-        Err(DecoderProfileError::Unavailable {
-            profile: DecoderProfile::Ps2EeR5900LeCoreV1
-        })
+        decoder.decode_one(&0_u32.to_le_bytes(), 0),
+        DecodeOutcome::Decoded(_)
     ));
 }
 
@@ -36,6 +36,10 @@ fn public_generic_x86_profile_delegates_to_the_existing_factory() {
         .expect("x86-64 decoder is always available");
 
     assert_eq!(decoder.arch(), TargetArch::X86_64);
+    assert_eq!(
+        decoder.profile(),
+        DecoderProfile::Generic(TargetArch::X86_64)
+    );
     assert!(matches!(
         decoder.decode_one(&[0xc3], 0x1000),
         resymbol_analysis::DecodeOutcome::Decoded(_)

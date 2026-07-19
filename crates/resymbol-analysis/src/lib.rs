@@ -19,8 +19,8 @@ mod types;
 
 pub use arch::{
     DecodeOutcome, DecodedInstruction, DecoderProfile, DecoderProfileError, FlowKind,
-    InstructionDecoder, TargetArch, UnsupportedArchError, decoder_for, decoder_for_profile,
-    target_arch_for_identity,
+    InstructionDecoder, TargetArch, UnsupportedArchError, UnsupportedInstructionClass, decoder_for,
+    decoder_for_profile, target_arch_for_identity,
 };
 pub use elf::{ElfMachine, analyze_elf};
 pub use error::AnalysisError;

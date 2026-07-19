@@ -8,11 +8,16 @@ prereleases; breaking changes remain explicit.
 
 ### Added
 
-- Added an explicit, in-memory `DecoderProfile` API with the stable
-  `ps2-ee-r5900-le-core-v1` identity. The specialized profile is declaration-only and returns a
-  typed unavailable error before Capstone or generic MIPS dispatch; automatic ELF identity
-  selection, existing decoder factories, package/projection/plugin schemas, CLI syntax, and wire
-  formats remain unchanged.
+- Added an explicit, in-memory `DecoderProfile` API with an always-available pure-Rust
+  `ps2-ee-r5900-le-core-v1` decoder. The specialized decoder accepts only fixed four-byte
+  little-endian words from a frozen scalar R5900 whitelist, validates reserved fields, applies
+  wrapping 32-bit branch/jump target rules, and returns typed unsupported outcomes for recognized
+  MMI, coprocessor, VU macro, and conditional-trap spaces instead of delegating to Capstone or
+  generic MIPS. `InstructionDecoder::profile()` is now the authoritative exact decoder identity;
+  `DecodeOutcome` and `LinearDisassemblyStopReason` are non-exhaustive and gain matching typed
+  unsupported cases, which is source-breaking for downstream exhaustive matches. Automatic ELF
+  identity selection, package/projection/plugin schemas, CLI/Workbench surfaces, and wire formats
+  remain unchanged.
 - Added a reusable capacity-one `SessionService` foundation for moving future live debugger
   ownership onto a named child thread. A `Send` factory constructs the potentially non-`Send`
   driver on that thread, accepted requests receive monotonic correlation IDs, polling never blocks

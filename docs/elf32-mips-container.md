@@ -30,12 +30,14 @@ dispatches a generic MIPS decoder; generic MIPS decoding requires an explicit
 caller request. This rule is independent of retained symbol-table metadata and
 does not itself authorize instruction-decoding or control-flow claims.
 
-Callers may name the exact in-memory decoder profile
-`ps2-ee-r5900-le-core-v1`, but the profile is deliberately unavailable in this
-release. Selecting it returns a typed error before any generic MIPS or Capstone
-path is consulted. The declaration does not identify an input automatically,
-decode any R5900 instruction, create graph evidence, or change a package,
-projection, plugin, CLI, or wire schema.
+Callers may explicitly select the exact in-memory decoder profile
+`ps2-ee-r5900-le-core-v1`. It returns an always-available pure-Rust decoder for
+a frozen, fail-closed scalar R5900 core whitelist and never consults generic
+MIPS or Capstone. Recognized-but-unmodeled MMI, coprocessor, VU macro, and
+conditional-trap spaces return typed unsupported outcomes; reserved and unknown
+words remain invalid. This opt-in API does not identify an input automatically,
+model delay slots, create graph evidence, or change a package, projection,
+plugin, CLI, Workbench, or wire schema.
 
 Debugger-neutral JSON and Markdown projection, IDAPython, and Ghidra Java can
 represent the empty validated graph. The format-neutral static address-space
