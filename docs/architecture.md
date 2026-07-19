@@ -201,6 +201,16 @@ a partial import prefix. Accepted delay-IAT slots join conventional IAT slots in
 control-flow membership set; an exact supported call or thunk becomes `ImportIat` before any
 read-only function-pointer fallback. The inventory itself does not create a new graph shape.
 
+Decoder selection has a separate, explicit in-memory profile boundary. A
+`DecoderProfile::Generic(TargetArch)` request preserves the existing architecture factory, while
+`DecoderProfile::Ps2EeR5900LeCoreV1` names the exact little-endian PlayStation 2 Emotion
+Engine/R5900 core profile. That specialized profile is declaration-only and currently returns a
+typed `DecoderProfileError::Unavailable` before Capstone or a generic MIPS backend is consulted.
+No parser infers it from an ELF identity, and it is not serialized into packages, projections,
+plugins, the CLI, or any wire format. Callers own the copyable profile choice and the unique boxed
+decoder returned for an available generic profile; no registry, global state, filesystem access,
+or additional thread-safety contract is introduced.
+
 The x86-64 decoder is a pure-Rust, bounded control-flow-guided block sweep used only over complete
 file-backed executable exception ranges and the first instruction at deterministic thunk seeds.
 Each distinct exception range seeds an ordered worklist. Pending supported direct conditional and
