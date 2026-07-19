@@ -20,12 +20,15 @@ preferred virtual extent. File ranges, table arithmetic, segment congruence,
 entry backing, collection counts, and the reconstructed sparse extent are all
 revalidated during package deserialization.
 
-`EM_MIPS` is only a container fact. It is not evidence that a generic MIPS32
-decoder models the executable correctly; PlayStation 2 software may target the
-Emotion Engine/R5900 family. This slice therefore performs no instruction
-decoding and emits no function, call, thunk, string, or data-reference claims.
-The serialized architecture token is `elf32-em-mips-le`; it describes the
-validated container identity only and must not dispatch a generic MIPS decoder.
+`EM_MIPS` is only a container fact. It is not evidence that a generic MIPS32 or
+MIPS64 decoder models the executable correctly; PlayStation 2 software may
+target the Emotion Engine/R5900 family. Although this document specifies the
+ELF32 little-endian intake, the decoder-selection rule applies to all four
+canonical container identities: `elf32-em-mips-le`, `elf32-em-mips-be`,
+`elf64-em-mips-le`, and `elf64-em-mips-be`. None infers a target architecture or
+dispatches a generic MIPS decoder; generic MIPS decoding requires an explicit
+caller request. This rule is independent of retained symbol-table metadata and
+does not itself authorize instruction-decoding or control-flow claims.
 
 Debugger-neutral JSON and Markdown projection, IDAPython, and Ghidra Java can
 represent the empty validated graph. The format-neutral static address-space

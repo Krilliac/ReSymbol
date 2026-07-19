@@ -152,9 +152,12 @@ fn decoder_for_non_x86(
 
 /// Map an analysis `architecture` identity string to a [`TargetArch`].
 ///
-/// The accepted strings are exactly those produced by the ELF, Mach-O, and PE
-/// parsers. Unknown or unmodeled strings return `None` so callers never guess a
-/// decoder for an architecture the toolchain does not recognize.
+/// Known mappings use the exact strings produced by the ELF, Mach-O, and PE
+/// parsers. Unknown or deliberately unmodeled strings return `None`. In
+/// particular, ELF `EM_MIPS` identities intentionally return `None`: the
+/// container field does not identify a sufficiently precise ISA profile, so
+/// this mapper never infers generic MIPS decoding. Callers may still request a
+/// generic MIPS target explicitly.
 #[must_use]
 pub fn target_arch_for_identity(architecture: &str) -> Option<TargetArch> {
     match architecture {
@@ -175,8 +178,6 @@ pub fn target_arch_for_identity(architecture: &str) -> Option<TargetArch> {
         "elf32-x86-le" | "elf32-x86-be" => Some(TargetArch::X86),
         "elf64-aarch64" => Some(TargetArch::Aarch64),
         "elf32-arm-le" | "elf32-arm-be" => Some(TargetArch::Arm),
-        "elf32-em-mips-le" | "elf32-em-mips-be" => Some(TargetArch::Mips32),
-        "elf64-em-mips-le" | "elf64-em-mips-be" => Some(TargetArch::Mips64),
         "elf32-riscv-le" | "elf32-riscv-be" => Some(TargetArch::Riscv32),
         "elf64-riscv-le" | "elf64-riscv-be" => Some(TargetArch::Riscv64),
         "elf32-ppc-le" | "elf32-ppc-be" => Some(TargetArch::PowerPc32),
@@ -204,14 +205,6 @@ mod tests {
         assert_eq!(
             target_arch_for_identity("elf32-arm-le"),
             Some(TargetArch::Arm)
-        );
-        assert_eq!(
-            target_arch_for_identity("elf32-em-mips-le"),
-            Some(TargetArch::Mips32)
-        );
-        assert_eq!(
-            target_arch_for_identity("elf64-em-mips-be"),
-            Some(TargetArch::Mips64)
         );
         assert_eq!(
             target_arch_for_identity("elf32-riscv-le"),
@@ -245,6 +238,18 @@ mod tests {
             target_arch_for_identity("macho64-ppc64"),
             Some(TargetArch::PowerPc64)
         );
+    }
+
+    #[test]
+    fn em_mips_container_identities_do_not_infer_a_generic_mips_architecture() {
+        for architecture in [
+            "elf32-em-mips-le",
+            "elf32-em-mips-be",
+            "elf64-em-mips-le",
+            "elf64-em-mips-be",
+        ] {
+            assert_eq!(target_arch_for_identity(architecture), None);
+        }
     }
 
     #[test]
