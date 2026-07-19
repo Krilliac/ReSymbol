@@ -8,6 +8,13 @@ prereleases; breaking changes remain explicit.
 
 ### Added
 
+- Added the immutable, explicitly selected
+  `ps2-ee-r5900-le-core-v1-mmi-word-shift-v1` decoder profile. It preserves the complete scalar
+  core-v1 contract and adds only canonical `PSLLW`, `PSRLW`, and `PSRAW` words with `rs = 0`, matched
+  by `0xffe0003f`; the same function codes with nonzero `rs` are invalid and every residual primary
+  `0x1c` word remains typed `ps2-ee-mmi-encoding` unsupported. The original core-v1 profile remains
+  behaviorally unchanged. No dependency, automatic ELF selection, package/projection/plugin schema,
+  CLI/Workbench surface, or wire format changed.
 - Added an explicit, in-memory `DecoderProfile` API with an always-available pure-Rust
   `ps2-ee-r5900-le-core-v1` decoder. The specialized decoder accepts only fixed four-byte
   little-endian words from a frozen scalar R5900 whitelist, validates reserved fields, applies
