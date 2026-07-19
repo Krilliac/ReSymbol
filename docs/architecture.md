@@ -206,10 +206,11 @@ Decoder selection has a separate, explicit in-memory profile boundary. A
 `DecoderProfile::Ps2EeR5900LeCoreV1` names the exact little-endian PlayStation 2 Emotion
 Engine/R5900 scalar core profile and
 `DecoderProfile::Ps2EeR5900LeCoreV1MmiWordShiftV1` names its immutable MMI word-immediate-shift
-extension. Both specialized profiles return dedicated, always-available pure-Rust decoders and
-never consult Capstone or a generic MIPS backend. Each decoder's `profile()` result is its
-authoritative exact identity; `arch()` reports `Mips64` only as a broad compatibility family. No
-parser infers either profile from an ELF identity, and neither is serialized into packages,
+extension. `DecoderProfile::Ps2EeR5900LeCoreV1MmiWordShiftV1PackedLogicalV1` names the next immutable
+packed-logical extension. All three specialized profiles return dedicated, always-available
+pure-Rust decoders and never consult Capstone or a generic MIPS backend. Each decoder's `profile()`
+result is its authoritative exact identity; `arch()` reports `Mips64` only as a broad compatibility
+family. No parser infers any profile from an ELF identity, and none is serialized into packages,
 projections, plugins, the CLI, or any wire format. Callers own the copyable profile choice and unique
 boxed decoder; no registry, global state, filesystem access, or additional thread-safety contract
 is introduced.
@@ -229,6 +230,18 @@ field to be zero. Their destination, source, and immediate shift amount are `rd`
 the shift range is therefore exactly 0 through 31. A word using one of those three function codes
 with nonzero `rs` is invalid. The original core-v1 profile continues to classify every MMI word,
 including these three forms, as typed unsupported.
+
+The additive packed-logical-v1 profile preserves every word-shift-v1 disposition, then matches only
+`PAND`, `POR`, `PXOR`, and `PNOR` under mask `0xfc0007ff` with patterns `0x70000489`, `0x700004a9`,
+`0x700004c9`, and `0x700004e9`. The fixed `sa` and function fields select the nested MMI2/MMI3
+operations; `rd`, `rs`, and `rt` are all unconstrained register operands and render in that order.
+There are no reserved operand fields, so selector near-misses remain residual typed MMI unsupported
+rather than invalid. The two earlier profiles continue to classify all four forms as typed
+unsupported.
+
+`PSLLH`, `PSRLH`, and `PSRAH` remain deliberately excluded because their five-bit shift field leaves
+the halfword-width bit-4 alias semantics unresolved; both apparent base forms and bit-4 aliases stay
+typed `ps2-ee-mmi-encoding` unsupported.
 
 Recognized residual MMI, COP0, valid EE COP1, COP2, VU macro, and conditional-trap opcode spaces
 return a typed `DecodeOutcome::Unsupported` and stop a linear preview after preserving its accepted

@@ -36,11 +36,13 @@ a frozen, fail-closed scalar R5900 core whitelist and never consults generic
 MIPS or Capstone. The separate immutable profile
 `ps2-ee-r5900-le-core-v1-mmi-word-shift-v1` preserves that entire contract and
 adds only canonical `PSLLW`, `PSRLW`, and `PSRAW` encodings with `rs = 0`.
-Recognized-but-unmodeled residual MMI, coprocessor, VU macro, and
-conditional-trap spaces return typed unsupported outcomes; reserved and unknown
-words remain invalid. This opt-in API does not identify an input automatically,
-model delay slots, create graph evidence, or change a package, projection,
-plugin, CLI, Workbench, or wire schema.
+The further immutable profile
+`ps2-ee-r5900-le-core-v1-mmi-word-shift-v1-packed-logical-v1` preserves both
+earlier profiles and adds only `PAND`, `POR`, `PXOR`, and `PNOR`. Recognized-but-unmodeled
+residual MMI, coprocessor, VU macro, and conditional-trap spaces return typed unsupported
+outcomes; reserved and unknown words remain invalid. This opt-in API does not identify an input
+automatically, model delay slots, create graph evidence, or change a package, projection, plugin,
+CLI, Workbench, or wire schema.
 
 Debugger-neutral JSON and Markdown projection, IDAPython, and Ghidra Java can
 represent the empty validated graph. The format-neutral static address-space
