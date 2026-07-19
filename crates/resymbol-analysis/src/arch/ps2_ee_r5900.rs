@@ -83,6 +83,45 @@ impl InstructionDecoder for Ps2EeR5900LeCoreV1MmiWordShiftV1Decoder {
     }
 }
 
+/// Always-available pure-Rust decoder for the little-endian EE/R5900 core-v1
+/// profile plus the frozen MMI word-shift-v1 and packed-logical-v1 extensions.
+#[derive(Debug, Default)]
+pub(crate) struct Ps2EeR5900LeCoreV1MmiWordShiftV1PackedLogicalV1Decoder;
+
+impl Ps2EeR5900LeCoreV1MmiWordShiftV1PackedLogicalV1Decoder {
+    pub(crate) const fn new() -> Self {
+        Self
+    }
+}
+
+impl InstructionDecoder for Ps2EeR5900LeCoreV1MmiWordShiftV1PackedLogicalV1Decoder {
+    fn arch(&self) -> TargetArch {
+        TargetArch::Mips64
+    }
+
+    fn profile(&self) -> DecoderProfile {
+        DecoderProfile::Ps2EeR5900LeCoreV1MmiWordShiftV1PackedLogicalV1
+    }
+
+    fn decode_one(&mut self, bytes: &[u8], address: u64) -> DecodeOutcome {
+        if bytes.len() < 4 {
+            return DecodeOutcome::Truncated {
+                available: bytes.len(),
+            };
+        }
+        if address > u64::from(u32::MAX) || address % 4 != 0 {
+            return DecodeOutcome::Invalid;
+        }
+
+        let word = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        if field(word, 26, 0x3f) == 0x1c {
+            decode_mmi_word_shift_packed_logical(word, address as u32)
+        } else {
+            decode_word(word, address as u32)
+        }
+    }
+}
+
 fn decode_mmi_word_shift(word: u32, address: u32) -> DecodeOutcome {
     const MASK: u32 = 0xffe0_003f;
     const PSLLW: u32 = 0x7000_003c;
@@ -95,6 +134,22 @@ fn decode_mmi_word_shift(word: u32, address: u32) -> DecodeOutcome {
         PSRAW => shift_immediate("psraw", word, address),
         _ if matches!(field(word, 0, 0x3f), 0x3c | 0x3e | 0x3f) => DecodeOutcome::Invalid,
         _ => unsupported(UnsupportedInstructionClass::Ps2EeMmiEncoding),
+    }
+}
+
+fn decode_mmi_word_shift_packed_logical(word: u32, address: u32) -> DecodeOutcome {
+    const MASK: u32 = 0xfc00_07ff;
+    const PAND: u32 = 0x7000_0489;
+    const POR: u32 = 0x7000_04a9;
+    const PXOR: u32 = 0x7000_04c9;
+    const PNOR: u32 = 0x7000_04e9;
+
+    match word & MASK {
+        PAND => three_registers("pand", word, address),
+        POR => three_registers("por", word, address),
+        PXOR => three_registers("pxor", word, address),
+        PNOR => three_registers("pnor", word, address),
+        _ => decode_mmi_word_shift(word, address),
     }
 }
 

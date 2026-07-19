@@ -9,6 +9,13 @@ prereleases; breaking changes remain explicit.
 ### Added
 
 - Added the immutable, explicitly selected
+  `ps2-ee-r5900-le-core-v1-mmi-word-shift-v1-packed-logical-v1` decoder profile. It preserves both
+  earlier profiles and adds only `PAND`, `POR`, `PXOR`, and `PNOR`, matched by the exact nested-MMI
+  mask `0xfc0007ff`. Their `rd`, `rs`, and `rt` fields are all operands, including register zero, and
+  selector near-misses remain typed `ps2-ee-mmi-encoding` unsupported rather than becoming invalid.
+  No dependency, flow taxonomy, automatic ELF selection, package/projection/plugin schema,
+  CLI/Workbench surface, or wire format changed.
+- Added the immutable, explicitly selected
   `ps2-ee-r5900-le-core-v1-mmi-word-shift-v1` decoder profile. It preserves the complete scalar
   core-v1 contract and adds only canonical `PSLLW`, `PSRLW`, and `PSRAW` words with `rs = 0`, matched
   by `0xffe0003f`; the same function codes with nonzero `rs` are invalid and every residual primary
