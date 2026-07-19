@@ -287,6 +287,7 @@ struct GdbserverArgs {
 }
 
 /// What the `gdbserver` command should attach the RSP server to.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 enum GdbserverTarget {
     /// Launch `program` with `arguments` (already including `argv[0]`).
     Launch {
