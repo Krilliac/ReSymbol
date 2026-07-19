@@ -9,6 +9,14 @@ prereleases; breaking changes remain explicit.
 ### Added
 
 - Added the immutable, explicitly selected
+  `ps2-ee-r5900-le-core-v1-mmi-word-shift-v1-packed-logical-v1-packed-add-v1-packed-sub-v1`
+  decoder profile. It preserves all four earlier profiles and adds only `PSUBW`, `PSUBH`, and
+  `PSUBB`, matched by the exact nested-MMI mask `0xfc0007ff` and patterns `0x70000048`,
+  `0x70000148`, and `0x70000248`. Their `rd`, `rs`, and `rt` fields are all operands, including
+  register zero, while comparison, saturating, alternate-function, and hidden-field near-misses
+  remain typed `ps2-ee-mmi-encoding` unsupported. No dependency, flow taxonomy, automatic ELF
+  selection, package/projection/plugin schema, CLI/Workbench surface, or wire format changed.
+- Added the immutable, explicitly selected
   `ps2-ee-r5900-le-core-v1-mmi-word-shift-v1-packed-logical-v1-packed-add-v1` decoder profile. It
   preserves all three earlier profiles and adds only `PADDW`, `PADDH`, and `PADDB`, matched by the
   exact nested-MMI mask `0xfc0007ff` and patterns `0x70000008`, `0x70000108`, and `0x70000208`.

@@ -209,13 +209,15 @@ Engine/R5900 scalar core profile and
 extension. `DecoderProfile::Ps2EeR5900LeCoreV1MmiWordShiftV1PackedLogicalV1` names the next immutable
 packed-logical extension, and
 `DecoderProfile::Ps2EeR5900LeCoreV1MmiWordShiftV1PackedLogicalV1PackedAddV1` names the following
-immutable packed-add extension. All four specialized profiles return dedicated, always-available
-pure-Rust decoders and never consult Capstone or a generic MIPS backend. Each decoder's `profile()`
-result is its authoritative exact identity; `arch()` reports `Mips64` only as a broad compatibility
-family. No parser infers any profile from an ELF identity, and none is serialized into packages,
-projections, plugins, the CLI, or any wire format. Callers own the copyable profile choice and unique
-boxed decoder; no registry, global state, filesystem access, or additional thread-safety contract
-is introduced.
+immutable packed-add extension.
+`DecoderProfile::Ps2EeR5900LeCoreV1MmiWordShiftV1PackedLogicalV1PackedAddV1PackedSubV1` names the
+following immutable packed-sub extension. All five specialized profiles return dedicated,
+always-available pure-Rust decoders and never consult Capstone or a generic MIPS backend. Each
+decoder's `profile()` result is its authoritative exact identity; `arch()` reports `Mips64` only as
+a broad compatibility family. No parser infers any profile from an ELF identity, and none is
+serialized into packages, projections, plugins, the CLI, or any wire format. Callers own the
+copyable profile choice and unique boxed decoder; no registry, global state, filesystem access, or
+additional thread-safety contract is introduced.
 
 Core-v1 accepts only aligned, 32-bit-addressed, fixed four-byte little-endian EE words. It decodes a
 frozen scalar whitelist across `SPECIAL`, `REGIMM`, immediate, branch/jump, and scalar load/store
@@ -248,6 +250,14 @@ byte lane widths; `rd`, `rs`, and `rt` are all unconstrained register operands a
 order. There are no reserved operand fields, so selector, subtraction, comparison, saturating, and
 unsigned-add near-misses remain residual typed MMI unsupported rather than invalid. The three
 earlier profiles continue to classify all three forms as typed unsupported.
+
+The additive packed-sub-v1 profile preserves every packed-add-v1 disposition, then matches only
+`PSUBW`, `PSUBH`, and `PSUBB` under mask `0xfc0007ff` with patterns `0x70000048`, `0x70000148`, and
+`0x70000248`. The fixed MMI0 function and secondary-selector fields choose the word, halfword, and
+byte lane widths; `rd`, `rs`, and `rt` are all unconstrained register operands and render in that
+order. There are no reserved operand fields, so comparison, signed- or unsigned-saturating,
+alternate-function, and hidden-field near-misses remain residual typed MMI unsupported rather than
+invalid. The four earlier profiles continue to classify all three forms as typed unsupported.
 
 `PSLLH`, `PSRLH`, and `PSRAH` remain deliberately excluded because their five-bit shift field leaves
 the halfword-width bit-4 alias semantics unresolved; both apparent base forms and bit-4 aliases stay
