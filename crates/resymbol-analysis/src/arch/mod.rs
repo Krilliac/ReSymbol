@@ -57,6 +57,35 @@ impl TargetArch {
     }
 }
 
+/// An explicit instruction-decoder selection profile.
+///
+/// Generic profiles preserve the existing architecture factory behavior. A
+/// specialized profile names semantics that must never be approximated by a
+/// generic architecture backend.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecoderProfile {
+    Generic(TargetArch),
+    Ps2EeR5900LeCoreV1,
+}
+
+impl DecoderProfile {
+    /// Stable human-readable identifier used in diagnostics.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Generic(arch) => arch.name(),
+            Self::Ps2EeR5900LeCoreV1 => "ps2-ee-r5900-le-core-v1",
+        }
+    }
+}
+
+impl std::fmt::Display for DecoderProfile {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
 /// Architecture-neutral control-flow classification of one decoded instruction.
 ///
 /// The x86/x86-64 backend maps `iced-x86`'s `FlowControl` onto this enum. Two of
@@ -122,6 +151,16 @@ pub enum UnsupportedArchError {
     BackendUnavailable { arch: &'static str, reason: String },
 }
 
+/// No decoder is available for the requested explicit profile.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum DecoderProfileError {
+    #[error(transparent)]
+    GenericArchitecture(#[from] UnsupportedArchError),
+    #[error("decoder profile `{profile}` is declared but no implementation is available")]
+    Unavailable { profile: DecoderProfile },
+}
+
 /// Construct a boxed decoder for `arch`.
 ///
 /// `X86` and `X86_64` always return the pure-Rust `iced-x86` backend. Every
@@ -132,6 +171,20 @@ pub fn decoder_for(arch: TargetArch) -> Result<Box<dyn InstructionDecoder>, Unsu
         TargetArch::X86 => Ok(Box::new(IcedX64Decoder::new_x86())),
         TargetArch::X86_64 => Ok(Box::new(IcedX64Decoder::new_x86_64())),
         other => decoder_for_non_x86(other),
+    }
+}
+
+/// Construct a boxed decoder for an explicit selection profile.
+///
+/// Generic profiles delegate to [`decoder_for`]. The PlayStation 2 Emotion
+/// Engine/R5900 profile is declaration-only: it fails with a typed error before
+/// consulting Capstone or any generic MIPS backend.
+pub fn decoder_for_profile(
+    profile: DecoderProfile,
+) -> Result<Box<dyn InstructionDecoder>, DecoderProfileError> {
+    match profile {
+        DecoderProfile::Generic(arch) => decoder_for(arch).map_err(Into::into),
+        DecoderProfile::Ps2EeR5900LeCoreV1 => Err(DecoderProfileError::Unavailable { profile }),
     }
 }
 
@@ -272,6 +325,32 @@ mod tests {
             decoder_for(TargetArch::X86).expect("x86 decoder").arch(),
             TargetArch::X86
         );
+    }
+
+    #[test]
+    fn decoder_profile_names_are_stable() {
+        assert_eq!(DecoderProfile::Generic(TargetArch::X86_64).name(), "x86-64");
+        assert_eq!(
+            DecoderProfile::Ps2EeR5900LeCoreV1.name(),
+            "ps2-ee-r5900-le-core-v1"
+        );
+        assert_eq!(
+            DecoderProfile::Ps2EeR5900LeCoreV1.to_string(),
+            "ps2-ee-r5900-le-core-v1"
+        );
+    }
+
+    #[test]
+    fn specialized_r5900_profile_is_declared_but_unavailable() {
+        let profile = DecoderProfile::Ps2EeR5900LeCoreV1;
+        let result = decoder_for_profile(profile);
+
+        assert!(matches!(
+            result,
+            Err(DecoderProfileError::Unavailable {
+                profile: DecoderProfile::Ps2EeR5900LeCoreV1
+            })
+        ));
     }
 
     #[cfg(not(feature = "capstone"))]

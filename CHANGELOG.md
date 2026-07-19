@@ -8,6 +8,11 @@ prereleases; breaking changes remain explicit.
 
 ### Added
 
+- Added an explicit, in-memory `DecoderProfile` API with the stable
+  `ps2-ee-r5900-le-core-v1` identity. The specialized profile is declaration-only and returns a
+  typed unavailable error before Capstone or generic MIPS dispatch; automatic ELF identity
+  selection, existing decoder factories, package/projection/plugin schemas, CLI syntax, and wire
+  formats remain unchanged.
 - Added a reusable capacity-one `SessionService` foundation for moving future live debugger
   ownership onto a named child thread. A `Send` factory constructs the potentially non-`Send`
   driver on that thread, accepted requests receive monotonic correlation IDs, polling never blocks
