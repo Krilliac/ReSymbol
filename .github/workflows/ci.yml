@@ -148,6 +148,10 @@ jobs:
       - name: Run tests
         run: cargo test --locked --workspace --all-features
 
+      - name: Verify decoder profiles without optional backends
+        if: runner.os == 'Linux'
+        run: cargo test --locked -p resymbol-analysis --test decoder_profiles --no-default-features
+
       - name: Build CLI and disposable native host
         run: cargo build --locked --bin resymbol --bin resymbol-native-host
 
