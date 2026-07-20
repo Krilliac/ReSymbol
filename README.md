@@ -44,9 +44,11 @@ The current alpha implements and tests an end-to-end, deliberately narrow analys
   canonical `PSLLW`/`PSRLW`/`PSRAW` shifts, then `PAND`/`POR`/`PXOR`/`PNOR`, then
   `PADDW`/`PADDH`/`PADDB`, then `PSUBW`/`PSUBH`/`PSUBB`, and finally
   `PCGTW`/`PCGTH`/`PCGTB` while retaining typed stops for residual MMI, coprocessor, VU macro, and
-  conditional-trap spaces. No profile is inferred by container analysis or stored in packages,
-  projections, plugins, the CLI, or a wire format; the Workbench can transiently use the complete
-  packed-compare-gt-v1 profile only after an explicit user selection for an eligible exact source;
+  conditional-trap spaces. No profile is inferred by container analysis. The Workbench can
+  transiently use the complete packed-compare-gt-v1 profile only after an explicit user selection
+  for an eligible exact source. Separately, `resymbol ps2 observe` accepts only these six exact
+  profile names and records the resolved selection in a binary-bound private `.resym` observer
+  report; generic and moving aliases are not accepted;
 - bounded discovery of modern MSVC x64 Rev1 RTTI and vftables from file-backed compiler metadata,
   including both legacy 24-byte and `BCD_HASPCHD` 28-byte base-class descriptors, validated
   class/type names, and contiguous executable slot candidates;
@@ -397,12 +399,18 @@ resymbol export application.resym --format ida-python
 resymbol export application.resym --format ghidra-java
 resymbol export application.resym --format map --dry-run
 resymbol patch application.exe reviewed.respatch.json --output application-patched.exe
+resymbol ps2 observe owned-ps2-ee.elf --profile ps2-ee-r5900-le-core-v1 --output private-observer.resym
 resymbol plugin list
 resymbol plugin doctor
 # After reviewing a dropped-in executable plugin:
 resymbol plugin trust community.example-analyzer --fingerprint <sha256>
 resymbol analyze application.exe --plugin community.example-analyzer
 ```
+
+`ps2 observe` reads one exact eligible PlayStation 2 EE ELF snapshot and never executes it. It writes
+a binary-bound canonical-JSON `.resym` package with a 64 MiB maximum, create-new semantics, and no
+overwrite path. The report may contain target-derived string anchors; keep it in a private location
+outside version control.
 
 On Windows, open the same supported container in the desktop workbench. ELF projects expose their
 sparse `PT_LOAD` address map and exact file-backed offline bytes as hex. Eligible ELF32
@@ -578,9 +586,11 @@ package schema 12 adds checked XFG and CastGuard storage RVAs, package schema 13
 GuardMemcpy function-pointer-slot RVA, and package schema 14 adds checked ELF32 little-endian
 `EM_MIPS` container metadata and sparse `PT_LOAD` mappings without automatic instruction decoding.
 The separately selectable R5900 core-v1, MMI-word-shift-v1, packed-logical-v1, packed-add-v1,
-packed-sub-v1, and packed-compare-gt-v1 decoder profiles remain in-memory analysis API state and
-create no package claim. `DecoderProfile::PS2_EE_R5900_LATEST` currently resolves to the exact
-packed-compare-gt-v1 variant; the Workbench stores that resolved value only in transient UI state.
+packed-sub-v1, and packed-compare-gt-v1 decoder profiles create no ordinary analysis-session package
+claim. `DecoderProfile::PS2_EE_R5900_LATEST` currently resolves to the exact packed-compare-gt-v1
+variant; the Workbench stores that resolved value only in transient UI state, while the explicit
+`ps2 observe` command records its exact non-alias selection only in the specialized private observer
+report.
 The independently versioned neutral projection remains schema 6, and the
 plugin API and external wire handshake remain unchanged. A plugin granted `symbols.read` can
 observe these additive result families in its base-analysis JSON; a plugin without that permission
