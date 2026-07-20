@@ -10,6 +10,7 @@ members = [
     "crates/resymbol-linux-debug-host",
     "crates/resymbol-native-host",
     "crates/resymbol-package",
+    "crates/resymbol-ps2",
     "crates/resymbol-plugin-api",
     "crates/resymbol-plugin-runtime",
     "crates/resymbol-plugin-state",

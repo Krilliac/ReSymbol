@@ -1,0 +1,17 @@
+[package]
+name = "resymbol-ps2"
+description = "Explicit PlayStation 2 container views and analysis adapters for ReSymbol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+resymbol-analysis = { path = "../resymbol-analysis" }
+resymbol-core = { path = "../resymbol-core" }
+thiserror = "2.0.12"
+
+[lints]
+workspace = true
