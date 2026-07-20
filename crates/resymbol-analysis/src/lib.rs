@@ -13,6 +13,7 @@ mod linear_disassembly;
 mod macho;
 mod msvc_rtti;
 mod pe;
+mod ps2_ee_observer;
 mod session;
 mod string_recovery;
 mod types;
@@ -37,6 +38,18 @@ pub use macho::{MachOKind, analyze_macho, detect_macho};
 pub use pe::{
     PeCodeViewInspection, PeCodeViewRsds, PeLayoutInspection, analyze_pe, inspect_pe_codeview,
     inspect_pe_layout,
+};
+pub use ps2_ee_observer::{
+    MAX_PS2_EE_OBSERVER_BLOCKS, MAX_PS2_EE_OBSERVER_EDGES, MAX_PS2_EE_OBSERVER_SCAN_BYTES,
+    MAX_PS2_EE_OBSERVER_SEEDS, MAX_PS2_EE_OBSERVER_SITES, MAX_PS2_EE_OBSERVER_STRING_BYTES,
+    MAX_PS2_EE_OBSERVER_TOTAL_STRING_BYTES, MAX_PS2_EE_OBSERVER_WORDS, MAX_PS2_EE_OBSERVER_XREFS,
+    PS2_EE_OBSERVER_REPORT_SCHEMA_VERSION, Ps2EeAccessDirection, Ps2EeAccessForm, Ps2EeAccessWidth,
+    Ps2EeAddressMaterialization, Ps2EeBasicBlock, Ps2EeBlockTerminator, Ps2EeCfgEdge,
+    Ps2EeCfgEdgeKind, Ps2EeDataTargetClass, Ps2EeDataXref, Ps2EeExecutableCoverage,
+    Ps2EeFunctionSeed, Ps2EeFunctionSeedSource, Ps2EeObserverError, Ps2EeObserverHook,
+    Ps2EeObserverLimits, Ps2EeObserverReport, Ps2EeObserverSelection, Ps2EeObserverSite,
+    Ps2EeObserverSiteSelector, Ps2EeSegmentPermissions, Ps2EeStringAnchor,
+    scan_ps2_ee_observer_sites, select_site,
 };
 pub use session::{AnalysisSession, PluginRunRecord, PluginRunStatus, SessionValidationError};
 pub use types::{

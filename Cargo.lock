@@ -3137,6 +3137,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "resymbol-ps2"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "resymbol-analysis",
+ "resymbol-core",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "resymbol-windows-debug-host"
 version = "0.1.0-alpha.1"
 dependencies = [
