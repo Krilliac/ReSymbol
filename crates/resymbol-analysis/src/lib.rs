@@ -104,6 +104,12 @@ impl resymbol_package::BinaryBoundPayload for AnalysisSession {
     }
 }
 
+impl resymbol_package::BinaryBoundPayload for Ps2EeObserverReport {
+    fn binary_id(&self) -> &resymbol_core::BinaryId {
+        &self.identity.id
+    }
+}
+
 fn format_bytes(bytes: &[u8]) -> String {
     let mut result = String::with_capacity(bytes.len().saturating_mul(3));
     for (index, byte) in bytes.iter().enumerate() {

@@ -57,8 +57,16 @@ binding includes full identity, canonical source path, requested RVA span, and r
 The existing profile-agnostic offline worker still reads the bytes; a pure planner decodes at the
 checked preferred VA, then maps every row and stop address back to RVA. This preserves correct
 high-base J/JAL targets. Follow is available only for a translated target with exact file backing.
-No selection is serialized into preferences, packages, projections, plugins, reviews, the CLI, or
-wire protocols, and the preview does not model delay slots, CFG, or function boundaries.
+No Workbench selection is serialized into preferences, packages, projections, plugins, reviews, or
+worker/debugger protocols, and the preview does not model delay slots, CFG, or function boundaries.
+
+`resymbol ps2 observe EXACT_PS2_EE_ELF --profile EXACT_R5900_PROFILE --output
+NEW_PRIVATE_REPORT.resym` is a separate, non-executing CLI consumer. It accepts only the six exact
+profile names above, never `PS2_EE_R5900_LATEST` or a generic MIPS alias, reads one exact eligible ELF
+snapshot, and records the resolved profile in a binary-bound canonical-JSON `.resym` package. The
+write is capped at 64 MiB, uses create-new semantics, and never replaces an existing destination.
+Because the report may retain target-derived string anchors, keep it private and outside version
+control.
 
 Debugger-neutral JSON and Markdown projection, IDAPython, and Ghidra Java can
 represent the empty validated graph. The format-neutral static address-space

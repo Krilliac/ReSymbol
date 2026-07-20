@@ -9,9 +9,10 @@ use std::{
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use resymbol_analysis::{
-    AnalysisSession, BinaryAnalysis, PeAnalysis, PeControlFlowTarget,
+    AnalysisSession, BinaryAnalysis, DecoderProfile, PeAnalysis, PeControlFlowTarget,
     PeLoadConfigGuardMemcpyAnchor, PeLoadConfigSecurityAnchors, PeLoadConfigXfgAnchors,
-    PluginRunRecord, PluginRunStatus, analyze_bytes,
+    PluginRunRecord, PluginRunStatus, Ps2EeObserverLimits, Ps2EeObserverReport,
+    Ps2EeObserverSelection, analyze_bytes, scan_ps2_ee_observer_sites,
 };
 use resymbol_app::{AppServices, StaticPatchPlan};
 use resymbol_core::{
@@ -88,6 +89,8 @@ enum Command {
     Export(ExportArgs),
     /// Apply a strict portable patch set to an exact PE without executing it.
     Patch(PatchArgs),
+    /// Run bounded, offline PlayStation 2 research helpers.
+    Ps2(Ps2Args),
     /// Inspect and manage discovered plugins.
     Plugin(PluginArgs),
     /// Serve a live process (Linux) or an ELF core dump over the GDB Remote Serial Protocol.
@@ -169,6 +172,74 @@ struct PatchArgs {
     /// New patched-binary destination; an existing path is never replaced.
     #[arg(short, long, value_name = "NEW_BINARY")]
     output: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct Ps2Args {
+    #[command(subcommand)]
+    command: Ps2Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Ps2Command {
+    /// Produce a deterministic EE/R5900 observer-site report without executing the ELF.
+    Observe(Ps2ObserveArgs),
+}
+
+#[derive(Debug, Args)]
+struct Ps2ObserveArgs {
+    /// Exact PlayStation 2 EE ELF to inspect; it is read once and never executed.
+    #[arg(value_name = "EXACT_PS2_EE_ELF")]
+    binary: PathBuf,
+
+    /// Exact bundled R5900 decoder profile. Moving aliases are deliberately unavailable.
+    #[arg(long, value_enum, value_name = "EXACT_R5900_PROFILE")]
+    profile: Ps2EeObserverProfile,
+
+    /// New bounded JSON package destination; an existing path is never replaced.
+    #[arg(short, long, value_name = "NEW_PRIVATE_REPORT")]
+    output: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Ps2EeObserverProfile {
+    #[value(name = "ps2-ee-r5900-le-core-v1")]
+    CoreV1,
+    #[value(name = "ps2-ee-r5900-le-core-v1-mmi-word-shift-v1")]
+    MmiWordShiftV1,
+    #[value(name = "ps2-ee-r5900-le-core-v1-mmi-word-shift-v1-packed-logical-v1")]
+    PackedLogicalV1,
+    #[value(name = "ps2-ee-r5900-le-core-v1-mmi-word-shift-v1-packed-logical-v1-packed-add-v1")]
+    PackedAddV1,
+    #[value(
+        name = "ps2-ee-r5900-le-core-v1-mmi-word-shift-v1-packed-logical-v1-packed-add-v1-packed-sub-v1"
+    )]
+    PackedSubV1,
+    #[value(
+        name = "ps2-ee-r5900-le-core-v1-mmi-word-shift-v1-packed-logical-v1-packed-add-v1-packed-sub-v1-packed-compare-gt-v1"
+    )]
+    PackedCompareGtV1,
+}
+
+impl Ps2EeObserverProfile {
+    const fn decoder_profile(self) -> DecoderProfile {
+        match self {
+            Self::CoreV1 => DecoderProfile::Ps2EeR5900LeCoreV1,
+            Self::MmiWordShiftV1 => DecoderProfile::Ps2EeR5900LeCoreV1MmiWordShiftV1,
+            Self::PackedLogicalV1 => {
+                DecoderProfile::Ps2EeR5900LeCoreV1MmiWordShiftV1PackedLogicalV1
+            }
+            Self::PackedAddV1 => {
+                DecoderProfile::Ps2EeR5900LeCoreV1MmiWordShiftV1PackedLogicalV1PackedAddV1
+            }
+            Self::PackedSubV1 => {
+                DecoderProfile::Ps2EeR5900LeCoreV1MmiWordShiftV1PackedLogicalV1PackedAddV1PackedSubV1
+            }
+            Self::PackedCompareGtV1 => {
+                DecoderProfile::Ps2EeR5900LeCoreV1MmiWordShiftV1PackedLogicalV1PackedAddV1PackedSubV1PackedCompareGtV1
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -476,9 +547,54 @@ fn main() -> Result<()> {
         Command::Inspect(args) => inspect(args),
         Command::Export(args) => export(args),
         Command::Patch(args) => patch_binary(args),
+        Command::Ps2(args) => ps2(args),
         Command::Plugin(args) => plugins(args, cli.safe_mode, cli.plugin_dir),
         Command::Gdbserver(args) => gdbserver(args),
     }
+}
+
+fn ps2(args: Ps2Args) -> Result<()> {
+    match args.command {
+        Ps2Command::Observe(args) => ps2_observe(args),
+    }
+}
+
+fn ps2_observe(args: Ps2ObserveArgs) -> Result<()> {
+    ensure_output_absent(&args.output)?;
+    let source = AppServices::default()
+        .read_binary_exact(&args.binary, None)
+        .with_context(|| format!("cannot read exact PS2 EE ELF {}", args.binary.display()))?;
+    let selection = Ps2EeObserverSelection::new(args.profile.decoder_profile())
+        .context("cannot select exact PS2 EE R5900 observer profile")?;
+    let report: Ps2EeObserverReport =
+        scan_ps2_ee_observer_sites(source.bytes(), selection, Ps2EeObserverLimits::default())
+            .with_context(|| {
+                format!(
+                    "cannot inspect exact PS2 EE ELF {}",
+                    source.path().display()
+                )
+            })?;
+    let package = ResymPackage::from_bound_payload(env!("CARGO_PKG_VERSION"), report)
+        .context("cannot create binary-bound PS2 EE observer report")?;
+    write_file_new_bound(&args.output, &package).with_context(|| {
+        format!(
+            "cannot write private observer report {}",
+            args.output.display()
+        )
+    })?;
+
+    println!("source ELF: {}", source.path().display());
+    println!("binary SHA-256: {}", package.binary_sha256());
+    println!(
+        "exact R5900 profile: {}",
+        package.payload().exact_profile_name
+    );
+    println!("observer sites: {}", package.payload().observer_sites.len());
+    println!("report: {}", args.output.display());
+    println!(
+        "privacy: this report may contain target-derived string anchors; keep it outside version control"
+    );
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4633,6 +4749,136 @@ entrypoint = "Plugin.dll"
         };
         assert_eq!(args.binary, None);
         assert!(!args.json);
+    }
+
+    #[test]
+    fn command_line_accepts_only_explicit_ps2_observer_profiles() {
+        let cases = [
+            (
+                "ps2-ee-r5900-le-core-v1",
+                DecoderProfile::Ps2EeR5900LeCoreV1,
+            ),
+            (
+                "ps2-ee-r5900-le-core-v1-mmi-word-shift-v1",
+                DecoderProfile::Ps2EeR5900LeCoreV1MmiWordShiftV1,
+            ),
+            (
+                "ps2-ee-r5900-le-core-v1-mmi-word-shift-v1-packed-logical-v1",
+                DecoderProfile::Ps2EeR5900LeCoreV1MmiWordShiftV1PackedLogicalV1,
+            ),
+            (
+                "ps2-ee-r5900-le-core-v1-mmi-word-shift-v1-packed-logical-v1-packed-add-v1",
+                DecoderProfile::Ps2EeR5900LeCoreV1MmiWordShiftV1PackedLogicalV1PackedAddV1,
+            ),
+            (
+                "ps2-ee-r5900-le-core-v1-mmi-word-shift-v1-packed-logical-v1-packed-add-v1-packed-sub-v1",
+                DecoderProfile::Ps2EeR5900LeCoreV1MmiWordShiftV1PackedLogicalV1PackedAddV1PackedSubV1,
+            ),
+            (
+                "ps2-ee-r5900-le-core-v1-mmi-word-shift-v1-packed-logical-v1-packed-add-v1-packed-sub-v1-packed-compare-gt-v1",
+                DecoderProfile::Ps2EeR5900LeCoreV1MmiWordShiftV1PackedLogicalV1PackedAddV1PackedSubV1PackedCompareGtV1,
+            ),
+        ];
+
+        for (name, expected) in cases {
+            let cli = Cli::try_parse_from([
+                "resymbol",
+                "ps2",
+                "observe",
+                "owned.elf",
+                "--profile",
+                name,
+                "--output",
+                "private-report.json",
+            ])
+            .expect("exact observer profile parses");
+            let Command::Ps2(Ps2Args {
+                command: Ps2Command::Observe(args),
+            }) = cli.command
+            else {
+                panic!("PS2 observe command expected");
+            };
+            assert_eq!(args.binary, PathBuf::from("owned.elf"));
+            assert_eq!(args.output, PathBuf::from("private-report.json"));
+            assert_eq!(args.profile.decoder_profile(), expected);
+            assert_eq!(expected.name(), name);
+            Ps2EeObserverSelection::new(expected).expect("CLI profile is observer eligible");
+        }
+
+        for invalid in ["latest", "mips32", "ps2-ee-r5900-latest"] {
+            let error = Cli::try_parse_from([
+                "resymbol",
+                "ps2",
+                "observe",
+                "owned.elf",
+                "--profile",
+                invalid,
+                "--output",
+                "private-report.json",
+            ])
+            .expect_err("moving or generic profile aliases must be rejected");
+            assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+        }
+    }
+
+    #[test]
+    fn ps2_observer_writes_one_bound_private_package_without_overwrite() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let source = temp.path().join("owned.elf");
+        let output = temp.path().join("private-observer.json");
+        fs::write(&source, elf32_container_fixture()).expect("write synthetic PS2 ELF");
+
+        ps2_observe(Ps2ObserveArgs {
+            binary: source.clone(),
+            profile: Ps2EeObserverProfile::CoreV1,
+            output: output.clone(),
+        })
+        .expect("synthetic observer report succeeds");
+
+        let first = fs::read(&output).expect("read observer report");
+        assert!(first.len() <= DEFAULT_MAX_PACKAGE_BYTES);
+        let document: Value = serde_json::from_slice(&first).expect("observer package is JSON");
+        assert_eq!(
+            document["schema_version"],
+            Value::from(CURRENT_SCHEMA_VERSION)
+        );
+        assert_eq!(
+            document["payload"]["schema_version"],
+            Value::from(resymbol_analysis::PS2_EE_OBSERVER_REPORT_SCHEMA_VERSION)
+        );
+        assert_eq!(
+            document["payload"]["exact_profile"],
+            Value::from(DecoderProfile::Ps2EeR5900LeCoreV1.name())
+        );
+        assert_eq!(
+            document["binary_sha256"],
+            document["payload"]["identity"]["id"]
+        );
+
+        let error = ps2_observe(Ps2ObserveArgs {
+            binary: source,
+            profile: Ps2EeObserverProfile::CoreV1,
+            output: output.clone(),
+        })
+        .expect_err("an existing observer report is never replaced");
+        assert!(error.to_string().contains("refusing to overwrite"));
+        assert_eq!(fs::read(output).expect("read preserved report"), first);
+    }
+
+    #[test]
+    fn ps2_observer_rejects_ineligible_input_before_publication() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let source = temp.path().join("not-ps2.exe");
+        let output = temp.path().join("must-not-exist.json");
+        fs::write(&source, pe_fixture()).expect("write synthetic PE");
+
+        ps2_observe(Ps2ObserveArgs {
+            binary: source,
+            profile: Ps2EeObserverProfile::PackedCompareGtV1,
+            output: output.clone(),
+        })
+        .expect_err("non-PS2 input must fail");
+        assert!(!output.exists());
     }
 
     #[test]

@@ -14,7 +14,10 @@ CMake, Visual Studio, LLVM, DIA, or another compiler to run an official archive.
 The current analyzer accepts native Windows x86-64 PE32+ input. It also accepts ELF32
 little-endian `EM_MIPS` `ET_EXEC` input through a container-only path that retains checked headers,
 sparse non-empty `PT_LOAD` mappings, and zero base claims without decoding instructions; see
-[elf32-mips-container.md](elf32-mips-container.md). For PE, it safely extracts image and section
+[elf32-mips-container.md](elf32-mips-container.md). The separate `resymbol ps2 observe` command can
+run a bounded, non-executing observer pass only after the caller supplies one of the six exact
+immutable R5900 profile names; no profile is inferred and generic or moving aliases are rejected.
+For PE, it safely extracts image and section
 metadata, conventional imports, modern RVA-form delay imports, exports, forwarded exports, x64
 exception-directory records, ordered TLS callback records, and load-config GuardCF function,
 address-taken IAT, long-jump, and EH-continuation records, plus checked security-cookie, GuardCF,
@@ -205,9 +208,17 @@ resymbol export path/to/application.resym --format pdb --binary path/to/applicat
 resymbol export path/to/application.resym --format ida-python
 resymbol export path/to/application.resym --format ghidra-java
 resymbol patch path/to/application.exe path/to/reviewed.respatch.json --output path/to/application-patched.exe
+resymbol ps2 observe path/to/owned-ps2-ee.elf --profile ps2-ee-r5900-le-core-v1 --output private/observer.resym
 resymbol plugin list
 resymbol plugin doctor
 ```
+
+`ps2 observe` reads the exact eligible ELF once and never executes it. The required output is a
+binary-bound canonical-JSON `.resym` package capped at 64 MiB; publication creates a new file and
+refuses to overwrite an existing destination. Observer reports may contain target-derived string
+anchors. Store them in a private location outside version control; the `.resym` suffix is ignored by
+this repository by default, but it is not a substitute for keeping proprietary artifacts out of the
+repository tree.
 
 On Windows, start the desktop workbench with a supported PE or bounded ELF32 path, or launch it
 without a path and use the file picker. ELF projects provide a sparse `PT_LOAD` map and exact

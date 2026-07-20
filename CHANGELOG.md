@@ -8,6 +8,14 @@ prereleases; breaking changes remain explicit.
 
 ### Added
 
+- Added `resymbol ps2 observe EXACT_PS2_EE_ELF --profile EXACT_R5900_PROFILE --output
+  NEW_PRIVATE_REPORT` as a bounded, non-executing research path for eligible PlayStation 2 EE ELF
+  snapshots. The command accepts only the six immutable bundled R5900 profile names, records the
+  resolved profile and deterministic observer evidence in a binary-bound canonical-JSON `.resym`
+  package, caps output at 64 MiB, and publishes with create-new/no-overwrite semantics. Observer
+  reports may contain target-derived string anchors and are explicitly private artifacts that must
+  remain outside version control; the existing `inspect` and `export` commands continue to consume
+  ordinary `AnalysisSession` packages rather than this specialized payload.
 - Added an explicit, read-only ELF/R5900 Workbench linear preview without changing the existing
   profile-agnostic offline worker. Only structured ELF32 little-endian `ET_EXEC`/`EM_MIPS` analyses
   are eligible, no profile is selected automatically, and each transient selection/preview is bound

@@ -17,10 +17,19 @@ resymbol export application.resym --format map
 resymbol export application.resym --format pdb --binary application.exe
 resymbol export application.resym --format ida-python
 resymbol export application.resym --format ghidra-java
+resymbol ps2 observe owned-ps2-ee.elf --profile ps2-ee-r5900-le-core-v1 --output private-observer.resym
 ```
 
 Use `resymbol analyze application.exe --output another.resym` to select a different destination.
 Existing files are never overwritten.
+
+`ps2 observe` emits a specialized private observer package rather than an `AnalysisSession`. It
+accepts only the six exact immutable R5900 profiles documented in
+[elf32-mips-container.md](elf32-mips-container.md), reads one exact eligible ELF snapshot, and stores
+the resolved profile in a binary-bound canonical-JSON `.resym` envelope. The output is capped at
+64 MiB, uses create-new/no-overwrite publication, and may contain target-derived string anchors;
+keep it outside version control. The current `inspect` and `export` commands consume
+`AnalysisSession` packages, not this specialized observer payload.
 
 ## Envelope
 
@@ -38,8 +47,9 @@ Every package contains four top-level fields:
 - `binary_sha256` binds every result to the exact bytes that were analyzed.
 - `generator_version` identifies the ReSymbol build that produced the package.
 - `schema_version` controls envelope compatibility independently from the application version.
-- `payload` contains one validated `AnalysisSession`: deterministic base analysis, a plugin-run
-  ledger, and accepted plugin claims.
+- `payload` contains the binary-bound application payload. `resymbol analyze` stores one validated
+  `AnalysisSession`: deterministic base analysis, a plugin-run ledger, and accepted plugin claims.
+  `resymbol ps2 observe` instead stores its specialized observer report.
 
 This package envelope currently writes schema 14. The CLI can also inspect and export schemas 1
 through 13 through the compatibility paths described below, while other schema versions fail
@@ -56,12 +66,12 @@ Package reads are size-bounded and reject malformed binary identities, unsupport
 invalid payloads, and files that exceed the configured limit. Writes use create-new semantics: an
 existing destination is never silently replaced.
 
-Binary ingestion for `resymbol analyze`, the workbench, and PDB `--binary` export shares one
-application-service reader. It accepts only regular files, defaults to a 1 GiB ceiling, checks the
-open handle's declared length before a fallible exact-capacity reservation, reads through a
-`declared length + 1` bound, and rejects any retained length change. When an expected package
-identity is available, its exact size is checked before allocation and its SHA-256 is computed from
-the same immutable retained bytes passed to the PDB renderer.
+Binary ingestion for `resymbol analyze`, `resymbol ps2 observe`, the workbench, and PDB `--binary`
+export shares one application-service reader. It accepts only regular files, defaults to a 1 GiB
+ceiling, checks the open handle's declared length before a fallible exact-capacity reservation,
+reads through a `declared length + 1` bound, and rejects any retained length change. When an expected
+package identity is available, its exact size is checked before allocation and its SHA-256 is
+computed from the same immutable retained bytes passed to the PDB renderer.
 
 `resymbol inspect PACKAGE --binary EXACT_ORIGINAL_BINARY` optionally verifies the package against
 the bytes it names. ReSymbol fully validates the package, canonicalizes and reads the supplied file,

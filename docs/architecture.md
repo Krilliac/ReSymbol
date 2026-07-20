@@ -201,7 +201,7 @@ a partial import prefix. Accepted delay-IAT slots join conventional IAT slots in
 control-flow membership set; an exact supported call or thunk becomes `ImportIat` before any
 read-only function-pointer fallback. The inventory itself does not create a new graph shape.
 
-Decoder selection has a separate, explicit in-memory profile boundary. A
+Decoder selection has a separate, explicit profile boundary. A
 `DecoderProfile::Generic(TargetArch)` request preserves the existing architecture factory, while
 `DecoderProfile::Ps2EeR5900LeCoreV1` names the exact little-endian PlayStation 2 Emotion
 Engine/R5900 scalar core profile and
@@ -217,9 +217,11 @@ names the following immutable packed-greater-than comparison extension. All six 
 profiles return dedicated, always-available pure-Rust decoders and never consult Capstone or a
 generic MIPS backend. Each decoder's `profile()` result is its authoritative exact identity;
 `arch()` reports `Mips64` only as a broad compatibility family. No parser infers any profile from an
-ELF identity, and none is serialized into packages, projections, plugins, the CLI, or any wire
-format. Callers own the copyable profile choice and unique boxed decoder; no registry, global state,
-filesystem access, or additional thread-safety contract is introduced.
+ELF identity. Ordinary callers own the copyable in-memory profile choice and unique boxed decoder;
+no registry, global state, filesystem access, or additional thread-safety contract is introduced.
+The sole serialized selection boundary is the explicit `resymbol ps2 observe` private observer
+report described below; projections, plugins, and unrelated wire formats neither choose nor infer a
+profile.
 
 `DecoderProfile::PS2_EE_R5900_LATEST` is a moving source-level convenience constant that currently
 resolves to the exact packed-compare-gt-v1 enum variant. Any retained selection stores that resolved
@@ -227,7 +229,15 @@ variant, never the alias name. The Workbench is the first UI consumer: it offers
 selection and enables the bridge only for structured `BinaryAnalysis::Elf` values that are ELF32,
 little-endian, `ET_EXEC`, and `ElfMachine::Mips`. The transient selection and preview bind the full
 `BinaryIdentity`, canonical verified source, exact RVA span, and resolved profile; none enters
-preferences, packages, projections, reviews, plugins, the CLI, or worker/debugger protocols.
+preferences, packages, projections, reviews, plugins, or worker/debugger protocols.
+
+The separate `resymbol ps2 observe` command accepts only the six explicit immutable profile names;
+moving and generic aliases fail at argument parsing. It reads the eligible exact ELF once through
+the application snapshot service, runs the bounded observer without executing the input, and stores
+the resolved exact profile in a binary-bound canonical-JSON `.resym` envelope. Publication is
+create-new, refuses overwrite, and is bounded to 64 MiB. The observer payload can contain
+target-derived string anchors, so the command labels it private and directs users to keep it outside
+version control.
 
 The unchanged offline worker still reads an RVA span without knowing a decoder profile. A pure UI
 planner then checks four-byte alignment, one of the exact 16/32/64/128/256-byte sizes, checked RVA
