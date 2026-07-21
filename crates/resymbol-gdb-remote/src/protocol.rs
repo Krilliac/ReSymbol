@@ -17,6 +17,39 @@
 //! consumes bytes one at a time and yields [`PacketEvent`]s, keeping the
 //! transport layer free of protocol state.
 
+/// Default maximum decoded RSP packet payload (4 KiB).
+pub const DEFAULT_MAX_PACKET_PAYLOAD: usize = 0x1000;
+
+/// Default maximum memory bytes transferred by one `m`/`M` request.
+///
+/// A read reply hex-encodes every byte, so this is half the default packet
+/// payload and cannot produce an oversized response.
+pub const DEFAULT_MAX_MEMORY_TRANSFER: usize = DEFAULT_MAX_PACKET_PAYLOAD / 2;
+
+/// Default aggregate size limit for a chunked `target.xml` document (256 KiB).
+pub const DEFAULT_MAX_TARGET_DESCRIPTION: usize = 256 * 1024;
+
+/// Fail-closed resource limits shared by the RSP client and server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProtocolLimits {
+    /// Maximum decoded payload bytes in one framed packet.
+    pub max_packet_payload: usize,
+    /// Maximum decoded memory bytes in one `m`/`M` transaction.
+    pub max_memory_transfer: usize,
+    /// Maximum aggregate bytes accepted while fetching a chunked target XML.
+    pub max_target_description: usize,
+}
+
+impl Default for ProtocolLimits {
+    fn default() -> Self {
+        Self {
+            max_packet_payload: DEFAULT_MAX_PACKET_PAYLOAD,
+            max_memory_transfer: DEFAULT_MAX_MEMORY_TRANSFER,
+            max_target_description: DEFAULT_MAX_TARGET_DESCRIPTION,
+        }
+    }
+}
+
 /// The escape prefix byte (`}`) and the XOR mask applied to escaped bytes.
 const ESCAPE_BYTE: u8 = b'}';
 const ESCAPE_MASK: u8 = 0x20;
@@ -63,12 +96,21 @@ pub fn encode_packet(payload: &[u8]) -> Vec<u8> {
 /// marker with no preceding byte, or an out-of-range count byte).
 #[must_use]
 pub fn decode_body(body: &[u8]) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(body.len());
+    decode_body_with_limit(body, DEFAULT_MAX_PACKET_PAYLOAD)
+}
+
+/// Decode a packet body while rejecting decoded output larger than
+/// `max_payload`.
+fn decode_body_with_limit(body: &[u8], max_payload: usize) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(body.len().min(max_payload));
     let mut index = 0;
     while index < body.len() {
         match body[index] {
             ESCAPE_BYTE => {
                 let escaped = *body.get(index + 1)?;
+                if out.len() == max_payload {
+                    return None;
+                }
                 out.push(escaped ^ ESCAPE_MASK);
                 index += 2;
             }
@@ -76,12 +118,17 @@ pub fn decode_body(body: &[u8]) -> Option<Vec<u8>> {
                 let count_byte = *body.get(index + 1)?;
                 let additional = count_byte.checked_sub(RLE_BIAS)?;
                 let previous = *out.last()?;
-                for _ in 0..additional {
-                    out.push(previous);
+                let new_len = out.len().checked_add(usize::from(additional))?;
+                if new_len > max_payload {
+                    return None;
                 }
+                out.resize(new_len, previous);
                 index += 2;
             }
             literal => {
+                if out.len() == max_payload {
+                    return None;
+                }
                 out.push(literal);
                 index += 1;
             }
@@ -140,6 +187,9 @@ pub struct PacketReader {
     body: Vec<u8>,
     running_checksum: u8,
     expected_checksum: u8,
+    max_payload: usize,
+    max_transmitted_body: usize,
+    body_overflowed: bool,
 }
 
 impl Default for PacketReader {
@@ -152,11 +202,22 @@ impl PacketReader {
     /// Create a reader in its initial idle state.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_max_payload(DEFAULT_MAX_PACKET_PAYLOAD)
+    }
+
+    /// Create a reader which rejects decoded packet payloads larger than
+    /// `max_payload` without retaining the oversized body.
+    #[must_use]
+    pub fn with_max_payload(max_payload: usize) -> Self {
         Self {
             state: State::Idle,
             body: Vec::new(),
             running_checksum: 0,
             expected_checksum: 0,
+            max_payload,
+            // Every decoded special byte may occupy two transmitted bytes.
+            max_transmitted_body: max_payload.saturating_mul(2),
+            body_overflowed: false,
         }
     }
 
@@ -167,6 +228,7 @@ impl PacketReader {
                 b'$' => {
                     self.body.clear();
                     self.running_checksum = 0;
+                    self.body_overflowed = false;
                     self.state = State::Body;
                     None
                 }
@@ -180,7 +242,11 @@ impl PacketReader {
                     self.state = State::Checksum1;
                 } else {
                     self.running_checksum = self.running_checksum.wrapping_add(byte);
-                    self.body.push(byte);
+                    if self.body.len() < self.max_transmitted_body {
+                        self.body.push(byte);
+                    } else {
+                        self.body_overflowed = true;
+                    }
                 }
                 None
             }
@@ -214,13 +280,13 @@ impl PacketReader {
                 };
                 self.expected_checksum |= low;
                 let matches = self.expected_checksum == self.running_checksum;
-                if !matches {
+                if !matches || self.body_overflowed {
                     return Some(PacketEvent::Packet {
                         payload: Vec::new(),
                         checksum_ok: false,
                     });
                 }
-                match decode_body(&self.body) {
+                match decode_body_with_limit(&self.body, self.max_payload) {
                     Some(payload) => Some(PacketEvent::Packet {
                         payload,
                         checksum_ok: true,
@@ -422,6 +488,27 @@ mod tests {
     #[test]
     fn dangling_escape_is_rejected() {
         assert_eq!(decode_body(b"abc}"), None);
+    }
+
+    #[test]
+    fn decoded_payload_limit_rejects_literal_and_rle_expansion() {
+        assert_eq!(decode_body_with_limit(b"abcd", 3), None);
+        assert_eq!(decode_body_with_limit(b"0* ", 3), None);
+        assert_eq!(decode_body_with_limit(b"0* ", 4), Some(b"0000".to_vec()));
+    }
+
+    #[test]
+    fn packet_reader_discards_oversized_transmitted_body() {
+        let packet = encode_packet(b"abcde");
+        let mut reader = PacketReader::with_max_payload(4);
+        let events = drain(&mut reader, &packet);
+        assert_eq!(
+            events,
+            vec![PacketEvent::Packet {
+                payload: Vec::new(),
+                checksum_ok: false,
+            }]
+        );
     }
 
     #[test]

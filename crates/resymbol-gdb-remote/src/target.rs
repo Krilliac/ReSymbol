@@ -1,5 +1,5 @@
-//! The backend contract the RSP server drives, plus the amd64 `g`-packet
-//! register layout.
+//! The architecture-neutral backend contract the RSP server drives, plus the
+//! legacy amd64 `g`-packet register layout.
 //!
 //! [`RemoteTarget`] is the narrow surface [`crate::server`] needs: register and
 //! memory access, execution control, and software breakpoints. It is
@@ -7,6 +7,7 @@
 //! lives in [`crate::ptrace_target`] and maps its own register type onto the
 //! dependency-free [`Amd64CoreRegisters`] defined here.
 
+use crate::target_description::TargetDescription;
 use thiserror::Error;
 
 /// Why a [`RemoteTarget`] resumed the debugger.
@@ -51,7 +52,8 @@ pub enum TargetError {
     /// A breakpoint could not be set or removed.
     #[error("target breakpoint operation failed: {0}")]
     Breakpoint(String),
-    /// A supplied register buffer was not a valid amd64 `g`-packet.
+    /// A supplied register buffer was not valid for the target's register
+    /// description.
     #[error("malformed g-packet: {0}")]
     Registers(String),
     /// The target is gone and can no longer be driven.
@@ -72,10 +74,30 @@ impl TargetError {
 
 /// The backend the RSP server serves.
 ///
-/// Register buffers are raw amd64 `g`-packet bytes (see
-/// [`Amd64CoreRegisters::to_gpacket`]); the server hex-encodes them for the
-/// wire. Addresses are absolute target virtual addresses.
+/// Register buffers are raw architecture-specific `g`-packet bytes; the
+/// server hex-encodes them for the wire. A target that provides
+/// [`RemoteTarget::target_description`] must return bytes in strictly
+/// increasing XML register-number order. Addresses are absolute target
+/// virtual addresses.
 pub trait RemoteTarget {
+    /// Architecture and register metadata served as `target.xml`.
+    ///
+    /// The default is `None`, preserving compatibility with targets that rely
+    /// on a debugger's preselected architecture and historical register
+    /// packet layout.
+    fn target_description(&self) -> Option<TargetDescription<'_>> {
+        None
+    }
+
+    /// Required RSP `kind` for software breakpoints on this architecture.
+    ///
+    /// Described targets inherit the value from their metadata. Legacy
+    /// targets retain the historical one-byte default.
+    fn software_breakpoint_kind(&self) -> u64 {
+        self.target_description()
+            .map_or(1, |description| description.software_breakpoint_kind)
+    }
+
     /// Read the full register file as raw `g`-packet bytes.
     ///
     /// # Errors
@@ -125,12 +147,48 @@ pub trait RemoteTarget {
     /// Returns [`TargetError::Breakpoint`] if the breakpoint cannot be set.
     fn set_sw_breakpoint(&mut self, addr: u64) -> Result<(), TargetError>;
 
+    /// Validate an explicit RSP breakpoint `kind`, then arm it at `addr`.
+    ///
+    /// Existing backends need not override this method. Architectures that
+    /// support multiple instruction encodings may override it to accept more
+    /// than the single value returned by [`Self::software_breakpoint_kind`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TargetError::Breakpoint`] when `kind` is not valid, otherwise
+    /// propagates [`Self::set_sw_breakpoint`].
+    fn set_sw_breakpoint_with_kind(&mut self, addr: u64, kind: u64) -> Result<(), TargetError> {
+        let expected = self.software_breakpoint_kind();
+        if kind != expected {
+            return Err(TargetError::Breakpoint(format!(
+                "software breakpoint kind {kind} is invalid; target requires {expected}"
+            )));
+        }
+        self.set_sw_breakpoint(addr)
+    }
+
     /// Remove the software breakpoint at `addr`.
     ///
     /// # Errors
     ///
     /// Returns [`TargetError::Breakpoint`] if the breakpoint cannot be removed.
     fn remove_sw_breakpoint(&mut self, addr: u64) -> Result<(), TargetError>;
+
+    /// Validate an explicit RSP breakpoint `kind`, then remove it at `addr`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TargetError::Breakpoint`] when `kind` is not valid, otherwise
+    /// propagates [`Self::remove_sw_breakpoint`].
+    fn remove_sw_breakpoint_with_kind(&mut self, addr: u64, kind: u64) -> Result<(), TargetError> {
+        let expected = self.software_breakpoint_kind();
+        if kind != expected {
+            return Err(TargetError::Breakpoint(format!(
+                "software breakpoint kind {kind} is invalid; target requires {expected}"
+            )));
+        }
+        self.remove_sw_breakpoint(addr)
+    }
 
     /// Arm a hardware execute breakpoint at `addr` (RSP `Z1`).
     ///

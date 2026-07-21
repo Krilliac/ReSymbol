@@ -11,6 +11,7 @@ use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 /// A full-duplex byte channel for the GDB Remote Serial Protocol.
 pub trait Transport {
@@ -35,6 +36,16 @@ pub trait Transport {
     ///
     /// Propagates any underlying I/O error.
     fn flush(&mut self) -> io::Result<()>;
+
+    /// Apply a timeout to subsequent blocking reads and writes.
+    ///
+    /// Generic/in-memory transports may retain the default no-op; deadline-
+    /// aware callers still check the clock between I/O calls. TCP transports
+    /// override this so one blocked system call cannot wait indefinitely.
+    fn set_io_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+        let _ = timeout;
+        Ok(())
+    }
 }
 
 /// The read-buffer size used by [`StreamTransport`].
@@ -48,10 +59,16 @@ pub struct StreamTransport<S> {
     buffer: Box<[u8]>,
     position: usize,
     filled: usize,
+    timeout_setter: Option<fn(&S, Option<Duration>) -> io::Result<()>>,
 }
 
 impl<S> StreamTransport<S> {
     /// Wrap `inner` in a buffered transport.
+    ///
+    /// This generic constructor cannot configure an underlying stream's system
+    /// call timeouts. Use [`StreamTransport::<TcpStream>::from_connected_stream`]
+    /// for an already-connected TCP socket when client operation deadlines
+    /// must bound blocking I/O.
     #[must_use]
     pub fn new(inner: S) -> Self {
         Self {
@@ -59,6 +76,7 @@ impl<S> StreamTransport<S> {
             buffer: vec![0u8; READ_BUFFER_BYTES].into_boxed_slice(),
             position: 0,
             filled: 0,
+            timeout_setter: None,
         }
     }
 
@@ -93,12 +111,32 @@ impl<S: Read + Write> Transport for StreamTransport<S> {
     fn flush(&mut self) -> io::Result<()> {
         self.inner.flush()
     }
+
+    fn set_io_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+        match self.timeout_setter {
+            Some(setter) => setter(&self.inner, timeout),
+            None => Ok(()),
+        }
+    }
 }
 
 /// A [`Transport`] over a TCP connection.
 pub type TcpTransport = StreamTransport<TcpStream>;
 
 impl StreamTransport<TcpStream> {
+    /// Wrap an already-connected TCP stream with deadline-adjustable blocking
+    /// I/O and TCP no-delay enabled.
+    ///
+    /// # Errors
+    ///
+    /// Propagates socket option failures.
+    pub fn from_connected_stream(stream: TcpStream) -> io::Result<Self> {
+        stream.set_nodelay(true)?;
+        let mut transport = Self::new(stream);
+        transport.timeout_setter = Some(set_tcp_timeout);
+        Ok(transport)
+    }
+
     /// Connect to a remote RSP endpoint (e.g. a QEMU or kernel gdbstub).
     ///
     /// # Errors
@@ -106,8 +144,7 @@ impl StreamTransport<TcpStream> {
     /// Propagates connection failures.
     pub fn connect<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
         let stream = TcpStream::connect(addr)?;
-        stream.set_nodelay(true)?;
-        Ok(Self::new(stream))
+        Self::from_connected_stream(stream)
     }
 }
 
@@ -145,9 +182,13 @@ impl TcpServerListener {
     /// Propagates accept failures.
     pub fn accept(&self) -> io::Result<TcpTransport> {
         let (stream, _peer) = self.listener.accept()?;
-        stream.set_nodelay(true)?;
-        Ok(StreamTransport::new(stream))
+        StreamTransport::from_connected_stream(stream)
     }
+}
+
+fn set_tcp_timeout(stream: &TcpStream, timeout: Option<Duration>) -> io::Result<()> {
+    stream.set_read_timeout(timeout)?;
+    stream.set_write_timeout(timeout)
 }
 
 /// A shared, blocking byte queue used by the in-process [`MemoryStream`] pair.
@@ -300,5 +341,26 @@ mod tests {
         a.flush().unwrap();
         assert_eq!(a.read_byte().unwrap(), b'A');
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn connected_tcp_transport_applies_operation_timeouts() {
+        let listener = TcpServerListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = std::thread::spawn(move || TcpStream::connect(address).unwrap());
+        let mut transport = listener.accept().unwrap();
+        transport
+            .set_io_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        let stream = transport.into_inner();
+        assert_eq!(
+            stream.read_timeout().unwrap(),
+            Some(Duration::from_millis(250))
+        );
+        assert_eq!(
+            stream.write_timeout().unwrap(),
+            Some(Duration::from_millis(250))
+        );
+        drop(peer.join().unwrap());
     }
 }

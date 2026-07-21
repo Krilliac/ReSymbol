@@ -16,6 +16,7 @@ publish = false
 gdb-remote-e2e = []
 
 [dependencies]
+quick-xml = "0.39.4"
 thiserror = "2.0.12"
 
 [target.'cfg(unix)'.dependencies]
