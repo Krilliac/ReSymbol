@@ -44,9 +44,10 @@ resymbol-gdb-remote-client thread
 - A connection becomes visible only after `qSupported` and a bounded
   `qXfer:features:read:target.xml` fetch succeed. Target XML is mandatory for
   this typed surface; missing architecture or register layout fails closed.
-- The current policy exposes only schema-validated raw register reads and
-  memory reads of at most 256 bytes. Every `g` reply must have the exact byte
-  length declared by the connected target description.
+- The current policy exposes only schema-validated raw register reads, memory
+  reads of at most 256 bytes, and one typed EE program-counter read. Every `g`
+  reply must have the exact byte length declared by the connected target
+  description.
 - A target declaring `mips:5900` must structurally match ReSymbol's canonical
   109-register, 708-byte PS2 EE schema, including register type and group
   metadata. Near-matches are rejected rather than silently narrowing the EE's
@@ -57,13 +58,45 @@ resymbol-gdb-remote-client thread
   packets, and memory bytes are ephemeral UI state. The complete target XML
   and parsed register description remain worker-owned. None are serialized into
   preferences, `.resym` packages, review ledgers, or repository artifacts.
-- Connected-target identity, features, target metadata, register previews, and
-  memory previews are scrubbed on a new connection attempt, disconnect,
-  cancellation, worker loss, or connection loss so observations cannot be
-  attributed to a later endpoint.
+- Connected-target identity, features, target metadata, register previews,
+  memory previews, and the EE program-counter preview are scrubbed on a new
+  connection attempt, disconnect, cancellation, worker loss, connection loss,
+  or session replacement so observations cannot be attributed to a later
+  endpoint. A result that arrives for an already-cancelled or superseded
+  request never reaches presentation state.
 - Capability badges describe the read-only routes implemented by Workbench;
   they do not claim that a disconnected or unprobed target supports a route.
 - Exporting a sanitized observation remains a separate explicit workflow.
+
+## Current EE program counter
+
+One explicit, capacity-one, read-only operation reads the EE program counter.
+
+- The route is offered only for a live connection whose target description
+  matched the exact canonical 109-register, 708-byte PS2 EE schema. Every other
+  target — including a `mips:5900` near-match and any non-EE architecture — has
+  no button and fails closed on submission.
+- The schema is enforced twice. The egui-side gate refuses to submit, and the
+  remote-I/O worker re-derives the same decision from its own retained target
+  description before touching the socket, so the UI gate is never the sole
+  enforcement point. Both resolve "canonical EE schema" through one shared
+  structural comparison.
+- The worker reads `g`, validates the reply against the connected description,
+  re-checks the exact canonical 708-byte length, and parses it with the
+  protocol crate's `ps2_ee_gpacket_to_registers`. Workbench does not carry a
+  second EE register decoder.
+- Only the typed `u32` program counter crosses the worker/UI channel. The raw
+  packet and every other decoded register, including the EE's 128-bit GPR, HI,
+  and LO state, stay worker-local and are dropped there.
+- The value is displayed as a fixed-width `0xXXXXXXXX` literal and is ephemeral
+  UI state on the same terms as every other observation above.
+- The operation is a strict narrowing of the existing read-register route: it
+  issues the same `g` read and adds no capability. It is a single explicit
+  read, never a poll, and carries no execution control, memory or instruction
+  read, disassembly, breakpoint, write, export, or persistence.
+- A worker-side schema rejection does not discard the connection, because
+  nothing was read and the packet stream is still synchronized. A protocol or
+  transport failure discards it on the same terms as any other operation.
 
 ## Deliberately deferred
 
@@ -78,7 +111,10 @@ until all of the following exist:
 2. Explicit write/control authorization separate from connection
    establishment and the current read-only routing policy.
 3. Typed register interpretation and evidence-export policy beyond the current
-   ephemeral, schema-validated raw preview.
+   ephemeral, schema-validated raw preview and the single typed EE
+   program-counter read described above. Broader typed decoding, any polled or
+   continuously refreshed view, instruction reads, and disassembly are not part
+   of this surface.
 
 The displayed software-breakpoint kind is descriptor metadata only. Workbench
 does not route breakpoint, register-write, memory-write, continue, or step
