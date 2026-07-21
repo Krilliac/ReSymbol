@@ -298,8 +298,8 @@ fn server_dispatches_thread_packets() {
     assert_eq!(client.transact(b"T9").unwrap(), b"E01");
     // The stop reply is tagged with the stopping thread.
     assert_eq!(client.transact(b"?").unwrap(), b"T05thread:1;");
-    // vCont advertises the thread action.
-    assert_eq!(client.transact(b"vCont?").unwrap(), b"vCont;c;s;t");
+    // vCont advertises only the implemented continue and step actions.
+    assert_eq!(client.transact(b"vCont?").unwrap(), b"vCont;c;s");
 
     client.send_packet(b"k").expect("kill");
     server.join().expect("server thread");
