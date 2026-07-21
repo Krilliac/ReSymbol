@@ -21,6 +21,7 @@ resymbol-app = { path = "../resymbol-app" }
 resymbol-core = { path = "../resymbol-core" }
 resymbol-debugger = { path = "../resymbol-debugger" }
 resymbol-export = { path = "../resymbol-export" }
+resymbol-gdb-remote = { path = "../resymbol-gdb-remote" }
 rfd = "=0.15.4"
 png = { version = "=0.18.1", optional = true }
 serde = { version = "1.0.219", features = ["derive"] }

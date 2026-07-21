@@ -33,6 +33,10 @@ use crate::{
         ConsoleTheme, format_activity, format_command_result, format_help, parse_command,
     },
     console_host::{ConsoleHost, ConsoleHostEvent},
+    gdb_session::{
+        DEFAULT_REMOTE_ENDPOINT, MAX_REMOTE_MEMORY_READ_BYTES, RemoteAttachRequest,
+        RemoteMemoryRead, RemoteNoticeLevel, RemoteSessionController,
+    },
     graph::{
         GRAPH_MAX_DEPTH, GRAPH_MAX_EDGES, GRAPH_MAX_NODES, GraphEdge, GraphEdgeKind,
         GraphEdgeOrigin, GraphImportKind, GraphNode, GraphNodeId, GraphNodeKind, GraphRootKind,
@@ -428,6 +432,14 @@ enum ReviewUiAction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteSessionUiAction {
+    Connect,
+    Disconnect,
+    ReadRegisters,
+    ReadMemory,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CloseDialogAction {
     SaveNew,
     DiscardAndClose,
@@ -663,6 +675,7 @@ pub struct WorkbenchApp {
     started_at: Instant,
     project: Option<LoadedProject>,
     service_worker: ServiceWorker,
+    remote_session: RemoteSessionController,
     operation_sequence: OperationSequence,
     project_operation: OperationGate,
     publication_operation: PublicationGate,
@@ -711,6 +724,10 @@ pub struct WorkbenchApp {
     readiness_choice: SandboxProviderChoice,
     readiness_outcome: Option<DebuggerReadinessOutcome>,
     readiness_error: Option<String>,
+    remote_endpoint_input: String,
+    remote_allow_non_loopback: bool,
+    remote_memory_address_input: String,
+    remote_memory_size: usize,
     offline_read: OfflineReadUiState,
     offline_read_rva_input: String,
     offline_read_size: u32,
@@ -797,6 +814,7 @@ impl WorkbenchApp {
             started_at: Instant::now(),
             project: None,
             service_worker: ServiceWorker::start(creation_context.egui_ctx.clone()),
+            remote_session: RemoteSessionController::start(creation_context.egui_ctx.clone()),
             operation_sequence: OperationSequence::default(),
             project_operation: OperationGate::default(),
             publication_operation: PublicationGate::default(),
@@ -846,6 +864,10 @@ impl WorkbenchApp {
             readiness_choice: SandboxProviderChoice::default(),
             readiness_outcome: None,
             readiness_error: None,
+            remote_endpoint_input: DEFAULT_REMOTE_ENDPOINT.to_owned(),
+            remote_allow_non_loopback: false,
+            remote_memory_address_input: "0x00000000".to_owned(),
+            remote_memory_size: 64,
             offline_read: OfflineReadUiState::default(),
             offline_read_rva_input: "0x00000000".to_owned(),
             offline_read_size: 64,
@@ -863,7 +885,7 @@ impl WorkbenchApp {
         };
         app.log(
             ActivityLevel::Info,
-            "Workbench ready in core-only non-executing review mode",
+            "Workbench ready; project review is non-executing and remote GDB inspection is explicit opt-in",
         );
 
         #[cfg(feature = "screenshot")]
@@ -2746,6 +2768,19 @@ impl WorkbenchApp {
                     self.finish_static_patch_set_load(operation, result);
                 }
             }
+        }
+    }
+
+    /// Drain ready remote-debugger results on the egui thread. The controller
+    /// performs no socket I/O here; it only receives bounded worker messages.
+    fn poll_remote_session(&mut self) {
+        for notice in self.remote_session.poll() {
+            let level = match notice.level {
+                RemoteNoticeLevel::Info => ActivityLevel::Info,
+                RemoteNoticeLevel::Success => ActivityLevel::Success,
+                RemoteNoticeLevel::Error => ActivityLevel::Error,
+            };
+            self.log(level, notice.message);
         }
     }
 
@@ -8746,12 +8781,12 @@ impl WorkbenchApp {
                 .corner_radius(4)
                 .show(ui, |ui| {
                     ui.label(
-                        RichText::new("[NON-EXECUTING] Discovery only")
+                        RichText::new("[NON-EXECUTING] Readiness discovery only")
                             .strong()
                             .color(colors.healthy),
                     );
                     ui.label(
-                        "This tab cannot open, attach, launch, resume, or modify a target. It cannot create an AppContainer profile or VM, activate a provider, or produce an attestation.",
+                        "This readiness section cannot open, attach, launch, resume, or modify a target. It cannot create an AppContainer profile or VM, activate a provider, or produce an attestation. The separately labeled remote section below is an explicit live connection boundary.",
                     );
                     ui.label(
                         RichText::new(
@@ -8878,7 +8913,216 @@ impl WorkbenchApp {
                     .color(colors.secondary_text),
                 );
             }
+
+            ui.add_space(16.0);
+            ui.separator();
+            ui.add_space(12.0);
+            self.show_remote_gdb_session(ui, colors);
         });
+    }
+
+    fn show_remote_gdb_session(&mut self, ui: &mut egui::Ui, colors: SemanticColors) {
+        let view = self.remote_session.view().clone();
+        let capabilities = self.remote_session.capabilities();
+        let connected = view.is_connected();
+        let pending = view.is_pending();
+        let mut action = None;
+
+        ui.heading("Remote GDB target");
+        ui.label(
+            RichText::new(
+                "Experimental outbound TCP/RSP inspection; session data remains ephemeral and is never added to project or preference state.",
+            )
+            .color(colors.secondary_text),
+        );
+        ui.add_space(8.0);
+
+        egui::Frame::new()
+            .fill(colors.raised)
+            .stroke(egui::Stroke::new(1.0, colors.border))
+            .inner_margin(egui::Margin::same(12))
+            .corner_radius(4)
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(view.status()).strong().monospace());
+                    ui.label(
+                        RichText::new("one connection / one operation at a time")
+                            .small()
+                            .color(colors.secondary_text),
+                    );
+                });
+
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("TCP endpoint");
+                    ui.add_enabled(
+                        !pending && !connected,
+                        TextEdit::singleline(&mut self.remote_endpoint_input)
+                            .desired_width(190.0)
+                            .hint_text(DEFAULT_REMOTE_ENDPOINT),
+                    );
+                    if ui
+                        .add_enabled(
+                            !pending && !connected,
+                            egui::Button::new("Connect read-only"),
+                        )
+                        .clicked()
+                    {
+                        action = Some(RemoteSessionUiAction::Connect);
+                    }
+                    if ui
+                        .add_enabled(
+                            !pending && connected,
+                            egui::Button::new("Disconnect"),
+                        )
+                        .clicked()
+                    {
+                        action = Some(RemoteSessionUiAction::Disconnect);
+                    }
+                });
+                ui.add_enabled_ui(!pending && !connected, |ui| {
+                    ui.checkbox(
+                        &mut self.remote_allow_non_loopback,
+                        "Allow a non-loopback endpoint for this session",
+                    );
+                });
+                ui.small(
+                    "Numeric addresses only. Loopback is the default; remote-network access requires the explicit opt-in above.",
+                );
+
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(if capabilities.read_registers {
+                            "[READ REGISTERS]"
+                        } else {
+                            "[NO REGISTER READ]"
+                        })
+                        .monospace()
+                        .color(colors.healthy),
+                    );
+                    ui.label(
+                        RichText::new(if capabilities.read_memory {
+                            "[READ MEMORY]"
+                        } else {
+                            "[NO MEMORY READ]"
+                        })
+                        .monospace()
+                        .color(colors.healthy),
+                    );
+                    ui.label(
+                        RichText::new(if capabilities.write_target {
+                            "[WRITE ENABLED]"
+                        } else {
+                            "[NO WRITES]"
+                        })
+                        .monospace()
+                        .color(colors.warning_conflict),
+                    );
+                    ui.label(
+                        RichText::new(if capabilities.control_execution {
+                            "[CONTROL ENABLED]"
+                        } else {
+                            "[NO EXECUTION CONTROL]"
+                        })
+                        .monospace()
+                        .color(colors.warning_conflict),
+                    );
+                });
+                ui.small(
+                    "Writes, breakpoints, continue, and step are not merely hidden: this session policy does not authorize or route them.",
+                );
+
+                if connected {
+                    ui.add_space(10.0);
+                    if ui
+                        .add_enabled(!pending, egui::Button::new("Read raw registers"))
+                        .clicked()
+                    {
+                        action = Some(RemoteSessionUiAction::ReadRegisters);
+                    }
+
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Guest address");
+                        ui.add_enabled(
+                            !pending,
+                            TextEdit::singleline(&mut self.remote_memory_address_input)
+                                .desired_width(150.0),
+                        );
+                        ui.label("Bytes");
+                        ui.add_enabled(
+                            !pending,
+                            egui::DragValue::new(&mut self.remote_memory_size)
+                                .range(1..=MAX_REMOTE_MEMORY_READ_BYTES),
+                        );
+                        if ui
+                            .add_enabled(!pending, egui::Button::new("Read memory"))
+                            .clicked()
+                        {
+                            action = Some(RemoteSessionUiAction::ReadMemory);
+                        }
+                    });
+                }
+
+                if let Some(features) = view.advertised_features() {
+                    ui.add_space(8.0);
+                    property_row(ui, "qSupported", features, true);
+                }
+                if let Some(registers) = view.register_summary() {
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(registers).small().monospace());
+                }
+                if let Some(memory) = view.memory_summary() {
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(memory).small().monospace());
+                }
+                if let Some(error) = view.last_error() {
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(format!("[REMOTE ERROR] {error}"))
+                            .color(colors.destructive_quarantined),
+                    );
+                }
+            });
+
+        let result: Result<(), String> = match action {
+            Some(RemoteSessionUiAction::Connect) => RemoteAttachRequest::parse(
+                &self.remote_endpoint_input,
+                self.remote_allow_non_loopback,
+            )
+            .and_then(|attach| self.remote_session.connect(attach))
+            .map_err(|error| error.to_string()),
+            Some(RemoteSessionUiAction::Disconnect) => self
+                .remote_session
+                .disconnect()
+                .map_err(|error| error.to_string()),
+            Some(RemoteSessionUiAction::ReadRegisters) => self
+                .remote_session
+                .read_registers()
+                .map_err(|error| error.to_string()),
+            Some(RemoteSessionUiAction::ReadMemory) => {
+                parse_remote_address(&self.remote_memory_address_input)
+                    .and_then(|address| {
+                        RemoteMemoryRead::new(address, self.remote_memory_size)
+                            .map_err(|error| error.to_string())
+                    })
+                    .and_then(|read| {
+                        self.remote_session
+                            .read_memory(read)
+                            .map_err(|error| error.to_string())
+                    })
+            }
+            None => return,
+        };
+
+        if let Err(error) = result {
+            let message = error.to_string();
+            self.remote_session.note_local_error(&message);
+            self.log(
+                ActivityLevel::Error,
+                format!("Remote GDB request rejected: {message}"),
+            );
+        }
     }
 
     fn show_exports(&mut self, ui: &mut egui::Ui) {
@@ -9150,6 +9394,7 @@ impl eframe::App for WorkbenchApp {
         self.preferences.theme.apply(context);
         self.poll_console(context);
         self.poll_service_worker(context);
+        self.poll_remote_session();
         if context.input(|input| input.viewport().close_requested()) && !self.request_close(context)
         {
             context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -9177,6 +9422,7 @@ impl eframe::App for WorkbenchApp {
                 || self.review_operation.is_pending()
                 || self.readiness_operation.is_pending()
                 || self.offline_read.is_pending()
+                || self.remote_session.view().is_pending()
                 || self.console_host.is_enabled())
         {
             context.request_repaint_after(std::time::Duration::from_millis(100));
@@ -9663,6 +9909,21 @@ fn parse_hex_rva(input: &str) -> Result<u64, String> {
         return Err("RVA must contain at most 16 hexadecimal digits".to_owned());
     }
     u64::from_str_radix(digits, 16).map_err(|_| "RVA is outside the u64 range".to_owned())
+}
+
+fn parse_remote_address(input: &str) -> Result<u64, String> {
+    let input = input.trim();
+    let digits = input
+        .strip_prefix("0x")
+        .or_else(|| input.strip_prefix("0X"))
+        .unwrap_or(input);
+    if digits.is_empty() {
+        return Err("enter a hexadecimal guest address".to_owned());
+    }
+    if digits.len() > 16 || !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("guest address must contain at most 16 hexadecimal digits".to_owned());
+    }
+    u64::from_str_radix(digits, 16).map_err(|_| "guest address is outside the u64 range".to_owned())
 }
 
 fn format_offline_hex_rows(start_rva: u64, bytes: &[u8]) -> Vec<OfflineHexRow> {
