@@ -24,7 +24,7 @@ use std::{
 
 use resymbol_gdb_remote::{
     GdbRemoteClient, PS2_EE_GPACKET_BYTES, PS2_EE_TARGET_DESCRIPTION, PS2_EE_TARGET_XML,
-    RemoteTargetDescription, TargetByteOrder, TcpTransport,
+    RemoteTargetDescription, TargetByteOrder, TcpTransport, ps2_ee_gpacket_to_registers,
 };
 use thiserror::Error;
 
@@ -36,6 +36,11 @@ const MAX_FEATURE_TEXT_BYTES: usize = 1_024;
 const MAX_REGISTER_PREVIEW_BYTES: usize = 512;
 const COMMAND_QUEUE_CAPACITY: usize = 1;
 const EVENT_QUEUE_CAPACITY: usize = 2;
+/// Register count of ReSymbol's canonical PS2 EE target description.
+///
+/// Asserted against the parsed canonical XML by
+/// `canonical_ps2_ee_constants_match_the_shared_schema`.
+const PS2_EE_REGISTER_COUNT: usize = 109;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RemoteSessionCapabilities {
@@ -175,6 +180,10 @@ pub(crate) enum RemoteSessionError {
     WorkerDisconnected,
     #[error("there is no pending remote operation to cancel")]
     NoPendingOperation,
+    #[error(
+        "reading the current EE program counter requires the exact canonical {PS2_EE_REGISTER_COUNT}-register, {PS2_EE_GPACKET_BYTES}-byte PS2 EE schema"
+    )]
+    RequiresExactPs2EeSchema,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,6 +192,7 @@ enum RequestKind {
     Disconnect,
     Registers,
     Memory,
+    ProgramCounter,
 }
 
 impl RequestKind {
@@ -192,6 +202,7 @@ impl RequestKind {
             Self::Disconnect => "disconnect",
             Self::Registers => "register read",
             Self::Memory => "memory read",
+            Self::ProgramCounter => "EE program counter read",
         }
     }
 }
@@ -212,6 +223,9 @@ enum RemoteCommand {
         request: u64,
         read: RemoteMemoryRead,
     },
+    ReadProgramCounter {
+        request: u64,
+    },
 }
 
 impl RemoteCommand {
@@ -220,7 +234,8 @@ impl RemoteCommand {
             Self::Connect { request, .. }
             | Self::Disconnect { request }
             | Self::ReadRegisters { request }
-            | Self::ReadMemory { request, .. } => *request,
+            | Self::ReadMemory { request, .. }
+            | Self::ReadProgramCounter { request } => *request,
         }
     }
 
@@ -230,6 +245,7 @@ impl RemoteCommand {
             Self::Disconnect { .. } => RequestKind::Disconnect,
             Self::ReadRegisters { .. } => RequestKind::Registers,
             Self::ReadMemory { .. } => RequestKind::Memory,
+            Self::ReadProgramCounter { .. } => RequestKind::ProgramCounter,
         }
     }
 }
@@ -250,6 +266,11 @@ enum RemoteOutcome {
         address: u64,
         bytes: Vec<u8>,
     },
+    /// Only the typed program counter crosses the worker/UI channel. The raw
+    /// `g` packet and every other decoded EE register stay worker-local.
+    ProgramCounter {
+        pc: u32,
+    },
     Failed {
         detail: String,
         connection_lost: bool,
@@ -263,6 +284,38 @@ struct RemoteEvent {
     outcome: RemoteOutcome,
 }
 
+/// What presentation state should do with one worker result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventDisposition {
+    /// The result belongs to no tracked request; drop it without touching
+    /// presentation state so a superseded observation can never be displayed.
+    Stale,
+    /// The result completes a request the UI already cancelled; scrub instead
+    /// of displaying it.
+    Cancelled,
+    /// The result completes the sole tracked request.
+    Apply,
+}
+
+/// `[egui thread, non-blocking]` Decide one worker result's disposition.
+///
+/// Because the session is capacity-one, any result whose identifier is not the
+/// tracked pending request is stale by construction — including results that
+/// won a race against socket shutdown.
+fn classify_event(
+    pending_request: Option<u64>,
+    cancelled_request: Option<u64>,
+    request: u64,
+) -> EventDisposition {
+    if pending_request != Some(request) {
+        EventDisposition::Stale
+    } else if cancelled_request == Some(request) {
+        EventDisposition::Cancelled
+    } else {
+        EventDisposition::Apply
+    }
+}
+
 /// Presentation snapshot owned exclusively by the egui thread.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct RemoteSessionView {
@@ -273,6 +326,7 @@ pub(crate) struct RemoteSessionView {
     target: Option<RemoteTargetView>,
     register_summary: Option<String>,
     memory_summary: Option<String>,
+    program_counter: Option<u32>,
     last_error: Option<String>,
 }
 
@@ -319,6 +373,16 @@ impl RemoteSessionView {
         self.memory_summary.as_deref()
     }
 
+    /// Last observed EE program counter, retained as a typed scalar only.
+    pub(crate) const fn program_counter(&self) -> Option<u32> {
+        self.program_counter
+    }
+
+    /// Whether the typed EE program-counter route is currently offered.
+    pub(crate) fn can_read_program_counter(&self) -> bool {
+        require_program_counter_route(self).is_ok()
+    }
+
     pub(crate) fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
     }
@@ -326,6 +390,18 @@ impl RemoteSessionView {
     fn clear_observations(&mut self) {
         self.register_summary = None;
         self.memory_summary = None;
+        self.program_counter = None;
+    }
+
+    /// Drop only the observation `kind` produces, so a failed read never leaves
+    /// a stale preview attributable to it.
+    fn clear_observation_for(&mut self, kind: RequestKind) {
+        match kind {
+            RequestKind::Registers => self.register_summary = None,
+            RequestKind::Memory => self.memory_summary = None,
+            RequestKind::ProgramCounter => self.program_counter = None,
+            RequestKind::Connect | RequestKind::Disconnect => {}
+        }
     }
 
     fn clear_session(&mut self) {
@@ -334,6 +410,37 @@ impl RemoteSessionView {
         self.target = None;
         self.clear_observations();
     }
+}
+
+/// `[egui thread, non-blocking]` Submission gate for the typed EE
+/// program-counter route.
+///
+/// This route is a strict narrowing of the existing read-register route: it
+/// issues the same `g` read and adds no capability. It is offered only for a
+/// live connection whose target description matched the exact canonical PS2 EE
+/// schema at connect time. The remote-I/O worker re-derives the same decision
+/// from its own retained description before touching the socket, so this check
+/// is a UI gate and never the sole enforcement point.
+fn require_program_counter_route(view: &RemoteSessionView) -> Result<(), RemoteSessionError> {
+    if !view.is_connected() {
+        return Err(RemoteSessionError::NotConnected);
+    }
+    if !view
+        .target
+        .as_ref()
+        .is_some_and(RemoteTargetView::is_exact_ps2_ee_schema)
+    {
+        return Err(RemoteSessionError::RequiresExactPs2EeSchema);
+    }
+    Ok(())
+}
+
+/// Render an EE program counter as a fixed-width `0xXXXXXXXX` literal.
+///
+/// The EE program counter is exactly 32 bits, so the width is constant and
+/// never truncates or elides a digit.
+pub(crate) fn format_ee_program_counter(pc: u32) -> String {
+    format!("{pc:#010x}")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -494,6 +601,18 @@ impl RemoteSessionController {
         })
     }
 
+    /// `[egui thread, non-blocking]` Request one typed read of the current EE
+    /// program counter.
+    ///
+    /// This is a single explicit observation, never a poll. It fails closed
+    /// unless the connected target matched the exact canonical PS2 EE schema.
+    pub(crate) fn read_program_counter(&mut self) -> Result<(), RemoteSessionError> {
+        require_program_counter_route(&self.view)?;
+        self.submit(RequestKind::ProgramCounter, |request| {
+            RemoteCommand::ReadProgramCounter { request }
+        })
+    }
+
     /// `[egui thread, non-blocking]` Apply every ready worker result.
     pub(crate) fn poll(&mut self) -> Vec<RemoteSessionNotice> {
         let mut notices = Vec::new();
@@ -520,24 +639,29 @@ impl RemoteSessionController {
                     break;
                 }
             };
-            if self.pending_request != Some(event.request) {
-                continue;
+            match classify_event(self.pending_request, self.cancelled_request, event.request) {
+                EventDisposition::Stale => continue,
+                EventDisposition::Cancelled => {
+                    self.pending_request = None;
+                    self.view.pending = None;
+                    self.view.cancelling = false;
+                    self.cancelled_request = None;
+                    self.cancel_requested.store(false, Ordering::Release);
+                    self.view.clear_session();
+                    clear_cancel_stream(&self.cancel_stream);
+                    notices.push(RemoteSessionNotice {
+                        level: RemoteNoticeLevel::Info,
+                        message: format!("Cancelled remote {}", event.kind.label()),
+                    });
+                    continue;
+                }
+                EventDisposition::Apply => {
+                    self.pending_request = None;
+                    self.view.pending = None;
+                    self.view.cancelling = false;
+                    self.apply_event(event, &mut notices);
+                }
             }
-            self.pending_request = None;
-            self.view.pending = None;
-            self.view.cancelling = false;
-            if self.cancelled_request == Some(event.request) {
-                self.cancelled_request = None;
-                self.cancel_requested.store(false, Ordering::Release);
-                self.view.clear_session();
-                clear_cancel_stream(&self.cancel_stream);
-                notices.push(RemoteSessionNotice {
-                    level: RemoteNoticeLevel::Info,
-                    message: format!("Cancelled remote {}", event.kind.label()),
-                });
-                continue;
-            }
-            self.apply_event(event, &mut notices);
         }
         notices
     }
@@ -636,15 +760,22 @@ impl RemoteSessionController {
                     message: format!("Read {} remote byte(s) at {address:#x}", bytes.len()),
                 });
             }
+            RemoteOutcome::ProgramCounter { pc } => {
+                self.view.program_counter = Some(pc);
+                self.view.last_error = None;
+                let rendered = format_ee_program_counter(pc);
+                notices.push(RemoteSessionNotice {
+                    level: RemoteNoticeLevel::Success,
+                    message: format!(
+                        "Read the current EE program counter {rendered} from the remote target"
+                    ),
+                });
+            }
             RemoteOutcome::Failed {
                 detail,
                 connection_lost,
             } => {
-                match event.kind {
-                    RequestKind::Registers => self.view.register_summary = None,
-                    RequestKind::Memory => self.view.memory_summary = None,
-                    RequestKind::Connect | RequestKind::Disconnect => {}
-                }
+                self.view.clear_observation_for(event.kind);
                 if connection_lost {
                     self.view.clear_session();
                     clear_cancel_stream(&self.cancel_stream);
@@ -772,6 +903,41 @@ fn process_remote_command(
                 }
             }
         }
+        RemoteCommand::ReadProgramCounter { .. } => {
+            let Some(connected) = client.as_mut() else {
+                return RemoteOutcome::Failed {
+                    detail: RemoteSessionError::NotConnected.to_string(),
+                    connection_lost: true,
+                };
+            };
+            // Re-enforce the schema here, against this worker's own retained
+            // description, rather than trusting the egui-side route gate.
+            if let Err(error) = require_exact_ps2_ee_schema(&connected.description) {
+                // The packet stream is still synchronized and nothing was
+                // read, so the session survives an unroutable request.
+                return RemoteOutcome::Failed {
+                    detail: bounded_io_error(error),
+                    connection_lost: false,
+                };
+            }
+            let result = connected.client.read_registers().and_then(|registers| {
+                connected.description.validate_gpacket(&registers)?;
+                extract_ee_program_counter(&registers)
+                // `registers` is dropped here: the raw packet is worker-local
+                // and only the typed program counter leaves this scope.
+            });
+            match result {
+                Ok(pc) => RemoteOutcome::ProgramCounter { pc },
+                Err(error) => {
+                    *client = None;
+                    clear_cancel_stream(cancel_stream);
+                    RemoteOutcome::Failed {
+                        detail: bounded_io_error(error),
+                        connection_lost: true,
+                    }
+                }
+            }
+        }
         RemoteCommand::ReadMemory { read, .. } => {
             let Some(connected) = client.as_mut() else {
                 return RemoteOutcome::Failed {
@@ -877,13 +1043,8 @@ fn validate_target_description(
     })?;
 
     let exact_ps2_ee_schema = if architecture == PS2_EE_TARGET_DESCRIPTION.architecture {
-        let canonical = RemoteTargetDescription::parse(PS2_EE_TARGET_XML.to_owned())?;
-        if expected_gpacket_bytes != PS2_EE_TARGET_DESCRIPTION.register_packet_bytes
-            || description.registers() != canonical.registers()
-            || description.byte_order() != Some(PS2_EE_TARGET_DESCRIPTION.byte_order)
-            || description.software_breakpoint_kind()
-                != Some(PS2_EE_TARGET_DESCRIPTION.software_breakpoint_kind)
-        {
+        let canonical = canonical_ps2_ee_description()?;
+        if !matches_canonical_ps2_ee_schema(description, &canonical) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
@@ -905,6 +1066,65 @@ fn validate_target_description(
         software_breakpoint_kind: description.software_breakpoint_kind(),
         exact_ps2_ee_schema,
     })
+}
+
+/// Parse ReSymbol's own canonical PS2 EE target description.
+fn canonical_ps2_ee_description() -> io::Result<RemoteTargetDescription> {
+    RemoteTargetDescription::parse(PS2_EE_TARGET_XML.to_owned())
+}
+
+/// Whether `description` is structurally identical to the canonical EE schema.
+///
+/// Both the connect-time validation and the worker's per-operation
+/// re-enforcement resolve "exact PS2 EE schema" through this one definition, so
+/// the two enforcement points cannot drift apart.
+fn matches_canonical_ps2_ee_schema(
+    description: &RemoteTargetDescription,
+    canonical: &RemoteTargetDescription,
+) -> bool {
+    description.architecture() == Some(PS2_EE_TARGET_DESCRIPTION.architecture)
+        && description.expected_gpacket_bytes()
+            == Some(PS2_EE_TARGET_DESCRIPTION.register_packet_bytes)
+        && description.registers() == canonical.registers()
+        && description.byte_order() == Some(PS2_EE_TARGET_DESCRIPTION.byte_order)
+        && description.software_breakpoint_kind()
+            == Some(PS2_EE_TARGET_DESCRIPTION.software_breakpoint_kind)
+}
+
+/// `[remote I/O thread]` Fail closed unless the worker's retained description
+/// is still the exact canonical PS2 EE schema.
+fn require_exact_ps2_ee_schema(description: &RemoteTargetDescription) -> io::Result<()> {
+    let canonical = canonical_ps2_ee_description()?;
+    if matches_canonical_ps2_ee_schema(description, &canonical) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            RemoteSessionError::RequiresExactPs2EeSchema.to_string(),
+        ))
+    }
+}
+
+/// `[remote I/O thread]` Reduce one exact canonical EE `g` packet to its typed
+/// program counter.
+///
+/// The length is re-checked here so parsing never depends on an earlier
+/// validation having run. Every other decoded register — including the EE's
+/// 128-bit GPR, HI, and LO state — is dropped when this function returns; only
+/// the `u32` escapes.
+fn extract_ee_program_counter(raw: &[u8]) -> io::Result<u32> {
+    if raw.len() != PS2_EE_GPACKET_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "expected exactly {PS2_EE_GPACKET_BYTES} canonical PS2 EE register bytes, got {}",
+                raw.len()
+            ),
+        ));
+    }
+    ps2_ee_gpacket_to_registers(raw)
+        .map(|registers| registers.pc)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
 }
 
 fn shutdown_cancel_stream(cancel_stream: &Arc<Mutex<Option<TcpStream>>>) {
@@ -963,6 +1183,32 @@ fn hex_bytes(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use resymbol_gdb_remote::{AMD64_TARGET_XML, Ps2EeCoreRegisters};
+
+    /// Byte offset of the 32-bit `pc` register inside the canonical EE `g`
+    /// packet, restated here so the extraction path is checked against a
+    /// literal offset rather than against the serializer that produced it.
+    const PS2_EE_PC_OFFSET: usize = 284;
+
+    fn ee_target_view(exact_ps2_ee_schema: bool) -> RemoteTargetView {
+        RemoteTargetView {
+            architecture: PS2_EE_TARGET_DESCRIPTION.architecture.to_owned(),
+            byte_order: Some(TargetByteOrder::Little),
+            register_count: PS2_EE_REGISTER_COUNT,
+            expected_gpacket_bytes: PS2_EE_GPACKET_BYTES,
+            software_breakpoint_kind: Some(PS2_EE_TARGET_DESCRIPTION.software_breakpoint_kind),
+            exact_ps2_ee_schema,
+        }
+    }
+
+    fn connected_view(target: Option<RemoteTargetView>) -> RemoteSessionView {
+        RemoteSessionView {
+            endpoint: Some("127.0.0.1:1234".parse().expect("numeric endpoint")),
+            target,
+            ..RemoteSessionView::default()
+        }
+    }
 
     #[test]
     fn attach_defaults_fail_closed_for_non_loopback_networks() {
@@ -1087,6 +1333,7 @@ mod tests {
             }),
             register_summary: Some("register bytes".to_owned()),
             memory_summary: Some("memory bytes".to_owned()),
+            program_counter: Some(0x0010_2000),
             last_error: Some("diagnostic".to_owned()),
         };
 
@@ -1097,6 +1344,7 @@ mod tests {
         assert!(view.target().is_none());
         assert!(view.register_summary().is_none());
         assert!(view.memory_summary().is_none());
+        assert!(view.program_counter().is_none());
         assert!(view.is_pending());
         assert!(view.is_cancelling());
         assert_eq!(view.last_error(), Some("diagnostic"));
@@ -1112,5 +1360,174 @@ mod tests {
 
         view.cancelling = true;
         assert_eq!(view.status(), "[CANCELLING] register read");
+    }
+
+    #[test]
+    fn canonical_ps2_ee_constants_match_the_shared_schema() {
+        let canonical = canonical_ps2_ee_description().expect("canonical PS2 XML");
+
+        assert_eq!(canonical.registers().len(), PS2_EE_REGISTER_COUNT);
+        assert_eq!(
+            canonical.expected_gpacket_bytes(),
+            Some(PS2_EE_GPACKET_BYTES)
+        );
+        assert_eq!(
+            PS2_EE_TARGET_DESCRIPTION.register_packet_bytes,
+            PS2_EE_GPACKET_BYTES
+        );
+    }
+
+    #[test]
+    fn ee_program_counter_is_read_from_the_canonical_packet_offset() {
+        let mut packet = vec![0u8; PS2_EE_GPACKET_BYTES];
+        packet[PS2_EE_PC_OFFSET..PS2_EE_PC_OFFSET + 4]
+            .copy_from_slice(&0x0010_2000u32.to_le_bytes());
+        assert_eq!(
+            extract_ee_program_counter(&packet).expect("canonical packet"),
+            0x0010_2000
+        );
+
+        // Cross-check the hand-built offset against the protocol crate's own
+        // serializer so this constant cannot drift from the shared schema.
+        let registers = Ps2EeCoreRegisters {
+            pc: 0x2000_1234,
+            ..Ps2EeCoreRegisters::default()
+        };
+        let serialized = registers.to_gpacket();
+        assert_eq!(serialized.len(), PS2_EE_GPACKET_BYTES);
+        assert_eq!(
+            &serialized[PS2_EE_PC_OFFSET..PS2_EE_PC_OFFSET + 4],
+            &0x2000_1234u32.to_le_bytes()
+        );
+        assert_eq!(
+            extract_ee_program_counter(&serialized).expect("canonical packet"),
+            0x2000_1234
+        );
+    }
+
+    #[test]
+    fn ee_program_counter_rejects_near_canonical_packet_lengths() {
+        let packet = vec![0u8; PS2_EE_GPACKET_BYTES];
+
+        assert_eq!(
+            extract_ee_program_counter(&packet[..PS2_EE_GPACKET_BYTES - 1])
+                .expect_err("a short packet must never be decoded")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let mut trailing = packet;
+        trailing.push(0);
+        assert_eq!(
+            extract_ee_program_counter(&trailing)
+                .expect_err("a long packet must never be decoded")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn worker_reenforcement_rejects_near_schema_and_foreign_targets() {
+        let canonical = canonical_ps2_ee_description().expect("canonical PS2 XML");
+        require_exact_ps2_ee_schema(&canonical).expect("canonical EE schema is routable");
+
+        let drifted = PS2_EE_TARGET_XML.replacen(
+            "name=\"fpu_acc\" bitsize=\"32\" regnum=\"108\" type=\"ieee_single\"",
+            "name=\"fpu_acc\" bitsize=\"32\" regnum=\"108\" type=\"uint32\"",
+            1,
+        );
+        assert_ne!(drifted, PS2_EE_TARGET_XML);
+        let near_match =
+            RemoteTargetDescription::parse(drifted).expect("drift remains valid target XML");
+        assert_eq!(
+            require_exact_ps2_ee_schema(&near_match)
+                .expect_err("a near-match must never reach the EE program-counter route")
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
+
+        let foreign = RemoteTargetDescription::parse(AMD64_TARGET_XML.to_owned())
+            .expect("canonical amd64 XML");
+        assert!(require_exact_ps2_ee_schema(&foreign).is_err());
+    }
+
+    #[test]
+    fn program_counter_route_is_gated_on_connection_and_exact_schema() {
+        assert_eq!(
+            require_program_counter_route(&RemoteSessionView::default()),
+            Err(RemoteSessionError::NotConnected)
+        );
+        assert!(!RemoteSessionView::default().can_read_program_counter());
+
+        assert_eq!(
+            require_program_counter_route(&connected_view(None)),
+            Err(RemoteSessionError::RequiresExactPs2EeSchema)
+        );
+        assert_eq!(
+            require_program_counter_route(&connected_view(Some(ee_target_view(false)))),
+            Err(RemoteSessionError::RequiresExactPs2EeSchema)
+        );
+
+        let exact = connected_view(Some(ee_target_view(true)));
+        assert_eq!(require_program_counter_route(&exact), Ok(()));
+        assert!(exact.can_read_program_counter());
+    }
+
+    #[test]
+    fn ee_program_counter_is_formatted_as_fixed_width_hexadecimal() {
+        assert_eq!(format_ee_program_counter(0), "0x00000000");
+        assert_eq!(format_ee_program_counter(0x0010_2000), "0x00102000");
+        assert_eq!(format_ee_program_counter(u32::MAX), "0xffffffff");
+        for pc in [0, 1, 0x0010_2000, 0x8000_0000, u32::MAX] {
+            assert_eq!(format_ee_program_counter(pc).len(), 10);
+        }
+    }
+
+    #[test]
+    fn lifecycle_scrub_clears_the_ee_program_counter_preview() {
+        let mut view = connected_view(Some(ee_target_view(true)));
+        view.program_counter = Some(0x0010_2000);
+
+        // Disconnect scrubs observations while the session is torn down.
+        view.clear_observations();
+        assert!(view.program_counter().is_none());
+
+        // Connection attempt, cancellation, worker loss, and connection loss
+        // all scrub the whole session, which must take the PC with it.
+        view.program_counter = Some(0x0010_2000);
+        view.clear_session();
+        assert!(view.program_counter().is_none());
+        assert!(!view.can_read_program_counter());
+    }
+
+    #[test]
+    fn a_failed_program_counter_read_scrubs_only_its_own_preview() {
+        let mut view = connected_view(Some(ee_target_view(true)));
+        view.program_counter = Some(0x0010_2000);
+        view.register_summary = Some("register bytes".to_owned());
+        view.memory_summary = Some("memory bytes".to_owned());
+
+        view.clear_observation_for(RequestKind::ProgramCounter);
+
+        assert!(view.program_counter().is_none());
+        assert_eq!(view.register_summary(), Some("register bytes"));
+        assert_eq!(view.memory_summary(), Some("memory bytes"));
+    }
+
+    #[test]
+    fn cancelled_and_stale_program_counter_results_are_never_displayed() {
+        // The sole tracked request completes normally.
+        assert_eq!(classify_event(Some(7), None, 7), EventDisposition::Apply);
+        // The same request once the UI cancelled it scrubs instead of showing
+        // a PC the operator already withdrew.
+        assert_eq!(
+            classify_event(Some(7), Some(7), 7),
+            EventDisposition::Cancelled
+        );
+        // A completion that lost its race with socket shutdown, or that landed
+        // with nothing pending, never touches presentation state.
+        assert_eq!(classify_event(Some(8), Some(7), 7), EventDisposition::Stale);
+        assert_eq!(classify_event(None, Some(7), 7), EventDisposition::Stale);
+        assert_eq!(classify_event(None, None, 7), EventDisposition::Stale);
     }
 }
