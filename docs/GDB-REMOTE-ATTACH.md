@@ -19,8 +19,15 @@ resymbol-gdb-remote-client thread
 - Every controller entry point is non-blocking and runs on the egui thread.
 - Connect, packet framing, acknowledgement waits, and replies run only on the
   named remote-I/O thread.
-- Connect and socket I/O have finite deadlines. Dropping the controller closes
-  its request/result channels and joins the sole owner thread.
+- Connect and socket I/O have finite deadlines. A cloned socket handle lets the
+  egui controller interrupt pending I/O without taking socket ownership away
+  from the remote-I/O thread.
+- Cancel remains available while an operation is pending. Cancellation closes
+  the connection, ignores that request's stale completion, and scrubs target
+  observations.
+- Dropping the controller signals cancellation, closes its request/result
+  channels, and detaches the sole owner thread; UI teardown never joins a
+  network thread.
 - One request may be outstanding. A second request fails closed as busy rather
   than queuing stale target operations.
 - A protocol or transport error discards the connection because the packet
@@ -38,6 +45,12 @@ resymbol-gdb-remote-client thread
 - Endpoint text, feature replies, addresses, register packets, and memory bytes
   are ephemeral UI state. They are not serialized into preferences, `.resym`
   packages, review ledgers, or repository artifacts.
+- Connected-target identity, features, register previews, and memory previews
+  are scrubbed on a new connection attempt, disconnect, cancellation, worker
+  loss, or connection loss so observations cannot be attributed to a later
+  endpoint.
+- Capability badges describe the read-only routes implemented by Workbench;
+  they do not claim that a disconnected or unprobed target supports a route.
 - Exporting a sanitized observation remains a separate explicit workflow.
 
 ## Deliberately deferred

@@ -12,8 +12,12 @@
 
 use std::{
     io,
-    net::{SocketAddr, TcpStream},
-    sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel},
+    net::{Shutdown, SocketAddr, TcpStream},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel},
+    },
     thread::{self, JoinHandle},
     time::Duration,
 };
@@ -125,6 +129,8 @@ pub(crate) enum RemoteSessionError {
     AlreadyConnected,
     #[error("the remote GDB session worker stopped unexpectedly")]
     WorkerDisconnected,
+    #[error("there is no pending remote operation to cancel")]
+    NoPendingOperation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -217,6 +223,7 @@ struct RemoteEvent {
 pub(crate) struct RemoteSessionView {
     endpoint: Option<SocketAddr>,
     pending: Option<&'static str>,
+    cancelling: bool,
     advertised_features: Option<String>,
     register_summary: Option<String>,
     memory_summary: Option<String>,
@@ -232,9 +239,17 @@ impl RemoteSessionView {
         self.pending.is_some()
     }
 
+    pub(crate) const fn is_cancelling(&self) -> bool {
+        self.cancelling
+    }
+
     pub(crate) fn status(&self) -> String {
         if let Some(operation) = self.pending {
-            format!("[BUSY] {operation}")
+            if self.cancelling {
+                format!("[CANCELLING] {operation}")
+            } else {
+                format!("[BUSY] {operation}")
+            }
         } else if let Some(endpoint) = self.endpoint {
             format!("[CONNECTED] {endpoint}")
         } else {
@@ -257,6 +272,17 @@ impl RemoteSessionView {
     pub(crate) fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
     }
+
+    fn clear_observations(&mut self) {
+        self.register_summary = None;
+        self.memory_summary = None;
+    }
+
+    fn clear_session(&mut self) {
+        self.endpoint = None;
+        self.advertised_features = None;
+        self.clear_observations();
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,13 +302,17 @@ pub(crate) struct RemoteSessionNotice {
 ///
 /// All methods are `[egui thread, non-blocking]`. The controller is
 /// non-hot-reloadable because it owns a named native thread and socket
-/// lifecycle; dropping it closes the request channel and joins that thread.
+/// lifecycle; dropping it cancels socket I/O, closes the channels, and detaches
+/// that thread without blocking UI teardown.
 pub(crate) struct RemoteSessionController {
     commands: Option<SyncSender<RemoteCommand>>,
     events: Option<Receiver<RemoteEvent>>,
     join: Option<JoinHandle<()>>,
+    cancel_stream: Arc<Mutex<Option<TcpStream>>>,
+    cancel_requested: Arc<AtomicBool>,
     next_request: u64,
     pending_request: Option<u64>,
+    cancelled_request: Option<u64>,
     worker_disconnected: bool,
     view: RemoteSessionView,
 }
@@ -292,16 +322,31 @@ impl RemoteSessionController {
     pub(crate) fn start(repaint: eframe::egui::Context) -> Self {
         let (commands, command_rx) = sync_channel(COMMAND_QUEUE_CAPACITY);
         let (event_tx, events) = sync_channel(EVENT_QUEUE_CAPACITY);
+        let cancel_stream = Arc::new(Mutex::new(None));
+        let worker_cancel_stream = Arc::clone(&cancel_stream);
+        let cancel_requested = Arc::new(AtomicBool::new(false));
+        let worker_cancel_requested = Arc::clone(&cancel_requested);
         let join = thread::Builder::new()
             .name("resymbol-gdb-remote-client".to_owned())
-            .spawn(move || remote_worker_loop(command_rx, event_tx, repaint))
+            .spawn(move || {
+                remote_worker_loop(
+                    command_rx,
+                    event_tx,
+                    repaint,
+                    worker_cancel_stream,
+                    worker_cancel_requested,
+                );
+            })
             .expect("the remote GDB client worker thread must start");
         Self {
             commands: Some(commands),
             events: Some(events),
             join: Some(join),
+            cancel_stream,
+            cancel_requested,
             next_request: 1,
             pending_request: None,
+            cancelled_request: None,
             worker_disconnected: false,
             view: RemoteSessionView::default(),
         }
@@ -332,6 +377,7 @@ impl RemoteSessionController {
         if self.view.is_connected() {
             return Err(RemoteSessionError::AlreadyConnected);
         }
+        self.view.clear_session();
         self.submit(RequestKind::Connect, |request| RemoteCommand::Connect {
             request,
             attach,
@@ -343,9 +389,28 @@ impl RemoteSessionController {
         if !self.view.is_connected() {
             return Err(RemoteSessionError::NotConnected);
         }
+        self.view.clear_observations();
         self.submit(RequestKind::Disconnect, |request| {
             RemoteCommand::Disconnect { request }
         })
+    }
+
+    /// `[egui thread, non-blocking]` Request cancellation of the sole pending
+    /// operation and interrupt any socket I/O already in progress.
+    pub(crate) fn cancel_pending(&mut self) -> Result<(), RemoteSessionError> {
+        let Some(request) = self.pending_request else {
+            return Err(RemoteSessionError::NoPendingOperation);
+        };
+        if self.cancelled_request == Some(request) {
+            return Ok(());
+        }
+
+        self.cancelled_request = Some(request);
+        self.cancel_requested.store(true, Ordering::Release);
+        self.view.cancelling = true;
+        self.view.clear_session();
+        shutdown_cancel_stream(&self.cancel_stream);
+        Ok(())
     }
 
     /// `[egui thread, non-blocking]`
@@ -380,8 +445,11 @@ impl RemoteSessionController {
                     if !self.worker_disconnected {
                         self.worker_disconnected = true;
                         self.pending_request = None;
+                        self.cancelled_request = None;
                         self.view.pending = None;
-                        self.view.endpoint = None;
+                        self.view.cancelling = false;
+                        self.view.clear_session();
+                        clear_cancel_stream(&self.cancel_stream);
                         let message = RemoteSessionError::WorkerDisconnected.to_string();
                         self.view.last_error = Some(message.clone());
                         notices.push(RemoteSessionNotice {
@@ -397,6 +465,18 @@ impl RemoteSessionController {
             }
             self.pending_request = None;
             self.view.pending = None;
+            self.view.cancelling = false;
+            if self.cancelled_request == Some(event.request) {
+                self.cancelled_request = None;
+                self.cancel_requested.store(false, Ordering::Release);
+                self.view.clear_session();
+                clear_cancel_stream(&self.cancel_stream);
+                notices.push(RemoteSessionNotice {
+                    level: RemoteNoticeLevel::Info,
+                    message: format!("Cancelled remote {}", event.kind.label()),
+                });
+                continue;
+            }
             self.apply_event(event, &mut notices);
         }
         notices
@@ -417,6 +497,8 @@ impl RemoteSessionController {
         let command = make(request);
         debug_assert_eq!(command.request(), request);
         debug_assert_eq!(command.kind(), kind);
+        self.cancel_requested.store(false, Ordering::Release);
+        self.cancelled_request = None;
         commands.try_send(command).map_err(|error| match error {
             TrySendError::Full(_) => RemoteSessionError::Busy,
             TrySendError::Disconnected(_) => RemoteSessionError::WorkerDisconnected,
@@ -449,7 +531,8 @@ impl RemoteSessionController {
             }
             RemoteOutcome::Disconnected => {
                 let endpoint = self.view.endpoint.take();
-                self.view.advertised_features = None;
+                self.view.clear_session();
+                clear_cancel_stream(&self.cancel_stream);
                 self.view.last_error = None;
                 notices.push(RemoteSessionNotice {
                     level: RemoteNoticeLevel::Info,
@@ -495,9 +578,14 @@ impl RemoteSessionController {
                 detail,
                 connection_lost,
             } => {
+                match event.kind {
+                    RequestKind::Registers => self.view.register_summary = None,
+                    RequestKind::Memory => self.view.memory_summary = None,
+                    RequestKind::Connect | RequestKind::Disconnect => {}
+                }
                 if connection_lost {
-                    self.view.endpoint = None;
-                    self.view.advertised_features = None;
+                    self.view.clear_session();
+                    clear_cancel_stream(&self.cancel_stream);
                 }
                 let message = format!("Remote {} failed: {detail}", event.kind.label());
                 self.view.last_error = Some(message.clone());
@@ -512,13 +600,14 @@ impl RemoteSessionController {
 
 impl Drop for RemoteSessionController {
     fn drop(&mut self) {
-        // Closing the request channel wakes an idle worker. Socket operations
-        // have finite deadlines, so shutdown cannot wait on unbounded network I/O.
+        // UI teardown must never join a network owner. Signal cancellation,
+        // interrupt any socket operation, close the channels, and detach the
+        // named worker. Its bounded connect path or interrupted I/O will unwind.
+        self.cancel_requested.store(true, Ordering::Release);
+        shutdown_cancel_stream(&self.cancel_stream);
         self.commands.take();
         self.events.take();
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
-        }
+        drop(self.join.take());
     }
 }
 
@@ -527,12 +616,15 @@ fn remote_worker_loop(
     commands: Receiver<RemoteCommand>,
     events: SyncSender<RemoteEvent>,
     repaint: eframe::egui::Context,
+    cancel_stream: Arc<Mutex<Option<TcpStream>>>,
+    cancel_requested: Arc<AtomicBool>,
 ) {
     let mut client: Option<GdbRemoteClient<TcpTransport>> = None;
     while let Ok(command) = commands.recv() {
         let request = command.request();
         let kind = command.kind();
-        let outcome = process_remote_command(command, &mut client);
+        let outcome =
+            process_remote_command(command, &mut client, &cancel_stream, &cancel_requested);
         if events
             .send(RemoteEvent {
                 request,
@@ -545,29 +637,40 @@ fn remote_worker_loop(
         }
         repaint.request_repaint();
     }
+    clear_cancel_stream(&cancel_stream);
 }
 
 /// `[remote I/O thread]`
 fn process_remote_command(
     command: RemoteCommand,
     client: &mut Option<GdbRemoteClient<TcpTransport>>,
+    cancel_stream: &Arc<Mutex<Option<TcpStream>>>,
+    cancel_requested: &Arc<AtomicBool>,
 ) -> RemoteOutcome {
     match command {
-        RemoteCommand::Connect { attach, .. } => match connect_client(attach.endpoint()) {
-            Ok((connected, advertised_features)) => {
-                *client = Some(connected);
-                RemoteOutcome::Connected {
-                    endpoint: attach.endpoint(),
-                    advertised_features,
+        RemoteCommand::Connect { attach, .. } => {
+            *client = None;
+            clear_cancel_stream(cancel_stream);
+            match connect_client(attach.endpoint(), cancel_stream, cancel_requested) {
+                Ok((connected, advertised_features)) => {
+                    *client = Some(connected);
+                    RemoteOutcome::Connected {
+                        endpoint: attach.endpoint(),
+                        advertised_features,
+                    }
+                }
+                Err(error) => {
+                    clear_cancel_stream(cancel_stream);
+                    RemoteOutcome::Failed {
+                        detail: bounded_io_error(error),
+                        connection_lost: true,
+                    }
                 }
             }
-            Err(error) => RemoteOutcome::Failed {
-                detail: bounded_io_error(error),
-                connection_lost: true,
-            },
-        },
+        }
         RemoteCommand::Disconnect { .. } => {
             *client = None;
+            clear_cancel_stream(cancel_stream);
             RemoteOutcome::Disconnected
         }
         RemoteCommand::ReadRegisters { .. } => {
@@ -578,15 +681,20 @@ fn process_remote_command(
                 };
             };
             match connected.read_registers() {
-                Ok(registers) => RemoteOutcome::Registers {
+                Ok(registers) if !registers.is_empty() => RemoteOutcome::Registers {
                     byte_count: registers.len(),
                     preview: registers
                         .into_iter()
                         .take(MAX_REGISTER_PREVIEW_BYTES)
                         .collect(),
                 },
+                Ok(_) => RemoteOutcome::Failed {
+                    detail: "target returned an empty register packet".to_owned(),
+                    connection_lost: false,
+                },
                 Err(error) => {
                     *client = None;
+                    clear_cancel_stream(cancel_stream);
                     RemoteOutcome::Failed {
                         detail: bounded_io_error(error),
                         connection_lost: true,
@@ -606,16 +714,21 @@ fn process_remote_command(
                     address: read.address(),
                     bytes,
                 },
-                Ok(bytes) => RemoteOutcome::Failed {
-                    detail: format!(
-                        "target returned {} bytes for a {} byte request",
-                        bytes.len(),
-                        read.size()
-                    ),
-                    connection_lost: false,
-                },
+                Ok(bytes) => {
+                    *client = None;
+                    clear_cancel_stream(cancel_stream);
+                    RemoteOutcome::Failed {
+                        detail: format!(
+                            "target returned {} bytes for a {} byte request",
+                            bytes.len(),
+                            read.size()
+                        ),
+                        connection_lost: true,
+                    }
+                }
                 Err(error) => {
                     *client = None;
+                    clear_cancel_stream(cancel_stream);
                     RemoteOutcome::Failed {
                         detail: bounded_io_error(error),
                         connection_lost: true,
@@ -627,17 +740,65 @@ fn process_remote_command(
 }
 
 /// `[remote I/O thread]`
-fn connect_client(endpoint: SocketAddr) -> io::Result<(GdbRemoteClient<TcpTransport>, String)> {
+fn connect_client(
+    endpoint: SocketAddr,
+    cancel_stream: &Arc<Mutex<Option<TcpStream>>>,
+    cancel_requested: &Arc<AtomicBool>,
+) -> io::Result<(GdbRemoteClient<TcpTransport>, String)> {
     let stream = TcpStream::connect_timeout(&endpoint, CONNECT_TIMEOUT)?;
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
+    let interrupt = stream.try_clone()?;
+    *cancel_stream
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(interrupt);
+    if cancel_requested.load(Ordering::Acquire) {
+        let _ = stream.shutdown(Shutdown::Both);
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "remote operation cancelled",
+        ));
+    }
     let mut client = GdbRemoteClient::new(TcpTransport::new(stream));
     let advertised_features = client.query_supported()?;
+    if is_rsp_error_reply(&advertised_features) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "remote stub rejected qSupported with {}",
+                String::from_utf8_lossy(&advertised_features)
+            ),
+        ));
+    }
     Ok((
         client,
         bounded_printable(&advertised_features, MAX_FEATURE_TEXT_BYTES),
     ))
+}
+
+fn is_rsp_error_reply(reply: &[u8]) -> bool {
+    reply.len() == 3
+        && reply[0] == b'E'
+        && reply[1].is_ascii_hexdigit()
+        && reply[2].is_ascii_hexdigit()
+}
+
+fn shutdown_cancel_stream(cancel_stream: &Arc<Mutex<Option<TcpStream>>>) {
+    if let Some(stream) = cancel_stream
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+    {
+        let _ = stream.shutdown(Shutdown::Both);
+    }
+}
+
+fn clear_cancel_stream(cancel_stream: &Arc<Mutex<Option<TcpStream>>>) {
+    cancel_stream
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
 }
 
 fn bounded_printable(bytes: &[u8], maximum: usize) -> String {
@@ -742,5 +903,50 @@ mod tests {
             bounded_printable(b"", 3),
             "(no advertised qSupported features)"
         );
+    }
+
+    #[test]
+    fn rsp_error_replies_are_rejected_without_overmatching_feature_text() {
+        assert!(is_rsp_error_reply(b"E01"));
+        assert!(is_rsp_error_reply(b"Eff"));
+        assert!(!is_rsp_error_reply(b""));
+        assert!(!is_rsp_error_reply(b"E0"));
+        assert!(!is_rsp_error_reply(b"Error"));
+        assert!(!is_rsp_error_reply(b"E0g"));
+    }
+
+    #[test]
+    fn session_scrub_removes_target_identity_and_observations() {
+        let mut view = RemoteSessionView {
+            endpoint: Some("127.0.0.1:1234".parse().expect("numeric endpoint")),
+            pending: Some("memory read"),
+            cancelling: true,
+            advertised_features: Some("PacketSize=1000".to_owned()),
+            register_summary: Some("register bytes".to_owned()),
+            memory_summary: Some("memory bytes".to_owned()),
+            last_error: Some("diagnostic".to_owned()),
+        };
+
+        view.clear_session();
+
+        assert!(!view.is_connected());
+        assert!(view.advertised_features().is_none());
+        assert!(view.register_summary().is_none());
+        assert!(view.memory_summary().is_none());
+        assert!(view.is_pending());
+        assert!(view.is_cancelling());
+        assert_eq!(view.last_error(), Some("diagnostic"));
+    }
+
+    #[test]
+    fn cancelling_status_is_distinct_from_ordinary_busy_state() {
+        let mut view = RemoteSessionView {
+            pending: Some("register read"),
+            ..RemoteSessionView::default()
+        };
+        assert_eq!(view.status(), "[BUSY] register read");
+
+        view.cancelling = true;
+        assert_eq!(view.status(), "[CANCELLING] register read");
     }
 }
