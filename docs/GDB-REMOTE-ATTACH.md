@@ -88,8 +88,15 @@ One explicit, capacity-one, read-only operation reads the EE program counter.
 - Only the typed `u32` program counter crosses the worker/UI channel. The raw
   packet and every other decoded register, including the EE's 128-bit GPR, HI,
   and LO state, stay worker-local and are dropped there.
-- The value is displayed as a fixed-width `0xXXXXXXXX` literal and is ephemeral
-  UI state on the same terms as every other observation above.
+- The value is displayed as a fixed-width `0xXXXXXXXX` literal in the remote
+  session panel's current-PC row, and is ephemeral UI state on the same terms as
+  every other observation above.
+- That row is the value's only presentation. The notice announcing a completed
+  read is deliberately value-free and identical for every observed program
+  counter. Notices are forwarded to the bounded Workbench activity log and to
+  the companion console, and no session scrub can reach either, so a notice
+  carrying the value would outlive every scrub this route promises and stay
+  attributable after the connection it came from is gone.
 - The operation is a strict narrowing of the existing read-register route: it
   issues the same `g` read and adds no capability. It is a single explicit
   read, never a poll, and carries no execution control, memory or instruction
