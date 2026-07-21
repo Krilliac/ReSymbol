@@ -3055,6 +3055,7 @@ name = "resymbol-gdb-remote"
 version = "0.1.0-alpha.1"
 dependencies = [
  "libc",
+ "quick-xml 0.39.4",
  "resymbol-linux-debug-host",
  "thiserror 2.0.18",
 ]

@@ -1,0 +1,122 @@
+<?xml version="1.0"?>
+<!DOCTYPE target SYSTEM "gdb-target.dtd">
+<target version="1.0">
+  <architecture>mips:5900</architecture>
+  <feature name="org.gnu.gdb.mips.cpu">
+    <reg name="r0" bitsize="64" regnum="0" type="uint64" group="general"/>
+    <reg name="r1" bitsize="64" regnum="1" type="uint64" group="general"/>
+    <reg name="r2" bitsize="64" regnum="2" type="uint64" group="general"/>
+    <reg name="r3" bitsize="64" regnum="3" type="uint64" group="general"/>
+    <reg name="r4" bitsize="64" regnum="4" type="uint64" group="general"/>
+    <reg name="r5" bitsize="64" regnum="5" type="uint64" group="general"/>
+    <reg name="r6" bitsize="64" regnum="6" type="uint64" group="general"/>
+    <reg name="r7" bitsize="64" regnum="7" type="uint64" group="general"/>
+    <reg name="r8" bitsize="64" regnum="8" type="uint64" group="general"/>
+    <reg name="r9" bitsize="64" regnum="9" type="uint64" group="general"/>
+    <reg name="r10" bitsize="64" regnum="10" type="uint64" group="general"/>
+    <reg name="r11" bitsize="64" regnum="11" type="uint64" group="general"/>
+    <reg name="r12" bitsize="64" regnum="12" type="uint64" group="general"/>
+    <reg name="r13" bitsize="64" regnum="13" type="uint64" group="general"/>
+    <reg name="r14" bitsize="64" regnum="14" type="uint64" group="general"/>
+    <reg name="r15" bitsize="64" regnum="15" type="uint64" group="general"/>
+    <reg name="r16" bitsize="64" regnum="16" type="uint64" group="general"/>
+    <reg name="r17" bitsize="64" regnum="17" type="uint64" group="general"/>
+    <reg name="r18" bitsize="64" regnum="18" type="uint64" group="general"/>
+    <reg name="r19" bitsize="64" regnum="19" type="uint64" group="general"/>
+    <reg name="r20" bitsize="64" regnum="20" type="uint64" group="general"/>
+    <reg name="r21" bitsize="64" regnum="21" type="uint64" group="general"/>
+    <reg name="r22" bitsize="64" regnum="22" type="uint64" group="general"/>
+    <reg name="r23" bitsize="64" regnum="23" type="uint64" group="general"/>
+    <reg name="r24" bitsize="64" regnum="24" type="uint64" group="general"/>
+    <reg name="r25" bitsize="64" regnum="25" type="uint64" group="general"/>
+    <reg name="r26" bitsize="64" regnum="26" type="uint64" group="general"/>
+    <reg name="r27" bitsize="64" regnum="27" type="uint64" group="general"/>
+    <reg name="r28" bitsize="64" regnum="28" type="uint64" group="general"/>
+    <reg name="r29" bitsize="64" regnum="29" type="uint64" group="general"/>
+    <reg name="r30" bitsize="64" regnum="30" type="uint64" group="general"/>
+    <reg name="r31" bitsize="64" regnum="31" type="uint64" group="general"/>
+    <reg name="lo" bitsize="64" regnum="33" type="uint64" group="general"/>
+    <reg name="hi" bitsize="64" regnum="34" type="uint64" group="general"/>
+    <reg name="pc" bitsize="32" regnum="37" type="code_ptr" group="general"/>
+  </feature>
+  <feature name="org.gnu.gdb.mips.cp0">
+    <reg name="status" bitsize="32" regnum="32" type="uint32" group="system"/>
+    <reg name="badvaddr" bitsize="32" regnum="35" type="uint32" group="system"/>
+    <reg name="cause" bitsize="32" regnum="36" type="uint32" group="system"/>
+  </feature>
+  <feature name="org.gnu.gdb.mips.fpu">
+    <reg name="f0" bitsize="32" regnum="38" type="ieee_single" group="float"/>
+    <reg name="f1" bitsize="32" regnum="39" type="ieee_single" group="float"/>
+    <reg name="f2" bitsize="32" regnum="40" type="ieee_single" group="float"/>
+    <reg name="f3" bitsize="32" regnum="41" type="ieee_single" group="float"/>
+    <reg name="f4" bitsize="32" regnum="42" type="ieee_single" group="float"/>
+    <reg name="f5" bitsize="32" regnum="43" type="ieee_single" group="float"/>
+    <reg name="f6" bitsize="32" regnum="44" type="ieee_single" group="float"/>
+    <reg name="f7" bitsize="32" regnum="45" type="ieee_single" group="float"/>
+    <reg name="f8" bitsize="32" regnum="46" type="ieee_single" group="float"/>
+    <reg name="f9" bitsize="32" regnum="47" type="ieee_single" group="float"/>
+    <reg name="f10" bitsize="32" regnum="48" type="ieee_single" group="float"/>
+    <reg name="f11" bitsize="32" regnum="49" type="ieee_single" group="float"/>
+    <reg name="f12" bitsize="32" regnum="50" type="ieee_single" group="float"/>
+    <reg name="f13" bitsize="32" regnum="51" type="ieee_single" group="float"/>
+    <reg name="f14" bitsize="32" regnum="52" type="ieee_single" group="float"/>
+    <reg name="f15" bitsize="32" regnum="53" type="ieee_single" group="float"/>
+    <reg name="f16" bitsize="32" regnum="54" type="ieee_single" group="float"/>
+    <reg name="f17" bitsize="32" regnum="55" type="ieee_single" group="float"/>
+    <reg name="f18" bitsize="32" regnum="56" type="ieee_single" group="float"/>
+    <reg name="f19" bitsize="32" regnum="57" type="ieee_single" group="float"/>
+    <reg name="f20" bitsize="32" regnum="58" type="ieee_single" group="float"/>
+    <reg name="f21" bitsize="32" regnum="59" type="ieee_single" group="float"/>
+    <reg name="f22" bitsize="32" regnum="60" type="ieee_single" group="float"/>
+    <reg name="f23" bitsize="32" regnum="61" type="ieee_single" group="float"/>
+    <reg name="f24" bitsize="32" regnum="62" type="ieee_single" group="float"/>
+    <reg name="f25" bitsize="32" regnum="63" type="ieee_single" group="float"/>
+    <reg name="f26" bitsize="32" regnum="64" type="ieee_single" group="float"/>
+    <reg name="f27" bitsize="32" regnum="65" type="ieee_single" group="float"/>
+    <reg name="f28" bitsize="32" regnum="66" type="ieee_single" group="float"/>
+    <reg name="f29" bitsize="32" regnum="67" type="ieee_single" group="float"/>
+    <reg name="f30" bitsize="32" regnum="68" type="ieee_single" group="float"/>
+    <reg name="f31" bitsize="32" regnum="69" type="ieee_single" group="float"/>
+    <reg name="fcsr" bitsize="32" regnum="70" type="uint32" group="float"/>
+    <reg name="fir" bitsize="32" regnum="71" type="uint32" group="float"/>
+  </feature>
+  <feature name="org.openomega.ps2.ee">
+    <reg name="epc" bitsize="32" regnum="72" type="uint32" group="system"/>
+    <reg name="r0_upper" bitsize="64" regnum="73" type="uint64" group="general"/>
+    <reg name="r1_upper" bitsize="64" regnum="74" type="uint64" group="general"/>
+    <reg name="r2_upper" bitsize="64" regnum="75" type="uint64" group="general"/>
+    <reg name="r3_upper" bitsize="64" regnum="76" type="uint64" group="general"/>
+    <reg name="r4_upper" bitsize="64" regnum="77" type="uint64" group="general"/>
+    <reg name="r5_upper" bitsize="64" regnum="78" type="uint64" group="general"/>
+    <reg name="r6_upper" bitsize="64" regnum="79" type="uint64" group="general"/>
+    <reg name="r7_upper" bitsize="64" regnum="80" type="uint64" group="general"/>
+    <reg name="r8_upper" bitsize="64" regnum="81" type="uint64" group="general"/>
+    <reg name="r9_upper" bitsize="64" regnum="82" type="uint64" group="general"/>
+    <reg name="r10_upper" bitsize="64" regnum="83" type="uint64" group="general"/>
+    <reg name="r11_upper" bitsize="64" regnum="84" type="uint64" group="general"/>
+    <reg name="r12_upper" bitsize="64" regnum="85" type="uint64" group="general"/>
+    <reg name="r13_upper" bitsize="64" regnum="86" type="uint64" group="general"/>
+    <reg name="r14_upper" bitsize="64" regnum="87" type="uint64" group="general"/>
+    <reg name="r15_upper" bitsize="64" regnum="88" type="uint64" group="general"/>
+    <reg name="r16_upper" bitsize="64" regnum="89" type="uint64" group="general"/>
+    <reg name="r17_upper" bitsize="64" regnum="90" type="uint64" group="general"/>
+    <reg name="r18_upper" bitsize="64" regnum="91" type="uint64" group="general"/>
+    <reg name="r19_upper" bitsize="64" regnum="92" type="uint64" group="general"/>
+    <reg name="r20_upper" bitsize="64" regnum="93" type="uint64" group="general"/>
+    <reg name="r21_upper" bitsize="64" regnum="94" type="uint64" group="general"/>
+    <reg name="r22_upper" bitsize="64" regnum="95" type="uint64" group="general"/>
+    <reg name="r23_upper" bitsize="64" regnum="96" type="uint64" group="general"/>
+    <reg name="r24_upper" bitsize="64" regnum="97" type="uint64" group="general"/>
+    <reg name="r25_upper" bitsize="64" regnum="98" type="uint64" group="general"/>
+    <reg name="r26_upper" bitsize="64" regnum="99" type="uint64" group="general"/>
+    <reg name="r27_upper" bitsize="64" regnum="100" type="uint64" group="general"/>
+    <reg name="r28_upper" bitsize="64" regnum="101" type="uint64" group="general"/>
+    <reg name="r29_upper" bitsize="64" regnum="102" type="uint64" group="general"/>
+    <reg name="r30_upper" bitsize="64" regnum="103" type="uint64" group="general"/>
+    <reg name="r31_upper" bitsize="64" regnum="104" type="uint64" group="general"/>
+    <reg name="lo_upper" bitsize="64" regnum="105" type="uint64" group="general"/>
+    <reg name="hi_upper" bitsize="64" regnum="106" type="uint64" group="general"/>
+    <reg name="sa" bitsize="32" regnum="107" type="uint32" group="general"/>
+    <reg name="fpu_acc" bitsize="32" regnum="108" type="ieee_single" group="float"/>
+  </feature>
+</target>

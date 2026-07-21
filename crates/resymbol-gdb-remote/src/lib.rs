@@ -28,6 +28,7 @@ pub mod core_dump;
 pub mod protocol;
 pub mod server;
 pub mod target;
+pub mod target_description;
 pub mod transport;
 
 #[cfg(unix)]
@@ -36,13 +37,23 @@ pub mod serial;
 #[cfg(target_os = "linux")]
 pub mod ptrace_target;
 
-pub use client::GdbRemoteClient;
+pub use client::{
+    DEFAULT_OPERATION_TIMEOUT, GdbRemoteClient, RemoteRegisterDescription, RemoteTargetDescription,
+};
 pub use core_dump::{CoreClass, CoreDump, CoreDumpError, CoreDumpTarget, CoreEndian, CoreRegion};
-pub use protocol::{PacketEvent, PacketReader, encode_packet};
-pub use server::{GdbStubServer, serve_one};
+pub use protocol::{
+    DEFAULT_MAX_MEMORY_TRANSFER, DEFAULT_MAX_PACKET_PAYLOAD, DEFAULT_MAX_TARGET_DESCRIPTION,
+    PacketEvent, PacketReader, ProtocolLimits, encode_packet,
+};
+pub use server::{GdbStubServer, serve_one, serve_one_with_limits};
 pub use target::{
     AMD64_GPACKET_BYTES, Amd64CoreRegisters, RemoteTarget, StopReply, TargetError, WatchKind,
     amd64_gpacket_to_registers, amd64_registers_to_gpacket,
+};
+pub use target_description::{
+    AMD64_TARGET_DESCRIPTION, AMD64_TARGET_XML, PS2_EE_GPACKET_BYTES, PS2_EE_TARGET_DESCRIPTION,
+    PS2_EE_TARGET_XML, Ps2EeCoreRegisters, TargetByteOrder, TargetDescription,
+    ps2_ee_gpacket_to_registers, ps2_ee_registers_to_gpacket,
 };
 pub use transport::{
     MemoryStream, StreamTransport, TcpServerListener, TcpTransport, Transport, memory_pair,

@@ -6,7 +6,10 @@
 use resymbol_gdb_remote::target::{
     Amd64CoreRegisters, RemoteTarget, StopReply, TargetError, WatchKind,
 };
-use resymbol_gdb_remote::{GdbRemoteClient, GdbStubServer, memory_pair};
+use resymbol_gdb_remote::{
+    AMD64_GPACKET_BYTES, AMD64_TARGET_DESCRIPTION, GdbRemoteClient, GdbStubServer, TargetByteOrder,
+    TargetDescription, memory_pair,
+};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
@@ -45,6 +48,10 @@ impl MockTarget {
 }
 
 impl RemoteTarget for MockTarget {
+    fn target_description(&self) -> Option<TargetDescription<'_>> {
+        Some(AMD64_TARGET_DESCRIPTION)
+    }
+
     fn read_registers(&mut self) -> Result<Vec<u8>, TargetError> {
         Ok(self.registers.to_gpacket())
     }
@@ -315,6 +322,26 @@ fn client_drives_server_over_in_memory_transport() {
     let supported = String::from_utf8(supported).unwrap();
     assert!(supported.contains("swbreak+"), "got: {supported}");
     assert!(supported.contains("PacketSize="), "got: {supported}");
+    assert!(
+        supported.contains("qXfer:features:read+"),
+        "got: {supported}"
+    );
+
+    // Target XML is fetched over multiple bounded qXfer chunks and parsed.
+    let description = client
+        .read_target_description()
+        .expect("target description request")
+        .expect("mock advertises target description");
+    assert_eq!(description.architecture(), Some("i386:x86-64"));
+    assert_eq!(
+        description.expected_gpacket_bytes(),
+        Some(AMD64_GPACKET_BYTES)
+    );
+    assert_eq!(description.byte_order(), Some(TargetByteOrder::Little));
+
+    // Oversized and internally inconsistent memory requests fail closed.
+    assert_eq!(client.transact(b"m401000,801").unwrap(), b"E01");
+    assert_eq!(client.transact(b"M402000,2:aa").unwrap(), b"E01");
 
     // Read registers and confirm the g-packet decodes to the mock's values.
     let raw = client.read_registers().expect("read registers");
@@ -344,6 +371,7 @@ fn client_drives_server_over_in_memory_transport() {
     assert_eq!(read_back, vec![0xaa, 0xbb, 0xcc]);
 
     // Breakpoint set/remove both acknowledge OK.
+    assert!(client.set_breakpoint_with_kind(0x0040_1002, 4).is_err());
     client.set_breakpoint(0x0040_1002).expect("set breakpoint");
     client
         .remove_breakpoint(0x0040_1002)
