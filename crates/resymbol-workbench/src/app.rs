@@ -35,7 +35,7 @@ use crate::{
     console_host::{ConsoleHost, ConsoleHostEvent},
     gdb_session::{
         DEFAULT_REMOTE_ENDPOINT, MAX_REMOTE_MEMORY_READ_BYTES, RemoteAttachRequest,
-        RemoteMemoryRead, RemoteNoticeLevel, RemoteSessionController,
+        RemoteMemoryRead, RemoteNoticeLevel, RemoteSessionController, format_ee_program_counter,
     },
     graph::{
         GRAPH_MAX_DEPTH, GRAPH_MAX_EDGES, GRAPH_MAX_NODES, GraphEdge, GraphEdgeKind,
@@ -438,6 +438,7 @@ enum RemoteSessionUiAction {
     CancelPending,
     ReadRegisters,
     ReadMemory,
+    ReadProgramCounter,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9057,6 +9058,18 @@ impl WorkbenchApp {
                         action = Some(RemoteSessionUiAction::ReadRegisters);
                     }
 
+                    if view.can_read_program_counter() {
+                        if ui
+                            .add_enabled(!pending, egui::Button::new("Read current EE PC"))
+                            .clicked()
+                        {
+                            action = Some(RemoteSessionUiAction::ReadProgramCounter);
+                        }
+                        ui.small(
+                            "One explicit read, never a poll. The raw g packet is parsed on the remote-I/O worker and dropped there; only the typed 32-bit program counter reaches this window.",
+                        );
+                    }
+
                     ui.horizontal_wrapped(|ui| {
                         ui.label("Guest address");
                         ui.add_enabled(
@@ -9118,6 +9131,10 @@ impl WorkbenchApp {
                         );
                     }
                 }
+                if let Some(pc) = view.program_counter() {
+                    ui.add_space(6.0);
+                    property_row(ui, "Current EE PC", &format_ee_program_counter(pc), true);
+                }
                 if let Some(registers) = view.register_summary() {
                     ui.add_space(6.0);
                     ui.label(RichText::new(registers).small().monospace());
@@ -9153,6 +9170,10 @@ impl WorkbenchApp {
             Some(RemoteSessionUiAction::ReadRegisters) => self
                 .remote_session
                 .read_registers()
+                .map_err(|error| error.to_string()),
+            Some(RemoteSessionUiAction::ReadProgramCounter) => self
+                .remote_session
+                .read_program_counter()
                 .map_err(|error| error.to_string()),
             Some(RemoteSessionUiAction::ReadMemory) => {
                 parse_remote_address(&self.remote_memory_address_input)
