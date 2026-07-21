@@ -1,19 +1,23 @@
 # Workbench outbound GDB/RSP attach
 
-The Workbench can open one inspection-only TCP connection to a GDB Remote
-Serial Protocol target. Its initial use is a PCSX2 guest-state endpoint, but
-the controller has no PCSX2 dependency.
+The Workbench can open one experimental inspection-only TCP connection to a GDB
+Remote Serial Protocol target. Its initial use is a PCSX2 guest-state endpoint,
+but the controller has no PCSX2 dependency. This is a transport-specific,
+read-only, best-effort observer, not an authenticated `resymbol-debugger`
+session or an execution-control bridge.
 
 ## Ownership and thread affinity
 
 ```text
 egui / WorkbenchApp
     owns RemoteSessionController and ephemeral presentation state
+    holds only a cloned shutdown handle for interrupting pending I/O
              |
              | capacity-one request channel
              v
 resymbol-gdb-remote-client thread
-    exclusively owns TcpStream, GdbRemoteClient<TcpTransport>, and target.xml
+    exclusively owns the protocol read/write stream,
+    GdbRemoteClient<TcpTransport>, and target.xml
 ```
 
 - Every controller entry point is non-blocking and runs on the egui thread.
@@ -23,8 +27,9 @@ resymbol-gdb-remote-client thread
   absolute deadline covering request, acknowledgement, and reply; the complete
   multi-chunk `target.xml` fetch shares one deadline. The TCP transport reduces
   each blocking socket timeout to the remaining operation time. A cloned socket
-  handle lets the egui controller interrupt pending I/O without taking socket
-  ownership away from the remote-I/O thread.
+  handle lets the egui controller interrupt pending I/O without taking protocol
+  read/write ownership away from the remote-I/O thread. The controller has no
+  operation that can use this clone for RSP traffic; it is shutdown-only.
 - Cancel remains available while an operation is pending. Cancellation closes
   the connection, ignores that request's stale completion, and scrubs target
   observations.
@@ -40,7 +45,11 @@ resymbol-gdb-remote-client thread
 
 - The default endpoint is `127.0.0.1:1234`.
 - Endpoints must be numeric. A non-loopback address requires an explicit UI
-  opt-in for that Workbench process.
+  opt-in for that Workbench process. Neither the opt-in nor TCP connection
+  authenticates the RSP peer or target process.
+- This observer does not enter the `resymbol-debugger` session/token layer.
+  Connection establishment creates no `SessionId`, stopped-state token,
+  one-use lease, capability authority, attestation, or cleanup evidence.
 - A connection becomes visible only after `qSupported` and a bounded
   `qXfer:features:read:target.xml` fetch succeed. Target XML is mandatory for
   this typed surface; missing architecture or register layout fails closed.
@@ -66,9 +75,13 @@ resymbol-gdb-remote-client thread
   request never reaches presentation state.
 - Capability badges describe the read-only routes implemented by Workbench;
   they do not claim that a disconnected or unprobed target supports a route.
-- Exporting a sanitized observation remains a separate explicit workflow.
+- There is no route from these observations to project state, `.resym`
+  packages, review ledgers, exports, or evidence publication. They cannot
+  authorize launch, attach, write, breakpoint, continue, step, or any other
+  live action. Any future sanitized export is a separate explicit workflow and
+  must not inherit authority from this connection.
 
-## Current EE program counter
+## Last-observed EE program counter
 
 One explicit, capacity-one, read-only operation reads the EE program counter.
 
@@ -89,8 +102,9 @@ One explicit, capacity-one, read-only operation reads the EE program counter.
   packet and every other decoded register, including the EE's 128-bit GPR, HI,
   and LO state, stay worker-local and are dropped there.
 - The value is displayed as a fixed-width `0xXXXXXXXX` literal in the remote
-  session panel's current-PC row, and is ephemeral UI state on the same terms as
-  every other observation above.
+  session panel's **Last observed EE PC** row. It is one best-effort snapshot,
+  never a claim that the target is still stopped there, and is ephemeral UI
+  state on the same terms as every other observation above.
 - That row is the value's only presentation. The notice announcing a completed
   read is deliberately value-free and identical for every observed program
   counter. Notices are forwarded to the bounded Workbench activity log and to

@@ -18,7 +18,8 @@ background core-only Analyze -> Review -> Export**, preserves exact SHA-256 iden
 read-only plugin health in a persistent four-theme, four-region shell. The shell includes a
 virtualized sortable/filterable function table, synchronized evidence inspector,
 progress/warning/log surface, evidence-first Reconstruction Graph, non-executing static Address
-Space/protection view, and read-only Debugger / Sandbox readiness view. That graph roots at the PE
+Space/protection view, read-only Debugger / Sandbox readiness view, and an experimental outbound TCP
+GDB/RSP observer for explicit read-only, best-effort inspection. That graph roots at the PE
 entry point or a clearly labeled deterministic lowest-RVA navigation fallback, shares selection with
 the function review surfaces, and displays only retained direct-call, thunk, and import
 relationships. Explicit node/tier bounds keep large binaries responsive and visible as truncated
@@ -49,12 +50,21 @@ peer or process. A new same-thread Windows phase-one provider primitive can exac
 attach to an explicitly selected existing process, retain its initial attach breakpoint, read a
 bounded exact main-image span while stopped, and explicitly continue/detach. It advertises only
 `HostAttach` and `LiveMemoryRead` on Windows. Its authorization-named entry point cannot authenticate
-or consume authority itself, and it has no helper transport, Workbench route, launch, breakpoint,
-register, step, write, AppContainer/Hyper-V, or sandbox service.
+or consume authority itself, and this Windows provider stack has no helper transport, Workbench
+route, launch, breakpoint, register, step, write, AppContainer/Hyper-V, or sandbox service.
+
+Separately, the Workbench's experimental GDB/RSP observer is a capacity-one, transport-specific
+read-only surface whose remote-I/O worker owns the protocol stream and target description. It is
+unauthenticated at the `resymbol-debugger` session/token layer, publishes no evidence, and
+authorizes no live action. Its canonical PS2 EE current-PC request sends only one typed `u32` to
+presentation; the raw packet and other decoded registers remain worker-local. Stale completions are
+discarded before presentation; cancellation, disconnect, connection or worker loss, and replacement
+scrub the preview, while the longer-lived activity log receives only a value-free completion notice.
 
 This is a foundation, not the completed workbench or a working sandbox. GUI plugin execution,
-legacy-package migration, bulk review, docking, synchronized disassembly/pseudocode views, and an
-interactive debugger bridge remain planned. Address Space now includes a bounded non-executing x64
+legacy-package migration, bulk review, docking, synchronized disassembly/pseudocode views, and
+authenticated or mutating interactive debugger bridges remain planned. Address Space now includes a
+bounded non-executing x64
 linear preview, but it is not CFG or function-boundary truth. A portable Windows archive is the
 initial GUI packaging target; broader desktop packaging remains future validation.
 
@@ -304,9 +314,9 @@ inventories and all three load-config storage-anchor families are also package-o
 projection schema 6 is unchanged. The scripts
 bind to the exact loaded binary SHA-256, resolve addresses as loaded image base plus RVA, preserve
 user-authored names and existing function bodies, and continue past per-symbol application errors.
-They are deliberately narrower than the planned interactive debugger bridges: prototypes, types,
-alternate names, provenance comments, and richer relationships are retained or diagnosed by the
-projection but are not yet fully applied inside the tools.
+They are deliberately narrower than the planned interactive IDA/Ghidra evidence-application
+bridges: prototypes, types, alternate names, provenance comments, and richer relationships are
+retained or diagnosed by the projection but are not yet fully applied inside the tools.
 
 The MAP writer emits selected named symbols in deterministic RVA order using one-based PE
 `section:offset` and preferred-image-base-plus-RVA values. A selected function wins over a selected
@@ -350,8 +360,10 @@ modeling, broader RTTI/ABI coverage, broader compiler fixtures,
 benchmarks, and continued malformed-input/resource-limit validation.
 The strictly non-executing offline image host and its bounded workbench byte reader are implemented.
 The same-thread Windows phase-one attach/read primitive is also implemented and covered by an owned
-child fixture, but authenticated helper integration, UI control, execution control, and sandboxed
-process-hosting paths remain future work. Neither primitive should be mistaken for a working end-user
+child fixture. The separate experimental GDB/RSP observer supplies only unauthenticated, read-only,
+best-effort Workbench observations; it does not compose with that primitive or publish evidence.
+Authenticated helper integration, action authority, execution control, and sandboxed process-hosting
+paths remain future work. None of these surfaces should be mistaken for an authenticated end-user
 live debugger or malware sandbox.
 
 ## Milestone 0: repository foundation
@@ -394,8 +406,9 @@ package installation and process-executing debugger-hosted runtimes are still ou
 - App-local self-contained managed/.NET analysis helper with a host-supplied SDK, verified private
   DLL and exact-binary snapshots, phase-bounded services, and transactional lifecycle
 - Backend-neutral debugger framing, typed reducer/client seam, one-use authorization, exact
-  attestation/cleanup evidence models, test-only synthetic mechanics, and read-only provider
-  readiness without a live target or claimed sandbox
+  attestation/cleanup evidence models, test-only synthetic mechanics, read-only provider readiness,
+  and a separate experimental outbound GDB/RSP observer without authenticated action authority or a
+  claimed sandbox
 - Transactional plugin claims and failure-tolerant `AnalysisSession` packaging
 - Initial contracts and example packages for:
   - WebAssembly plugins with a source-backed, release-staged component
@@ -496,10 +509,12 @@ Semantic inference remains optional and never converts a hypothesis into an extr
   bounded retained-relationship graphing, and export preview (initial Windows-first core-only shell,
   synchronized Reconstruction Graph, static Address Space/protection assessment, bounded exact-RVA
   reads plus bounded x64 linear preview from verified source snapshots, non-executing
-  debugger/sandbox readiness, evidence inspector, current-package opening, six create-new exports,
+  debugger/sandbox readiness, experimental read-only GDB/RSP observation, evidence inspector,
+  current-package opening, six create-new exports,
   and transaction-safe exact-claim review with versioned sidecars, dirty-close protection, and
   undo/redo implemented; bulk review, plugin execution, docking/synchronized disassembly and
-  pseudocode, editable or exhaustive graphing, live debugger bridges, and the remaining
+  pseudocode, editable or exhaustive graphing, authenticated or mutating live debugger bridges, and
+  the remaining
   [approved design](gui-design.md) are planned)
 - Signed or verifiable plugin packages and registry metadata
 - Hash-addressed community symbol packs without bundled application binaries
