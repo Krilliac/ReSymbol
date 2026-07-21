@@ -456,6 +456,30 @@ pub(crate) struct RemoteSessionNotice {
     pub(crate) message: String,
 }
 
+/// `[egui thread, non-blocking]` Apply one successful EE program-counter read.
+///
+/// The observed value is retained in exactly one place: the [`RemoteSessionView`]
+/// scalar, which `clear_observations` and `clear_session` own and which only the
+/// session panel's explicit current-PC row renders.
+///
+/// The returned notice is deliberately value-free. Notices are forwarded to the
+/// Workbench activity log — a bounded ring that outlives the session — and to
+/// the companion console process, and no session scrub can reach either. A
+/// notice carrying the formatted program counter would therefore survive every
+/// scrub this route promises, and would leave the observation attributable after
+/// the connection it came from is gone. The message is a constant, identical for
+/// every observed value, so the log-facing payload encodes nothing about it.
+fn apply_program_counter(view: &mut RemoteSessionView, pc: u32) -> RemoteSessionNotice {
+    view.program_counter = Some(pc);
+    view.last_error = None;
+    RemoteSessionNotice {
+        level: RemoteNoticeLevel::Success,
+        message: "Read the current EE program counter from the remote target; \
+                  the value is shown only in the remote session panel"
+            .to_owned(),
+    }
+}
+
 /// UI-facing controller for exactly one outbound RSP session.
 ///
 /// All methods are `[egui thread, non-blocking]`. The controller is
@@ -761,15 +785,7 @@ impl RemoteSessionController {
                 });
             }
             RemoteOutcome::ProgramCounter { pc } => {
-                self.view.program_counter = Some(pc);
-                self.view.last_error = None;
-                let rendered = format_ee_program_counter(pc);
-                notices.push(RemoteSessionNotice {
-                    level: RemoteNoticeLevel::Success,
-                    message: format!(
-                        "Read the current EE program counter {rendered} from the remote target"
-                    ),
-                });
+                notices.push(apply_program_counter(&mut self.view, pc));
             }
             RemoteOutcome::Failed {
                 detail,
@@ -1512,6 +1528,47 @@ mod tests {
         assert!(view.program_counter().is_none());
         assert_eq!(view.register_summary(), Some("register bytes"));
         assert_eq!(view.memory_summary(), Some("memory bytes"));
+    }
+
+    #[test]
+    fn an_applied_program_counter_never_reaches_the_activity_log() {
+        let mut view = connected_view(Some(ee_target_view(true)));
+        let mut notices = Vec::new();
+
+        for pc in [0, 1, 0x0010_2000, 0x8000_0000, u32::MAX] {
+            let notice = apply_program_counter(&mut view, pc);
+
+            // The typed scalar still reaches presentation state, where the
+            // session scrub owns it and the explicit current-PC row renders it.
+            assert_eq!(view.program_counter(), Some(pc));
+
+            // Notices are forwarded to the bounded activity log and to the
+            // companion console, neither of which any scrub can reach, so the
+            // log-facing payload must carry no rendering of the value: not the
+            // displayed literal, not a bare hexadecimal or decimal rendering,
+            // and not a hexadecimal literal of any other observation.
+            assert!(!notice.message.contains(&format_ee_program_counter(pc)));
+            assert!(!notice.message.contains(&format!("{pc:x}")));
+            assert!(!notice.message.contains(&format!("{pc:X}")));
+            assert!(!notice.message.contains("0x"));
+            assert!(!notice.message.contains("0X"));
+            assert!(!notice.message.chars().any(|c| c.is_ascii_digit()));
+
+            notices.push(notice);
+        }
+
+        // The invariant in its strongest form: the whole log-facing payload --
+        // level and message -- is identical across the full 32-bit range, so it
+        // cannot encode the program counter by any rendering at all.
+        let (first, rest) = notices.split_first().expect("one applied result");
+        for notice in rest {
+            assert_eq!(notice, first);
+        }
+        assert_eq!(first.level, RemoteNoticeLevel::Success);
+
+        // The sole retained copy still answers to the scrub.
+        view.clear_session();
+        assert!(view.program_counter().is_none());
     }
 
     #[test]
