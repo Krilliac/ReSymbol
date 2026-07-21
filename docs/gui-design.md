@@ -4,9 +4,10 @@ This document records both the first implemented ReSymbol workbench slice and th
 long-term direction. `crates/resymbol-workbench` is a Windows-first desktop application built with
 the pinned eframe/egui 0.32.3 stack; that version was selected to preserve the workspace's Rust 1.86
 minimum. The `resymbol` CLI remains supported and currently exposes capabilities that the GUI does
-not. Sections that describe later bulk review, docking, synchronized disassembly/pseudocode, or live
-debugger integration are target design rather than current behavior; the bounded linear preview
-described below is implemented.
+not. Sections that describe later bulk review, docking, synchronized disassembly/pseudocode, or
+authenticated and mutating live-debugger integration are target design rather than current behavior;
+the bounded linear preview and experimental read-only GDB/RSP observer described below are
+implemented.
 
 The workbench should feel familiar to people who spend time in disassemblers and debuggers while
 making ReSymbol's evidence, confidence, provenance, and plugin health more visible than a typical
@@ -208,9 +209,11 @@ live memory** is a different typed action: it requires an authenticated stopped 
 capability report with `LiveMemoryWrite`, an exact live-address binding, and
 `DebugCommand::WriteMemory` compare-before-write using the exact selected bytes and a same-length
 `0x90` replacement. Software breakpoint, Run to Cursor, Step Into/Over/Out, and Continue are also
-listed, but the current workbench has no live client adapter and leaves every action visibly disabled
-with the missing authority. Run to Cursor is explicitly a temporary software breakpoint followed by
-Continue. A future adapter must validate the current stop token and any required address binding;
+listed, but the current workbench has no authenticated `resymbol-debugger` action adapter and leaves
+every action visibly disabled with the missing authority. The experimental GDB/RSP observer below
+cannot mint that authority. Run to Cursor is explicitly a temporary software breakpoint followed by
+Continue. A future action adapter must validate the current stop token and any required address
+binding;
 Step Into/Over/Out may use only the thread carried by the authenticated stopped state, with UI thread
 selection treated as a non-authorizing match requirement. The static preview never supplies live
 authority.
@@ -226,12 +229,14 @@ duplicate, overlapping, stale, unbacked, virtual-tail, or non-executable ranges 
 does not mutate the current drafts until that whole operation succeeds; cancellation, worker
 failure, stale completion, wrong source, or any validation error preserves them. Successful results
 show the exact source identity and edit count. This portable static workflow remains independent of
-the disabled live debugger path and only feeds the separate create-new patched-binary publisher.
+the disabled authenticated live-action path and only feeds the separate create-new patched-binary
+publisher.
 
 Protection assessment shows bounded artifact evidence for entry-point placement and backing,
 TLS-before-entry behavior, anti-debug imports, common packer section names, high-entropy samples, and
 writable/executable sections. These are review cues, not malware verdicts. Offline opening keeps the
-evidence visible without granting permission to run the target. A future live launch or attach must
+evidence visible without granting permission to run the target. A future process-executing launch or
+authenticated attach must
 use a separate blocking acknowledgement bound to the exact binary, operation, provider, and sandbox
 policy; dismissing an offline finding can never authorize execution.
 
@@ -253,6 +258,32 @@ a project change, source-verification change, provider change, or superseding re
 result stale. The surface shows typed unavailable/indeterminate reasons and unresolved requirements
 without enabling a Windows feature, creating a profile or VM, requesting elevation, launching or
 attaching to the target, or falling back to direct host execution.
+
+### Experimental remote GDB/RSP observer
+
+Beneath readiness, the Workbench implements a separate experimental outbound TCP GDB/RSP observer.
+It is a transport-specific, explicit-request, capacity-one, read-only, best-effort inspection
+surface, not a readiness result, containment boundary, or authenticated `resymbol-debugger`
+session. The plaintext peer and target process are not authenticated at that session/token layer;
+connecting therefore creates no live-action capability, stopped-state token, lease, attestation, or
+cleanup evidence. Observations cannot be published into the project, `.resym` packages, review
+ledgers, or exports and cannot authorize launch, attach, write, breakpoint, continue, or step.
+
+The egui controller admits one outstanding request through a capacity-one request channel and owns a
+bounded two-entry result channel, ephemeral presentation state, and a cloned socket handle used
+solely to interrupt pending I/O during cancellation or shutdown. The named
+remote-I/O worker owns the protocol client, parsed target description, and read/write stream. For a
+target matching the exact canonical PS2 EE schema, one button performs one register-packet read and
+shows a fixed-width `u32` as **Last observed EE PC**. Only that scalar crosses the worker/UI
+channel; the raw packet and every other decoded EE register remain worker-local and are dropped
+there. It is never polled.
+
+A new connection attempt, cancellation, disconnect, connection loss, worker loss, or session
+replacement scrubs the displayed observations so they cannot be attributed to another endpoint; a
+stale completion is discarded before presentation. The bounded activity log and companion console
+outlive those scrubs, so the completion notice is deliberately identical for every program-counter
+value and contains no rendering of the value.
+[GDB-REMOTE-ATTACH.md](GDB-REMOTE-ATTACH.md) records the complete transport and lifecycle boundary.
 
 ### Contextual inspector
 
@@ -341,9 +372,9 @@ The broader export surface should show:
 
 The PDB panel requires the exact verified original PE and describes the current output as public
 function/global names only, without implying that types, private symbols, source lines, or function
-extents are present. IDA and Ghidra scripts retain their identity gate. An interactive debugger
-bridge may add preview and selective application, but it must still use the core identity and
-projection rules.
+extents are present. IDA and Ghidra scripts retain their identity gate. A future interactive
+evidence-applying bridge may add preview and selective application, but it must still use the core
+identity and projection rules; the GDB/RSP observer does not consume or publish that evidence.
 
 The first slice opens and analyzes binaries; it does not open legacy `.resym` packages. Supporting
 legacy package review must use the CLI's explicit compatibility paths and must not relabel missing
@@ -445,8 +476,9 @@ later validation task.
 
 The current slice has no GUI plugin execution, legacy-package migration, bulk-review workflow,
 docking, synchronized disassembly/pseudocode workspace, editable or exhaustive control-flow
-graphing, live debugger bridge, process-executing debugger host, verified AppContainer/VM provider,
-multi-binary workspace, or remote collaboration. Current-package opening, exact-claim Accept
+graphing, authenticated or mutating live debugger bridge, process-executing debugger host, verified
+AppContainer/VM provider, multi-binary workspace, or remote collaboration. Current-package opening,
+the experimental read-only GDB/RSP observer, exact-claim Accept
 Primary/Keep as Alias/Reject, transaction-level undo/redo, binary-bound versioned review sidecars,
 dirty-close protection, static Address Space/protection assessment with bounded verified-source RVA
 hex and linear-disassembly previews, read-only provider readiness, and all six symbol export formats

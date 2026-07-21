@@ -19,9 +19,11 @@ export projection, deterministic Microsoft-linker-style MAP output, an exact-RSD
 writer, and conservative standalone import-script generators
 for IDA and Ghidra. A first Windows-first workbench slice now provides background core analysis,
 durable exact-name review, bounded graph navigation, static address/protection inspection,
-non-executing debugger/sandbox readiness, and a constrained shared-model export path. Broader
-disassembly-assisted discovery, matching, semantic inference, live debugger bridges, richer PDB and
-DWARF output, bulk review, and the rest of the workbench design remain future work.
+non-executing debugger/sandbox readiness, a constrained shared-model export path, and an
+experimental outbound TCP GDB/RSP observer for explicit read-only, best-effort inspection. Broader
+disassembly-assisted discovery, matching, semantic inference, authenticated or mutating live
+debugger bridges, richer PDB and DWARF output, bulk review, and the rest of the workbench design
+remain future work.
 
 ## Goals
 
@@ -529,7 +531,9 @@ fields.
 
 PDB, MAP, DWARF, IDA, Ghidra, and other targets have different capabilities and must not force
 their assumptions into the canonical graph. Richer PDB types, private symbols, and line data;
-DWARF writers; and interactive debugger bridges remain planned. See
+DWARF writers; and interactive tool-hosted bridges that preview or apply evidence remain planned.
+The Workbench's experimental GDB/RSP observer neither consumes this export projection nor publishes
+observations into it. See
 [exporting.md](exporting.md) for current behavior.
 
 ## Plugin boundary
@@ -813,12 +817,14 @@ a terminal reducer failure and freezes or poisons the worker until cleanup. Prov
 state, and worker health are independent axes: `Closed` health proves complete provider/core cleanup
 but retains the last reducer snapshot unchanged. Incomplete cleanup remains retryable while the
 provider retains cleanup authority. Once detached with incomplete evidence, the worker retains and
-returns that exact evidence forever and never reports a synthetic successful close. This is still not
-a Windows debugger-host helper process,
-authenticated transport, or UI bridge. No AppContainer or Hyper-V provider, guest agent, live
-launch, breakpoint engine, register service, execution stepping, Workbench live-memory bridge, or
-sandbox provisioning is implemented. The offline host, low-level attach/read/write foundation, and
-readiness UI therefore remain far short of a working malware sandbox or end-user live debugger.
+returns that exact evidence forever and never reports a synthetic successful close. This Windows
+debug-host stack is still not a debugger-host helper process, authenticated transport, or Workbench
+UI route. Its provider path has no AppContainer or Hyper-V provider, guest agent, live launch,
+breakpoint engine, register service, execution stepping, Workbench live-memory bridge, or sandbox
+provisioning. The separate experimental GDB/RSP observer does not compose this provider with the
+`resymbol-debugger` session/token layer and cannot supply any of those missing authorities. The
+offline host, low-level attach/read/write foundation, observer, and readiness UI therefore remain
+far short of a working malware sandbox or authenticated end-user live debugger.
 [debugger-sandbox.md](debugger-sandbox.md) records the exact ownership, authorization, containment,
 cleanup, and verification gates that future live providers must satisfy.
 
@@ -835,7 +841,8 @@ The initial shell implements the approved four-region structure: persistent, res
 collapsible project/plugin navigation, a virtualized sortable/filterable function table, a bounded
 Reconstruction Graph, a static Address Space/protection view with an at-most-256-byte worker-owned
 exact-RVA reader with automatic PE/x64 and explicitly selected eligible ELF/R5900 linear previews,
-a non-executing Debugger / Sandbox readiness view, an evidence inspector, and a
+a non-executing Debugger / Sandbox readiness view, an evidence inspector, an experimental outbound
+GDB/RSP observer, and a
 progress/warning/log area. The reader constructs one in-process offline client per request, then
 closes the session, releases it, and disconnects before returning a result. The shell accepts that
 result only when its operation, full identity, canonical verified source, span, and lifecycle receipt
@@ -847,6 +854,28 @@ activity chrome at minimum height so the central row viewport remains usable. Ma
 Function-search focus, and stable filtered/sorted Function-row movement are reduced on the GUI event
 loop; the pure layout and navigation policy owns no widgets, worker resources, project data, or
 mutable selection state.
+
+The GDB/RSP observer is a transport-specific, read-only, best-effort inspection path, not an
+authenticated `resymbol-debugger` session. `RemoteSessionController` admits one outstanding request
+through a capacity-one request channel and owns a bounded two-entry result channel plus ephemeral
+presentation state on the egui thread. The named remote-I/O worker
+exclusively owns `GdbRemoteClient<TcpTransport>`, the parsed target description, and the stream used
+for protocol reads and writes. The controller holds only a cloned socket handle whose sole purpose
+is to interrupt pending I/O during cancellation or shutdown; it cannot use that clone for protocol
+traffic. Dropping the controller signals cancellation, shuts down that clone, closes the channels,
+and detaches rather than joining the network owner during UI teardown.
+
+The plaintext RSP peer and target process are not authenticated, and connection establishment mints
+no `SessionId`, stopped-state token, lease, capability, or cleanup evidence. Consequently an
+observation cannot enter `.resym` packages or review ledgers, publish evidence, or authorize launch,
+attach, write, breakpoint, continue, or step actions. For the canonical PS2 EE current-PC operation,
+only one typed `u32` crosses the worker/UI channel; the raw `g` packet and every other decoded
+register stay worker-local. Stale completions are discarded before presentation; cancellation,
+disconnect, connection or worker loss, and session replacement scrub the retained value. The
+completion notice retained by the activity log and companion console is deliberately value-free
+because those logs outlive the scrubbed session.
+[GDB-REMOTE-ATTACH.md](GDB-REMOTE-ATTACH.md) records the complete transport, lifecycle, and
+observation boundary.
 
 The Reconstruction Graph is a read-only projection of retained analysis, not a second analyzer or a
 claim of complete call-graph recovery. It roots at the PE entry point when that point is available as
@@ -870,7 +899,9 @@ while operation identifiers and exact ledger/project binding reject stale result
 request or companion-console `quit` with unsaved review changes pauses for **Save New...**,
 **Discard and Close**, or **Cancel**; save-and-close waits for the exact queued ledger snapshot to
 be durable. GUI plugin execution, arbitrary docking, synchronized disassembly/pseudocode views,
-editable or exhaustive control-flow graphs, and a live debugger bridge remain planned.
+editable or exhaustive control-flow graphs, and authenticated or mutating live debugger bridges
+remain planned. The experimental GDB/RSP observer above does not satisfy those deferred authority or
+evidence requirements.
 
 Before create-new static patch publication, **Validate Drafts / Preview Output Hash** runs the same
 bounded plan construction and exact-source application entirely in memory. Its worker command has no
@@ -961,9 +992,11 @@ Developer toolchains are a contributor concern, not an end-user installation ste
    cannot directly create trusted facts.
 7. **Tool bridges are separate trust domains.** A bridge must validate the binary identity and
    address mapping before applying an analysis inside another program.
-8. **Debugger readiness is not containment.** A read-only readiness result authorizes neither
-   provisioning nor execution. The current plaintext build-claim exchange does not authenticate a
-   helper, and no process-executing debugger provider exists in the current implementation.
+8. **Debugger readiness and observation are not containment.** A read-only readiness result
+   authorizes neither provisioning nor execution. The current plaintext build-claim exchange does
+   not authenticate a helper, the experimental GDB/RSP transport does not authenticate into the
+   debugger session/token layer, and no process-executing debugger provider exists in the current
+   implementation.
 
 The core should retain enough structured diagnostics to explain which boundary failed without
 logging binary contents, source material, or secrets by default.

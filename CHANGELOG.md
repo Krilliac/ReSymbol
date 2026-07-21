@@ -8,6 +8,15 @@ prereleases; breaking changes remain explicit.
 
 ### Added
 
+- Added an experimental outbound TCP GDB/RSP observer to the Workbench for explicit, capacity-one,
+  read-only, best-effort target inspection. The transport is unauthenticated at the
+  `resymbol-debugger` session/token layer, cannot publish evidence or authorize live actions, and
+  keeps protocol traffic and the complete target description on its remote-I/O worker. For an exact
+  canonical PS2 EE schema, only the typed `u32` program counter leaves the decoded register set and
+  crosses to the UI, where it appears as **Last observed EE PC**; the raw packet and every other
+  decoded register remain worker-local. Stale completions are discarded before presentation;
+  cancellation, disconnect, connection or worker loss, and replacement scrub the retained value,
+  while persistent activity notices remain value-free.
 - Added `resymbol ps2 observe EXACT_PS2_EE_ELF --profile EXACT_R5900_PROFILE --output
   NEW_PRIVATE_REPORT` as a bounded, non-executing research path for eligible PlayStation 2 EE ELF
   snapshots. The command accepts only the six immutable bundled R5900 profile names, records the
@@ -186,9 +195,10 @@ prereleases; breaking changes remain explicit.
   fixture covers the real authority-bound attach/read/write/restore/cleanup path, with deterministic
   fake-backend tests
   covering ordering, handle closure, deadlines, cleanup faults, authenticated orchestration,
-  checkpoint resolution, and terminal cleanup. This is not an authenticated debugger-host process
-  or transport, and no Workbench live-memory bridge, launch, register, stepping, breakpoint engine,
-  or sandbox provisioning is exposed.
+  checkpoint resolution, and terminal cleanup. This Windows provider stack is not an authenticated
+  debugger-host process or transport and exposes no Workbench route for its live memory, launch,
+  registers, stepping, breakpoint engine, or sandbox provisioning. The separate experimental
+  GDB/RSP observer does not compose with this provider or its authority model.
 - Added schema-14, container-only intake for ELF32 little-endian `EM_MIPS` executables. Checked
   header and table parsing retains sparse non-empty `PT_LOAD` mappings and a deterministic
   identity-only graph without decoding or executing instructions. A source-built synthetic fixture

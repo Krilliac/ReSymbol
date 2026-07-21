@@ -9133,7 +9133,12 @@ impl WorkbenchApp {
                 }
                 if let Some(pc) = view.program_counter() {
                     ui.add_space(6.0);
-                    property_row(ui, "Current EE PC", &format_ee_program_counter(pc), true);
+                    property_row(
+                        ui,
+                        "Last observed EE PC",
+                        &format_ee_program_counter(pc),
+                        true,
+                    );
                 }
                 if let Some(registers) = view.register_summary() {
                     ui.add_space(6.0);

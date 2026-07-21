@@ -19,8 +19,10 @@ IDA, Ghidra, debuggers, PDB consumers, and DWARF consumers.
 > in-process engine; the process runtimes provide crash isolation rather than an OS sandbox.
 > The initial JSON, Markdown, Microsoft-linker-style MAP, exact-RSDS public-symbol PDB, IDAPython,
 > and Ghidra Java exporters are usable but deliberately conservative.
-> Plugin and data formats may change; DWARF and interactive debugger bridges are not implemented
-> yet.
+> Plugin and data formats may change; DWARF and authenticated, evidence-publishing, or mutating
+> interactive debugger bridges are not implemented yet. The Workbench does include an experimental,
+> transport-specific GDB/RSP observer for explicit read-only, best-effort inspection; it is not an
+> authenticated live-action bridge.
 
 ## What exists today
 
@@ -88,7 +90,7 @@ The current alpha implements and tests an end-to-end, deliberately narrow analys
   static Address Space/protection view with a worker-owned exact-RVA byte reader, automatic bounded
   x64 preview for PE, and an explicitly selected bounded R5900 preview for eligible ELF sources,
   read-only debugger/sandbox provider
-  readiness, and read-only plugin health.
+  readiness, read-only plugin health, and an experimental outbound TCP GDB/RSP observer.
   The graph starts from the PE entry point or a clearly labeled deterministic lowest-RVA fallback,
   shares function selection with the table and inspector, and draws only retained direct-call,
   thunk, and import relationships. Accept Primary, Keep as Alias, Reject, rationale, undo, and redo
@@ -100,7 +102,14 @@ The current alpha implements and tests an end-to-end, deliberately narrow analys
   is a non-mutating preflight only: it does not provision a sandbox, launch or attach to a target, or
   attest containment. The Address Space reader serves at most 256 bytes from the frozen exact source
   through the in-process offline host; its disassembly is a capped linear preview, not CFG or
-  function-boundary truth. PE/x64 row context menus can queue exact NOP, invert-condition, and
+  function-boundary truth. The GDB/RSP observer is a capacity-one, explicit-request surface for
+  schema-validated register and bounded memory reads. An exact canonical PS2 EE target can also
+  expose one typed `u32` last-observed program counter; the raw packet and all other decoded EE
+  registers stay on its remote-I/O worker. This best-effort transport path is unauthenticated at the
+  `resymbol-debugger` session/token layer, cannot publish evidence or authorize live actions, and
+  scrubs observations on cancellation, disconnect, connection loss, worker loss, or replacement.
+  See [the outbound GDB/RSP observer boundary](docs/GDB-REMOTE-ATTACH.md).
+  PE/x64 row context menus can queue exact NOP, invert-condition, and
   always-taken edits for canonical conditional branches; these remain unpublished drafts, and
   explicit R5900 rows expose only copy and file-backed direct-target navigation. Neither view opens
   a process or claims a live mapping. See
@@ -313,8 +322,10 @@ external-process host supports one-shot analysis requests; its interactive binar
 reserved for a later protocol revision. The native host instead
 provides a bounded synchronous C callback for file-backed RVAs in the exact PE. The managed host
 provides the equivalent bounded asynchronous SDK service for approved .NET plugins. Plugin package
-verification/extraction, cross-build matching, semantic inference, interactive debugger bridges,
-richer PDB records, and DWARF export are also **not implemented yet**.
+verification/extraction, cross-build matching, semantic inference, authenticated or mutating
+interactive debugger bridges, richer PDB records, and DWARF export are also **not implemented
+yet**. The experimental outbound GDB/RSP observer is narrower: it retains no authenticated debugger
+session authority and cannot publish evidence.
 
 ## Why ReSymbol?
 
@@ -350,7 +361,7 @@ ReSymbol is growing from the working PE/package foundation toward:
 - a Windows-first desktop workbench for background core analysis, current-package opening, exact
   claim review with durable binary-bound decisions, read-only plugin health, reconstruction and
   address-space views, non-executing debugger/sandbox readiness, and constrained create-new exports,
-  followed by GUI plugin execution and richer debugger/tool bridges;
+  followed by GUI plugin execution and richer authenticated debugger/tool bridges;
 - drop-in plugin discovery from a local `plugins/` directory;
 - WASM, native C/C++, managed/.NET, external-process, and debugger-hosted plugin families from the
   initial architecture, with WASM, external-process, native C/C++, and managed/.NET execution
@@ -427,9 +438,13 @@ Package...**, the **Open Binary** workflow stage, Ctrl+O, **File -> Open Recent*
 supported file onto the window. A dirty review ledger triggers an explicit save/discard/cancel
 handoff, and the old project remains active if the replacement cannot be opened.
 
-The desktop slice runs core analysis only. It exposes evidence, provenance, durable exact-claim
-review, plugin health, a static Address Space/protection assessment, and read-only debugger/sandbox
-provider readiness. Its Reconstruction Graph roots at the PE entry point when available, otherwise
+The desktop analysis flow runs core analysis only. The Workbench exposes evidence, provenance,
+durable exact-claim review, plugin health, a static Address Space/protection assessment, read-only
+debugger/sandbox provider readiness, and a separate experimental outbound TCP GDB/RSP observer. The
+observer is an explicit, capacity-one, read-only, best-effort transport surface. It is
+unauthenticated at the `resymbol-debugger` session/token layer, publishes no evidence, and
+authorizes no live action. Its
+Reconstruction Graph roots at the PE entry point when available, otherwise
 at a clearly labeled deterministic lowest-RVA navigation fallback, synchronizes selection with the
 function inspector, and shows only relationships retained by analysis. Large graphs are rendered
 through an explicit bounded view rather than implying complete call-graph recovery. Address Space is
@@ -443,8 +458,9 @@ and follows only decoder-proven direct branch/call targets with exact file backi
 Gaps, zero-fill, padding, and crossing spans remain explicitly unavailable. Static NOP requests are
 exact-byte drafts; **Create New Patched Binary** validates them as complete instructions on the
 application-service worker, rechecks the exact source identity and bytes, then publishes a separate
-no-clobber binary with explicit signature/checksum warnings. Live debugger actions remain disabled
-without authenticated capabilities and current tokens. Provider readiness means only that
+no-clobber binary with explicit signature/checksum warnings. The GDB/RSP observer cannot mint the
+authenticated capabilities or current tokens required by live debugger actions, so those actions
+remain disabled. Provider readiness means only that
 provisioning may be attempted; none of these surfaces executes the input or proves containment.
 The workbench opens
 current `.resym` packages and creates new patched PE binaries, `.resym`, neutral JSON, Markdown, MAP,
