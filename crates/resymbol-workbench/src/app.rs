@@ -435,6 +435,7 @@ enum ReviewUiAction {
 enum RemoteSessionUiAction {
     Connect,
     Disconnect,
+    CancelPending,
     ReadRegisters,
     ReadMemory,
 }
@@ -8979,6 +8980,19 @@ impl WorkbenchApp {
                     {
                         action = Some(RemoteSessionUiAction::Disconnect);
                     }
+                    if ui
+                        .add_enabled(
+                            pending && !view.is_cancelling(),
+                            egui::Button::new(if view.is_cancelling() {
+                                "Cancelling..."
+                            } else {
+                                "Cancel pending operation"
+                            }),
+                        )
+                        .clicked()
+                    {
+                        action = Some(RemoteSessionUiAction::CancelPending);
+                    }
                 });
                 ui.add_enabled_ui(!pending && !connected, |ui| {
                     ui.checkbox(
@@ -8991,46 +9005,47 @@ impl WorkbenchApp {
                 );
 
                 ui.add_space(8.0);
+                ui.label(RichText::new("Workbench read-only routing policy").strong());
                 ui.horizontal_wrapped(|ui| {
                     ui.label(
                         RichText::new(if capabilities.read_registers {
-                            "[READ REGISTERS]"
+                            "[ROUTE: READ REGISTERS]"
                         } else {
-                            "[NO REGISTER READ]"
+                            "[NO ROUTE: READ REGISTERS]"
                         })
                         .monospace()
                         .color(colors.healthy),
                     );
                     ui.label(
                         RichText::new(if capabilities.read_memory {
-                            "[READ MEMORY]"
+                            "[ROUTE: READ MEMORY]"
                         } else {
-                            "[NO MEMORY READ]"
+                            "[NO ROUTE: READ MEMORY]"
                         })
                         .monospace()
                         .color(colors.healthy),
                     );
                     ui.label(
                         RichText::new(if capabilities.write_target {
-                            "[WRITE ENABLED]"
+                            "[ROUTE: WRITE TARGET]"
                         } else {
-                            "[NO WRITES]"
+                            "[NO ROUTE: WRITE TARGET]"
                         })
                         .monospace()
                         .color(colors.warning_conflict),
                     );
                     ui.label(
                         RichText::new(if capabilities.control_execution {
-                            "[CONTROL ENABLED]"
+                            "[ROUTE: CONTROL EXECUTION]"
                         } else {
-                            "[NO EXECUTION CONTROL]"
+                            "[NO ROUTE: CONTROL EXECUTION]"
                         })
                         .monospace()
                         .color(colors.warning_conflict),
                     );
                 });
                 ui.small(
-                    "Writes, breakpoints, continue, and step are not merely hidden: this session policy does not authorize or route them.",
+                    "These badges describe Workbench routes, not target-advertised support. Writes, breakpoints, continue, and step are not authorized or routed.",
                 );
 
                 if connected {
@@ -9096,6 +9111,10 @@ impl WorkbenchApp {
                 .remote_session
                 .disconnect()
                 .map_err(|error| error.to_string()),
+            Some(RemoteSessionUiAction::CancelPending) => self
+                .remote_session
+                .cancel_pending()
+                .map_err(|error| error.to_string()),
             Some(RemoteSessionUiAction::ReadRegisters) => self
                 .remote_session
                 .read_registers()
@@ -9115,8 +9134,7 @@ impl WorkbenchApp {
             None => return,
         };
 
-        if let Err(error) = result {
-            let message = error.to_string();
+        if let Err(message) = result {
             self.remote_session.note_local_error(&message);
             self.log(
                 ActivityLevel::Error,

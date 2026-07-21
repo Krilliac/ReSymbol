@@ -3194,6 +3194,7 @@ dependencies = [
  "resymbol-core",
  "resymbol-debugger",
  "resymbol-export",
+ "resymbol-gdb-remote",
  "resymbol-windows-process",
  "rfd",
  "serde",
