@@ -3,6 +3,7 @@
 mod app;
 pub mod console;
 mod console_host;
+mod gdb_session;
 mod graph;
 mod instruction_actions;
 mod model;
