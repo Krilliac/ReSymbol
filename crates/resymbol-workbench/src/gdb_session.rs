@@ -22,7 +22,10 @@ use std::{
     time::Duration,
 };
 
-use resymbol_gdb_remote::{GdbRemoteClient, TcpTransport};
+use resymbol_gdb_remote::{
+    GdbRemoteClient, PS2_EE_GPACKET_BYTES, PS2_EE_TARGET_DESCRIPTION, PS2_EE_TARGET_XML,
+    RemoteTargetDescription, TargetByteOrder, TcpTransport,
+};
 use thiserror::Error;
 
 pub(crate) const DEFAULT_REMOTE_ENDPOINT: &str = "127.0.0.1:1234";
@@ -44,14 +47,55 @@ pub(crate) struct RemoteSessionCapabilities {
 
 impl RemoteSessionCapabilities {
     /// The first Workbench surface is intentionally inspection-only. Mutating
-    /// and execution-control commands require separate explicit policy and a
-    /// cancellable RSP client before they can be advertised here.
+    /// and execution-control commands require separate explicit policy and
+    /// asynchronous target-interrupt support before they can be advertised.
     const READ_ONLY: Self = Self {
         read_registers: true,
         read_memory: true,
         write_target: false,
         control_execution: false,
     };
+}
+
+/// Bounded target metadata copied into ephemeral egui presentation state.
+///
+/// The complete XML and parsed register schema stay with the remote-I/O
+/// worker. Workbench never serializes either representation into a project or
+/// preference artifact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RemoteTargetView {
+    architecture: String,
+    byte_order: Option<TargetByteOrder>,
+    register_count: usize,
+    expected_gpacket_bytes: usize,
+    software_breakpoint_kind: Option<u64>,
+    exact_ps2_ee_schema: bool,
+}
+
+impl RemoteTargetView {
+    pub(crate) fn architecture(&self) -> &str {
+        &self.architecture
+    }
+
+    pub(crate) const fn byte_order(&self) -> Option<TargetByteOrder> {
+        self.byte_order
+    }
+
+    pub(crate) const fn register_count(&self) -> usize {
+        self.register_count
+    }
+
+    pub(crate) const fn expected_gpacket_bytes(&self) -> usize {
+        self.expected_gpacket_bytes
+    }
+
+    pub(crate) const fn software_breakpoint_kind(&self) -> Option<u64> {
+        self.software_breakpoint_kind
+    }
+
+    pub(crate) const fn is_exact_ps2_ee_schema(&self) -> bool {
+        self.exact_ps2_ee_schema
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,6 +239,7 @@ enum RemoteOutcome {
     Connected {
         endpoint: SocketAddr,
         advertised_features: String,
+        target: RemoteTargetView,
     },
     Disconnected,
     Registers {
@@ -225,6 +270,7 @@ pub(crate) struct RemoteSessionView {
     pending: Option<&'static str>,
     cancelling: bool,
     advertised_features: Option<String>,
+    target: Option<RemoteTargetView>,
     register_summary: Option<String>,
     memory_summary: Option<String>,
     last_error: Option<String>,
@@ -261,6 +307,10 @@ impl RemoteSessionView {
         self.advertised_features.as_deref()
     }
 
+    pub(crate) const fn target(&self) -> Option<&RemoteTargetView> {
+        self.target.as_ref()
+    }
+
     pub(crate) fn register_summary(&self) -> Option<&str> {
         self.register_summary.as_deref()
     }
@@ -281,6 +331,7 @@ impl RemoteSessionView {
     fn clear_session(&mut self) {
         self.endpoint = None;
         self.advertised_features = None;
+        self.target = None;
         self.clear_observations();
     }
 }
@@ -409,6 +460,15 @@ impl RemoteSessionController {
         self.cancel_requested.store(true, Ordering::Release);
         self.view.cancelling = true;
         self.view.clear_session();
+        if let Some(commands) = &self.commands {
+            // Usually socket shutdown wakes the in-flight command and its
+            // worker-side cancellation check drops the typed session. If the
+            // result already won that race, this queued disconnect wakes the
+            // idle worker and still scrubs its client/description. Both events
+            // carry the cancelled request ID and are ignored by presentation
+            // state after the first stale completion is consumed.
+            let _ = commands.try_send(RemoteCommand::Disconnect { request });
+        }
         shutdown_cancel_stream(&self.cancel_stream);
         Ok(())
     }
@@ -518,9 +578,11 @@ impl RemoteSessionController {
             RemoteOutcome::Connected {
                 endpoint,
                 advertised_features,
+                target,
             } => {
                 self.view.endpoint = Some(endpoint);
                 self.view.advertised_features = Some(advertised_features);
+                self.view.target = Some(target);
                 self.view.register_summary = None;
                 self.view.memory_summary = None;
                 self.view.last_error = None;
@@ -619,12 +681,19 @@ fn remote_worker_loop(
     cancel_stream: Arc<Mutex<Option<TcpStream>>>,
     cancel_requested: Arc<AtomicBool>,
 ) {
-    let mut client: Option<GdbRemoteClient<TcpTransport>> = None;
+    let mut client: Option<RemoteClientSession> = None;
     while let Ok(command) = commands.recv() {
         let request = command.request();
         let kind = command.kind();
         let outcome =
             process_remote_command(command, &mut client, &cancel_stream, &cancel_requested);
+        if cancel_requested.load(Ordering::Acquire) {
+            // Cancellation is a lifecycle boundary even if an operation won a
+            // race with socket shutdown. Drop the worker-owned XML/schema and
+            // client before reporting the stale result that the UI will ignore.
+            client = None;
+            clear_cancel_stream(&cancel_stream);
+        }
         if events
             .send(RemoteEvent {
                 request,
@@ -643,7 +712,7 @@ fn remote_worker_loop(
 /// `[remote I/O thread]`
 fn process_remote_command(
     command: RemoteCommand,
-    client: &mut Option<GdbRemoteClient<TcpTransport>>,
+    client: &mut Option<RemoteClientSession>,
     cancel_stream: &Arc<Mutex<Option<TcpStream>>>,
     cancel_requested: &Arc<AtomicBool>,
 ) -> RemoteOutcome {
@@ -652,11 +721,12 @@ fn process_remote_command(
             *client = None;
             clear_cancel_stream(cancel_stream);
             match connect_client(attach.endpoint(), cancel_stream, cancel_requested) {
-                Ok((connected, advertised_features)) => {
+                Ok((connected, advertised_features, target)) => {
                     *client = Some(connected);
                     RemoteOutcome::Connected {
                         endpoint: attach.endpoint(),
                         advertised_features,
+                        target,
                     }
                 }
                 Err(error) => {
@@ -680,17 +750,17 @@ fn process_remote_command(
                     connection_lost: true,
                 };
             };
-            match connected.read_registers() {
-                Ok(registers) if !registers.is_empty() => RemoteOutcome::Registers {
+            let result = connected.client.read_registers().and_then(|registers| {
+                connected.description.validate_gpacket(&registers)?;
+                Ok(registers)
+            });
+            match result {
+                Ok(registers) => RemoteOutcome::Registers {
                     byte_count: registers.len(),
                     preview: registers
                         .into_iter()
                         .take(MAX_REGISTER_PREVIEW_BYTES)
                         .collect(),
-                },
-                Ok(_) => RemoteOutcome::Failed {
-                    detail: "target returned an empty register packet".to_owned(),
-                    connection_lost: false,
                 },
                 Err(error) => {
                     *client = None;
@@ -709,7 +779,7 @@ fn process_remote_command(
                     connection_lost: true,
                 };
             };
-            match connected.read_memory(read.address(), read.size()) {
+            match connected.client.read_memory(read.address(), read.size()) {
                 Ok(bytes) if bytes.len() == read.size() => RemoteOutcome::Memory {
                     address: read.address(),
                     bytes,
@@ -739,16 +809,20 @@ fn process_remote_command(
     }
 }
 
+/// Complete typed session retained only by the remote-I/O worker.
+#[derive(Debug)]
+struct RemoteClientSession {
+    client: GdbRemoteClient<TcpTransport>,
+    description: RemoteTargetDescription,
+}
+
 /// `[remote I/O thread]`
 fn connect_client(
     endpoint: SocketAddr,
     cancel_stream: &Arc<Mutex<Option<TcpStream>>>,
     cancel_requested: &Arc<AtomicBool>,
-) -> io::Result<(GdbRemoteClient<TcpTransport>, String)> {
+) -> io::Result<(RemoteClientSession, String, RemoteTargetView)> {
     let stream = TcpStream::connect_timeout(&endpoint, CONNECT_TIMEOUT)?;
-    stream.set_nodelay(true)?;
-    stream.set_read_timeout(Some(IO_TIMEOUT))?;
-    stream.set_write_timeout(Some(IO_TIMEOUT))?;
     let interrupt = stream.try_clone()?;
     *cancel_stream
         .lock()
@@ -760,28 +834,77 @@ fn connect_client(
             "remote operation cancelled",
         ));
     }
-    let mut client = GdbRemoteClient::new(TcpTransport::new(stream));
+    let transport = TcpTransport::from_connected_stream(stream)?;
+    let mut client = GdbRemoteClient::new(transport).with_operation_timeout(IO_TIMEOUT);
     let advertised_features = client.query_supported()?;
-    if is_rsp_error_reply(&advertised_features) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "remote stub rejected qSupported with {}",
-                String::from_utf8_lossy(&advertised_features)
-            ),
-        ));
-    }
+    let description = require_target_description(client.read_target_description()?)?;
+    let target = validate_target_description(&description)?;
     Ok((
-        client,
+        RemoteClientSession {
+            client,
+            description,
+        },
         bounded_printable(&advertised_features, MAX_FEATURE_TEXT_BYTES),
+        target,
     ))
 }
 
-fn is_rsp_error_reply(reply: &[u8]) -> bool {
-    reply.len() == 3
-        && reply[0] == b'E'
-        && reply[1].is_ascii_hexdigit()
-        && reply[2].is_ascii_hexdigit()
+fn require_target_description(
+    description: Option<RemoteTargetDescription>,
+) -> io::Result<RemoteTargetDescription> {
+    description.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "remote stub does not provide qXfer:features:read:target.xml; typed inspection requires a target description",
+        )
+    })
+}
+
+fn validate_target_description(
+    description: &RemoteTargetDescription,
+) -> io::Result<RemoteTargetView> {
+    let architecture = description.architecture().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "target description does not declare an architecture",
+        )
+    })?;
+    let expected_gpacket_bytes = description.expected_gpacket_bytes().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "target description does not declare a register layout",
+        )
+    })?;
+
+    let exact_ps2_ee_schema = if architecture == PS2_EE_TARGET_DESCRIPTION.architecture {
+        let canonical = RemoteTargetDescription::parse(PS2_EE_TARGET_XML.to_owned())?;
+        if expected_gpacket_bytes != PS2_EE_TARGET_DESCRIPTION.register_packet_bytes
+            || description.registers() != canonical.registers()
+            || description.byte_order() != Some(PS2_EE_TARGET_DESCRIPTION.byte_order)
+            || description.software_breakpoint_kind()
+                != Some(PS2_EE_TARGET_DESCRIPTION.software_breakpoint_kind)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "mips:5900 target does not match the canonical {}-register, {PS2_EE_GPACKET_BYTES}-byte PS2 EE schema",
+                    canonical.registers().len()
+                ),
+            ));
+        }
+        true
+    } else {
+        false
+    };
+
+    Ok(RemoteTargetView {
+        architecture: architecture.to_owned(),
+        byte_order: description.byte_order(),
+        register_count: description.registers().len(),
+        expected_gpacket_bytes,
+        software_breakpoint_kind: description.software_breakpoint_kind(),
+        exact_ps2_ee_schema,
+    })
 }
 
 fn shutdown_cancel_stream(cancel_stream: &Arc<Mutex<Option<TcpStream>>>) {
@@ -906,13 +1029,45 @@ mod tests {
     }
 
     #[test]
-    fn rsp_error_replies_are_rejected_without_overmatching_feature_text() {
-        assert!(is_rsp_error_reply(b"E01"));
-        assert!(is_rsp_error_reply(b"Eff"));
-        assert!(!is_rsp_error_reply(b""));
-        assert!(!is_rsp_error_reply(b"E0"));
-        assert!(!is_rsp_error_reply(b"Error"));
-        assert!(!is_rsp_error_reply(b"E0g"));
+    fn typed_surface_requires_a_target_description() {
+        let error = require_target_description(None).expect_err("missing XML must fail closed");
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn canonical_ps2_description_is_typed_as_exact_708_byte_state() {
+        let description = RemoteTargetDescription::parse(PS2_EE_TARGET_XML.to_owned())
+            .expect("canonical PS2 XML");
+        let target = validate_target_description(&description).expect("canonical PS2 schema");
+
+        assert_eq!(
+            target.architecture(),
+            PS2_EE_TARGET_DESCRIPTION.architecture
+        );
+        assert_eq!(target.byte_order(), Some(TargetByteOrder::Little));
+        assert_eq!(target.register_count(), 109);
+        assert_eq!(target.expected_gpacket_bytes(), PS2_EE_GPACKET_BYTES);
+        assert_eq!(
+            target.software_breakpoint_kind(),
+            Some(PS2_EE_TARGET_DESCRIPTION.software_breakpoint_kind)
+        );
+        assert!(target.is_exact_ps2_ee_schema());
+    }
+
+    #[test]
+    fn ps2_description_rejects_structural_metadata_drift() {
+        let drifted = PS2_EE_TARGET_XML.replacen(
+            "name=\"fpu_acc\" bitsize=\"32\" regnum=\"108\" type=\"ieee_single\"",
+            "name=\"fpu_acc\" bitsize=\"32\" regnum=\"108\" type=\"uint32\"",
+            1,
+        );
+        assert_ne!(drifted, PS2_EE_TARGET_XML);
+        let description =
+            RemoteTargetDescription::parse(drifted).expect("drift remains valid target XML");
+
+        let error = validate_target_description(&description)
+            .expect_err("a near-match must not be treated as canonical EE state");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
@@ -922,6 +1077,14 @@ mod tests {
             pending: Some("memory read"),
             cancelling: true,
             advertised_features: Some("PacketSize=1000".to_owned()),
+            target: Some(RemoteTargetView {
+                architecture: "mips:5900".to_owned(),
+                byte_order: Some(TargetByteOrder::Little),
+                register_count: 109,
+                expected_gpacket_bytes: PS2_EE_GPACKET_BYTES,
+                software_breakpoint_kind: Some(4),
+                exact_ps2_ee_schema: true,
+            }),
             register_summary: Some("register bytes".to_owned()),
             memory_summary: Some("memory bytes".to_owned()),
             last_error: Some("diagnostic".to_owned()),
@@ -931,6 +1094,7 @@ mod tests {
 
         assert!(!view.is_connected());
         assert!(view.advertised_features().is_none());
+        assert!(view.target().is_none());
         assert!(view.register_summary().is_none());
         assert!(view.memory_summary().is_none());
         assert!(view.is_pending());
