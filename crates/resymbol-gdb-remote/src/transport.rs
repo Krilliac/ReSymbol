@@ -51,6 +51,8 @@ pub trait Transport {
 /// The read-buffer size used by [`StreamTransport`].
 const READ_BUFFER_BYTES: usize = 4096;
 
+type TimeoutSetter<S> = fn(&S, Option<Duration>) -> io::Result<()>;
+
 /// A [`Transport`] over any [`Read`] + [`Write`] stream, with a small buffer so
 /// single-byte reads coalesce into larger underlying reads.
 #[derive(Debug)]
@@ -59,7 +61,7 @@ pub struct StreamTransport<S> {
     buffer: Box<[u8]>,
     position: usize,
     filled: usize,
-    timeout_setter: Option<fn(&S, Option<Duration>) -> io::Result<()>>,
+    timeout_setter: Option<TimeoutSetter<S>>,
 }
 
 impl<S> StreamTransport<S> {
