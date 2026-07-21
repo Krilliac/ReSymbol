@@ -9083,6 +9083,41 @@ impl WorkbenchApp {
                     ui.add_space(8.0);
                     property_row(ui, "qSupported", features, true);
                 }
+                if let Some(target) = view.target() {
+                    ui.add_space(6.0);
+                    property_row(ui, "Architecture", target.architecture(), true);
+                    let byte_order = match target.byte_order() {
+                        Some(resymbol_gdb_remote::TargetByteOrder::Little) => "little-endian",
+                        Some(resymbol_gdb_remote::TargetByteOrder::Big) => "big-endian",
+                        None => "unknown (not inferred)",
+                    };
+                    property_row(ui, "Byte order", byte_order, false);
+                    property_row(
+                        ui,
+                        "Registers",
+                        &target.register_count().to_string(),
+                        true,
+                    );
+                    property_row(
+                        ui,
+                        "Expected g packet",
+                        &format!("{} bytes", target.expected_gpacket_bytes()),
+                        true,
+                    );
+                    let breakpoint_kind = target.software_breakpoint_kind().map_or_else(
+                        || "unknown (no write/control route)".to_owned(),
+                        |kind| format!("{kind} (informational only)"),
+                    );
+                    property_row(ui, "Software breakpoint kind", &breakpoint_kind, true);
+                    if target.is_exact_ps2_ee_schema() {
+                        property_row(
+                            ui,
+                            "Typed schema",
+                            "canonical PS2 EE/R5900 (lossless 128-bit state)",
+                            false,
+                        );
+                    }
+                }
                 if let Some(registers) = view.register_summary() {
                     ui.add_space(6.0);
                     ui.label(RichText::new(registers).small().monospace());
